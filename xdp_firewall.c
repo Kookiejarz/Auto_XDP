@@ -36,22 +36,18 @@ static __always_inline int check_tcp(void *trans_data, void *data_end) {
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    // 1. 查询目标端口是否在白名单中
-    __u8 *allow = bpf_map_lookup_elem(&tcp_whitelist, &tcp->dest);
+    // 将网络字节序端口转换为主机字节序再查询 map
+    // 因为 Python 脚本写入的 key 是主机字节序
+    __u16 dest_port = bpf_ntohs(tcp->dest);
+    __u8 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
     if (allow && *allow)
         return XDP_PASS;
 
-    // 2. 绕过位域 Bug：直接读取 TCP 头部第 14 字节 (Flags)
-    // 偏移量 [13] 是 TCP 标志位字节
     __u8 tcp_flags = ((__u8 *)tcp)[13];
 
-    // 3. 判断逻辑：
-    // SYN=1 (0x02), ACK=1 (0x10)
-    // 如果是 ACK 包（回包或已有连接），放行
     if (tcp_flags & 0x10)
         return XDP_PASS;
 
-    // 如果是纯 SYN 包（发起新连接）且不在白名单，斩杀
     if (tcp_flags & 0x02)
         return XDP_DROP;
 
@@ -66,20 +62,18 @@ static __always_inline int check_udp(void *trans_data, void *data_end) {
     if ((void *)(udp + 1) > data_end)
         return XDP_PASS;
 
-    // 放行常见出站 UDP 服务的响应包（源端口匹配）
-    // UDP 无连接状态，用源端口判断是否为已知服务的回包
-    if (udp->source == bpf_htons(53)  ||   // DNS 响应
-        udp->source == bpf_htons(123) ||   // NTP 响应
-        udp->source == bpf_htons(67)  ||   // DHCP server → client
-        udp->source == bpf_htons(443))     // QUIC 响应
+    if (udp->source == bpf_htons(53)  ||
+        udp->source == bpf_htons(123) ||
+        udp->source == bpf_htons(67)  ||
+        udp->source == bpf_htons(443))
         return XDP_PASS;
 
-    // 查询 UDP 白名单（支持运行时添加入站 UDP 服务端口）
-    __u8 *allow = bpf_map_lookup_elem(&udp_whitelist, &udp->dest);
+    // 同样转换为主机字节序查询
+    __u16 dest_port = bpf_ntohs(udp->dest);
+    __u8 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     if (allow && *allow)
         return XDP_PASS;
 
-    // 默认丢弃，防御 UDP 放大攻击
     return XDP_DROP;
 }
 
