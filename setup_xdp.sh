@@ -252,7 +252,7 @@ def get_listening_ports() -> PortState:
 def port_to_key(port: int):
     hi = (port >> 8) & 0xFF
     lo = port & 0xFF
-    return [f"0x{hi:02x}", f"0x{lo:02x}"]
+    return [f"0x{lo:02x}", f"0x{hi:02x}"]
 
 def map_update(map_path, port, dry_run):
     import struct
