@@ -107,7 +107,6 @@ fi
 
     # 4. Last Check
     command -v bpftool &>/dev/null || die "bpftool installation failed. Please run: apt install linux-tools-generic"
-fi
 
 ok "Dependency check completed"
 
