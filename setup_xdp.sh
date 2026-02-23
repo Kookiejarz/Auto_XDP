@@ -48,10 +48,10 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     warn "Missing dependency: ${MISSING[*]}, Installing..."
     apt-get update -qq
 
-    apt-get install -y clang llvm libbpf-dev build-essential iproute2 python3 gcc-multilib || true
+    apt-get install -y -qq clang llvm libbpf-dev build-essential iproute2 python3 gcc-multilib || true
 
     info "Installing specific kernel tools..."
-    apt-get install -y linux-tools-common linux-tools-generic linux-tools-$(uname -r) linux-headers-$(uname -r) || true
+    apt-get install -y -qq linux-tools-common linux-tools-generic linux-tools-$(uname -r) linux-headers-$(uname -r) || true
 
     if ! command -v bpftool &>/dev/null; then
         REAL_BPFTOOL=$(find /usr/lib/linux-tools -name bpftool -type f -executable -print -quit 2>/dev/null || true)
