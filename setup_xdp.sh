@@ -250,25 +250,18 @@ def get_listening_ports() -> PortState:
     return state
 
 def port_to_key(port: int):
-    hi = (port >> 8) & 0xFF
+    # 主机字节序写入，对应 XDP 中 bpf_ntohs(tcp->dest)
     lo = port & 0xFF
+    hi = (port >> 8) & 0xFF
     return [f"0x{lo:02x}", f"0x{hi:02x}"]
 
 def map_update(map_path, port, dry_run):
-    import struct
-    # Convert port to network byte order for the key
-    # tcp->dest is big-endian: port 1066 (0x042A) is stored as 04 2A in packet
-    # On x86 (little-endian), __u16 with value 0x042A is stored in memory as 2A 04
-    # bpftool writes raw bytes into memory, so we write the little-endian representation
-    # of the big-endian port value
-    net_port = ((port >> 8) & 0xFF) | ((port & 0xFF) << 8)
-    lo = net_port & 0xFF
-    hi = (net_port >> 8) & 0xFF
-
+    # 直接用主机字节序写入 key
+    lo = port & 0xFF
+    hi = (port >> 8) & 0xFF
     cmd = ["bpftool", "map", "update", "pinned", map_path,
            "key", f"0x{lo:02x}", f"0x{hi:02x}",
            "value", "0x01", "0x00", "0x00", "0x00"]
-
     if dry_run:
         log.info(f"[DRY] {' '.join(cmd)}")
         return True
@@ -303,15 +296,13 @@ def map_dump_ports(map_path) -> set:
         ports = set()
         for e in entries:
             k = e.get("key")
-            if isinstance(k, list) and len(k) == 2:
-                # Bytes are in memory order (little-endian on x86)
-                # Reconstruct the __u16 value (which is network byte order port)
+            # bpftool 无 -j 原始字节时返回整数
+            if isinstance(k, int):
+                ports.add(k)
+            elif isinstance(k, list) and len(k) == 2:
                 b0 = int(k[0], 16) if isinstance(k[0], str) else k[0]
                 b1 = int(k[1], 16) if isinstance(k[1], str) else k[1]
-                net_port = b0 | (b1 << 8)  # little-endian memory to __u16
-                # Convert from network byte order to host byte order
-                port = ((net_port >> 8) & 0xFF) | ((net_port & 0xFF) << 8)
-                ports.add(port)
+                ports.add(b0 | (b1 << 8))
         return ports
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return set()
