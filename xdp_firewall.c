@@ -36,20 +36,18 @@ static __always_inline int check_tcp(void *trans_data, void *data_end) {
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    // 将网络字节序端口转换为主机字节序再查询 map
-    // 因为 Python 脚本写入的 key 是主机字节序
-    __u16 dest_port = bpf_ntohs(tcp->dest);
-    __u8 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
-    if (allow && *allow)
-        return XDP_PASS;
-
     __u8 tcp_flags = ((__u8 *)tcp)[13];
 
-    if (tcp_flags & 0x10)
+    // 优先放行已建立连接的回包（ACK/SYN-ACK/FIN/RST）
+    //    回包的 dest_port 是客户端随机端口，不在白名单，必须在白名单检查前放行
+    if (tcp_flags & 0x10)        // ACK bit 置位
         return XDP_PASS;
 
-    if (tcp_flags & 0x02)
-        return XDP_DROP;
+    // 只有纯 SYN（0x02，无 ACK）才查白名单
+    __u16 dest_port = bpf_ntohs(tcp->dest);
+    __u32 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
+    if (allow && *allow)
+        return XDP_PASS;
 
     return XDP_DROP;
 }

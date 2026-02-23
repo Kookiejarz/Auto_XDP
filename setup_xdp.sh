@@ -111,12 +111,69 @@ fi
 ok "Dependency check completed"
 
 # ── 4. Getting Source Code ───────────────────────────────────────────
-if [[ ! -f "$XDP_SRC" ]]; then
-    echo -e "\033[0;36m[INFO]\033[0m Retrieving core source code from GitHub..."
-    curl -fsSL "${RAW_URL}/${XDP_SRC}" -o "$XDP_SRC" || { 
-        echo "Download failed"; exit 1; 
-    }
-fi
+fetch_or_keep() {
+    local filename="$1"
+    local url="${RAW_URL}/${filename}"
+    local tmp_file=$(mktemp)
+
+    info "Checking ${filename} ..."
+
+    # 如果本地不存在，直接下载
+    if [[ ! -f "$filename" ]]; then
+        info "${filename} not found locally, downloading..."
+        if curl -fsSL "$url" -o "$filename" 2>/dev/null; then
+            ok "Downloaded ${filename} from GitHub"
+        else
+            die "Failed to download ${filename} from ${url}"
+        fi
+        return
+    fi
+
+    # 本地存在，尝试拉取 GitHub 版本到临时文件
+    if ! curl -fsSL "$url" -o "$tmp_file" 2>/dev/null; then
+        warn "GitHub unreachable, keeping local ${filename}"
+        rm -f "$tmp_file"
+        return
+    fi
+
+    # 对比两个文件的内容
+    if diff -q "$filename" "$tmp_file" &>/dev/null; then
+        info "${filename} is identical to GitHub, no update needed"
+        rm -f "$tmp_file"
+        return
+    fi
+
+    # 内容不同，比较修改时间
+    # 获取 GitHub 文件的 Last-Modified 时间戳
+    local remote_date
+    remote_date=$(curl -fsSI "$url" 2>/dev/null \
+        | grep -i "last-modified:" \
+        | sed 's/last-modified: //i' \
+        | tr -d '\r')
+
+    local remote_ts=0
+    if [[ -n "$remote_date" ]]; then
+        remote_ts=$(date -d "$remote_date" +%s 2>/dev/null || echo 0)
+    fi
+
+    local local_ts
+    local_ts=$(stat -c %Y "$filename" 2>/dev/null || echo 0)
+
+    info "  Local  : $(date -d @"$local_ts"  '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown')"
+    info "  GitHub : $(date -d @"$remote_ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown')"
+
+    if [[ "$remote_ts" -gt "$local_ts" ]]; then
+        # 备份本地文件
+        cp "$filename" "${filename}.bak"
+        mv "$tmp_file" "$filename"
+        ok "Updated ${filename} from GitHub (backup saved as ${filename}.bak)"
+    else
+        info "Local ${filename} is newer or same age, keeping local version"
+        rm -f "$tmp_file"
+    fi
+}
+
+fetch_or_keep "$XDP_SRC"
 
 # ── 5. Compile XDP ──────────────────────────────────────────
 info "Compiling $XDP_SRC ..."
@@ -410,11 +467,13 @@ try:
     items = data if isinstance(data, list) else data.get('items', [])
     for e in items:
         if isinstance(e, dict):
-            k = e.get('key', [])
-            if len(k) >= 2:
-                h = int(k[0], 16) if isinstance(k[0], str) else k[0]
-                l = int(k[1], 16) if isinstance(k[1], str) else k[1]
-                print(f'    → TCP {(h << 8) | l}')
+            k = e.get('key')
+            if isinstance(k, int):
+                print(f'    → TCP {k}')
+            elif isinstance(k, list) and len(k) >= 2:
+                b0 = int(k[0], 16) if isinstance(k[0], str) else k[0]
+                b1 = int(k[1], 16) if isinstance(k[1], str) else k[1]
+                print(f'    → TCP {b0 | (b1 << 8)}')
 except:
     pass
 " || echo "    (NULL)"
