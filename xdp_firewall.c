@@ -9,6 +9,14 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+// <linux/ip.h> 的 BPF 编译路径下不暴露这两个宏，在此手动定义
+#ifndef IP_MF
+#define IP_MF     0x2000  // More Fragments bit
+#endif
+#ifndef IP_OFFSET
+#define IP_OFFSET 0x1FFF  // Fragment offset mask
+#endif
+
 // ============================================================
 // BPF Map：运行时可热更新的 TCP/UDP 端口白名单（ARRAY 实现）
 // ARRAY Map 以端口号（主机字节序）作为数组下标（__u32 key），
