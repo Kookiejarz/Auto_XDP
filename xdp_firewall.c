@@ -72,7 +72,17 @@ static __always_inline int check_udp(void *trans_data, void *data_end) {
     if ((void *)(udp + 1) > data_end)
         return XDP_PASS;
 
+    // 函数开头一次性完成字节序转换
+    __u16 src_port  = bpf_ntohs(udp->source);
     __u32 dest_port = (__u32)bpf_ntohs(udp->dest);
+
+    // 放行常见 UDP 响应：DNS(53) / NTP(123) / DHCP(67) / QUIC(443)
+    // 这些协议的回包 dest_port 是客户端随机端口，不在白名单，必须在此处放行
+    if (src_port == 53  ||
+        src_port == 123 ||
+        src_port == 67  ||
+        src_port == 443)
+        return XDP_PASS;
 
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     if (allow && *allow)
