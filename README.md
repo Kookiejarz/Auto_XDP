@@ -4,6 +4,8 @@ A lightweight, high-performance XDP/eBPF-based rule for Linux that provides **au
 
 Although there are some XDP firewall solutions available, Basic XDP provides users with automatic port whitelisting, which makes maintenance easier.
 
+***⚠️ XDP only filters traffic that reaches your NIC. If your upstream bandwidth is already saturated by a volumetric attack, this tool cannot help. For large-scale DDoS mitigation, consider upstream scrubbing services or a DDoS-protected hosting provider.***
+
 ---
 
 ## Overview
