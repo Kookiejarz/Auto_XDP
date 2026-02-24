@@ -13,38 +13,39 @@
 // BPF Map：运行时可热更新的 TCP/UDP 端口白名单（ARRAY 实现）
 // ARRAY Map 以端口号（主机字节序）作为数组下标（__u32 key），
 // max_entries = 65536 覆盖全部合法端口。
-// 用法：bpftool map update pinned /sys/fs/bpf/tcp_whitelist \
+// 用法：bpftool map update pinned /sys/fs/bpf/xdp_fw/tcp_whitelist \
 //         key 0x50 0x00 0x00 0x00 value 0x01 0x00 0x00 0x00
 // ============================================================
+
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 65536);
     __type(key, __u32);   // 主机字节序端口号作为数组下标
-    __type(value, __u32);  // 1 = 放行
+    __type(value, __u32); // 1 = 放行
 } tcp_whitelist SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 65536);
     __type(key, __u32);   // 主机字节序端口号作为数组下标
-    __type(value, __u32);
+    __type(value, __u32); // 1 = 放行
 } udp_whitelist SEC(".maps");
 
 // ============================================================
-// 修复1：TCP 端口检查改用 map 查询
+// TCP 端口检查
 // ============================================================
 static __always_inline int check_tcp(void *trans_data, void *data_end) {
     struct tcphdr *tcp = trans_data;
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    // 函数开头一次性完成字节序转换，后续逻辑统一使用主机字节序
     __u8  tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
 
     // 优先放行已建立连接的回包（ACK/SYN-ACK/FIN/RST）
-    //    回包的 dest_port 是客户端随机端口，不在白名单，必须在白名单检查前放行
-    if (tcp_flags & 0x10)        // ACK bit 置位
+    // 回包的 dest_port 是客户端随机端口，不在白名单，必须在白名单检查前放行
+    if (tcp_flags & 0x10) // ACK bit 置位
         return XDP_PASS;
 
     // 只有纯 SYN（0x02，无 ACK）才查白名单
@@ -56,24 +57,14 @@ static __always_inline int check_tcp(void *trans_data, void *data_end) {
 }
 
 // ============================================================
-// 修复2：UDP 增加白名单（默认放行 DNS 响应，其余丢弃）
+// UDP 端口检查
 // ============================================================
 static __always_inline int check_udp(void *trans_data, void *data_end) {
     struct udphdr *udp = trans_data;
     if ((void *)(udp + 1) > data_end)
         return XDP_PASS;
 
-    // 函数开头一次性完成字节序转换：
-    //   原来 source 侧用 4 次 bpf_htons() 做比较，现在只需 1 次 bpf_ntohs()
-    __u16 src_port  = bpf_ntohs(udp->source);
     __u32 dest_port = (__u32)bpf_ntohs(udp->dest);
-
-    // 放行常见 UDP 响应（DNS / NTP / DHCP / QUIC）
-    if (src_port == 53  ||
-        src_port == 123 ||
-        src_port == 67  ||
-        src_port == 443)
-        return XDP_PASS;
 
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     if (allow && *allow)
@@ -83,7 +74,7 @@ static __always_inline int check_udp(void *trans_data, void *data_end) {
 }
 
 // ============================================================
-// 修复3：IPv6 扩展头遍历，防止扩展头绕过端口检查
+// IPv6 扩展头遍历，防止扩展头绕过端口检查
 // ============================================================
 static __always_inline __u8 skip_ipv6_exthdr(
     void **trans_data, void *data_end, __u8 nexthdr)
@@ -92,12 +83,10 @@ static __always_inline __u8 skip_ipv6_exthdr(
     #pragma unroll
     for (int i = 0; i < 6; i++) {
         switch (nexthdr) {
-        case IPPROTO_HOPOPTS:   // 0  逐跳选项
-        case IPPROTO_ROUTING:   // 43 路由头
-        case IPPROTO_DSTOPTS:   // 60 目标选项
+        case IPPROTO_HOPOPTS:  // 0  逐跳选项
+        case IPPROTO_ROUTING:  // 43 路由头
+        case IPPROTO_DSTOPTS:  // 60 目标选项
         {
-            // 扩展头格式：[nexthdr(1B)][hdrlen(1B)][data...]
-            // 总长度 = (hdrlen + 1) * 8 字节
             __u8 *hdr = *trans_data;
             if ((void *)(hdr + 2) > data_end)
                 return IPPROTO_NONE;
@@ -108,7 +97,7 @@ static __always_inline __u8 skip_ipv6_exthdr(
                 return IPPROTO_NONE;
             break;
         }
-        case IPPROTO_FRAGMENT:  // 44 分片头（固定 8 字节）
+        case IPPROTO_FRAGMENT: // 44 分片头（固定 8 字节）
         {
             __u8 *hdr = *trans_data;
             if ((void *)(hdr + 8) > data_end)
@@ -144,13 +133,17 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
 
+        // 确保 ihl 合法后再读 frag_off
         __u32 ip_hlen = ip->ihl * 4;
         if (ip_hlen < sizeof(*ip))
             return XDP_PASS;
 
+        // 丢弃 IPv4 分片包（个人服务器基本不需要，且分片可绕过端口过滤）
+        if (ip->frag_off & bpf_htons(IP_MF | IP_OFFSET))
+            return XDP_DROP;
+
         void *trans_data = (void *)ip + ip_hlen;
 
-        // 修复4：检查传输层起始地址合法性
         if (trans_data >= data_end)
             return XDP_PASS;
 
@@ -173,7 +166,6 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
 
         void *trans_data = (void *)(ipv6 + 1);
 
-        // 修复3：跳过扩展头，找到真正的传输层协议
         __u8 nexthdr = skip_ipv6_exthdr(&trans_data, data_end, ipv6->nexthdr);
         if (nexthdr == IPPROTO_NONE)
             return XDP_PASS;

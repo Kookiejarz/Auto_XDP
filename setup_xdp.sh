@@ -54,7 +54,7 @@ XDP_OBJ="xdp_firewall.o"
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 SYNC_SCRIPT="/usr/local/bin/xdp-sync-ports.py"
 SERVICE_NAME="xdp-port-sync"
-SYNC_INTERVAL=5
+SYNC_INTERVAL=30   # fallback poll interval (primary trigger is netlink proc events)
 RAW_URL="https://raw.githubusercontent.com/Kookiejarz/basic_xdp/main"
 
 # ── 1. Check root ──────────────────────────────────────────────
@@ -262,16 +262,32 @@ echo ""
 info "Deploying Daemon → $SYNC_SCRIPT ..."
 cat > "$SYNC_SCRIPT" << 'PYEOF'
 #!/usr/bin/env python3
-"""XDP Port Whitelist Auto-Sync Daemon"""
-import subprocess, argparse, time, logging, sys, json
+"""XDP Port Whitelist Auto-Sync Daemon
+
+Event-driven via Linux Netlink Process Connector (NETLINK_CONNECTOR /
+CN_IDX_PROC): the kernel pushes EXEC/EXIT events whenever any process
+starts or exits, letting us react to port changes in < 1 ms instead of
+waiting for a fixed poll interval.  A configurable fallback poll period
+(default 30 s) catches any edge cases where events may be missed.
+
+Architecture:
+  kernel -> NETLINK_CONNECTOR (EXEC/EXIT) -> debounce 300 ms -> sync_once()
+  + periodic fallback poll every --interval seconds (default 30)
+"""
+import subprocess, argparse, time, logging, sys, json, socket, struct, select, os
 from dataclasses import dataclass, field
 
 TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
 UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
 
-# In case you have some critical services that must always be allowed, even if their processes are not currently listening (e.g. for port knocking), you can add them here:
+# Ports that must always stay whitelisted regardless of whether a process
+# is currently listening (e.g. for port-knocking / SSH emergency fallback).
 TCP_PERMANENT = {22: "SSH-fallback"}
 UDP_PERMANENT = {}
+
+# After a proc EXEC/EXIT event, wait this long before scanning — gives the
+# new process time to call bind() before we query ss(8).
+DEBOUNCE_S = 0.3
 
 logging.basicConfig(
     level=logging.INFO,
@@ -279,6 +295,70 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+# ── Netlink Process Connector constants ───────────────────────────────
+_NETLINK_CONNECTOR    = 11
+_CN_IDX_PROC          = 1
+_CN_VAL_PROC          = 1
+_NLMSG_HDRLEN         = 16
+_CN_MSG_HDRLEN        = 20   # idx(4)+val(4)+seq(4)+ack(4)+len(2)+flags(2)
+_NLMSG_MIN_TYPE       = 0x10  # first user-defined netlink message type
+_PROC_CN_MCAST_LISTEN = 1
+_PROC_EVENT_EXEC      = 0x00000002
+_PROC_EVENT_EXIT      = 0x80000000
+
+
+def _make_subscribe_msg(pid: int) -> bytes:
+    """Build the NETLINK_CONNECTOR subscription message for proc events."""
+    op  = struct.pack("I", _PROC_CN_MCAST_LISTEN)
+    cn  = struct.pack("IIIIHH", _CN_IDX_PROC, _CN_VAL_PROC, 0, 0, len(op), 0) + op
+    hdr = struct.pack("IHHII", _NLMSG_HDRLEN + len(cn), _NLMSG_MIN_TYPE, 0, 0, pid)
+    return hdr + cn
+
+
+def open_proc_connector():
+    """Open and subscribe to the kernel proc-event netlink socket.
+
+    Returns the socket on success, or None if unavailable (non-Linux,
+    insufficient privileges, old kernel, etc.).
+    """
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, _NETLINK_CONNECTOR)
+        sock.bind((os.getpid(), _CN_IDX_PROC))
+        sock.send(_make_subscribe_msg(os.getpid()))
+        log.info("Netlink proc connector active — event-driven mode enabled")
+        return sock
+    except OSError as exc:
+        log.warning(f"Netlink proc connector unavailable ({exc}); using poll-only mode")
+        return None
+
+
+def drain_proc_events(sock: socket.socket) -> bool:
+    """Drain all pending netlink messages; return True if EXEC or EXIT seen."""
+    triggered = False
+    while True:
+        try:
+            ready, _, _ = select.select([sock], [], [], 0)
+            if not ready:
+                break
+            data = sock.recv(4096)
+        except OSError:
+            break
+        offset = 0
+        while offset + _NLMSG_HDRLEN <= len(data):
+            nl_len = struct.unpack_from("I", data, offset)[0]
+            if nl_len < _NLMSG_HDRLEN:
+                break
+            cn_off = offset + _NLMSG_HDRLEN
+            if cn_off + _CN_MSG_HDRLEN <= offset + nl_len:
+                idx = struct.unpack_from("I", data, cn_off)[0]
+                cn_data = cn_off + _CN_MSG_HDRLEN
+                if idx == _CN_IDX_PROC and cn_data + 4 <= offset + nl_len:
+                    what = struct.unpack_from("I", data, cn_data)[0]
+                    if what in (_PROC_EVENT_EXEC, _PROC_EVENT_EXIT):
+                        triggered = True
+            offset += (nl_len + 3) & ~3  # NLMSG_ALIGN
+    return triggered
 
 @dataclass
 class PortState:
@@ -405,21 +485,75 @@ def sync_once(dry_run: bool):
     if not changed:
         log.debug("Port whitelist is up-to-date")
 
+def watch(interval: int, dry_run: bool):
+    """Event-driven watch loop.
+
+    - Listens to kernel EXEC/EXIT proc events via NETLINK_CONNECTOR.
+    - On event: arms a DEBOUNCE_S timer; syncs when the timer fires.
+    - Every `interval` seconds: syncs unconditionally as a safety net.
+    - Falls back to pure polling if the netlink socket is unavailable.
+    """
+    nl = open_proc_connector()
+    last_sync_t  = 0.0
+    last_event_t = 0.0
+
+    sync_once(dry_run)
+    last_sync_t = time.monotonic()
+
+    while True:
+        now = time.monotonic()
+        poll_due  = last_sync_t + interval
+        deb_due   = (last_event_t + DEBOUNCE_S) if last_event_t else float("inf")
+        sleep_for = max(0.0, min(poll_due, deb_due) - now)
+
+        try:
+            if nl:
+                ready, _, _ = select.select([nl], [], [], sleep_for)
+                if ready and drain_proc_events(nl):
+                    if not last_event_t:
+                        log.debug("Proc event received, debounce armed")
+                    last_event_t = time.monotonic()
+            else:
+                time.sleep(sleep_for)
+        except OSError as exc:
+            log.warning(f"Netlink socket error ({exc}); disabling event-driven mode")
+            if nl:
+                nl.close()
+                nl = None
+            continue
+        except KeyboardInterrupt:
+            log.info("exiting...")
+            if nl:
+                nl.close()
+            break
+
+        now = time.monotonic()
+        debounce_fired = bool(last_event_t) and (now - last_event_t >= DEBOUNCE_S)
+        fallback_fired = (now - last_sync_t >= interval)
+
+        if debounce_fired or fallback_fired:
+            reason = "event" if debounce_fired else "poll"
+            log.debug(f"sync triggered by {reason}")
+            try:
+                sync_once(dry_run)
+            except Exception as exc:
+                log.error(f"sync error: {exc}")
+            last_sync_t  = time.monotonic()
+            last_event_t = 0.0
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--watch",    action="store_true")
-    parser.add_argument("--interval", type=int, default=5)
-    parser.add_argument("--dry-run",  action="store_true")
+    parser = argparse.ArgumentParser(
+        description="XDP port-whitelist sync (event-driven via netlink proc connector)")
+    parser.add_argument("--watch",    action="store_true",
+                        help="Run as a daemon (event-driven + fallback poll)")
+    parser.add_argument("--interval", type=int, default=30,
+                        help="Fallback poll interval in seconds (default: 30)")
+    parser.add_argument("--dry-run",  action="store_true",
+                        help="Print bpftool commands without executing them")
     args = parser.parse_args()
     if args.watch:
-        log.info(f"Daemon started with interval {args.interval}s")
-        while True:
-            try:
-                sync_once(args.dry_run)
-                time.sleep(args.interval)
-            except KeyboardInterrupt:
-                log.info("exiting...")
-                break
+        watch(args.interval, args.dry_run)
     else:
         sync_once(args.dry_run)
         log.info("Sync completed")
