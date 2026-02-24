@@ -127,7 +127,7 @@ sudo bash setup_xdp.sh eth0
 Pinned directory: `/sys/fs/bpf/xdp_fw/` 
 
 | Map | Type | Max Entries | Key | Value |
-|---|---|---:|---|---|
+|:-:|:-:|:--:|:-:|:-:|
 | `tcp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
 | `udp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
 
@@ -150,6 +150,16 @@ Key encoding note: the map type is now **ARRAY** (`BPF_MAP_TYPE_ARRAY`), so the 
 
 ---
 
+## Why ARRAY instead of HASH?
+
+Originally, this project used **BPF_MAP_TYPE_HASH** for the whitelist. We transitioned to **BPF_MAP_TYPE_ARRAY** for several critical reasons:
+
+- **O(1) Lookup Time**: An Array map provides constant-time lookup ($O(1)$) by directly indexing into memory using the port number. A Hash map averages O(1) but degrades under hash collisions, whereas an Array map guarantees O(1) by direct index access with no collision possible. :))))
+- **Zero Hash Collisions**: With 65,536 entries (one for every possible port), there is no possibility of hash collisions. In a Hash map with a small max_entries (e.g., 64), collisions frequently occur during high-volume scans, causing latency spikes.
+- **CPU Cache Efficiency**: Because the Array is a contiguous block of memory, the CPU's prefetcher can handle it much more efficiently than the pointer-chasing required by Hash map buckets.
+
+---
+
 ## Auto-Sync Daemon
 
 The daemon `xdp-sync-ports.py` runs as a systemd service and loops every **5 seconds**:
@@ -164,7 +174,7 @@ The daemon `xdp-sync-ports.py` runs as a systemd service and loops every **5 sec
 Edit constants in the daemon to always allow specific ports:
 
 ```python
-TCP_PERMANENT = {22: "SSH-fallback"}   # Always allow SSH
+TCP_PERMANENT = {22: "SSH-fallback"}   # Always allow SSH in case you block yourself out
 UDP_PERMANENT = {}
 ```
 
@@ -215,13 +225,6 @@ rm /etc/systemd/system/xdp-port-sync.service
 systemctl daemon-reload
 ```
 
-
-
----
-
-## License
-
-MIT License (see [`LICENSE`](./LICENSE))
 ---
 
 ## Benchmarks
@@ -229,20 +232,22 @@ MIT License (see [`LICENSE`](./LICENSE))
 Measured with `bpftool prog run ... repeat N data_in <packet>` against the JIT-compiled XDP program. Return value `2` = `XDP_DROP` (fast-path hit).
 
 | Host | CPU | vCPUs | Packet input | Repeat | Avg latency |
-|------|-----|------:|--------------|-------:|------------:|
+|:----:|:---:|:-----:|:------------:|:------:|:-----------:|
 | VPS A | Intel Xeon Platinum 8160M @ 2.10 GHz (KVM) | 2 | synthetic (no `data_in`) | 100 000 000 | **65 ns** |
 | VPS B | AMD Ryzen 9 3900X @ 2.0 GHz (KVM) | 1 | 30-byte IPv4 pkt (`data_in`) | 1 000 000 000 | **40 ns** |
+| VPS C | AMD EPYC 7Y43 @ 2.55GHz (KVM) | 1 | 30-byte IPv4 pkt (`data_in`) | 1 000 000 000 | **34 ns** |
 
 > **Note — `data_in` matters.**  
 > Without `data_in` the runner feeds a zero-length buffer; the BPF program returns immediately at the first bounds check (`data_end` == `data`), so the measurement reflects JIT dispatch overhead more than real packet-processing logic.  
-> The 40 ns figure (VPS B, with a real IPv4 frame) is the more representative number.
+> The 40ns and 34 ns figure (VPS B and VPS C, with a real IPv4 frame) are the more representative numbers.
 
 ### Theoretical throughput (single core, `XDP_DROP` fast path)
 
 | Avg latency | Packets / second |
-|------------:|-----------------:|
+|:-----------:|:----------------:|
 | 65 ns | ≈ **15.4 Mpps** |
 | 40 ns | ≈ **25.0 Mpps** |
+| 34 ns | ≈ **29.4 Mpps** |
 
 > Real-world NIC throughput will be the practical ceiling; the XDP program itself is not the bottleneck.
 
@@ -259,3 +264,10 @@ PROG_ID=$(bpftool -j prog show pinned /sys/fs/bpf/xdp_fw/prog \
 # Run 100 M iterations with a real packet
 sudo bpftool prog run id "$PROG_ID" repeat 100000000 data_in /tmp/pkt.bin
 ```
+
+## License
+
+---
+
+MIT License (see [`LICENSE`](./LICENSE))
+---
