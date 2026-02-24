@@ -15,34 +15,6 @@ ok()    { echo -e "${GREEN}[ OK ]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()   { echo -e "${RED}[ERR ]${NC}  $*" >&2; exit 1; }
 
-# ── Spinner ───────────────────────────────────────────────────────────
-spinner() {
-    local pid=$1 delay=0.1 spinstr='|/-\\'
-    while kill -0 "$pid" 2>/dev/null; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
-    done
-    printf "    \b\b\b\b"
-}
-
-run_with_spinner() {
-    local msg="$1"; shift
-    info "$msg"
-    "$@" > /tmp/xdp_install.log 2>&1 &
-    local pid=$!
-    spinner $pid
-    wait $pid
-    local rc=$?
-    if [[ $rc -ne 0 ]]; then
-        echo -e "${RED}[FAIL]${NC}"
-        die "Command failed: $*\nSee /tmp/xdp_install.log for details."
-    fi
-    echo -e "${GREEN}[DONE]${NC}"
-}
-
 # ── Settings ──────────────────────────────────────────────────────────
 IFACE="${1:-}"
 XDP_SRC="xdp_firewall.c"
@@ -77,19 +49,15 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     export DEBIAN_FRONTEND=noninteractive
     APT_OPTS="-y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 
-    run_with_spinner "Updating package lists..." \
         apt-get update -qq
 
-    run_with_spinner "Installing build tools (clang, llvm, libbpf-dev ...)..." \
         apt-get install $APT_OPTS clang llvm libbpf-dev build-essential iproute2 \
                         python3 python3-pip gcc-multilib
 
-    run_with_spinner "Installing bpftool & kernel headers..." \
         apt-get install $APT_OPTS linux-tools-common linux-tools-generic \
                         "linux-tools-$(uname -r)" "linux-headers-$(uname -r)"
 
     # Ensure pip is available for the psutil install below
-    run_with_spinner "Installing python3-pip..." \
         apt-get install $APT_OPTS python3-pip
 
     if ! command -v bpftool &>/dev/null; then
@@ -230,7 +198,7 @@ TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
 UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
 
 # Always-whitelisted ports (e.g. SSH emergency fallback)
-TCP_PERMANENT: dict[int, str] = {22: "SSH-fallback"}
+TCP_PERMANENT: dict[int, str] = {}
 UDP_PERMANENT: dict[int, str] = {}
 
 # Wait this long after an EXEC/EXIT event before scanning,
