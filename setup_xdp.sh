@@ -19,8 +19,8 @@ die()   { echo -e "${RED}[ERR ]${NC}  $*" >&2; exit 1; }
 spinner() {
     local pid=$1
     local delay=0.1
-    local spinstr='|/-\'
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+    local spinstr="|/-\\"
+    while kill -0 "$pid" 2>/dev/null; do
         local temp=${spinstr#?}
         printf " [%c]  " "$spinstr"
         local spinstr=$temp${spinstr%"$temp"}
@@ -69,9 +69,9 @@ fi
 ip link show "$IFACE" &>/dev/null || die "Interface $IFACE does not exist"
 
 # ── 3. Check and install dependencies ─────────────────────────────────────────
-info "Cheching dependencies..."
+info "Checking dependencies..."
 MISSING=()
-for cmd in clang llc bpftool python3; do
+for cmd in clang bpftool python3; do
     command -v "$cmd" &>/dev/null || MISSING+=("$cmd")
 done
 [[ -d /usr/include/linux ]] || MISSING+=("linux-headers")
@@ -88,7 +88,7 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     apt-get update -qq
 
     run_with_spinner "Installing core build tools (clang, llvm, etc.)..." \
-    apt-get install $APT_OPTS clang llvm libbpf-dev build-essential iproute2 python3 gcc-multilib || true
+    apt-get install $APT_OPTS clang llvm libbpf-dev build-essential iproute2 python3 python3-pip gcc-multilib || true
 
     run_with_spinner "Installing kernel specific tools (bpftool)..." \
     apt-get install $APT_OPTS linux-tools-common linux-tools-generic linux-tools-$(uname -r) linux-headers-$(uname -r) || true
@@ -104,9 +104,10 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     unset DEBIAN_FRONTEND
 fi
 
-    # 4. Last Check
-    command -v bpftool &>/dev/null || die "bpftool installation failed. Please run: apt install linux-tools-generic"
+# Always ensure psutil is available (independent of the missing-deps block)
+pip3 install --quiet psutil
 
+command -v bpftool &>/dev/null || die "bpftool installation failed. Please run: apt install linux-tools-generic"
 ok "Dependency check completed"
 
 # ── 4. Getting Source Code ───────────────────────────────────────────
@@ -134,7 +135,7 @@ case "$ARCH" in
     *)       ASM_INC="/usr/include/${ARCH}-linux-gnu";   TARGET_ARCH="${ARCH}" ;;
 esac
 if [[ ! -d "$ASM_INC" ]]; then
-    ASM_INC="/usr/src/linux-headers-$(uname -r)/arch/x86/include/generated"
+    ASM_INC="/usr/src/linux-headers-$(uname -r)/arch/${TARGET_ARCH}/include/generated"
 elif [[ -d "/usr/include/asm" ]]; then
     ASM_INC="/usr/include"
 else
@@ -161,7 +162,7 @@ if ! mount | grep -q 'type bpf'; then
     mount -t bpf bpf /sys/fs/bpf || die "bpffs mount failed"
 fi
 
-# ── 7. Uninstall the old XDP program and rebuild the directory. ──────────────────────────────
+# ── 7. Detach old XDP program and rebuild pin directory ─────────────────────────────────────
 if ip link show "$IFACE" | grep -q "xdp"; then
     warn "An XDP program has been detected. Uninstall it first...."
     ip link set dev "$IFACE" xdp off
@@ -172,7 +173,7 @@ if [[ -d "$BPF_PIN_DIR" ]]; then
 fi
 mkdir -p "$BPF_PIN_DIR"
 
-# ── 8. Loading XDP  ──────────────────────────────────────────
+# ── 8. Load and attach XDP program ──────────────────────────────────────────────────────────
 info "Loading XDP to $IFACE ..."
 
 bpftool prog load "$XDP_OBJ" "$BPF_PIN_DIR/prog"
@@ -192,7 +193,7 @@ for map_id in prog.get('map_ids', []):
     pin_path = f'{pin_dir}/{name}'
     subprocess.check_call(['bpftool','map','pin','id',str(map_id), pin_path])
     print(f'  pinned map [{name}] → {pin_path}')
-" || die "map pin faild"
+" || die "map pin failed"
 
 # attach to interface, try native mode first, fallback to generic if it fails
 if ip link set dev "$IFACE" xdp pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
@@ -208,35 +209,40 @@ info "BPF maps is pinned to :"
 ls "$BPF_PIN_DIR/"
 echo ""
 
-# ── 8. Deploy Daemon ───────────────────────────────────
+# ── 9. Deploy Daemon ────────────────────────────────────────────────────────────────────────
 info "Deploying Daemon → $SYNC_SCRIPT ..."
 cat > "$SYNC_SCRIPT" << 'PYEOF'
 #!/usr/bin/env python3
 """XDP Port Whitelist Auto-Sync Daemon
 
-Event-driven via Linux Netlink Process Connector (NETLINK_CONNECTOR /
-CN_IDX_PROC): the kernel pushes EXEC/EXIT events whenever any process
-starts or exits, letting us react to port changes in < 1 ms instead of
-waiting for a fixed poll interval.  A configurable fallback poll period
-(default 30 s) catches any edge cases where events may be missed.
+Port discovery  : psutil (no external process, no ss(8))
+Map operations  : direct bpf(2) syscall via ctypes (no bpftool)
+Event trigger   : Linux Netlink Process Connector (EXEC/EXIT events)
+Fallback        : periodic poll every --interval seconds (default 30)
 
 Architecture:
   kernel -> NETLINK_CONNECTOR (EXEC/EXIT) -> debounce 300 ms -> sync_once()
-  + periodic fallback poll every --interval seconds (default 30)
+  + periodic fallback poll every --interval seconds
 """
-import subprocess, argparse, time, logging, sys, json, socket, struct, select, os
+from __future__ import annotations
+import argparse, ctypes, ctypes.util, logging, os, platform
+import select, socket, struct, sys, time
 from dataclasses import dataclass, field
+
+try:
+    import psutil
+except ImportError:
+    sys.exit("psutil not installed. Run: pip3 install psutil")
 
 TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
 UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
 
 # Ports that must always stay whitelisted regardless of whether a process
-# is currently listening (e.g. for port-knocking / SSH emergency fallback).
-TCP_PERMANENT = {22: "SSH-fallback"}
-UDP_PERMANENT = {}
+# is currently listening (e.g. SSH emergency fallback).
+TCP_PERMANENT: dict[int, str] = {22: "SSH-fallback"}
+UDP_PERMANENT: dict[int, str] = {}
 
-# After a proc EXEC/EXIT event, wait this long before scanning — gives the
-# new process time to call bind() before we query ss(8).
+# After a proc EXEC/EXIT event, wait this long before scanning.
 DEBOUNCE_S = 0.3
 
 logging.basicConfig(
@@ -246,40 +252,196 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Netlink Process Connector constants ───────────────────────────────
+
+# ── BPF syscall interface ─────────────────────────────────────────────
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+# bpf(2) syscall numbers per architecture
+_NR_BPF: int = {
+    "x86_64":  321,
+    "aarch64": 280,
+    "armv7l":  386,
+    "armv6l":  386,
+}.get(platform.machine(), 321)
+
+_BPF_MAP_LOOKUP_ELEM = 1
+_BPF_MAP_UPDATE_ELEM = 2
+_BPF_OBJ_GET         = 7
+
+
+def _bpf(cmd: int, attr: ctypes.Array) -> int:
+    ret = _libc.syscall(_NR_BPF, ctypes.c_int(cmd), attr, ctypes.c_uint(len(attr)))
+    if ret < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return ret
+
+
+def _obj_get(path: str) -> int:
+    """Open a pinned BPF object and return its fd."""
+    path_b = ctypes.create_string_buffer(path.encode() + b"\x00")
+    attr   = ctypes.create_string_buffer(128)
+    struct.pack_into("=Q", attr, 0,
+                     ctypes.cast(path_b, ctypes.c_void_p).value or 0)
+    return _bpf(_BPF_OBJ_GET, attr)
+
+
+class BpfArrayMap:
+    """Pinned BPF ARRAY map with key=__u32 (port) and value=__u32 (0/1).
+
+    Maintains an in-memory write-through cache so that sync_once() only
+    issues syscalls for ports that actually changed.  A one-time warmup
+    scan at startup seeds the cache from the kernel map.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path  = path
+        self.fd    = _obj_get(path)
+        self._cache: dict[int, int] = {}  # port → 1 (only active ports stored)
+
+        # Pre-allocate reusable buffers and a single bpf_attr block.
+        # bpf_attr layout for MAP_LOOKUP / MAP_UPDATE:
+        #   offset  0 : map_fd  (u32)
+        #   offset  4 : padding (4 bytes)
+        #   offset  8 : key ptr (u64)
+        #   offset 16 : value ptr (u64)
+        #   offset 24 : flags   (u64)
+        self._key  = ctypes.create_string_buffer(4)
+        self._val  = ctypes.create_string_buffer(4)
+        self._attr = ctypes.create_string_buffer(128)
+        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
+        struct.pack_into("=I4xQQQ", self._attr, 0, self.fd, k_ptr, v_ptr, 0)
+
+    # ── low-level helpers ────────────────────────────────────────────
+    def _lookup(self, port: int) -> int:
+        struct.pack_into("=I", self._key, 0, port)
+        try:
+            _bpf(_BPF_MAP_LOOKUP_ELEM, self._attr)
+            return struct.unpack_from("=I", self._val, 0)[0]
+        except OSError:
+            return 0
+
+    def _update(self, port: int, val: int) -> None:
+        struct.pack_into("=I", self._key, 0, port)
+        struct.pack_into("=I", self._val, 0, val)
+        _bpf(_BPF_MAP_UPDATE_ELEM, self._attr)  # flags=0 → BPF_ANY
+
+    # ── public API ───────────────────────────────────────────────────
+    def warmup(self) -> None:
+        """Scan all 65536 ARRAY slots once to seed the in-memory cache."""
+        log.debug("Warming up cache from %s ...", self.path)
+        for port in range(65536):
+            if self._lookup(port):
+                self._cache[port] = 1
+        log.debug("  → %d active entries", len(self._cache))
+
+    def set(self, port: int, val: int, dry_run: bool = False) -> bool:
+        """Write val (0 or 1) for port into the map and update cache."""
+        if dry_run:
+            log.info("[DRY] map %s: %s port %d", self.path, "+allow" if val else "-block", port)
+            if val:
+                self._cache[port] = 1
+            else:
+                self._cache.pop(port, None)
+            return True
+        try:
+            self._update(port, val)
+            if val:
+                self._cache[port] = 1
+            else:
+                self._cache.pop(port, None)
+            return True
+        except OSError as e:
+            log.warning("map update failed port=%d: %s", port, e)
+            return False
+
+    def active_ports(self) -> set[int]:
+        return set(self._cache)
+
+
+# ── Port discovery via psutil ─────────────────────────────────────────
+@dataclass
+class PortState:
+    tcp: set = field(default_factory=set)
+    udp: set = field(default_factory=set)
+
+    _net_conns = getattr(psutil, "connections", psutil.net_connections)
+
+
+def get_listening_ports() -> PortState:
+    state = PortState()
+    for conn in _iter_connections():
+        if not (conn.laddr and conn.laddr.port):
+            continue
+        if conn.type == socket.SOCK_STREAM and conn.status == "LISTEN":
+            state.tcp.add(conn.laddr.port)
+        elif conn.type == socket.SOCK_DGRAM:
+            state.udp.add(conn.laddr.port)
+    return state
+
+
+# ── Sync logic ────────────────────────────────────────────────────────
+def sync_once(tcp_map: BpfArrayMap, udp_map: BpfArrayMap, dry_run: bool) -> None:
+    current    = get_listening_ports()
+    tcp_target = current.tcp | set(TCP_PERMANENT)
+    udp_target = current.udp | set(UDP_PERMANENT)
+
+    changed = False
+
+    for port in sorted(tcp_target - tcp_map.active_ports()):
+        tag = " [" + TCP_PERMANENT[port] + "]" if port in TCP_PERMANENT else ""
+        if tcp_map.set(port, 1, dry_run):
+            log.info("TCP Whitelist +%d%s", port, tag)
+            changed = True
+
+    for port in sorted(tcp_map.active_ports() - tcp_target - set(TCP_PERMANENT)):
+        if tcp_map.set(port, 0, dry_run):
+            log.info("TCP Whitelist -%d  (stopped)", port)
+            changed = True
+
+    for port in sorted(udp_target - udp_map.active_ports()):
+        tag = " [" + UDP_PERMANENT[port] + "]" if port in UDP_PERMANENT else ""
+        if udp_map.set(port, 1, dry_run):
+            log.info("UDP Whitelist +%d%s", port, tag)
+            changed = True
+
+    for port in sorted(udp_map.active_ports() - udp_target - set(UDP_PERMANENT)):
+        if udp_map.set(port, 0, dry_run):
+            log.info("UDP Whitelist -%d  (stopped)", port)
+            changed = True
+
+    if not changed:
+        log.debug("Port whitelist is up-to-date")
+
+
+# ── Netlink Process Connector ─────────────────────────────────────────
 _NETLINK_CONNECTOR    = 11
 _CN_IDX_PROC          = 1
-_CN_VAL_PROC          = 1
 _NLMSG_HDRLEN         = 16
 _CN_MSG_HDRLEN        = 20   # idx(4)+val(4)+seq(4)+ack(4)+len(2)+flags(2)
-_NLMSG_MIN_TYPE       = 0x10  # first user-defined netlink message type
+_NLMSG_MIN_TYPE       = 0x10
 _PROC_CN_MCAST_LISTEN = 1
 _PROC_EVENT_EXEC      = 0x00000002
 _PROC_EVENT_EXIT      = 0x80000000
 
 
 def _make_subscribe_msg(pid: int) -> bytes:
-    """Build the NETLINK_CONNECTOR subscription message for proc events."""
     op  = struct.pack("I", _PROC_CN_MCAST_LISTEN)
-    cn  = struct.pack("IIIIHH", _CN_IDX_PROC, _CN_VAL_PROC, 0, 0, len(op), 0) + op
+    cn  = struct.pack("IIIIHH", _CN_IDX_PROC, 1, 0, 0, len(op), 0) + op
     hdr = struct.pack("IHHII", _NLMSG_HDRLEN + len(cn), _NLMSG_MIN_TYPE, 0, 0, pid)
     return hdr + cn
 
 
 def open_proc_connector():
-    """Open and subscribe to the kernel proc-event netlink socket.
-
-    Returns the socket on success, or None if unavailable (non-Linux,
-    insufficient privileges, old kernel, etc.).
-    """
     try:
-        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, _NETLINK_CONNECTOR)
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM,
+                             _NETLINK_CONNECTOR)
         sock.bind((os.getpid(), _CN_IDX_PROC))
         sock.send(_make_subscribe_msg(os.getpid()))
         log.info("Netlink proc connector active — event-driven mode enabled")
         return sock
     except OSError as exc:
-        log.warning(f"Netlink proc connector unavailable ({exc}); using poll-only mode")
+        log.warning("Netlink proc connector unavailable (%s); poll-only mode", exc)
         return None
 
 
@@ -288,8 +450,8 @@ def drain_proc_events(sock: socket.socket) -> bool:
     triggered = False
     while True:
         try:
-            ready, _, _ = select.select([sock], [], [], 0)
-            if not ready:
+            rdy, _, _ = select.select([sock], [], [], 0)
+            if not rdy:
                 break
             data = sock.recv(4096)
         except OSError:
@@ -301,7 +463,7 @@ def drain_proc_events(sock: socket.socket) -> bool:
                 break
             cn_off = offset + _NLMSG_HDRLEN
             if cn_off + _CN_MSG_HDRLEN <= offset + nl_len:
-                idx = struct.unpack_from("I", data, cn_off)[0]
+                idx     = struct.unpack_from("I", data, cn_off)[0]
                 cn_data = cn_off + _CN_MSG_HDRLEN
                 if idx == _CN_IDX_PROC and cn_data + 4 <= offset + nl_len:
                     what = struct.unpack_from("I", data, cn_data)[0]
@@ -310,163 +472,43 @@ def drain_proc_events(sock: socket.socket) -> bool:
             offset += (nl_len + 3) & ~3  # NLMSG_ALIGN
     return triggered
 
-@dataclass
-class PortState:
-    tcp: set = field(default_factory=set)
-    udp: set = field(default_factory=set)
 
-def get_listening_ports() -> PortState:
-    state = PortState()
-    try:
-        out = subprocess.check_output(
-            ["ss", "-lnH", "-t", "-u"], text=True, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        log.error("The `ss` command is not found. Please install iproute2.")
-        sys.exit(1)
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 5:
-            continue
-        proto, local = parts[0], parts[4]
-        try:
-            port = int(local.rsplit(":", 1)[-1])
-        except ValueError:
-            continue
-        if proto == "tcp":
-            state.tcp.add(port)
-        elif proto == "udp":
-            state.udp.add(port)
-    return state
+# ── Watch loop ────────────────────────────────────────────────────────
+def _open_maps() -> tuple[BpfArrayMap, BpfArrayMap]:
+    tcp_map = BpfArrayMap(TCP_MAP_PATH)
+    tcp_map.warmup()
+    udp_map = BpfArrayMap(UDP_MAP_PATH)
+    udp_map.warmup()
+    return tcp_map, udp_map
 
-def port_to_key(port: int):
-    # ARRAY map key = __u32 (4 bytes, little-endian host byte order)
-    lo = port & 0xFF
-    hi = (port >> 8) & 0xFF
-    return [f"0x{lo:02x}", f"0x{hi:02x}", "0x00", "0x00"]
 
-def map_update(map_path, port, dry_run):
-    # ARRAY map key = __u32 (4 bytes, little-endian host byte order)
-    cmd = ["bpftool", "map", "update", "pinned", map_path,
-           "key", *port_to_key(port),
-           "value", "0x01", "0x00", "0x00", "0x00"]
-    if dry_run:
-        log.info(f"[DRY] {' '.join(cmd)}")
-        return True
-    try:
-        subprocess.check_call(cmd, stderr=subprocess.PIPE)
-        return True
-    except subprocess.CalledProcessError as e:
-        log.warning(f"update failed port={port}: {e}")
-        return False
-
-def map_delete(map_path, port, dry_run):
-    # ARRAY maps do not support deletion; zero out the value instead.
-    cmd = ["bpftool", "map", "update", "pinned", map_path,
-           "key", *port_to_key(port),
-           "value", "0x00", "0x00", "0x00", "0x00"]
-    if dry_run:
-        log.info(f"[DRY] {' '.join(cmd)}")
-        return True
-    try:
-        subprocess.check_call(cmd, stderr=subprocess.PIPE)
-        return True
-    except subprocess.CalledProcessError as e:
-        log.warning(f"delete (zero) failed port={port}: {e}")
-        return False
-
-def map_dump_ports(map_path) -> set:
-    try:
-        out = subprocess.check_output(
-            ["bpftool", "-j", "map", "dump", "pinned", map_path],
-            text=True, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
-        return set()
-    try:
-        entries = json.loads(out)
-        ports = set()
-        for e in entries:
-            # ARRAY map dumps ALL 65536 entries; skip zero-value (unset) slots.
-            v = e.get("value", 0)
-            val = v if isinstance(v, int) else \
-                  (int(v[0], 16) if isinstance(v, list) and v else 0)
-            if not val:
-                continue
-            k = e.get("key")
-            if isinstance(k, int):
-                ports.add(k)
-            elif isinstance(k, list) and len(k) >= 2:
-                b0 = int(k[0], 16) if isinstance(k[0], str) else k[0]
-                b1 = int(k[1], 16) if isinstance(k[1], str) else k[1]
-                ports.add(b0 | (b1 << 8))
-        return ports
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-        return set()
-
-def sync_once(dry_run: bool):
-    current    = get_listening_ports()
-    tcp_target = current.tcp | set(TCP_PERMANENT)
-    udp_target = current.udp | set(UDP_PERMANENT)
-    tcp_in_map = map_dump_ports(TCP_MAP_PATH)
-    udp_in_map = map_dump_ports(UDP_MAP_PATH)
-
-    changed = False
-    for port in sorted(tcp_target - tcp_in_map):
-        tag = f" [{TCP_PERMANENT[port]}]" if port in TCP_PERMANENT else ""
-        if map_update(TCP_MAP_PATH, port, dry_run):
-            log.info(f"TCP Whitelist +{port}{tag}")
-            changed = True
-
-    for port in sorted(tcp_in_map - tcp_target - set(TCP_PERMANENT)):
-        if map_delete(TCP_MAP_PATH, port, dry_run):
-            log.info(f"TCP Whitelist -{port}  (Stopped)")
-            changed = True
-
-    for port in sorted(udp_target - udp_in_map):
-        tag = f" [{UDP_PERMANENT[port]}]" if port in UDP_PERMANENT else ""
-        if map_update(UDP_MAP_PATH, port, dry_run):
-            log.info(f"UDP Whitelist +{port}{tag}")
-            changed = True
-
-    for port in sorted(udp_in_map - udp_target - set(UDP_PERMANENT)):
-        if map_delete(UDP_MAP_PATH, port, dry_run):
-            log.info(f"UDP Whitelist -{port}  (Stopped)")
-            changed = True
-
-    if not changed:
-        log.debug("Port whitelist is up-to-date")
-
-def watch(interval: int, dry_run: bool):
-    """Event-driven watch loop.
-
-    - Listens to kernel EXEC/EXIT proc events via NETLINK_CONNECTOR.
-    - On event: arms a DEBOUNCE_S timer; syncs when the timer fires.
-    - Every `interval` seconds: syncs unconditionally as a safety net.
-    - Falls back to pure polling if the netlink socket is unavailable.
-    """
+def watch(interval: int, dry_run: bool) -> None:
+    tcp_map, udp_map = _open_maps()
     nl = open_proc_connector()
     last_sync_t  = 0.0
     last_event_t = 0.0
 
-    sync_once(dry_run)
+    sync_once(tcp_map, udp_map, dry_run)
     last_sync_t = time.monotonic()
 
     while True:
-        now = time.monotonic()
-        poll_due  = last_sync_t + interval
-        deb_due   = (last_event_t + DEBOUNCE_S) if last_event_t else float("inf")
-        sleep_for = max(0.0, min(poll_due, deb_due) - now)
+        now      = time.monotonic()
+        poll_due = last_sync_t + interval
+        deb_due  = (last_event_t + DEBOUNCE_S) if last_event_t else float("inf")
+        sleep_for = max(0.05, min(poll_due, deb_due) - now)
 
         try:
-            if nl:
-                ready, _, _ = select.select([nl], [], [], sleep_for)
-                if ready and drain_proc_events(nl):
-                    if not last_event_t:
-                        log.debug("Proc event received, debounce armed")
+            if nl and not last_event_t:
+                # Only listen for new events when NOT already debouncing,
+                # to prevent spinning when the socket is continuously readable.
+                rdy, _, _ = select.select([nl], [], [], sleep_for)
+                if rdy and drain_proc_events(nl):
+                    log.debug("Proc event received, debounce armed")
                     last_event_t = time.monotonic()
             else:
                 time.sleep(sleep_for)
         except OSError as exc:
-            log.warning(f"Netlink socket error ({exc}); disabling event-driven mode")
+            log.warning("Netlink socket error (%s); disabling event-driven mode", exc)
             if nl:
                 nl.close()
                 nl = None
@@ -483,30 +525,34 @@ def watch(interval: int, dry_run: bool):
 
         if debounce_fired or fallback_fired:
             reason = "event" if debounce_fired else "poll"
-            log.debug(f"sync triggered by {reason}")
+            log.debug("sync triggered by %s", reason)
+            if nl:
+                drain_proc_events(nl)  # flush accumulated events before re-arming
             try:
-                sync_once(dry_run)
+                sync_once(tcp_map, udp_map, dry_run)
             except Exception as exc:
-                log.error(f"sync error: {exc}")
+                log.error("sync error: %s", exc)
             last_sync_t  = time.monotonic()
             last_event_t = 0.0
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="XDP port-whitelist sync (event-driven via netlink proc connector)")
-    parser.add_argument("--watch",    action="store_true",
-                        help="Run as a daemon (event-driven + fallback poll)")
-    parser.add_argument("--interval", type=int, default=30,
-                        help="Fallback poll interval in seconds (default: 30)")
-    parser.add_argument("--dry-run",  action="store_true",
-                        help="Print bpftool commands without executing them")
-    args = parser.parse_args()
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="XDP port-whitelist sync daemon")
+    p.add_argument("--watch",    action="store_true",
+                   help="Run as a daemon (event-driven + fallback poll)")
+    p.add_argument("--interval", type=int, default=30,
+                   help="Fallback poll interval in seconds (default: 30)")
+    p.add_argument("--dry-run",  action="store_true",
+                   help="Print operations without executing them")
+    args = p.parse_args()
     if args.watch:
         watch(args.interval, args.dry_run)
     else:
-        sync_once(args.dry_run)
+        tcp_map, udp_map = _open_maps()
+        sync_once(tcp_map, udp_map, args.dry_run)
         log.info("Sync completed")
+
 
 if __name__ == "__main__":
     main()
@@ -514,7 +560,7 @@ PYEOF
 chmod +x "$SYNC_SCRIPT"
 ok "Script deployed: $SYNC_SCRIPT"
 
-# ── 9. Enable systemd ────────────────────────────────
+# ── 10. Enable systemd ───────────────────────────────
 info "Enabling systemd: $SERVICE_NAME ..."
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
 [Unit]
@@ -534,13 +580,13 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME"
-ok "Deamon enabled: $SERVICE_NAME"
+ok "Daemon enabled: $SERVICE_NAME"
 
-# ── 10. Start test ──────────────────────────────────────
+# ── 11. Initial sync ─────────────────────────────────
 info "Syncing..."
 python3 "$SYNC_SCRIPT"
 
-# ── 11. Done ────────────────────────────────────────
+# ── 12. Done ─────────────────────────────────────────
 echo ""
 echo -e "${GREEN}════════════════════════════════════════${NC}"
 echo -e "${GREEN}  Deployment Completed! ${NC}"
@@ -548,7 +594,7 @@ echo -e "${GREEN}═════════════════════
 echo ""
 echo "  Interface:     $IFACE"
 echo "  BPF maps: $BPF_PIN_DIR/"
-echo "  Deamon: systemctl status $SERVICE_NAME"
+  echo "  Daemon:  systemctl status $SERVICE_NAME"
 echo ""
 echo "  Current whitelisted TCP:"
 bpftool -j map dump pinned "${BPF_PIN_DIR}/tcp_whitelist" 2>/dev/null \
