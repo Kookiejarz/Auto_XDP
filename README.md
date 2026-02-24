@@ -265,9 +265,7 @@ PROG_ID=$(bpftool -j prog show pinned /sys/fs/bpf/xdp_fw/prog \
 sudo bpftool prog run id "$PROG_ID" repeat 100000000 data_in /tmp/pkt.bin
 ```
 
-## License
-
 ---
 
-MIT License (see [`LICENSE`](./LICENSE))
----
+## License](./LICENSE)
+

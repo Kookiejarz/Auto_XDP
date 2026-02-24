@@ -113,62 +113,13 @@ ok "Dependency check completed"
 fetch_or_keep() {
     local filename="$1"
     local url="${RAW_URL}/${filename}"
-    local tmp_file=$(mktemp)
 
-    info "Checking ${filename} ..."
-
-    # If the file does not exist locally, download it directly. If it exists, try to fetch the GitHub version for comparison. If GitHub is unreachable, keep the local version.
-    if [[ ! -f "$filename" ]]; then
-        info "${filename} not found locally, downloading..."
-        if curl -fsSL "$url" -o "$filename" 2>/dev/null; then
-            ok "Downloaded ${filename} from GitHub"
-        else
-            die "Failed to download ${filename} from ${url}"
-        fi
-        return
-    fi
-
-    # Exist in local，try pulling GitHub version for comparison. If GitHub is unreachable, keep local version.
-    if ! curl -fsSL "$url" -o "$tmp_file" 2>/dev/null; then
-        warn "GitHub unreachable, keeping local ${filename}"
-        rm -f "$tmp_file"
-        return
-    fi
-
-    local local_hash github_hash
-    local_hash=$(sha256sum "$filename"  | awk '{print $1}')
-    github_hash=$(sha256sum "$tmp_file" | awk '{print $1}')
-
-    if [[ "$local_hash" == "$github_hash" ]]; then
-        info "${filename} is identical to GitHub, no update needed"
-        rm -f "$tmp_file"
-        return 0
-    fi
-
-    # Compare the last modified timestamps of the local and GitHub files to decide whether to update. This is a best-effort heuristic to avoid overwriting newer local changes, but it may not be perfect due to clock skew, timezone differences, or if the local file was modified without changing its timestamp.
-    local local_ts
-    local_ts=$(stat -c %Y "$filename" 2>/dev/null || echo 0)
-
-    local remote_date remote_ts=0
-    remote_date=$(curl -fsSI "$url" --connect-timeout 5 2>/dev/null \
-        | grep -i "^last-modified:" \
-        | sed 's/last-modified: //i' \
-        | tr -d '\r') || true
-    [[ -n "$remote_date" ]] && \
-        remote_ts=$(date -d "$remote_date" +%s 2>/dev/null || echo 0)
-
-    info "  Local  : $(date -d @"$local_ts"  '+%Y-%m-%d %H:%M:%S') [sha256: ${local_hash:0:8}...]"
-    info "  GitHub : $(date -d @"$remote_ts" '+%Y-%m-%d %H:%M:%S') [sha256: ${github_hash:0:8}...]"
-
-    if [[ "$remote_ts" -gt "$local_ts" ]]; then
-        cp "$filename" "${filename}.bak"
-        mv "$tmp_file" "$filename"
-        ok "Updated ${filename} from GitHub (backup → ${filename}.bak)"
+    info "Fetching ${filename} from GitHub ..."
+    if curl -fsSL "$url" -o "$filename" 2>/dev/null; then
+        ok "Downloaded ${filename} from GitHub"
     else
-        info "Local ${filename} is newer, keeping local version"
-        rm -f "$tmp_file"
+        die "Failed to download ${filename} from ${url}"
     fi
-    return 0
 }
 
 fetch_or_keep "$XDP_SRC"
