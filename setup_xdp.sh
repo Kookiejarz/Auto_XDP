@@ -101,7 +101,6 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
         fi
     fi
     
-    # 取消环境变量（可选，避免影响后续操作）
     unset DEBIAN_FRONTEND
 fi
 
@@ -118,7 +117,7 @@ fetch_or_keep() {
 
     info "Checking ${filename} ..."
 
-    # 如果本地不存在，直接下载
+    # If the file does not exist locally, download it directly. If it exists, try to fetch the GitHub version for comparison. If GitHub is unreachable, keep the local version.
     if [[ ! -f "$filename" ]]; then
         info "${filename} not found locally, downloading..."
         if curl -fsSL "$url" -o "$filename" 2>/dev/null; then
@@ -129,7 +128,7 @@ fetch_or_keep() {
         return
     fi
 
-    # 本地存在，尝试拉取 GitHub 版本到临时文件
+    # Exist in local，try pulling GitHub version for comparison. If GitHub is unreachable, keep local version.
     if ! curl -fsSL "$url" -o "$tmp_file" 2>/dev/null; then
         warn "GitHub unreachable, keeping local ${filename}"
         rm -f "$tmp_file"
@@ -146,7 +145,7 @@ fetch_or_keep() {
         return 0
     fi
 
-    # 内容不同，用本地修改时间 vs GitHub commit 时间
+    # Compare the last modified timestamps of the local and GitHub files to decide whether to update. This is a best-effort heuristic to avoid overwriting newer local changes, but it may not be perfect due to clock skew, timezone differences, or if the local file was modified without changing its timestamp.
     local local_ts
     local_ts=$(stat -c %Y "$filename" 2>/dev/null || echo 0)
 
