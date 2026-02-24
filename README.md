@@ -2,6 +2,8 @@
 
 A lightweight, high-performance XDP/eBPF-based rule for Linux that provides **automatic port whitelisting** and **basic DDoS protection** for personal cloud instances.
 
+Although there are some XDP firewall solutions available, Basic XDP provides users with automatic port whitelisting, which makes maintenance easier.
+
 ---
 
 ## Overview
@@ -59,7 +61,7 @@ Incoming Packet
 - **UDP whitelist**, plus allow rules for DNS (53), NTP (123), DHCP (67), QUIC (443) responses 
 - **Pinned BPF maps** that survive reloads and can be updated at runtime 
 - **ICMP/ICMPv6/ARP passthrough** (ping + IPv6 NDP still work) 
-- **Systemd daemon**: starts on boot, syncs every 5 seconds
+- **Systemd daemon**: starts on boot, auto sync open ports
 - **Native + generic XDP**: falls back to generic mode if native isn’t supported 
 
 ---
@@ -108,7 +110,7 @@ sudo bash setup_xdp.sh eth0
 2. Auto-detects default network interface
 3. Installs missing dependencies via `apt` 
 4. Fetches/updates `xdp_firewall.c` from GitHub (keeps newer local version)   
-5. Compiles the BPF program with `clang -mcpu=probe` (auto-detects the highest BPF ISA supported by the running kernel) 
+5. Compiles the BPF program with `clang -mcpu=v3` 
 6. Mounts `bpffs` at `/sys/fs/bpf` if needed 
 7. Detaches existing XDP program and removes old pinned maps   
 8. Loads + pins XDP program and maps to `/sys/fs/bpf/xdp_fw/` 
