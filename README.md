@@ -170,19 +170,19 @@ Originally, this project used **BPF_MAP_TYPE_HASH** for the whitelist. We transi
 
 ## Auto-Sync Daemon
 
-The daemon `xdp-sync-ports.py` runs as a systemd service and loops every **5 seconds**:
+The daemon `xdp_port_sync.py` runs as a systemd service and provides **real-time updates**:
 
-1. Reads listening ports via `ss -lnH -t -u`
-2. Compares with current BPF map entries
-3. Adds newly listening ports 
-4. Removes ports no longer listening 
+1. **Event-driven**: Uses Linux **Netlink Process Connector** to detect `exec()` and `exit()` events immediately.
+2. **Efficient Discovery**: Uses `psutil` to read `/proc` directly for listening ports (no slow `ss` or `netstat` subprocesses).
+3. **Safety Fallback**: Performs a full sync every **30 seconds** to ensure consistency.
+4. **Map Sync**: Compares state with BPF maps and updates only what changed.
 
 ### Permanent Ports
 
-Edit constants in the daemon to always allow specific ports:
+Edit `xdp_port_sync.py` to always allow specific ports:
 
 ```python
-TCP_PERMANENT = {22: "SSH-fallback"}   # Always allow SSH in case you block yourself out
+TCP_PERMANENT = {22: "SSH-fallback"}   # Optional: add ports you never want blocked
 UDP_PERMANENT = {}
 ```
 
@@ -192,8 +192,8 @@ UDP_PERMANENT = {}
 systemctl status xdp-port-sync
 journalctl -u xdp-port-sync -f
 
-python3 /usr/local/bin/xdp-sync-ports.py
-python3 /usr/local/bin/xdp-sync-ports.py --dry-run
+python3 /usr/local/bin/xdp-port-sync.py
+python3 /usr/local/bin/xdp-port-sync.py --dry-run
 ```
 
 ---
@@ -228,7 +228,7 @@ rm -rf /sys/fs/bpf/xdp_fw
 
 # Stop and disable daemon + remove files
 systemctl disable --now xdp-port-sync
-rm /usr/local/bin/xdp-sync-ports.py
+rm /usr/local/bin/xdp_port_sync.py
 rm /etc/systemd/system/xdp-port-sync.service
 systemctl daemon-reload
 ```
@@ -273,14 +273,6 @@ PROG_ID=$(bpftool -j prog show pinned /sys/fs/bpf/xdp_fw/prog \
 sudo bpftool prog run id "$PROG_ID" repeat 100000000 data_in /tmp/pkt.bin
 ```
 
----
-
-##  📁 Project Structure
-
-basic_xdp/
-├── xdp_firewall.c      # eBPF/XDP kernel program (packet filtering logic)
-├── setup_xdp.sh        # One-click deploy: compile, load, and start daemon
-└── README.md
 
 
 ## 🤝 **Contributing**
