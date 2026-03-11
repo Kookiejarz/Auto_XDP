@@ -64,7 +64,7 @@ Incoming Packet
 ## Key Features
 
 - **Wire-speed filtering** via XDP (bypasses kernel network stack)
-- **~40–65 ns per-packet latency** measured on real hardware (see [Benchmarks](#benchmarks))
+- **~40–65 ns per-packet latency** measured on real hardware (see [Benchmarks](#-real-world-performance-benchmark))
 - **Auto-sync whitelist**: daemon watches `ss` output and updates BPF maps in real time 
 - **TCP SYN filtering**: only new connections to whitelisted ports are allowed; established connections (ACK) pass 
 - **IPv6 support**, including extension header traversal to prevent bypasses 
