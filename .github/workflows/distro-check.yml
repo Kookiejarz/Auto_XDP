@@ -49,7 +49,7 @@ jobs:
             image: almalinux:10
             install: dnf -y install bash curl git ca-certificates iproute
           - name: rockylinux
-            image: rockylinux:10
+            image: rockylinux:9
             install: dnf -y install bash curl git ca-certificates iproute
     container:
       image: ${{ matrix.image }}
