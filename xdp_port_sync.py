@@ -274,23 +274,37 @@ class XdpBackend(PortBackend):
         for port in sorted(tcp_target - self.tcp_map.active_ports()):
             tag = f" [{TCP_PERMANENT[port]}]" if port in TCP_PERMANENT else ""
             if self.tcp_map.set(port, 1, dry_run):
-                log.info("TCP +%d%s", port, tag)
+                log.debug("TCP +%d%s", port, tag)
                 changed = True
 
         for port in sorted(self.tcp_map.active_ports() - tcp_target - set(TCP_PERMANENT)):
             if self.tcp_map.set(port, 0, dry_run):
-                log.info("TCP -%d  (stopped)", port)
+                log.debug("TCP -%d  (stopped)", port)
                 changed = True
 
         for port in sorted(udp_target - self.udp_map.active_ports()):
             tag = f" [{UDP_PERMANENT[port]}]" if port in UDP_PERMANENT else ""
             if self.udp_map.set(port, 1, dry_run):
-                log.info("UDP +%d%s", port, tag)
+                log.debug("UDP +%d%s", port, tag)
                 changed = True
 
         for port in sorted(self.udp_map.active_ports() - udp_target - set(UDP_PERMANENT)):
             if self.udp_map.set(port, 0, dry_run):
-                log.info("UDP -%d  (stopped)", port)
+                log.debug("UDP -%d  (stopped)", port)
+                changed = True
+
+        # Mirror host-initiated IPv4 TCP sessions into conntrack so reply ACKs
+        # for outbound client connections do not get dropped by XDP.
+        for flow in sorted(conntrack_target - self.conntrack_map.active_keys()):
+            remote_ip, local_ip, remote_port, local_port = flow
+            if self.conntrack_map.set(flow, dry_run):
+                log.debug("TCP_CT +%s:%d -> %s:%d", remote_ip, remote_port, local_ip, local_port)
+                changed = True
+
+        for flow in sorted(self.conntrack_map.active_keys() - conntrack_target):
+            remote_ip, local_ip, remote_port, local_port = flow
+            if self.conntrack_map.delete(flow, dry_run):
+                log.debug("TCP_CT -%s:%d -> %s:%d  (closed)", remote_ip, remote_port, local_ip, local_port)
                 changed = True
 
         # HASH maps need delete, not write-zero, when trust entries disappear.
