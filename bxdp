@@ -30,6 +30,7 @@ Commands:
   stats [args...]   Show Basic XDP statistics
   watch [args...]   Shorthand for: stats --watch
   sync [args...]    Run one sync pass with automatic backend selection
+  log-level [LVL]   Show or change daemon log level
   start             Start the installed service
   stop              Stop the installed service
   restart           Restart the installed service
@@ -117,6 +118,80 @@ load_config() {
     if [[ -n "$cli_iface" ]]; then
         IFACE="$cli_iface"
     fi
+}
+
+valid_log_level() {
+    case "$1" in
+        debug|info|warning|error)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+set_config_var() {
+    local key="$1"
+    local value="$2"
+    local tmp_file=""
+
+    [[ -f "$CONFIG_FILE" ]] || {
+        echo "Missing config: $CONFIG_FILE" >&2
+        exit 1
+    }
+
+    tmp_file=$(mktemp)
+    awk -v key="$key" -v value="$value" '
+    BEGIN { updated = 0 }
+    $0 ~ ("^" key "=") {
+        print key "=\"" value "\""
+        updated = 1
+        next
+    }
+    { print }
+    END {
+        if (!updated)
+            print key "=\"" value "\""
+    }' "$CONFIG_FILE" > "$tmp_file"
+    mv "$tmp_file" "$CONFIG_FILE"
+}
+
+run_log_level() {
+    local level="${1:-}"
+
+    load_config
+    local current="${LOG_LEVEL:-info}"
+
+    if [[ -z "$level" ]]; then
+        printf "%s\n" "$current"
+        return 0
+    fi
+
+    level=$(printf "%s" "$level" | tr '[:upper:]' '[:lower:]')
+    valid_log_level "$level" || {
+        echo "Invalid log level: $level" >&2
+        echo "Valid values: debug, info, warning, error" >&2
+        exit 1
+    }
+
+    set_config_var "LOG_LEVEL" "$level"
+    echo "LOG_LEVEL=$level"
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl restart "$SERVICE_NAME"
+        systemctl --no-pager --full status "$SERVICE_NAME"
+        return 0
+    fi
+
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service "$SERVICE_NAME" restart
+        rc-service "$SERVICE_NAME" status
+        return 0
+    fi
+
+    echo "No supported init system detected for service restart." >&2
+    return 0
 }
 
 autodetect_iface() {
@@ -258,7 +333,8 @@ import json
 import sys
 
 names = [
-    "TCP_PASS",
+    "TCP_NEW_ALLOW",
+    "TCP_ESTABLISHED",
     "TCP_DROP",
     "UDP_PASS",
     "UDP_DROP",
@@ -446,13 +522,13 @@ run_stats() {
         if [[ $SHOW_RATES -eq 1 ]]; then
             collect_rows
             copy_current_to_prev
-            prev_ts=$(python3 -c 'import time; print(time.time())')
+            prev_ts=$(read -r ts _ < /proc/uptime && echo "$ts")
         fi
 
         while true; do
             if [[ $SHOW_RATES -eq 1 ]]; then
                 sleep "$INTERVAL"
-                cur_ts=$(python3 -c 'import time; print(time.time())')
+                cur_ts=$(read -r ts _ < /proc/uptime && echo "$ts")
                 collect_rows
                 elapsed=$(awk -v a="$cur_ts" -v b="$prev_ts" 'BEGIN { printf "%.6f", a - b }')
             else
@@ -479,9 +555,9 @@ run_stats() {
     if [[ $SHOW_RATES -eq 1 ]]; then
         collect_rows
         copy_current_to_prev
-        prev_ts=$(python3 -c 'import time; print(time.time())')
+        prev_ts=$(read -r ts _ < /proc/uptime && echo "$ts")
         sleep "$INTERVAL"
-        cur_ts=$(python3 -c 'import time; print(time.time())')
+        cur_ts=$(read -r ts _ < /proc/uptime && echo "$ts")
         collect_rows
         elapsed=$(awk -v a="$cur_ts" -v b="$prev_ts" 'BEGIN { printf "%.6f", a - b }')
         render_stats "$elapsed"
@@ -508,6 +584,10 @@ main() {
             shift || true
             ensure_installed "$RUNNER_SCRIPT"
             exec "$RUNNER_SCRIPT" --sync-once "$@"
+            ;;
+        log-level)
+            shift || true
+            run_log_level "$@"
             ;;
         start|stop|restart|status)
             shift || true

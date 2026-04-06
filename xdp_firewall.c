@@ -18,6 +18,13 @@
 #endif
 
 #define IPV6_FRAG_DROP_SENTINEL 0xFF
+#define CT_FAMILY_IPV4 2
+#define CT_FAMILY_IPV6 10
+
+// Conntrack timeouts and refresh intervals (in nanoseconds)
+#define TCP_TIMEOUT_NS       (300ULL * 1000000000ULL) // 5 minutes
+#define UDP_TIMEOUT_NS       (60ULL * 1000000000ULL)  // 1 minute
+#define CT_REFRESH_INTERVAL  (30ULL * 1000000000ULL)  // 30 seconds
 
 // BPF Maps: hot-updatable TCP/UDP port whitelists (ARRAY implementation)
 // The ARRAY map uses the port number (host byte order) as the array index (__u32 key).
@@ -31,16 +38,17 @@
 // Read with: bpftool map dump pinned /sys/fs/bpf/xdp_fw/pkt_counters
 
 enum xdp_counter_idx {
-    CNT_TCP_PASS    = 0,  // TCP packets allowed
-    CNT_TCP_DROP    = 1,  // TCP packets dropped (not in whitelist)
-    CNT_UDP_PASS    = 2,  // UDP packets allowed
-    CNT_UDP_DROP    = 3,  // UDP packets dropped (not in whitelist)
-    CNT_IPV4_OTHER  = 4,  // IPv4 non-TCP/UDP (ICMP, etc.) passed
-    CNT_IPV6_OTHER  = 5,  // IPv6 non-TCP/UDP (ICMPv6, etc.) passed
-    CNT_FRAG_DROP   = 6,  // IPv4 fragmented packets dropped
-    CNT_NON_IP      = 7,  // Non-IP traffic (ARP, etc.) passed
-    CNT_TCP_CT_MISS = 8,  // TCP ACK packets dropped due to missing conntrack state
-    CNT_MAX         = 9,
+    CNT_TCP_NEW_ALLOW   = 0,  // TCP pure SYN packets allowed by tcp_whitelist
+    CNT_TCP_ESTABLISHED = 1,  // TCP established/reply packets allowed by conntrack
+    CNT_TCP_DROP        = 2,  // TCP packets dropped (not in whitelist / no conntrack)
+    CNT_UDP_PASS        = 3,  // UDP packets allowed
+    CNT_UDP_DROP        = 4,  // UDP packets dropped
+    CNT_IPV4_OTHER      = 5,  // IPv4 non-TCP/UDP (ICMP, etc.) passed
+    CNT_IPV6_OTHER      = 6,  // IPv6 non-TCP/UDP (ICMPv6, etc.) passed
+    CNT_FRAG_DROP       = 7,  // Fragmented packets dropped
+    CNT_NON_IP          = 8,  // Non-IP traffic (ARP, etc.) passed
+    CNT_TCP_CT_MISS     = 9,  // TCP ACK packets dropped due to missing conntrack state
+    CNT_MAX             = 10,
 };
 
 struct {
@@ -58,11 +66,13 @@ static __always_inline void count(enum xdp_counter_idx idx) {
 }
 
 struct ct_key {
-    __be32 saddr;
-    __be32 daddr;
+    __u8 family;
+    __u8 pad[3];
     __be16 sport;
     __be16 dport;
-};
+    __u32 saddr[4];
+    __u32 daddr[4];
+} __attribute__((aligned(8)));
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -99,40 +109,78 @@ struct {
     __type(value, __u32); // 1 = allow
 } udp_whitelist SEC(".maps");
 
-static __always_inline void fill_ct_key(
+static __always_inline void fill_ct_key_v4(
     struct ct_key *key, __be32 saddr, __be32 daddr,
     __be16 sport, __be16 dport)
 {
     // Zero the full key so the verifier never sees uninitialized padding.
     __builtin_memset(key, 0, sizeof(*key));
-    key->saddr = saddr;
-    key->daddr = daddr;
+    key->family = CT_FAMILY_IPV4;
     key->sport = sport;
     key->dport = dport;
+    key->saddr[0] = (__u32)saddr;
+    key->daddr[0] = (__u32)daddr;
 }
 
-// TCP port check
-static __always_inline int check_tcp_legacy(void *trans_data, void *data_end) {
-    struct tcphdr *tcp = trans_data;
-    if ((void *)(tcp + 1) > data_end)
-        return XDP_PASS;
+static __always_inline void fill_ct_key_v6(
+    struct ct_key *key, const struct in6_addr *saddr, const struct in6_addr *daddr,
+    __be16 sport, __be16 dport)
+{
+    __builtin_memset(key, 0, sizeof(*key));
+    key->family = CT_FAMILY_IPV6;
+    key->sport = sport;
+    key->dport = dport;
+    __builtin_memcpy(key->saddr, saddr, sizeof(*saddr));
+    __builtin_memcpy(key->daddr, daddr, sizeof(*daddr));
+}
 
-    __u8  tcp_flags = ((__u8 *)tcp)[13];
-    __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
+static __always_inline int check_tcp_conntrack(
+    struct ct_key *key, __u8 tcp_flags, __u32 dest_port)
+{
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last_seen;
 
-    // Pass reply packets of established connections first (ACK/SYN-ACK/FIN/RST).
-    // Their dest_port is a random client port not in the whitelist,
-    // so they must be passed before the whitelist check.
-    if (tcp_flags & 0x10) { // ACK bit set
-        count(CNT_TCP_PASS);
-        return XDP_PASS;
+    // 1. RST? Delete entry immediately and drop.
+    if (tcp_flags & 0x04) {
+        bpf_map_delete_elem(&tcp_conntrack, key);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
     }
 
-    // Only pure SYN (0x02, no ACK) is checked against the whitelist
-    __u32 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
-    if (allow && *allow) {
-        count(CNT_TCP_PASS);
-        return XDP_PASS;
+    // 2. ACK/SYN-ACK (established traffic)
+    if (tcp_flags & 0x10) {
+        last_seen = bpf_map_lookup_elem(&tcp_conntrack, key);
+        if (last_seen) {
+            // Check logical timeout
+            if (now - *last_seen > TCP_TIMEOUT_NS) {
+                bpf_map_delete_elem(&tcp_conntrack, key);
+                count(CNT_TCP_CT_MISS);
+                count(CNT_TCP_DROP);
+                return XDP_DROP;
+            }
+
+            // Periodic refresh
+            if (now - *last_seen > CT_REFRESH_INTERVAL) {
+                bpf_map_update_elem(&tcp_conntrack, key, &now, BPF_EXIST);
+            }
+
+            count(CNT_TCP_ESTABLISHED);
+            return XDP_PASS;
+        }
+
+        count(CNT_TCP_CT_MISS);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
+    }
+
+    // 3. SYN (new traffic)
+    if (tcp_flags == 0x02) {
+        __u32 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
+        if (allow && *allow) {
+            bpf_map_update_elem(&tcp_conntrack, key, &now, BPF_ANY);
+            count(CNT_TCP_NEW_ALLOW);
+            return XDP_PASS;
+        }
     }
 
     count(CNT_TCP_DROP);
@@ -144,77 +192,41 @@ static __always_inline int check_tcp_ipv4(
 {
     struct tcphdr *tcp = trans_data;
     struct ct_key key;
-    __u64 now;
 
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
     __u8  tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
+    fill_ct_key_v4(&key, ip->saddr, ip->daddr, tcp->source, tcp->dest);
 
-    if (tcp_flags & 0x10) {
-        fill_ct_key(&key, ip->saddr, ip->daddr, tcp->source, tcp->dest);
-        if (bpf_map_lookup_elem(&tcp_conntrack, &key)) {
-            count(CNT_TCP_PASS);
-            return XDP_PASS;
-        }
-
-        // Track conntrack misses separately while preserving total TCP drop count.
-        count(CNT_TCP_CT_MISS);
-        count(CNT_TCP_DROP);
-        return XDP_DROP;
-    }
-
-    if (tcp_flags == 0x02) {
-        __u32 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
-        if (allow && *allow) {
-            now = bpf_ktime_get_ns();
-            fill_ct_key(&key, ip->saddr, ip->daddr, tcp->source, tcp->dest);
-            bpf_map_update_elem(&tcp_conntrack, &key, &now, BPF_ANY);
-            count(CNT_TCP_PASS);
-            return XDP_PASS;
-        }
-    }
-
-    count(CNT_TCP_DROP);
-    return XDP_DROP;
+    return check_tcp_conntrack(&key, tcp_flags, dest_port);
 }
 
-// UDP port check
-static __always_inline int check_udp_legacy(void *trans_data, void *data_end) {
-    struct udphdr *udp = trans_data;
-    if ((void *)(udp + 1) > data_end)
+static __always_inline int check_tcp_ipv6(
+    struct ipv6hdr *ipv6, void *trans_data, void *data_end)
+{
+    struct tcphdr *tcp = trans_data;
+    struct ct_key key;
+
+    if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    // Convert byte order once at the start of the function
-    __u32 src_port  = (__u32)bpf_ntohs(udp->source);
-    __u32 dest_port = (__u32)bpf_ntohs(udp->dest);
+    __u8 tcp_flags = ((__u8 *)tcp)[13];
+    __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
+    fill_ct_key_v6(&key, &ipv6->saddr, &ipv6->daddr, tcp->source, tcp->dest);
 
-    // Pass common UDP responses: DNS(53) / NTP(123) / DHCP(67) / QUIC(443)
-    // Their dest_port is a random client port not in the whitelist, so pass them here
-    if (src_port == 53  ||
-        src_port == 123 ||
-        src_port == 67  ||
-        src_port == 443) {
-        count(CNT_UDP_PASS);
-        return XDP_PASS;
-    }
-
-    __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
-    if (allow && *allow) {
-        count(CNT_UDP_PASS);
-        return XDP_PASS;
-    }
-
-    count(CNT_UDP_DROP);
-    return XDP_DROP;
+    return check_tcp_conntrack(&key, tcp_flags, dest_port);
 }
 
-static __always_inline int check_udp(
+static __always_inline int check_udp_ipv4(
     struct iphdr *ip, void *trans_data, void *data_end)
 {
     struct udphdr *udp = trans_data;
     struct ct_key key;
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last_seen;
+
     if ((void *)(udp + 1) > data_end)
         return XDP_PASS;
 
@@ -222,10 +234,20 @@ static __always_inline int check_udp(
 
     // UDP replies are stateful now: tc egress records outbound packets as the
     // reverse tuple, and XDP ingress looks up the current inbound tuple here.
-    fill_ct_key(&key, ip->saddr, ip->daddr, udp->source, udp->dest);
-    if (bpf_map_lookup_elem(&udp_conntrack, &key)) {
-        count(CNT_UDP_PASS);
-        return XDP_PASS;
+    fill_ct_key_v4(&key, ip->saddr, ip->daddr, udp->source, udp->dest);
+    last_seen = bpf_map_lookup_elem(&udp_conntrack, &key);
+    if (last_seen) {
+        // Check logical timeout
+        if (now - *last_seen > UDP_TIMEOUT_NS) {
+            bpf_map_delete_elem(&udp_conntrack, &key);
+        } else {
+            // Periodic refresh
+            if (now - *last_seen > CT_REFRESH_INTERVAL) {
+                bpf_map_update_elem(&udp_conntrack, &key, &now, BPF_EXIST);
+            }
+            count(CNT_UDP_PASS);
+            return XDP_PASS;
+        }
     }
 
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
@@ -236,6 +258,46 @@ static __always_inline int check_udp(
 
     __u32 *trusted = bpf_map_lookup_elem(&trusted_src_ips, &ip->saddr);
     if (trusted && *trusted) {
+        count(CNT_UDP_PASS);
+        return XDP_PASS;
+    }
+
+    count(CNT_UDP_DROP);
+    return XDP_DROP;
+}
+
+static __always_inline int check_udp_ipv6(
+    struct ipv6hdr *ipv6, void *trans_data, void *data_end)
+{
+    struct udphdr *udp = trans_data;
+    struct ct_key key;
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *last_seen;
+
+    if ((void *)(udp + 1) > data_end)
+        return XDP_PASS;
+
+    __u32 dest_port = (__u32)bpf_ntohs(udp->dest);
+
+    // IPv6 UDP replies are matched by the same shared conntrack map shape.
+    fill_ct_key_v6(&key, &ipv6->saddr, &ipv6->daddr, udp->source, udp->dest);
+    last_seen = bpf_map_lookup_elem(&udp_conntrack, &key);
+    if (last_seen) {
+        // Check logical timeout
+        if (now - *last_seen > UDP_TIMEOUT_NS) {
+            bpf_map_delete_elem(&udp_conntrack, &key);
+        } else {
+            // Periodic refresh
+            if (now - *last_seen > CT_REFRESH_INTERVAL) {
+                bpf_map_update_elem(&udp_conntrack, &key, &now, BPF_EXIST);
+            }
+            count(CNT_UDP_PASS);
+            return XDP_PASS;
+        }
+    }
+
+    __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
+    if (allow && *allow) {
         count(CNT_UDP_PASS);
         return XDP_PASS;
     }
@@ -326,7 +388,7 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
         case IPPROTO_TCP:
             return check_tcp_ipv4(ip, trans_data, data_end);
         case IPPROTO_UDP:
-            return check_udp(ip, trans_data, data_end);
+            return check_udp_ipv4(ip, trans_data, data_end);
         default:
             // Pass other protocols such as ICMP (keep ping reachable)
             count(CNT_IPV4_OTHER);
@@ -356,11 +418,9 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
 
         switch (nexthdr) {
         case IPPROTO_TCP:
-            // TODO: IPv6 conntrack not yet implemented — ACK bypass still present on IPv6 path.
-            return check_tcp_legacy(trans_data, data_end);
+            return check_tcp_ipv6(ipv6, trans_data, data_end);
         case IPPROTO_UDP:
-            // TODO: IPv6 UDP conntrack / trusted_src_ips not yet implemented.
-            return check_udp_legacy(trans_data, data_end);
+            return check_udp_ipv6(ipv6, trans_data, data_end);
         default:
             // ICMPv6 (including NDP neighbor discovery) must be passed, otherwise IPv6 networking breaks
             count(CNT_IPV6_OTHER);
