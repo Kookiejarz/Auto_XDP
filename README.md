@@ -80,8 +80,10 @@ Incoming Packet
 ## Components
 
 1. **`xdp_firewall.c`** — eBPF/XDP kernel program that filters packets at wire speed
-2. **`tc_udp_track.c`** — eBPF `tc` egress helper that records outbound IPv4 TCP SYN and UDP reply tuples
-3. **`setup_xdp.sh`** — one-click installer that compiles XDP when available, installs the runtime launcher, and sets up boot-time auto-sync
+2. **`tc_flow_track.c`** — eBPF `tc` egress helper that records outbound IPv4/IPv6 TCP SYN packets and UDP reply tuples
+3. **`xdp_port_sync.py`** — userspace daemon that syncs TCP/UDP listening ports and trusted IPv4 source IPs
+4. **`bxdp`** — operator CLI for statistics, sync, service control, and daemon log level
+5. **`setup_xdp.sh`** — installer that compiles the BPF objects, installs the runtime launcher, and sets up boot-time auto-sync
 
 ---
 
@@ -90,16 +92,18 @@ Incoming Packet
 - **Wire-speed filtering** via XDP (bypasses kernel network stack)
 - **~40–65 ns per-packet latency** measured on real hardware (see [Benchmarks](#-real-world-performance-benchmark))
 - **Auto-sync whitelist**: daemon watches listening sockets and updates the active backend in real time
-- **IPv4 TCP conntrack hardening**: pure SYN creates temporary state; unsolicited ACK packets are dropped
-- **Outbound IPv4 TCP compatibility**: a `tc` egress program records host-initiated TCP SYN packets, so inbound SYN-ACK/ACK traffic can be matched at XDP without reopening the ACK bypass
-- **IPv4 UDP conntrack**: a `tc` egress program records outbound UDP flows so inbound reply traffic can be matched at XDP
-- **IPv4 UDP hardening**: inbound server ports use `udp_whitelist`, and reply traffic can be allowed by trusted source IP
-- **IPv6 support**, including extension header traversal and explicit non-initial fragment drops
-- **Reload-safe XDP attach**: existing IPv4 TCP sessions are pre-seeded into `tcp_conntrack` before re-attaching XDP, which helps preserve the current SSH session during reinstall/restart
+- **IPv4 + IPv6 TCP conntrack hardening**: pure SYN creates temporary state; unsolicited ACK packets are dropped
+- **Kernel-side outbound state tracking**: a `tc` egress program records host-initiated IPv4/IPv6 TCP SYN packets and UDP reply tuples so return traffic can be matched at XDP without reopening the old bypasses
+- **IPv4 UDP hardening**: inbound server ports use `udp_whitelist`, reply traffic can be matched by `udp_conntrack`, and explicitly trusted IPv4 sources can still be allowed via `trusted_src_ips`
+- **IPv6 UDP stateful filtering**: reply traffic uses the shared `udp_conntrack`, and inbound server traffic still uses `udp_whitelist` (note: `trusted_src_ips` is currently IPv4-only)
+- **IPv6 support**, including extension header traversal on both XDP and tc egress, plus explicit non-initial fragment drops
+- **Periodic conntrack sync (seeding established flows)**: the daemon now periodically seeds existing IPv4/IPv6 TCP sessions into `tcp_conntrack`, which helps preserve active sessions after re-attaching XDP or manual map clears.
+- **Reload-safe XDP attach**: the installer also pre-seeds existing sessions before initial attach.
 - **Pinned BPF maps** that survive reloads and can be updated at runtime 
 - **ICMP/ICMPv6/ARP passthrough** (ping + IPv6 NDP still work) 
 - **Boot-time loader**: restores protection on reboot instead of only syncing userspace state
 - **Systemd + OpenRC support**: installs the service automatically when either init system is present
+- **Configurable daemon verbosity**: `bxdp log-level debug|info|warning|error` updates the installed service config and restarts it
 - **Native + generic XDP**: tries native first, then generic
 - **nftables fallback**: if both XDP attach modes fail, keeps automatic port whitelisting with a dynamic `nftables` ruleset
 
@@ -127,6 +131,8 @@ Incoming Packet
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Kookiejarz/basic_xdp/refs/heads/main/setup_xdp.sh | sudo bash
 ```
+
+When the installer is executed from `stdin` (`curl | bash`), it prefers the matching GitHub source files instead of stale local files from the current working directory.
 
 ## Automated Distro Checks
 
@@ -174,9 +180,9 @@ sudo bash setup_xdp.sh --check-update --force
 1. Checks for root privileges 
 2. Auto-detects default network interface
 3. Installs missing dependencies via the detected package manager 
-4. Uses local `xdp_firewall.c` / `tc_udp_track.c` / `xdp_port_sync.py` by default, or compares them with GitHub when `--check-update` is enabled
-5. Compiles the BPF program when the host has the required XDP toolchain
-6. Pre-seeds current IPv4 established TCP sessions into `tcp_conntrack` before attaching XDP
+4. Uses local `xdp_firewall.c` / `tc_flow_track.c` / `xdp_port_sync.py` / `bxdp` by default from a local checkout; when run from `stdin`, it prefers the matching GitHub copies
+5. Compiles the XDP and tc BPF objects when the host has the required toolchain
+6. Pre-seeds current IPv4/IPv6 established TCP sessions into `tcp_conntrack` before attaching XDP
 7. Loads and attaches a `tc clsact egress` program that records outbound TCP SYN and UDP reply tuples
 8. Tries to attach XDP in native mode, then generic mode
 9. Falls back to `nftables` automatically if XDP cannot be attached
@@ -195,9 +201,10 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 |:-:|:-:|:--:|:-:|:-:|
 | `tcp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
 | `udp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
-| `tcp_conntrack` | LRU_HASH | 65536 | `struct ct_key { saddr, daddr, sport, dport }` | `__u64` ktime_ns |
-| `udp_conntrack` | LRU_HASH | 65536 | `struct ct_key { saddr, daddr, sport, dport }` | `__u64` ktime_ns |
+| `tcp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
+| `udp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
 | `trusted_src_ips` | HASH | 256 | `__be32` IPv4 source address | `__u32` (1 = trusted) |
+| `pkt_counters` | PERCPU_ARRAY | 10 | `__u32` counter index | `__u64` packet count |
 
 ### Manually Add / Remove a Port
 
@@ -236,11 +243,11 @@ The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/basic_xdp
 2. **Efficient Discovery**: Uses `psutil` to read `/proc` directly for listening ports (no slow `ss` or `netstat` subprocesses).
 3. **Safety Fallback**: Performs a full sync every **30 seconds** to ensure consistency.
 4. **Backend Sync**: Updates either pinned BPF maps or `nftables` sets, depending on what the host supports.
-5. **UDP Filtering Rule**: The daemon auto-detects whether the `tc` egress tracker is active. With `tc` tracking, only unconnected bound UDP sockets outside the system ephemeral port range are auto-synced; without it, the daemon falls back to the broader compatibility behavior.
+5. **UDP Discovery Rule**: Because UDP has no `LISTEN` state, the daemon syncs unconnected bound UDP sockets (no remote peer) into `udp_whitelist`, which is a practical approximation of server-style UDP ports.
 6. **Trusted Source IPs**: Optional IPv4 addresses can be synced into the XDP-side `trusted_src_ips` map for reply-style UDP traffic such as DNS or NTP.
-7. **Outbound TCP Sync**: A kernel-side `tc` egress hook records host-initiated IPv4 TCP SYN packets immediately, and the daemon still mirrors established client flows into `tcp_conntrack` as a reseed/fallback path.
+7. **Backend Guard Rails**: In `auto` mode, the daemon only selects XDP when the required pinned maps are present; otherwise it falls back to `nftables` instead of crashing.
 
-Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`, and the XDP ingress path checks those maps before falling back to `tcp_whitelist`, `udp_whitelist`, or `trusted_src_ips`. The daemon uses the presence of that pinned `tc` program to decide whether strict UDP auto-detection is safe to enable.
+Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`, and the XDP ingress path checks those maps before falling back to `tcp_whitelist`, `udp_whitelist`, or `trusted_src_ips`.
 
 ### Permanent Ports
 
@@ -252,7 +259,7 @@ UDP_PERMANENT = {50000: "custom-udp-service"}  # Use this for real high-port UDP
 TRUSTED_SRC_IPS = {"1.1.1.1": "cloudflare-dns"}
 ```
 
-If a real UDP server listens on a high port inside your system's ephemeral range, add it to `UDP_PERMANENT` explicitly so it is not mistaken for client traffic when strict UDP detection is active.
+If a real UDP server uses a high port, add it to `UDP_PERMANENT` explicitly so it remains whitelisted even when the daemon's socket heuristics cannot distinguish it cleanly from transient client traffic.
 
 You can also add trusted IPv4 sources at runtime:
 
@@ -279,6 +286,9 @@ rc-service xdp-port-sync status
 # One-shot sync with automatic backend selection
 python3 /usr/local/bin/xdp_port_sync.py --backend auto
 python3 /usr/local/bin/xdp_port_sync.py --backend auto --dry-run
+
+# Increase foreground verbosity temporarily
+python3 /usr/local/bin/xdp_port_sync.py --backend auto --log-level debug
 ```
 
 ## Statistics
@@ -301,7 +311,14 @@ sudo bxdp stats --watch --rates --interval 2
 # Run one manual sync
 sudo bxdp sync
 
+# View or change daemon log level
+sudo bxdp log-level
+sudo bxdp log-level debug
+
 # Service control
+sudo bxdp start
+sudo bxdp stop
+sudo bxdp restart
 sudo bxdp status
 ```
 
@@ -313,9 +330,11 @@ What it shows:
 
 Counter labels in `bxdp` are intentionally human-readable:
 
-1. `IPv6_ICMP` covers ICMPv6, neighbor discovery, and other non-TCP/UDP IPv6 traffic that is passed through
-2. `ARP_NON_IP` covers ARP and other non-IP Ethernet traffic
-3. `TCP_CT_MISS` counts IPv4 TCP ACK packets dropped because no conntrack entry was created by an allowed SYN
+1. `TCP_NEW_ALLOW` counts pure SYN packets admitted by `tcp_whitelist`
+2. `TCP_ESTABLISHED` counts TCP packets admitted by `tcp_conntrack`
+3. `TCP_CT_MISS` counts TCP ACK packets dropped because no conntrack entry existed
+4. `IPv6_ICMP` covers ICMPv6, neighbor discovery, and other non-TCP/UDP IPv6 traffic that is passed through
+5. `ARP_NON_IP` covers ARP and other non-IP Ethernet traffic
 
 ## Post-Install Quick Commands
 
@@ -340,7 +359,14 @@ sudo bxdp stats --watch --rates --interval 2
 # Run one manual sync
 sudo bxdp sync
 
-# Service status / restart
+# Change daemon log verbosity and restart the service
+sudo bxdp log-level
+sudo bxdp log-level debug
+sudo bxdp log-level info
+
+# Service control
+sudo bxdp start
+sudo bxdp stop
 sudo bxdp status
 sudo bxdp restart
 ```
@@ -355,7 +381,7 @@ sudo bash setup_xdp.sh --check-update
 
 In `--check-update` mode, the installer:
 
-1. Downloads the GitHub version of `xdp_firewall.c`, `tc_udp_track.c`, and `xdp_port_sync.py` to temporary files
+1. Downloads the GitHub version of `xdp_firewall.c`, `tc_flow_track.c`, `xdp_port_sync.py`, and `bxdp` to temporary files
 2. Compares the local and GitHub SHA-256 hashes
 3. Prompts you when they differ
 4. Pulls the GitHub copy only if you confirm
@@ -384,27 +410,29 @@ In `--force` mode, the installer skips confirmation prompts and:
 ## Packet Filtering Logic
 
 ### TCP
-- **IPv4 only hardening**:
-  - If packet is a **pure SYN** and destination port is in `tcp_whitelist` → insert 4-tuple into `tcp_conntrack` and **PASS**
-  - If **ACK** is set and the 4-tuple exists in `tcp_conntrack` → **PASS**
+- **IPv4 + IPv6 stateful path**:
+  - If packet is a **pure SYN** and destination port is in `tcp_whitelist` → insert flow key into `tcp_conntrack` and **PASS**
+  - If **ACK** is set and the flow key exists in `tcp_conntrack` → **PASS**
   - If **ACK** is set and no conntrack entry exists → count `CNT_TCP_CT_MISS` and **DROP**
   - Otherwise → **DROP**
-- **Kernel assist**: a `tc` egress program records host-initiated IPv4 TCP SYN packets immediately, closing the race where a very short outbound connection could receive SYN-ACK before userspace noticed it.
-- **Userspace assist**: `xdp_port_sync.py` still mirrors established IPv4 TCP client flows into `tcp_conntrack`, which helps reseed state after service restarts.
-- **IPv6 note**: IPv6 TCP still uses the legacy path for now. `xdp_firewall.c` includes a TODO comment documenting that IPv6 conntrack is not yet implemented.
+- **Kernel assist**: a `tc` egress program records host-initiated IPv4/IPv6 TCP SYN packets immediately, closing the race where a very short outbound connection could receive SYN-ACK before conntrack state existed.
+- **Reload assist**: `setup_xdp.sh` pre-seeds existing IPv4/IPv6 TCP sessions into `tcp_conntrack` before re-attaching XDP, which helps preserve active sessions during reinstall/restart.
 
 ### UDP
-- **IPv4 only hardening**:
-  - If the inbound 4-tuple exists in `udp_conntrack` → **PASS**
+- **IPv4 stateful path**:
+  - If the inbound flow key exists in `udp_conntrack` → **PASS**
   - If destination port is in `udp_whitelist` → **PASS**
   - Else if source IPv4 address is in `trusted_src_ips` → **PASS**
   - Otherwise → **DROP**
+- **IPv6 stateful path**:
+  - If the inbound flow key exists in `udp_conntrack` → **PASS**
+  - If destination port is in `udp_whitelist` → **PASS**
+  - Otherwise → **DROP**
 - **Userspace assist**: trusted IPv4 source addresses remain available as an explicit fallback for response-style UDP traffic.
-- **IPv6 note**: IPv6 UDP still uses the legacy path for now. `xdp_firewall.c` includes a TODO comment documenting that IPv6 UDP conntrack / trusted-source matching is not yet implemented.
 
 ### IPv6 Extension Headers
 
-Traverses IPv6 extension headers up to **6 levels deep** to locate the transport protocol and prevent crafted-header bypass attacks. Non-initial IPv6 fragments are explicitly counted and dropped before the transport parser, so they cannot slip through on a failed bounds check.
+Traverses IPv6 extension headers up to **6 levels deep** to locate the transport protocol and prevent crafted-header bypass attacks. This logic now exists on both the XDP ingress path and the `tc` egress tracker, so IPv6 reply-state tracking is not limited to the simplest `nexthdr` cases. Non-initial IPv6 fragments are explicitly counted and dropped before the transport parser, so they cannot slip through on a failed bounds check.
 
 ---
 

@@ -34,6 +34,12 @@ TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
 UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
 TCP_CONNTRACK_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_conntrack"
 TRUSTED_IPS_MAP_PATH = "/sys/fs/bpf/xdp_fw/trusted_src_ips"
+REQUIRED_XDP_MAP_PATHS = (
+    TCP_MAP_PATH,
+    UDP_MAP_PATH,
+    TCP_CONNTRACK_MAP_PATH,
+    TRUSTED_IPS_MAP_PATH,
+)
 
 NFT_FAMILY = "inet"
 NFT_TABLE = "basic_xdp"
@@ -53,8 +59,10 @@ TRUSTED_SRC_IPS: dict[str, str] = {}
 # giving the new process time to call bind().
 DEBOUNCE_S = 0.3
 
+DEFAULT_LOG_LEVEL = os.environ.get("BASIC_XDP_LOG_LEVEL", "INFO").upper()
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, DEFAULT_LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -233,6 +241,51 @@ class BpfHashMap:
             return False
 
 
+class BpfConntrackMap:
+    """Pinned BPF LRU_HASH map (key = struct ct_key, value = __u64)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.fd = _obj_get(path)
+        self._cache: set[bytes] = set()
+
+        self._key = ctypes.create_string_buffer(40)
+        self._val = ctypes.create_string_buffer(8)
+        self._attr = ctypes.create_string_buffer(128)
+        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
+        struct.pack_into("=I4xQQQ", self._attr, 0, self.fd, k_ptr, v_ptr, 0)
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def active_keys(self) -> set[bytes]:
+        return set(self._cache)
+
+    def set(self, key_bytes: bytes, dry_run: bool = False) -> bool:
+        if dry_run:
+            self._cache.add(key_bytes)
+            return True
+        try:
+            ctypes.memmove(self._key, key_bytes, 40)
+            # Use monotonic_ns as a stable timestamp for seeded flows.
+            struct.pack_into("=Q", self._val, 0, time.monotonic_ns())
+            _bpf(_BPF_MAP_UPDATE_ELEM, self._attr)
+            self._cache.add(key_bytes)
+            return True
+        except OSError as exc:
+            log.warning("BPF conntrack update failed: %s", exc)
+            return False
+
+
 class PortBackend:
     name = "backend"
 
@@ -241,6 +294,7 @@ class PortBackend:
         tcp_target: set[int],
         udp_target: set[int],
         trusted_target: set[str],
+        conntrack_target: set[bytes],
         dry_run: bool,
     ) -> None:
         raise NotImplementedError
@@ -256,17 +310,20 @@ class XdpBackend(PortBackend):
         self.tcp_map = BpfArrayMap(TCP_MAP_PATH)
         self.udp_map = BpfArrayMap(UDP_MAP_PATH)
         self.trusted_map = BpfHashMap(TRUSTED_IPS_MAP_PATH)
+        self.conntrack_map = BpfConntrackMap(TCP_CONNTRACK_MAP_PATH)
 
     def close(self) -> None:
         self.tcp_map.close()
         self.udp_map.close()
         self.trusted_map.close()
+        self.conntrack_map.close()
 
     def sync_ports(
         self,
         tcp_target: set[int],
         udp_target: set[int],
         trusted_target: set[str],
+        conntrack_target: set[bytes],
         dry_run: bool,
     ) -> None:
         changed = False
@@ -293,20 +350,6 @@ class XdpBackend(PortBackend):
                 log.debug("UDP -%d  (stopped)", port)
                 changed = True
 
-        # Mirror host-initiated IPv4 TCP sessions into conntrack so reply ACKs
-        # for outbound client connections do not get dropped by XDP.
-        for flow in sorted(conntrack_target - self.conntrack_map.active_keys()):
-            remote_ip, local_ip, remote_port, local_port = flow
-            if self.conntrack_map.set(flow, dry_run):
-                log.debug("TCP_CT +%s:%d -> %s:%d", remote_ip, remote_port, local_ip, local_port)
-                changed = True
-
-        for flow in sorted(self.conntrack_map.active_keys() - conntrack_target):
-            remote_ip, local_ip, remote_port, local_port = flow
-            if self.conntrack_map.delete(flow, dry_run):
-                log.debug("TCP_CT -%s:%d -> %s:%d  (closed)", remote_ip, remote_port, local_ip, local_port)
-                changed = True
-
         # HASH maps need delete, not write-zero, when trust entries disappear.
         for ip_str in sorted(trusted_target - self.trusted_map.active_keys()):
             tag = f" [{TRUSTED_SRC_IPS[ip_str]}]" if ip_str in TRUSTED_SRC_IPS else ""
@@ -317,6 +360,12 @@ class XdpBackend(PortBackend):
         for ip_str in sorted(self.trusted_map.active_keys() - trusted_target - set(TRUSTED_SRC_IPS)):
             if self.trusted_map.delete(ip_str, dry_run):
                 log.info("TRUST -%s  (removed)", ip_str)
+                changed = True
+
+        # Periodic conntrack sync (seeding established flows)
+        for flow in sorted(conntrack_target - self.conntrack_map.active_keys()):
+            if self.conntrack_map.set(flow, dry_run):
+                log.debug("CT +flow (established)")
                 changed = True
 
         if not changed:
@@ -397,10 +446,11 @@ class NftablesBackend(PortBackend):
         tcp_target: set[int],
         udp_target: set[int],
         trusted_target: set[str],
+        conntrack_target: set[bytes],
         dry_run: bool,
     ) -> None:
         changed = False
-        _ = trusted_target
+        _ = (trusted_target, conntrack_target)
 
         for port in sorted(tcp_target - self._tcp_cache):
             tag = f" [{TCP_PERMANENT[port]}]" if port in TCP_PERMANENT else ""
@@ -430,10 +480,11 @@ class NftablesBackend(PortBackend):
 class PortState:
     tcp: set[int] = field(default_factory=set)
     udp: set[int] = field(default_factory=set)
+    established: set[bytes] = field(default_factory=set)
 
 
 def get_listening_ports() -> PortState:
-    """Read listening TCP/UDP ports via psutil."""
+    """Read listening TCP/UDP ports and established TCP flows via psutil."""
     if psutil is None or _net_connections is None:
         sys.exit("psutil not installed. Run: pip3 install psutil")
 
@@ -441,8 +492,27 @@ def get_listening_ports() -> PortState:
     for conn in _net_connections(kind="inet"):
         if not (conn.laddr and conn.laddr.port):
             continue
-        if conn.type == socket.SOCK_STREAM and conn.status == psutil.CONN_LISTEN:
-            state.tcp.add(conn.laddr.port)
+
+        if conn.type == socket.SOCK_STREAM:
+            if conn.status == psutil.CONN_LISTEN:
+                state.tcp.add(conn.laddr.port)
+            elif conn.status == psutil.CONN_ESTABLISHED and conn.raddr:
+                try:
+                    if conn.family == socket.AF_INET:
+                        family = 2  # CT_FAMILY_IPV4
+                        remote_ip = socket.inet_aton(conn.raddr.ip) + (b"\x00" * 12)
+                        local_ip = socket.inet_aton(conn.laddr.ip) + (b"\x00" * 12)
+                    elif conn.family == socket.AF_INET6:
+                        family = 10  # CT_FAMILY_IPV6
+                        remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
+                        local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
+                    else:
+                        continue
+                    # struct ct_key { u8 family, u8 pad[3], be16 sport, be16 dport, u32 saddr[4], u32 daddr[4] }
+                    key = struct.pack("!B3xHH16s16s", family, conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
+                    state.established.add(key)
+                except Exception:
+                    continue
         elif conn.type == socket.SOCK_DGRAM:
             # UDP has no LISTEN state. Keep only bound sockets without a
             # connected remote peer, which better matches server-style ports.
@@ -457,7 +527,8 @@ def sync_once(backend: PortBackend, dry_run: bool) -> None:
     tcp_target = current.tcp | set(TCP_PERMANENT)
     udp_target = current.udp | set(UDP_PERMANENT)
     trusted_target = set(TRUSTED_SRC_IPS)
-    backend.sync_ports(tcp_target, udp_target, trusted_target, dry_run)
+    conntrack_target = current.established
+    backend.sync_ports(tcp_target, udp_target, trusted_target, conntrack_target, dry_run)
 
 
 _NETLINK_CONNECTOR = 11
@@ -518,25 +589,26 @@ def drain_proc_events(sock: socket.socket) -> bool:
 
 
 def open_backend(name: str) -> PortBackend:
+    missing_xdp_maps = [path for path in REQUIRED_XDP_MAP_PATHS if not os.path.exists(path)]
+
     if name == BACKEND_XDP:
+        if missing_xdp_maps:
+            raise RuntimeError(f"required XDP maps missing: {', '.join(missing_xdp_maps)}")
         return XdpBackend()
     if name == BACKEND_NFTABLES:
         return NftablesBackend()
     if name != BACKEND_AUTO:
         raise RuntimeError(f"Unsupported backend: {name}")
 
-    if (
-        os.path.exists(TCP_MAP_PATH)
-        and os.path.exists(UDP_MAP_PATH)
-        and os.path.exists(TCP_CONNTRACK_MAP_PATH)
-        and os.path.exists(TRUSTED_IPS_MAP_PATH)
-    ):
+    if not missing_xdp_maps:
         try:
             backend = XdpBackend()
             log.info("Backend selected: xdp")
             return backend
         except OSError as exc:
             log.warning("XDP backend unavailable (%s); trying nftables.", exc)
+    elif missing_xdp_maps:
+        log.warning("XDP maps incomplete (%s); trying nftables.", ", ".join(missing_xdp_maps))
 
     backend = NftablesBackend()
     log.info("Backend selected: nftables")
@@ -544,15 +616,32 @@ def open_backend(name: str) -> PortBackend:
 
 
 def watch(interval: int, dry_run: bool, backend_name: str) -> None:
-    backend = open_backend(backend_name)
-    nl = open_proc_connector()
+    backend = None
+    nl = None
 
-    sync_once(backend, dry_run)
-    last_sync_t = time.monotonic()
+    last_sync_t = 0.0
     last_event_t = 0.0
 
     try:
         while True:
+            # Re-initialize backend if needed
+            if backend is None:
+                try:
+                    backend = open_backend(backend_name)
+                    log.info("Backend initialized.")
+                    # Force a sync after (re)initialization
+                    sync_once(backend, dry_run)
+                    last_sync_t = time.monotonic()
+                    last_event_t = 0.0
+                except Exception as exc:
+                    log.error("Failed to open backend: %s. Retrying in 5s...", exc)
+                    time.sleep(5)
+                    continue
+
+            # Re-subscribe to netlink if needed
+            if nl is None:
+                nl = open_proc_connector()
+
             now = time.monotonic()
             poll_due = last_sync_t + interval
             deb_due = (last_event_t + DEBOUNCE_S) if last_event_t else float("inf")
@@ -585,6 +674,12 @@ def watch(interval: int, dry_run: bool, backend_name: str) -> None:
                     sync_once(backend, dry_run)
                 except Exception as exc:
                     log.error("Sync error: %s", exc)
+                    # If it's a BPF/backend error, reset it for re-init
+                    if isinstance(exc, (OSError, RuntimeError)):
+                        log.warning("Backend may be broken; will attempt to re-initialize.")
+                        backend.close()
+                        backend = None
+
                 last_sync_t = time.monotonic()
                 last_event_t = 0.0
 
@@ -593,7 +688,8 @@ def watch(interval: int, dry_run: bool, backend_name: str) -> None:
     finally:
         if nl:
             nl.close()
-        backend.close()
+        if backend:
+            backend.close()
 
 
 def main() -> None:
@@ -628,6 +724,12 @@ def main() -> None:
         help="Print operations without executing them",
     )
     p.add_argument(
+        "--log-level",
+        choices=["debug", "info", "warning", "error"],
+        default=DEFAULT_LOG_LEVEL.lower(),
+        help="Set daemon log level (default: %(default)s)",
+    )
+    p.add_argument(
         "--trusted-ip",
         action="append",
         nargs=2,
@@ -636,6 +738,8 @@ def main() -> None:
         help="Add a trusted IPv4 source IP and label (repeatable)",
     )
     args = p.parse_args()
+    logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
+    log.setLevel(getattr(logging, args.log_level.upper()))
 
     try:
         for ip_str, label in args.trusted_ip:

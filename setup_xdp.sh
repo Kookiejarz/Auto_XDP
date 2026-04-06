@@ -4,11 +4,6 @@
 # Usage: sudo bash setup_xdp.sh [--check-update] [--force] [--check-env] [--dry-run] [interface]
 # Supports Debian/Ubuntu, Fedora/RHEL, openSUSE, Arch, and Alpine.
 
-
-# setup_xdp.sh — Basic XDP installer / loader / fallback bootstrap
-# Usage: sudo bash setup_xdp.sh [--check-update] [--force] [--check-env] [--dry-run] [interface]
-# Supports Debian/Ubuntu, Fedora/RHEL, openSUSE, Arch, and Alpine.
-
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -19,16 +14,8 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()   { echo -e "${RED}[ERR ]${NC}  $*" >&2; exit 1; }
 
 IFACE=""
-IFACE=""
 XDP_SRC="xdp_firewall.c"
 XDP_OBJ="xdp_firewall.o"
-TC_SRC="tc_flow_track.c"
-TC_OBJ="tc_flow_track.o"
-SYNC_INTERVAL=30
-
-INSTALL_DIR="/usr/local/lib/basic_xdp"
-CONFIG_DIR="/etc/basic_xdp"
-CONFIG_FILE="${CONFIG_DIR}/basic_xdp.env"
 TC_SRC="tc_flow_track.c"
 TC_OBJ="tc_flow_track.o"
 SYNC_INTERVAL=30
@@ -43,15 +30,18 @@ XDP_OBJ_INSTALLED="${INSTALL_DIR}/xdp_firewall.o"
 TC_OBJ_INSTALLED="${INSTALL_DIR}/tc_flow_track.o"
 
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
-BXDP_CMD="/usr/local/bin/bxdp"
-RUNNER_SCRIPT="/usr/local/bin/basic_xdp_start.sh"
-XDP_OBJ_INSTALLED="${INSTALL_DIR}/xdp_firewall.o"
-TC_OBJ_INSTALLED="${INSTALL_DIR}/tc_flow_track.o"
-
-export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 SERVICE_NAME="xdp-port-sync"
 RAW_URL="https://raw.githubusercontent.com/Kookiejarz/basic_xdp/main"
 TC_FILTER_PREF=49152
+PREFER_REMOTE_SOURCES=0
+
+case "${BASH_SOURCE[0]:-}" in
+    stdin|/dev/stdin|/dev/fd/*|/proc/self/fd/*)
+        # curl | bash should use the matching GitHub sources instead of stale
+        # files from the caller's working directory.
+        PREFER_REMOTE_SOURCES=1
+        ;;
+esac
 
 PKG_MANAGER=""
 INIT_SYSTEM="none"
@@ -60,6 +50,7 @@ OPENRC_AVAILABLE=0
 ACTIVE_BACKEND="nftables"
 ACTIVE_XDP_MODE="none"
 PYTHON3_BIN=""
+LOG_LEVEL="info"
 CHECK_UPDATES=0
 FORCE=0
 CHECK_ENV=0
@@ -433,6 +424,12 @@ fetch_local_or_remote() {
     local local_hash=""
     local remote_hash=""
 
+    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
+        info "Installer is running from stdin; fetching ${remote_name} from GitHub..."
+        curl -fsSL "${RAW_URL}/${remote_name}" -o "$target_path"
+        return 0
+    fi
+
     if [[ -f "$local_path" ]]; then
         if [[ $CHECK_UPDATES -eq 1 ]]; then
             tmp_file=$(mktemp)
@@ -489,6 +486,22 @@ ensure_bpffs() {
 cleanup_tc_egress_filter() {
     command -v tc &>/dev/null || return 0
     tc filter del dev "$IFACE" egress pref "$TC_FILTER_PREF" 2>/dev/null || true
+}
+
+xdp_maps_ready() {
+    local required=(
+        "${BPF_PIN_DIR}/prog"
+        "${BPF_PIN_DIR}/tcp_whitelist"
+        "${BPF_PIN_DIR}/udp_whitelist"
+        "${BPF_PIN_DIR}/tcp_conntrack"
+        "${BPF_PIN_DIR}/udp_conntrack"
+        "${BPF_PIN_DIR}/trusted_src_ips"
+    )
+    local path=""
+    for path in "${required[@]}"; do
+        [[ -e "$path" ]] || return 1
+    done
+    return 0
 }
 
 cleanup_existing_xdp() {
@@ -549,8 +562,8 @@ seed_existing_tcp_conntrack() {
 
     [[ -e "$map_path" ]] || return 0
 
-    # Pre-seed established IPv4 TCP flows so reloading XDP does not cut off
-    # the current SSH session before a fresh SYN can recreate conntrack state.
+    # Pre-seed established TCP flows so reloading XDP does not cut off
+    # existing sessions before a fresh SYN can recreate conntrack state.
     if ! seeded=$("$PYTHON3_BIN" - "$map_path" <<'PY'
 import ctypes
 import ctypes.util
@@ -591,10 +604,10 @@ def obj_get(path):
     struct.pack_into("=Q", attr, 0, ctypes.cast(path_b, ctypes.c_void_p).value or 0)
     return bpf(BPF_OBJ_GET, attr)
 
-def iter_established_ipv4():
+def iter_established_tcp():
     getter = getattr(psutil, "connections", psutil.net_connections)
     for conn in getter(kind="inet"):
-        if getattr(conn, "family", None) != socket.AF_INET:
+        if getattr(conn, "family", None) not in (socket.AF_INET, socket.AF_INET6):
             continue
         if getattr(conn, "type", None) != socket.SOCK_STREAM:
             continue
@@ -604,8 +617,19 @@ def iter_established_ipv4():
             continue
         yield conn
 
+def pack_ct_key(conn):
+    if conn.family == socket.AF_INET:
+        family = socket.AF_INET
+        remote_ip = socket.inet_aton(conn.raddr.ip) + (b"\x00" * 12)
+        local_ip = socket.inet_aton(conn.laddr.ip) + (b"\x00" * 12)
+    else:
+        family = socket.AF_INET6
+        remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
+        local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
+    return struct.pack("!B3xHH16s16s", family, conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
+
 fd = obj_get(sys.argv[1])
-key = ctypes.create_string_buffer(12)
+key = ctypes.create_string_buffer(40)
 value = ctypes.create_string_buffer(8)
 attr = ctypes.create_string_buffer(128)
 struct.pack_into(
@@ -620,15 +644,9 @@ struct.pack_into(
 
 seeded = 0
 stamp = time.monotonic_ns()
-for conn in iter_established_ipv4():
+for conn in iter_established_tcp():
     try:
-        packed = struct.pack(
-            "!4s4sHH",
-            socket.inet_aton(conn.raddr.ip),
-            socket.inet_aton(conn.laddr.ip),
-            conn.raddr.port,
-            conn.laddr.port,
-        )
+        packed = pack_ct_key(conn)
         ctypes.memmove(key, packed, len(packed))
         struct.pack_into("=Q", value, 0, stamp)
         bpf(BPF_MAP_UPDATE_ELEM, attr)
@@ -645,7 +663,7 @@ PY
     fi
 
     if [[ "$seeded" != "0" ]]; then
-        info "Seeded ${seeded} existing IPv4 TCP session(s) into tcp_conntrack."
+        info "Seeded ${seeded} existing TCP session(s) into tcp_conntrack."
     fi
 }
 
@@ -842,6 +860,7 @@ write_config() {
     cat > "$CONFIG_FILE" <<EOF_CFG
 IFACE="${IFACE}"
 SYNC_INTERVAL="${SYNC_INTERVAL}"
+LOG_LEVEL="${LOG_LEVEL}"
 SYNC_SCRIPT="${SYNC_SCRIPT}"
 PYTHON3_BIN="${PYTHON3_BIN}"
 BPF_PIN_DIR="${BPF_PIN_DIR}"
@@ -892,6 +911,22 @@ cleanup_tc_egress_filter() {
     tc filter del dev "$IFACE" egress pref 49152 2>/dev/null || true
 }
 
+xdp_maps_ready() {
+    local required=(
+        "${BPF_PIN_DIR}/prog"
+        "${BPF_PIN_DIR}/tcp_whitelist"
+        "${BPF_PIN_DIR}/udp_whitelist"
+        "${BPF_PIN_DIR}/tcp_conntrack"
+        "${BPF_PIN_DIR}/udp_conntrack"
+        "${BPF_PIN_DIR}/trusted_src_ips"
+    )
+    local path=""
+    for path in "${required[@]}"; do
+        [[ -e "$path" ]] || return 1
+    done
+    return 0
+}
+
 seed_existing_tcp_conntrack() {
     local map_path="${BPF_PIN_DIR}/tcp_conntrack"
     local seeded=""
@@ -937,10 +972,10 @@ def obj_get(path):
     struct.pack_into("=Q", attr, 0, ctypes.cast(path_b, ctypes.c_void_p).value or 0)
     return bpf(BPF_OBJ_GET, attr)
 
-def iter_established_ipv4():
+def iter_established_tcp():
     getter = getattr(psutil, "connections", psutil.net_connections)
     for conn in getter(kind="inet"):
-        if getattr(conn, "family", None) != socket.AF_INET:
+        if getattr(conn, "family", None) not in (socket.AF_INET, socket.AF_INET6):
             continue
         if getattr(conn, "type", None) != socket.SOCK_STREAM:
             continue
@@ -950,16 +985,27 @@ def iter_established_ipv4():
             continue
         yield conn
 
+def pack_ct_key(conn):
+    if conn.family == socket.AF_INET:
+        family = socket.AF_INET
+        remote_ip = socket.inet_aton(conn.raddr.ip) + (b"\x00" * 12)
+        local_ip = socket.inet_aton(conn.laddr.ip) + (b"\x00" * 12)
+    else:
+        family = socket.AF_INET6
+        remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
+        local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
+    return struct.pack("!B3xHH16s16s", family, conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
+
 fd = obj_get(sys.argv[1])
-key = ctypes.create_string_buffer(12)
+key = ctypes.create_string_buffer(40)
 value = ctypes.create_string_buffer(8)
 attr = ctypes.create_string_buffer(128)
 struct.pack_into("=I4xQQQ", attr, 0, fd, ctypes.cast(key, ctypes.c_void_p).value or 0, ctypes.cast(value, ctypes.c_void_p).value or 0, 0)
 seeded = 0
 stamp = time.monotonic_ns()
-for conn in iter_established_ipv4():
+for conn in iter_established_tcp():
     try:
-        packed = struct.pack("!4s4sHH", socket.inet_aton(conn.raddr.ip), socket.inet_aton(conn.laddr.ip), conn.raddr.port, conn.laddr.port)
+        packed = pack_ct_key(conn)
         ctypes.memmove(key, packed, len(packed))
         struct.pack_into("=Q", value, 0, stamp)
         bpf(BPF_MAP_UPDATE_ELEM, attr)
@@ -975,7 +1021,7 @@ PY
     fi
 
     if [[ "$seeded" != "0" ]]; then
-        echo "[basic_xdp] seeded ${seeded} existing IPv4 TCP session(s) into tcp_conntrack" >&2
+        echo "[basic_xdp] seeded ${seeded} existing TCP session(s) into tcp_conntrack" >&2
     fi
 }
 
@@ -1015,8 +1061,11 @@ ensure_xdp_loaded() {
     }
 
     if [[ -f "$BPF_PIN_DIR/prog" ]] && ip link show "$IFACE" | grep -q "xdp"; then
-        echo "existing" > "${RUN_STATE_DIR}/xdp_mode"
-        return 0
+        if xdp_maps_ready; then
+            echo "existing" > "${RUN_STATE_DIR}/xdp_mode"
+            return 0
+        fi
+        echo "[basic_xdp] existing XDP maps incomplete; reloading runtime objects" >&2
     fi
 
     rm -rf "$BPF_PIN_DIR"
@@ -1067,11 +1116,11 @@ select_backend() {
 if [[ "${1:-}" == "--sync-once" ]]; then
     shift
     select_backend
-    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
+    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --log-level "$LOG_LEVEL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
 fi
 
 select_backend
-exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --watch --interval "$SYNC_INTERVAL" --backend "$(cat "${RUN_STATE_DIR}/backend")"
+exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --log-level "$LOG_LEVEL" --watch --interval "$SYNC_INTERVAL" --backend "$(cat "${RUN_STATE_DIR}/backend")"
 EOF_RUNNER
 
     chmod +x "$RUNNER_SCRIPT"
