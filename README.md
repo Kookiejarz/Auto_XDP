@@ -1,8 +1,30 @@
-## **⚡ Basic XDP**
+# Basic XDP
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE) [![Kernel](https://img.shields.io/badge/Kernel-%E2%89%A54.18-blue)](https://www.kernel.org/) [![Platform](https://img.shields.io/badge/Platform-Debian%20%7C%20Ubuntu-orange)](https://ubuntu.com/) [![XDP](https://img.shields.io/badge/Tech-eBPF%2FXDP-brightgreen)](https://ebpf.io/)
+**A lightweight XDP/eBPF firewall for automatic port whitelisting and basic DDoS protection on Linux hosts.**
 
-A lightweight, high-performance XDP/eBPF-based rule for Linux that provides **automatic port whitelisting** and **basic DDoS protection** for personal cloud instances.
+<p align="center">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License"></a>
+  <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+  <a href="https://www.kernel.org/"><img src="https://img.shields.io/badge/Kernel-%E2%89%A54.18-blue.svg?style=flat-square" alt="Kernel >= 4.18"></a>
+  <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+  <a href="https://github.com/Kookiejarz/basic_xdp/actions/workflows/distro-check.yml"><img src="https://github.com/Kookiejarz/basic_xdp/actions/workflows/distro-check.yml/badge.svg" alt="Distro Checks"></a>
+  <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+  <img src="https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC-555555.svg?style=flat-square" alt="systemd and OpenRC">
+  <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+  <a href="https://ebpf.io/"><img src="https://img.shields.io/badge/Tech-eBPF%2FXDP-brightgreen.svg?style=flat-square" alt="eBPF/XDP"></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Debian%2FUbuntu-supported-A81D33.svg?style=flat-square" alt="Debian/Ubuntu supported">
+  <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+  <img src="https://img.shields.io/badge/Fedora%2FRHEL-supported-294172.svg?style=flat-square" alt="Fedora/RHEL supported">
+  <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+  <img src="https://img.shields.io/badge/openSUSE-supported-73BA25.svg?style=flat-square" alt="openSUSE supported">
+  <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+  <img src="https://img.shields.io/badge/Arch-supported-1793D1.svg?style=flat-square" alt="Arch supported">
+  <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+  <img src="https://img.shields.io/badge/Alpine-supported-0D597F.svg?style=flat-square" alt="Alpine supported">
+</p>
 
 Although there are some XDP firewall solutions available, Basic XDP provides users with automatic port whitelisting, which makes maintenance easier.
 
@@ -20,7 +42,7 @@ Although there are some XDP firewall solutions available, Basic XDP provides use
 
 Personal cloud instances are constantly scanned and probed. Traditional firewalls like `iptables` work, but they process packets *after* the kernel networking stack — adding latency and CPU overhead.
 
-**Basic XDP** hooks in **at the NIC driver level**, before any kernel processing. And unlike other XDP solutions, it **manages the port whitelist for you**: a daemon watches which ports are actually open on your system and keeps the BPF maps in sync automatically. You never need to manually update firewall rules when you start or stop a service. 😎
+**Basic XDP** hooks in **at the NIC driver level**, before any kernel processing. And unlike other XDP solutions, it **manages the port whitelist for you**: a daemon watches which ports are actually open on your system and keeps the active backend in sync automatically. When a host cannot run XDP, it can fall back to an `nftables` ruleset instead of failing outright.
 
 ---
 
@@ -40,9 +62,10 @@ Incoming Packet
 │                              │
 │  ETH → IPv4/IPv6 → TCP/UDP   │
 │                              │
-│  TCP SYN?  → check map       │
-│  TCP ACK?  → PASS (reply)    │
-│  UDP?      → check map       │
+│  IPv4 TCP SYN? → whitelist + │
+│                  conntrack   │
+│  IPv4 TCP ACK? → conntrack   │
+│  IPv4 UDP?     → ct/port/IP  │
 │  ICMP/ARP? → PASS            │
 │                              │
 │  Not in whitelist → DROP     │
@@ -56,38 +79,46 @@ Incoming Packet
 
 ## Components
 
-1. **`xdp_firewall.c`** — eBPF/XDP kernel program that filters packets at wire speed   
-2. **`setup_xdp.sh`** — one-click deployment script that compiles, loads, and sets up an auto-sync daemon 
+1. **`xdp_firewall.c`** — eBPF/XDP kernel program that filters packets at wire speed
+2. **`tc_udp_track.c`** — eBPF `tc` egress helper that records outbound IPv4 TCP SYN and UDP reply tuples
+3. **`setup_xdp.sh`** — one-click installer that compiles XDP when available, installs the runtime launcher, and sets up boot-time auto-sync
 
 ---
 
 ## Key Features
 
 - **Wire-speed filtering** via XDP (bypasses kernel network stack)
-- **~40–65 ns per-packet latency** measured on real hardware (see [Benchmarks](#-real-world-performance-benchmark))
-- **Auto-sync whitelist**: daemon watches `ss` output and updates BPF maps in real time 
-- **TCP SYN filtering**: only new connections to whitelisted ports are allowed; established connections (ACK) pass 
-- **IPv6 support**, including extension header traversal to prevent bypasses 
-- **UDP whitelist**, plus allow rules for DNS (53), NTP (123), DHCP (67), QUIC (443) responses 
+- **~40–65 ns per-packet latency** measured on real hardware (see [Benchmarks](#benchmarks))
+- **Auto-sync whitelist**: daemon watches listening sockets and updates the active backend in real time
+- **IPv4 TCP conntrack hardening**: pure SYN creates temporary state; unsolicited ACK packets are dropped
+- **Outbound IPv4 TCP compatibility**: a `tc` egress program records host-initiated TCP SYN packets, so inbound SYN-ACK/ACK traffic can be matched at XDP without reopening the ACK bypass
+- **IPv4 UDP conntrack**: a `tc` egress program records outbound UDP flows so inbound reply traffic can be matched at XDP
+- **IPv4 UDP hardening**: inbound server ports use `udp_whitelist`, and reply traffic can be allowed by trusted source IP
+- **IPv6 support**, including extension header traversal and explicit non-initial fragment drops
+- **Reload-safe XDP attach**: existing IPv4 TCP sessions are pre-seeded into `tcp_conntrack` before re-attaching XDP, which helps preserve the current SSH session during reinstall/restart
 - **Pinned BPF maps** that survive reloads and can be updated at runtime 
 - **ICMP/ICMPv6/ARP passthrough** (ping + IPv6 NDP still work) 
-- **Systemd daemon**: starts on boot, auto sync open ports
-- **Native + generic XDP**: falls back to generic mode if native isn’t supported 
+- **Boot-time loader**: restores protection on reboot instead of only syncing userspace state
+- **Systemd + OpenRC support**: installs the service automatically when either init system is present
+- **Native + generic XDP**: tries native first, then generic
+- **nftables fallback**: if both XDP attach modes fail, keeps automatic port whitelisting with a dynamic `nftables` ruleset
 
 ---
 
 ## Requirements
 
-- Linux kernel **≥ 4.18** (BPF map pinning support)
-- Debian/Ubuntu-based distro (auto-installs dependencies) 
+- Linux kernel **≥ 4.18** for the XDP backend
+- Popular Linux distro with a supported package manager: Debian/Ubuntu, Fedora/RHEL, openSUSE, Arch, or Alpine
 - Root (sudo) privileges 
+- `nftables` support is used automatically as the compatibility fallback when XDP cannot be attached
 
 ### Dependencies (auto-installed)
 - `clang`, `llvm` — compile BPF 
-- `libbpf-dev` — BPF headers 
+- `libbpf` or `libbpf-dev` / `libbpf-devel` — BPF headers, depending on distro 
 - `bpftool` — manage BPF maps 
-- `iproute2` — attach XDP via `ip link` 
+- `iproute2` or `iproute` — provides both `ip` and `tc` for XDP attach and UDP egress tracking
 - `python3` — sync daemon runtime 
+- `nftables` — compatibility fallback backend 
 
 ---
 
@@ -95,6 +126,24 @@ Incoming Packet
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Kookiejarz/basic_xdp/refs/heads/main/setup_xdp.sh | sudo bash
+```
+
+## Automated Distro Checks
+
+The repository includes a GitHub Actions matrix that installs basic runtime tools in supported Linux container images and runs a non-destructive `setup_xdp.sh --dry-run` smoke test.
+
+The installer reads `/etc/os-release` to classify the distro family before choosing the matching package-manager and dependency set.
+
+You can also run the non-destructive smoke test locally:
+
+```bash
+bash setup_xdp.sh --dry-run
+```
+
+If you only want the package-manager and init-system probe, use:
+
+```bash
+bash setup_xdp.sh --check-env
 ```
 
 ---
@@ -110,6 +159,12 @@ sudo bash setup_xdp.sh
 
 # Or specify interface
 sudo bash setup_xdp.sh eth0
+
+# Compare local files with GitHub first, then decide interactively
+sudo bash setup_xdp.sh --check-update
+
+# Non-interactive mode for CI / automation
+sudo bash setup_xdp.sh --check-update --force
 ```
 
 ---
@@ -118,15 +173,17 @@ sudo bash setup_xdp.sh eth0
 
 1. Checks for root privileges 
 2. Auto-detects default network interface
-3. Installs missing dependencies via `apt` 
-4. Fetches/updates `xdp_firewall.c` from GitHub (keeps newer local version)   
-5. Compiles the BPF program with `clang -mcpu=v3` 
-6. Mounts `bpffs` at `/sys/fs/bpf` if needed 
-7. Detaches existing XDP program and removes old pinned maps   
-8. Loads + pins XDP program and maps to `/sys/fs/bpf/xdp_fw/` 
-9. Installs port-sync daemon to `/usr/local/bin/xdp-sync-ports.py`   
-10. Registers and starts systemd service `xdp-port-sync` 
-11. Runs an initial port sync 
+3. Installs missing dependencies via the detected package manager 
+4. Uses local `xdp_firewall.c` / `tc_udp_track.c` / `xdp_port_sync.py` by default, or compares them with GitHub when `--check-update` is enabled
+5. Compiles the BPF program when the host has the required XDP toolchain
+6. Pre-seeds current IPv4 established TCP sessions into `tcp_conntrack` before attaching XDP
+7. Loads and attaches a `tc clsact egress` program that records outbound TCP SYN and UDP reply tuples
+8. Tries to attach XDP in native mode, then generic mode
+9. Falls back to `nftables` automatically if XDP cannot be attached
+10. Installs the runtime launcher at `/usr/local/bin/basic_xdp_start.sh`
+11. Installs the sync daemon at `/usr/local/bin/xdp_port_sync.py`
+12. Runs an initial port sync using the selected backend
+13. Registers and starts `xdp-port-sync` on `systemd` or `OpenRC` when available
 
 ---
 
@@ -138,6 +195,9 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 |:-:|:-:|:--:|:-:|:-:|
 | `tcp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
 | `udp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
+| `tcp_conntrack` | LRU_HASH | 65536 | `struct ct_key { saddr, daddr, sport, dport }` | `__u64` ktime_ns |
+| `udp_conntrack` | LRU_HASH | 65536 | `struct ct_key { saddr, daddr, sport, dport }` | `__u64` ktime_ns |
+| `trusted_src_ips` | HASH | 256 | `__be32` IPv4 source address | `__u32` (1 = trusted) |
 
 ### Manually Add / Remove a Port
 
@@ -170,12 +230,17 @@ Originally, this project used **BPF_MAP_TYPE_HASH** for the whitelist. We transi
 
 ## Auto-Sync Daemon
 
-The daemon `xdp_port_sync.py` runs as a systemd service and provides **real-time updates**:
+The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/basic_xdp_start.sh` and provides **real-time updates** for either backend:
 
 1. **Event-driven**: Uses Linux **Netlink Process Connector** to detect `exec()` and `exit()` events immediately.
 2. **Efficient Discovery**: Uses `psutil` to read `/proc` directly for listening ports (no slow `ss` or `netstat` subprocesses).
 3. **Safety Fallback**: Performs a full sync every **30 seconds** to ensure consistency.
-4. **Map Sync**: Compares state with BPF maps and updates only what changed.
+4. **Backend Sync**: Updates either pinned BPF maps or `nftables` sets, depending on what the host supports.
+5. **UDP Filtering Rule**: The daemon auto-detects whether the `tc` egress tracker is active. With `tc` tracking, only unconnected bound UDP sockets outside the system ephemeral port range are auto-synced; without it, the daemon falls back to the broader compatibility behavior.
+6. **Trusted Source IPs**: Optional IPv4 addresses can be synced into the XDP-side `trusted_src_ips` map for reply-style UDP traffic such as DNS or NTP.
+7. **Outbound TCP Sync**: A kernel-side `tc` egress hook records host-initiated IPv4 TCP SYN packets immediately, and the daemon still mirrors established client flows into `tcp_conntrack` as a reseed/fallback path.
+
+Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`, and the XDP ingress path checks those maps before falling back to `tcp_whitelist`, `udp_whitelist`, or `trusted_src_ips`. The daemon uses the presence of that pinned `tc` program to decide whether strict UDP auto-detection is safe to enable.
 
 ### Permanent Ports
 
@@ -183,54 +248,195 @@ Edit `xdp_port_sync.py` to always allow specific ports:
 
 ```python
 TCP_PERMANENT = {22: "SSH-fallback"}   # Optional: add ports you never want blocked
-UDP_PERMANENT = {}
+UDP_PERMANENT = {50000: "custom-udp-service"}  # Use this for real high-port UDP services
+TRUSTED_SRC_IPS = {"1.1.1.1": "cloudflare-dns"}
 ```
+
+If a real UDP server listens on a high port inside your system's ephemeral range, add it to `UDP_PERMANENT` explicitly so it is not mistaken for client traffic when strict UDP detection is active.
+
+You can also add trusted IPv4 sources at runtime:
+
+```bash
+python3 /usr/local/bin/xdp_port_sync.py --backend auto --trusted-ip 1.1.1.1 cloudflare-dns
+python3 /usr/local/bin/xdp_port_sync.py --backend auto --trusted-ip 129.6.15.28 ntp-nist --dry-run
+```
+
+`--trusted-ip` currently affects the XDP backend. The `nftables` fallback continues to use its own compatibility ruleset.
 
 ### Daemon Management
 
 ```bash
+# systemd
 systemctl status xdp-port-sync
 journalctl -u xdp-port-sync -f
 
-python3 /usr/local/bin/xdp-port-sync.py
-python3 /usr/local/bin/xdp-port-sync.py --dry-run
+# OpenRC
+rc-service xdp-port-sync status
+
+# Manual foreground run
+/usr/local/bin/basic_xdp_start.sh
+
+# One-shot sync with automatic backend selection
+python3 /usr/local/bin/xdp_port_sync.py --backend auto
+python3 /usr/local/bin/xdp_port_sync.py --backend auto --dry-run
 ```
+
+## Statistics
+
+Basic XDP installs a convenience command `/usr/local/bin/bxdp`. Statistics are now built directly into `bxdp`, so you only need one operational command after installation.
+
+```bash
+# Single snapshot
+sudo bxdp
+
+# Real-time refresh
+sudo bxdp watch
+
+# Show delta rates (pps / bps)
+sudo bxdp stats --rates
+
+# Combine both
+sudo bxdp stats --watch --rates --interval 2
+
+# Run one manual sync
+sudo bxdp sync
+
+# Service control
+sudo bxdp status
+```
+
+What it shows:
+
+1. `xdp` backend: per-category packet counters from `/sys/fs/bpf/xdp_fw/pkt_counters`, plus interface RX totals
+2. `nftables` backend: current drop counter from the `inet basic_xdp input` chain, plus interface RX totals
+3. `--rates`: packet deltas for XDP counters, and packet/bit deltas where byte counters are available
+
+Counter labels in `bxdp` are intentionally human-readable:
+
+1. `IPv6_ICMP` covers ICMPv6, neighbor discovery, and other non-TCP/UDP IPv6 traffic that is passed through
+2. `ARP_NON_IP` covers ARP and other non-IP Ethernet traffic
+3. `TCP_CT_MISS` counts IPv4 TCP ACK packets dropped because no conntrack entry was created by an allowed SYN
+
+## Post-Install Quick Commands
+
+After installation, these are the main commands you will actually use:
+
+```bash
+# Help
+sudo bxdp help
+
+# Current statistics snapshot
+sudo bxdp
+
+# Live statistics
+sudo bxdp watch
+
+# Delta rates
+sudo bxdp stats --rates
+
+# Live delta rates
+sudo bxdp stats --watch --rates --interval 2
+
+# Run one manual sync
+sudo bxdp sync
+
+# Service status / restart
+sudo bxdp status
+sudo bxdp restart
+```
+
+### Source Update Check
+
+When you run the installer from a cloned repo, local source files win by default. If you want the script to compare your local copies with GitHub first, use:
+
+```bash
+sudo bash setup_xdp.sh --check-update
+```
+
+In `--check-update` mode, the installer:
+
+1. Downloads the GitHub version of `xdp_firewall.c`, `tc_udp_track.c`, and `xdp_port_sync.py` to temporary files
+2. Compares the local and GitHub SHA-256 hashes
+3. Prompts you when they differ
+4. Pulls the GitHub copy only if you confirm
+
+### Non-Interactive Mode
+
+For CI or automated deployment, use:
+
+```bash
+sudo bash setup_xdp.sh --force
+```
+
+Or combine it with source comparison:
+
+```bash
+sudo bash setup_xdp.sh --check-update --force
+```
+
+In `--force` mode, the installer skips confirmation prompts and:
+
+1. Pulls the GitHub copy automatically when `--check-update` finds a hash mismatch
+2. Unloads any existing XDP program automatically before reinstalling
 
 ---
 
 ## Packet Filtering Logic
 
 ### TCP
-- If **ACK** is set → **PASS** (established connection traffic) 
-- Else if packet is a **pure SYN**:
-  - destination port in `tcp_whitelist` → **PASS** 
-  - otherwise → **DROP** 
+- **IPv4 only hardening**:
+  - If packet is a **pure SYN** and destination port is in `tcp_whitelist` → insert 4-tuple into `tcp_conntrack` and **PASS**
+  - If **ACK** is set and the 4-tuple exists in `tcp_conntrack` → **PASS**
+  - If **ACK** is set and no conntrack entry exists → count `CNT_TCP_CT_MISS` and **DROP**
+  - Otherwise → **DROP**
+- **Kernel assist**: a `tc` egress program records host-initiated IPv4 TCP SYN packets immediately, closing the race where a very short outbound connection could receive SYN-ACK before userspace noticed it.
+- **Userspace assist**: `xdp_port_sync.py` still mirrors established IPv4 TCP client flows into `tcp_conntrack`, which helps reseed state after service restarts.
+- **IPv6 note**: IPv6 TCP still uses the legacy path for now. `xdp_firewall.c` includes a TODO comment documenting that IPv6 conntrack is not yet implemented.
 
 ### UDP
-- If source port in `{53, 123, 67, 443}` → **PASS** (common response traffic)
-- Else if destination port in `udp_whitelist` → **PASS** 
-- Otherwise → **DROP** 
+- **IPv4 only hardening**:
+  - If the inbound 4-tuple exists in `udp_conntrack` → **PASS**
+  - If destination port is in `udp_whitelist` → **PASS**
+  - Else if source IPv4 address is in `trusted_src_ips` → **PASS**
+  - Otherwise → **DROP**
+- **Userspace assist**: trusted IPv4 source addresses remain available as an explicit fallback for response-style UDP traffic.
+- **IPv6 note**: IPv6 UDP still uses the legacy path for now. `xdp_firewall.c` includes a TODO comment documenting that IPv6 UDP conntrack / trusted-source matching is not yet implemented.
 
 ### IPv6 Extension Headers
 
-Traverses IPv6 extension headers up to **6 levels deep** to locate the transport protocol and prevent crafted-header bypass attacks .
+Traverses IPv6 extension headers up to **6 levels deep** to locate the transport protocol and prevent crafted-header bypass attacks. Non-initial IPv6 fragments are explicitly counted and dropped before the transport parser, so they cannot slip through on a failed bounds check.
 
 ---
 
 ## Uninstall
 
 ```bash
-# Detach XDP
+# Detach XDP if it is attached
 ip link set dev eth0 xdp off
 
-# Remove pinned maps
-rm -rf /sys/fs/bpf/xdp_fw
+# Remove the TCP/UDP reply tracker
+tc filter del dev eth0 egress pref 49152 2>/dev/null || true
 
-# Stop and disable daemon + remove files
-systemctl disable --now xdp-port-sync
-rm /usr/local/bin/xdp_port_sync.py
+# Remove pinned maps and nftables fallback table
+rm -rf /sys/fs/bpf/xdp_fw
+nft delete table inet basic_xdp 2>/dev/null || true
+
+# systemd
+systemctl disable --now xdp-port-sync 2>/dev/null || true
 rm /etc/systemd/system/xdp-port-sync.service
-systemctl daemon-reload
+systemctl daemon-reload 2>/dev/null || true
+
+# OpenRC
+rc-service xdp-port-sync stop 2>/dev/null || true
+rc-update del xdp-port-sync default 2>/dev/null || true
+rm /etc/init.d/xdp-port-sync
+
+# Remove installed runtime files
+rm /usr/local/bin/xdp_port_sync.py
+rm /usr/local/bin/bxdp
+rm /usr/local/bin/basic_xdp_start.sh
+rm -rf /usr/local/lib/basic_xdp
+rm -rf /etc/basic_xdp
 ```
 
 ---
@@ -241,9 +447,10 @@ This benchmark simulates a volumetric UDP flood attack. We used a high-performan
 
 ### **Test Environment**
 
-+ **Attacker**: AMD EPYC™ 7Y43 @ 2.55GHz (Generating ~367k PPS / 188 Mbps)
-+ **Target (Receiver)**: AMD Ryzen 9 3900X @ 2.0GHz (1 vCPU, 1GB RAM)
++ 🇭🇰 **Attacker**: AMD EPYC™ 7Y43 @ 2.55GHz (Generating ~367k PPS / 188 Mbps)
++ 🇺🇸 **Target (Receiver)**: AMD Ryzen 9 3900X @ 2.0GHz (1 vCPU, 1GB RAM) 
 + **Tool**: `pktgen` (Linux Kernel Packet Generator)
++ **Attacker and target connected over *<u>public internet</u>***
 
 ### **Comparative Results**
 
@@ -293,8 +500,6 @@ echo "dst_mac TARGET_MAC" > $PGDEV  # Target MAC
 echo "clone_skb 100" > $PGDEV              # Speed up packet generation
 ```
 
-
-
 ## 🤝 **Contributing**
 
 Contributions are welcome! If you have a bug fix, performance improvement, or new feature in mind: 
@@ -319,10 +524,3 @@ Contributions are welcome! If you have a bug fix, performance improvement, or ne
 ## 📄 License
 
 [MIT](./LICENSE) © 2026 Yunheng Liu
-
-
-
-
-
-
-
