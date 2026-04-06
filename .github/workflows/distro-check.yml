@@ -21,6 +21,7 @@ jobs:
         run: bash -n bxdp
 
   distro-check:
+    needs: syntax
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -44,6 +45,12 @@ jobs:
           - name: alpine
             image: alpine:3.20
             install: apk add --no-cache bash curl git ca-certificates iproute2
+          - name: almalinux
+            image: almalinux:10
+            install: dnf -y install bash curl git ca-certificates iproute
+          - name: rockylinux
+            image: rockylinux:10
+            install: dnf -y install bash curl git ca-certificates iproute
     container:
       image: ${{ matrix.image }}
     steps:
