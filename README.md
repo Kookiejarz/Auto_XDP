@@ -88,7 +88,7 @@ Incoming Packet
 ## Key Features
 
 - **Wire-speed filtering** via XDP (bypasses kernel network stack)
-- **~40–65 ns per-packet latency** measured on real hardware (see [Benchmarks](#benchmarks))
+- **~40–65 ns per-packet latency** measured on real hardware (see [Benchmarks](#-real-world-performance-benchmark))
 - **Auto-sync whitelist**: daemon watches listening sockets and updates the active backend in real time
 - **IPv4 TCP conntrack hardening**: pure SYN creates temporary state; unsolicited ACK packets are dropped
 - **Outbound IPv4 TCP compatibility**: a `tc` egress program records host-initiated TCP SYN packets, so inbound SYN-ACK/ACK traffic can be matched at XDP without reopening the ACK bypass
