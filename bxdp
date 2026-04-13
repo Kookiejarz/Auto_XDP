@@ -350,6 +350,7 @@ names = [
     "FRAG_DROP",
     "ARP_NON_IP",
     "TCP_CT_MISS",
+    "ICMP_DROP",
 ]
 
 def norm(values):

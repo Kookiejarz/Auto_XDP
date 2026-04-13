@@ -5,6 +5,7 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/icmp.h>
+#include <linux/icmpv6.h>
 #include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -25,6 +26,11 @@
 #define TCP_TIMEOUT_NS       (300ULL * 1000000000ULL) // 5 minutes
 #define UDP_TIMEOUT_NS       (60ULL * 1000000000ULL)  // 1 minute
 #define CT_REFRESH_INTERVAL  (30ULL * 1000000000ULL)  // 30 seconds
+
+// ICMP token-bucket rate limiter
+#define ICMP_TOKEN_RATE    100ULL  // tokens (packets) replenished per second
+#define ICMP_TOKEN_MAX     100ULL  // burst capacity: bucket depth
+#define ICMP_NS_PER_TOKEN  (1000000000ULL / ICMP_TOKEN_RATE)
 
 // BPF Maps: hot-updatable TCP/UDP port whitelists (ARRAY implementation)
 // The ARRAY map uses the port number (host byte order) as the array index (__u32 key).
@@ -48,7 +54,8 @@ enum xdp_counter_idx {
     CNT_FRAG_DROP       = 7,  // Fragmented packets dropped
     CNT_NON_IP          = 8,  // Non-IP traffic (ARP, etc.) passed
     CNT_TCP_CT_MISS     = 9,  // TCP ACK packets dropped due to missing conntrack state
-    CNT_MAX             = 10,
+    CNT_ICMP_DROP       = 10, // ICMP/ICMPv6 echo packets dropped by token-bucket rate limiter
+    CNT_MAX             = 11,
 };
 
 struct {
@@ -108,6 +115,20 @@ struct {
     __type(key, __u32);   // port number (host byte order) as array index
     __type(value, __u32); // 1 = allow
 } udp_whitelist SEC(".maps");
+
+// Global ICMP token-bucket state (single entry, protected by spin lock)
+struct icmp_token_bucket {
+    struct bpf_spin_lock lock;
+    __u64 tokens;
+    __u64 last_refill_ns; // ktime_ns of last refill; 0 = uninitialized
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct icmp_token_bucket);
+} icmp_tb SEC(".maps");
 
 static __always_inline void fill_ct_key_v4(
     struct ct_key *key, __be32 saddr, __be32 daddr,
@@ -306,6 +327,48 @@ static __always_inline int check_udp_ipv6(
     return XDP_DROP;
 }
 
+// ICMP token-bucket rate limiter: returns XDP_PASS or XDP_DROP.
+// Tokens refill at ICMP_TOKEN_RATE per second up to ICMP_TOKEN_MAX.
+static __always_inline int icmp_rate_limit(void)
+{
+    __u32 key = 0;
+    struct icmp_token_bucket *tb = bpf_map_lookup_elem(&icmp_tb, &key);
+    if (!tb)
+        return XDP_PASS; // fail-open: never block because of a map miss
+
+    __u64 now = bpf_ktime_get_ns();
+    int ret;
+
+    bpf_spin_lock(&tb->lock);
+
+    if (tb->last_refill_ns == 0) {
+        // First ICMP packet ever: start with a full bucket.
+        tb->tokens = ICMP_TOKEN_MAX;
+        tb->last_refill_ns = now;
+    } else {
+        // Add whole tokens for elapsed time; advance the refill clock by the
+        // consumed intervals only (prevents credit accumulation across idle gaps).
+        __u64 elapsed = now - tb->last_refill_ns;
+        __u64 new_tokens = elapsed / ICMP_NS_PER_TOKEN;
+        if (new_tokens > 0) {
+            tb->tokens += new_tokens;
+            if (tb->tokens > ICMP_TOKEN_MAX)
+                tb->tokens = ICMP_TOKEN_MAX;
+            tb->last_refill_ns += new_tokens * ICMP_NS_PER_TOKEN;
+        }
+    }
+
+    if (tb->tokens > 0) {
+        tb->tokens--;
+        ret = XDP_PASS;
+    } else {
+        ret = XDP_DROP;
+    }
+
+    bpf_spin_unlock(&tb->lock);
+    return ret;
+}
+
 // IPv6 extension header traversal to prevent bypassing port checks
 
 static __always_inline __u8 skip_ipv6_exthdr(
@@ -389,8 +452,18 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
             return check_tcp_ipv4(ip, trans_data, data_end);
         case IPPROTO_UDP:
             return check_udp_ipv4(ip, trans_data, data_end);
+        case IPPROTO_ICMP: {
+            // Token-bucket: allows up to ICMP_TOKEN_RATE pps with a burst of
+            // ICMP_TOKEN_MAX, so normal ping still works but flood is truncated.
+            if (icmp_rate_limit() == XDP_DROP) {
+                count(CNT_ICMP_DROP);
+                return XDP_DROP;
+            }
+            count(CNT_IPV4_OTHER);
+            return XDP_PASS;
+        }
         default:
-            // Pass other protocols such as ICMP (keep ping reachable)
+            // Pass other IPv4 protocols (IGMP, GRE, etc.)
             count(CNT_IPV4_OTHER);
             return XDP_PASS;
         }
@@ -421,8 +494,26 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
             return check_tcp_ipv6(ipv6, trans_data, data_end);
         case IPPROTO_UDP:
             return check_udp_ipv6(ipv6, trans_data, data_end);
+        case IPPROTO_ICMPV6: {
+            // NDP (RS/RA/NS/NA/Redirect, types 133-137) must always pass —
+            // dropping them breaks IPv6 neighbour discovery and routing.
+            // Only echo requests (type 128) go through the shared token bucket.
+            struct icmp6hdr *icmp6 = trans_data;
+            if ((void *)(icmp6 + 1) > data_end) {
+                count(CNT_IPV6_OTHER);
+                return XDP_PASS;
+            }
+            if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST) {
+                if (icmp_rate_limit() == XDP_DROP) {
+                    count(CNT_ICMP_DROP);
+                    return XDP_DROP;
+                }
+            }
+            count(CNT_IPV6_OTHER);
+            return XDP_PASS;
+        }
         default:
-            // ICMPv6 (including NDP neighbor discovery) must be passed, otherwise IPv6 networking breaks
+            // Other IPv6 protocols pass freely
             count(CNT_IPV6_OTHER);
             return XDP_PASS;
         }
