@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Bash syntax check
         run: bash -n setup_xdp.sh
@@ -58,7 +58,7 @@ jobs:
         run: ${{ matrix.install }}
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run dry-run smoke test
         run: |
