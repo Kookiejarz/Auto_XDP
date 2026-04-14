@@ -34,12 +34,54 @@ TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
 UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
 TCP_CONNTRACK_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_conntrack"
 TRUSTED_IPS_MAP_PATH = "/sys/fs/bpf/xdp_fw/trusted_src_ips"
+SYN_RATE_MAP_PATH = "/sys/fs/bpf/xdp_fw/syn_rate_ports"
 REQUIRED_XDP_MAP_PATHS = (
     TCP_MAP_PATH,
     UDP_MAP_PATH,
     TCP_CONNTRACK_MAP_PATH,
     TRUSTED_IPS_MAP_PATH,
 )
+
+# SYN rate limits keyed by process name (highest priority).
+# Catches services running on non-standard ports (e.g. sshd on 2222).
+_SYN_RATE_BY_PROC: dict[str, int] = {
+    "sshd":         2,
+    "vsftpd":       10,
+    "proftpd":      10,
+    "pure-ftpd":    10,
+    "postfix":      20,
+    "sendmail":     20,
+    "dovecot":      15,
+    "mysqld":       2,
+    "mariadbd":     2,
+    "postgres":     2,
+    "redis-server": 2,
+    "mongod":       2,
+    "xrdp":         2,
+    "telnetd":      2,
+}
+
+# Fallback: rate limits keyed by IANA service name from /etc/services.
+# Used when the process name is unknown or not in _SYN_RATE_BY_PROC.
+_SYN_RATE_BY_SERVICE: dict[str, int] = {
+    "ssh":           2,
+    "ftp":           10,
+    "ftp-data":      10,
+    "smtp":          20,
+    "smtps":         20,
+    "submission":    20,
+    "pop3":          15,
+    "pop3s":         15,
+    "imap":          15,
+    "imaps":         15,
+    "mysql":         2,
+    "postgresql":    2,
+    "redis":         2,
+    "mongodb":       2,
+    "ms-wbt-server": 2,  # RDP 3389
+    "vnc":           2,
+    "telnet":        2,
+}
 
 NFT_FAMILY = "inet"
 NFT_TABLE = "basic_xdp"
@@ -369,6 +411,130 @@ class BpfConntrackMap:
             return False
 
 
+def _port_rate_limit(port: int, proc: str = "") -> int:
+    """Return the SYN rate limit for a TCP port, or 0 to skip rate limiting.
+
+    Resolution order:
+      1. Process name (_SYN_RATE_BY_PROC) — catches services on non-standard ports.
+      2. IANA service name (_SYN_RATE_BY_SERVICE) — fallback for unknown processes.
+      3. Anything else → 0 (no rate limit).
+    """
+    if proc:
+        rate = _SYN_RATE_BY_PROC.get(proc)
+        if rate is not None:
+            return rate
+    try:
+        svc = socket.getservbyport(port, "tcp")
+    except OSError:
+        return 0
+    return _SYN_RATE_BY_SERVICE.get(svc, 0)
+
+
+class BpfSynRatePortsMap:
+    """Pinned BPF HASH map: key=__u32 dest_port, value=struct{u32 rate_max, u32 _pad}."""
+
+    _VAL_SIZE = 8  # rate_max (__u32) + _pad (__u32)
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.fd = _obj_get(path)
+        self._cache: dict[int, int] = {}  # port -> rate_max currently in map
+
+        self._key = ctypes.create_string_buffer(4)
+        self._next_key = ctypes.create_string_buffer(4)
+        self._val = ctypes.create_string_buffer(self._VAL_SIZE)
+        self._update_attr = ctypes.create_string_buffer(128)
+        self._lookup_attr = ctypes.create_string_buffer(128)
+        self._delete_attr = ctypes.create_string_buffer(128)
+        self._next_attr = ctypes.create_string_buffer(128)
+        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
+        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
+        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
+        struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
+        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
+        self._load_cache()
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _iter_raw_keys(self):
+        current_ptr = 0
+        while True:
+            struct.pack_into(
+                "=I4xQQ", self._next_attr, 0, self.fd,
+                current_ptr, ctypes.cast(self._next_key, ctypes.c_void_p).value or 0,
+            )
+            try:
+                _bpf(_BPF_MAP_GET_NEXT_KEY, self._next_attr)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    break
+                raise
+            key_raw = bytes(self._next_key.raw[:4])
+            yield key_raw
+            ctypes.memmove(self._key, key_raw, 4)
+            current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+
+    def _load_cache(self) -> None:
+        try:
+            for key_raw in self._iter_raw_keys():
+                port = struct.unpack_from("=I", key_raw)[0]
+                ctypes.memmove(self._key, key_raw, 4)
+                try:
+                    _bpf(_BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+                    rate_max = struct.unpack_from("=I", self._val)[0]
+                    self._cache[port] = rate_max
+                except OSError:
+                    continue
+        except OSError:
+            return
+
+    def active(self) -> dict[int, int]:
+        return dict(self._cache)
+
+    def set(self, port: int, rate_max: int, dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info("[DRY] %s port %d rate_max=%d", self.path, port, rate_max)
+            self._cache[port] = rate_max
+            return True
+        try:
+            struct.pack_into("=I", self._key, 0, port)
+            struct.pack_into("=II", self._val, 0, rate_max, 0)
+            _bpf(_BPF_MAP_UPDATE_ELEM, self._update_attr)
+            self._cache[port] = rate_max
+            return True
+        except OSError as exc:
+            log.warning("BPF syn_rate_ports update failed port=%d: %s", port, exc)
+            return False
+
+    def delete(self, port: int, dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info("[DRY] %s delete port %d", self.path, port)
+            self._cache.pop(port, None)
+            return True
+        try:
+            struct.pack_into("=I", self._key, 0, port)
+            _bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
+            self._cache.pop(port, None)
+            return True
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                self._cache.pop(port, None)
+                return True
+            log.warning("BPF syn_rate_ports delete failed port=%d: %s", port, exc)
+            return False
+
+
 class PortBackend:
     name = "backend"
 
@@ -394,12 +560,20 @@ class XdpBackend(PortBackend):
         self.udp_map = BpfArrayMap(UDP_MAP_PATH)
         self.trusted_map = BpfHashMap(TRUSTED_IPS_MAP_PATH)
         self.conntrack_map = BpfConntrackMap(TCP_CONNTRACK_MAP_PATH)
+        try:
+            self.syn_rate_map: BpfSynRatePortsMap | None = BpfSynRatePortsMap(SYN_RATE_MAP_PATH)
+            log.debug("syn_rate_ports map opened; per-service SYN rate limiting active.")
+        except OSError as exc:
+            log.debug("syn_rate_ports map unavailable (%s); SYN rate limiting inactive.", exc)
+            self.syn_rate_map = None
 
     def close(self) -> None:
         self.tcp_map.close()
         self.udp_map.close()
         self.trusted_map.close()
         self.conntrack_map.close()
+        if self.syn_rate_map is not None:
+            self.syn_rate_map.close()
 
     def sync_ports(
         self,
@@ -460,6 +634,56 @@ class XdpBackend(PortBackend):
 
         if not changed:
             log.debug("Whitelist up-to-date.")
+
+        # Sync per-port SYN rate limits based on detected service types.
+        if self.syn_rate_map is not None:
+            self._sync_syn_rate(tcp_target, dry_run)
+
+    def _sync_syn_rate(self, tcp_ports: set[int], dry_run: bool) -> None:
+        """Update syn_rate_ports to match the current set of whitelisted TCP ports."""
+        active = self.syn_rate_map.active()  # type: ignore[union-attr]
+
+        # Resolve port → process name so _port_rate_limit can catch services
+        # on non-standard ports (e.g. sshd on 2222 won't match getservbyport).
+        port_procs: dict[int, str] = {}
+        if psutil is not None and _net_connections is not None:
+            try:
+                for conn in _net_connections(kind="inet"):
+                    if not (conn.laddr and conn.laddr.port in tcp_ports):
+                        continue
+                    if conn.type != socket.SOCK_STREAM:
+                        continue
+                    if getattr(conn, "status", None) != psutil.CONN_LISTEN:
+                        continue
+                    pid = getattr(conn, "pid", None)
+                    if pid is None:
+                        continue
+                    try:
+                        port_procs[conn.laddr.port] = psutil.Process(pid).name()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Desired state: port → rate_max (skip ports where rate=0, i.e. web).
+        desired: dict[int, int] = {}
+        for port in tcp_ports:
+            rate = _port_rate_limit(port, port_procs.get(port, ""))
+            if rate > 0:
+                desired[port] = rate
+
+        for port, rate_max in desired.items():
+            if active.get(port) != rate_max:
+                if self.syn_rate_map.set(port, rate_max, dry_run):  # type: ignore[union-attr]
+                    try:
+                        svc = socket.getservbyport(port, "tcp")
+                    except OSError:
+                        svc = "unknown"
+                    log.info("SYN rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
+
+        for port in set(active) - set(desired):
+            if self.syn_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
+                log.info("SYN rate port %d removed (port no longer whitelisted)", port)
 
 
 class NftablesBackend(PortBackend):

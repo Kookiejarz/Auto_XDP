@@ -36,14 +36,14 @@ struct ct_key {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, 262144);
     __type(key, struct ct_key);
     __type(value, __u64);
 } tcp_conntrack SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, 262144);
     __type(key, struct ct_key);
     __type(value, __u64);
 } udp_conntrack SEC(".maps");
@@ -156,7 +156,7 @@ int tc_egress_track(struct __sk_buff *skb)
             fill_ct_key_v4(&key, ip->daddr, ip->saddr, tcp->dest, tcp->source);
             now = bpf_ktime_get_ns();
 
-            if (tcp_flags == 0x02) { // SYN
+            if ((tcp_flags & 0x02) && !(tcp_flags & 0x10)) { // SYN & ECN
                 bpf_map_update_elem(&tcp_conntrack, &key, &now, BPF_ANY);
             } else {
                 __u64 *last_seen = bpf_map_lookup_elem(&tcp_conntrack, &key);
@@ -216,7 +216,7 @@ int tc_egress_track(struct __sk_buff *skb)
         tcp_flags = ((__u8 *)tcp)[13];
         // Record the reverse IPv6 tuple so inbound SYN-ACK/ACK packets can match.
         fill_ct_key_v6(&key, &ipv6->daddr, &ipv6->saddr, tcp->dest, tcp->source);
-        if (tcp_flags == 0x02) { // SYN
+        if ((tcp_flags & 0x02) && !(tcp_flags & 0x10)) { // SYN & ECN
             bpf_map_update_elem(&tcp_conntrack, &key, &now, BPF_ANY);
         } else {
             __u64 *last_seen = bpf_map_lookup_elem(&tcp_conntrack, &key);

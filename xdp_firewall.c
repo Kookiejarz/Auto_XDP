@@ -1,5 +1,6 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
+#include <linux/if_vlan.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
@@ -32,6 +33,10 @@
 #define ICMP_TOKEN_MAX     100ULL  // burst capacity: bucket depth
 #define ICMP_NS_PER_TOKEN  (1000000000ULL / ICMP_TOKEN_RATE)
 
+// Per-IP SYN rate limiter (anti-brute-force)
+// Rate limits per port are configured at runtime via the syn_rate_ports map.
+#define SYN_RATE_WINDOW_NS  (1000000000ULL)  // 1-second fixed window per source IP
+
 // BPF Maps: hot-updatable TCP/UDP port whitelists (ARRAY implementation)
 // The ARRAY map uses the port number (host byte order) as the array index (__u32 key).
 // max_entries = 65536 covers all valid ports.
@@ -55,7 +60,8 @@ enum xdp_counter_idx {
     CNT_NON_IP          = 8,  // Non-IP traffic (ARP, etc.) passed
     CNT_TCP_CT_MISS     = 9,  // TCP ACK packets dropped due to missing conntrack state
     CNT_ICMP_DROP       = 10, // ICMP/ICMPv6 echo packets dropped by token-bucket rate limiter
-    CNT_MAX             = 11,
+    CNT_SYN_RATE_DROP   = 11, // TCP SYN dropped by per-IP rate limiter (anti-brute-force)
+    CNT_MAX             = 12,
 };
 
 struct {
@@ -83,7 +89,7 @@ struct ct_key {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, 262144);
     __type(key, struct ct_key);
     __type(value, __u64); // ktime_ns at insert for future timeout handling
 } tcp_conntrack SEC(".maps");
@@ -97,7 +103,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, 262144);
     __type(key, struct ct_key);
     __type(value, __u64); // ktime_ns of the most recent outbound UDP packet
 } udp_conntrack SEC(".maps");
@@ -130,6 +136,89 @@ struct {
     __type(value, struct icmp_token_bucket);
 } icmp_tb SEC(".maps");
 
+// Per-port SYN rate limit config, populated at runtime by xdp_port_sync.
+// Key: dest port (host byte order). Value: rate_max SYNs/window (0 = disabled).
+// Ports absent from this map are NOT rate-limited (e.g. HTTP/HTTPS).
+struct syn_rate_port_cfg {
+    __u32 rate_max; // max SYNs per source IP per SYN_RATE_WINDOW_NS; 0 = skip
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);  // dest port (host byte order)
+    __type(value, struct syn_rate_port_cfg);
+} syn_rate_ports SEC(".maps");
+
+// Per-IP SYN rate limiter state
+struct syn_rate_key {
+    __u8  family;
+    __u8  pad[3];
+    __u32 addr[4]; // IPv4: addr[0] only; IPv6: all 4 words
+} __attribute__((aligned(8)));
+
+struct syn_rate_val {
+    __u64 window_start_ns;
+    __u32 count;
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536); // tracks up to 64K concurrent source IPs
+    __type(key, struct syn_rate_key);
+    __type(value, struct syn_rate_val);
+} syn_rate_map SEC(".maps");
+
+// Per-IP SYN rate limiter: returns XDP_PASS or XDP_DROP.
+// Looks up per-port config from syn_rate_ports; skips limiting entirely if
+// the port is absent (e.g. HTTP/HTTPS). Races on multi-core are tolerated —
+// a few extra SYNs slipping through is acceptable; spin locking every SYN
+// would be far too costly.
+static __always_inline int syn_rate_check(struct ct_key *key, __u64 now,
+                                           __u32 dest_port)
+{
+    // Per-port config: rate_max=0 or missing entry → no rate limit for this port.
+    struct syn_rate_port_cfg *cfg = bpf_map_lookup_elem(&syn_rate_ports, &dest_port);
+    if (!cfg || cfg->rate_max == 0)
+        return XDP_PASS;
+
+    __u32 rate_max = cfg->rate_max;
+
+    struct syn_rate_key rkey;
+    __builtin_memset(&rkey, 0, sizeof(rkey));
+    rkey.family   = key->family;
+    rkey.addr[0]  = key->saddr[0];
+    rkey.addr[1]  = key->saddr[1];
+    rkey.addr[2]  = key->saddr[2];
+    rkey.addr[3]  = key->saddr[3];
+
+    struct syn_rate_val *rv = bpf_map_lookup_elem(&syn_rate_map, &rkey);
+    if (!rv) {
+        // First SYN from this source IP — create a fresh entry.
+        struct syn_rate_val new_rv;
+        __builtin_memset(&new_rv, 0, sizeof(new_rv));
+        new_rv.window_start_ns = now;
+        new_rv.count = 1;
+        bpf_map_update_elem(&syn_rate_map, &rkey, &new_rv, BPF_ANY);
+        return XDP_PASS;
+    }
+
+    if (now - rv->window_start_ns >= SYN_RATE_WINDOW_NS) {
+        // Window has elapsed — start a fresh one.
+        rv->window_start_ns = now;
+        rv->count = 1;
+        return XDP_PASS;
+    }
+
+    if (rv->count >= rate_max)
+        return XDP_DROP;
+
+    rv->count++;
+    return XDP_PASS;
+}
+
 static __always_inline void fill_ct_key_v4(
     struct ct_key *key, __be32 saddr, __be32 daddr,
     __be16 sport, __be16 dport)
@@ -161,14 +250,16 @@ static __always_inline int check_tcp_conntrack(
     __u64 now = bpf_ktime_get_ns();
     __u64 *last_seen;
 
-    // 1. RST? Delete entry immediately and drop.
+    // 1. RST: evict conntrack entry, then pass to the kernel.
+    // Dropping RST would prevent the kernel from delivering ECONNRESET to
+    // the application, leaving the socket open until a read/write timeout.
     if (tcp_flags & 0x04) {
         bpf_map_delete_elem(&tcp_conntrack, key);
-        count(CNT_TCP_DROP);
-        return XDP_DROP;
+        count(CNT_TCP_ESTABLISHED);
+        return XDP_PASS;
     }
 
-    // 2. ACK/SYN-ACK (established traffic)
+    // 2. ACK / FIN+ACK / SYN-ACK (established traffic)
     if (tcp_flags & 0x10) {
         last_seen = bpf_map_lookup_elem(&tcp_conntrack, key);
         if (last_seen) {
@@ -180,7 +271,17 @@ static __always_inline int check_tcp_conntrack(
                 return XDP_DROP;
             }
 
-            // Periodic refresh
+            // FIN+ACK: connection is closing — evict immediately so the map
+            // slot is available for new connections rather than waiting up to
+            // TCP_TIMEOUT_NS (5 min).  The remaining FIN/ACK exchange will
+            // miss conntrack but those packets are benign on a closing conn.
+            if (tcp_flags & 0x01) {
+                bpf_map_delete_elem(&tcp_conntrack, key);
+                count(CNT_TCP_ESTABLISHED);
+                return XDP_PASS;
+            }
+
+            // Periodic refresh for long-lived connections
             if (now - *last_seen > CT_REFRESH_INTERVAL) {
                 bpf_map_update_elem(&tcp_conntrack, key, &now, BPF_EXIST);
             }
@@ -194,15 +295,41 @@ static __always_inline int check_tcp_conntrack(
         return XDP_DROP;
     }
 
-    // 3. SYN (new traffic)
-    if (tcp_flags == 0x02) {
-        __u32 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
-        if (allow && *allow) {
-            bpf_map_update_elem(&tcp_conntrack, key, &now, BPF_ANY);
-            count(CNT_TCP_NEW_ALLOW);
+    // 2b. Standalone FIN (no ACK, rare but valid per RFC 793 §3.5)
+    if (tcp_flags & 0x01) {
+        last_seen = bpf_map_lookup_elem(&tcp_conntrack, key);
+        if (last_seen) {
+            bpf_map_delete_elem(&tcp_conntrack, key);
+            count(CNT_TCP_ESTABLISHED);
             return XDP_PASS;
         }
+        goto drop;
     }
+
+    // 3. SYN (new inbound connection)
+    // TC egress only fires on outbound, so any inbound SYN on a new tuple
+    // will always miss conntrack — no pre-check needed or useful here.
+    // Use (flags & SYN) && !(flags & ACK) instead of == 0x02 so that
+    // ECN-negotiating SYNs (SYN+ECE=0x42, SYN+ECE+CWR=0xC2) are accepted.
+    if ((tcp_flags & 0x02) && !(tcp_flags & 0x10)) {
+        // Whitelist check: port not open → DROP, one map lookup and done.
+        __u32 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
+        if (!allow || !*allow)
+            goto drop;
+
+        // Port is open; apply per-IP SYN rate limiting for protected services.
+        if (syn_rate_check(key, now, dest_port) == XDP_DROP) {
+            count(CNT_SYN_RATE_DROP);
+            count(CNT_TCP_DROP);
+            return XDP_DROP;
+        }
+
+        bpf_map_update_elem(&tcp_conntrack, key, &now, BPF_ANY);
+        count(CNT_TCP_NEW_ALLOW);
+        return XDP_PASS;
+    }
+
+drop:
 
     count(CNT_TCP_DROP);
     return XDP_DROP;
@@ -425,9 +552,34 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
+    // Strip 802.1Q / QinQ VLAN tags so firewall rules apply to the inner
+    // EtherType.  Without this, VLAN-tagged IP packets arrive with
+    // h_proto=0x8100 and bypass all port/conntrack checks via CNT_NON_IP.
+    __be16 eth_proto = eth->h_proto;
+    void  *l3_data   = (void *)(eth + 1);
+
+    if (eth_proto == bpf_htons(ETH_P_8021Q) ||
+        eth_proto == bpf_htons(ETH_P_8021AD)) {
+        struct vlan_hdr *vlan = l3_data;
+        if ((void *)(vlan + 1) > data_end)
+            return XDP_PASS;
+        eth_proto = vlan->h_vlan_encapsulated_proto;
+        l3_data   = (void *)(vlan + 1);
+
+        // Handle double-tagged (QinQ) — one more layer at most.
+        if (eth_proto == bpf_htons(ETH_P_8021Q) ||
+            eth_proto == bpf_htons(ETH_P_8021AD)) {
+            vlan = l3_data;
+            if ((void *)(vlan + 1) > data_end)
+                return XDP_PASS;
+            eth_proto = vlan->h_vlan_encapsulated_proto;
+            l3_data   = (void *)(vlan + 1);
+        }
+    }
+
     // 2. IPv4
-    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
-        struct iphdr *ip = (void *)(eth + 1);
+    if (eth_proto == bpf_htons(ETH_P_IP)) {
+        struct iphdr *ip = l3_data;
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
 
@@ -469,9 +621,9 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
         }
     }
 
-    // 3. IPv6 
-    if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
-        struct ipv6hdr *ipv6 = (void *)(eth + 1);
+    // 3. IPv6
+    if (eth_proto == bpf_htons(ETH_P_IPV6)) {
+        struct ipv6hdr *ipv6 = l3_data;
         if ((void *)(ipv6 + 1) > data_end)
             return XDP_PASS;
 
