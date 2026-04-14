@@ -351,6 +351,7 @@ names = [
     "ARP_NON_IP",
     "TCP_CT_MISS",
     "ICMP_DROP",
+    "SYN_RATE_DROP",
 ]
 
 def norm(values):
@@ -617,12 +618,14 @@ render_port_lines() {
         return 0
     fi
 
-    python3 - "$proto" "$csv" <<'PY'
+    python3 - "$proto" "$csv" "${BPF_PIN_DIR}/syn_rate_ports" <<'PY'
 import socket
 import sys
+import os
 
 proto = sys.argv[1]
 csv = sys.argv[2]
+syn_rate_map_path = sys.argv[3] if len(sys.argv) > 3 else ""
 ports = [int(p) for p in csv.split(",") if p]
 proc_by_port = {p: set() for p in ports}
 
@@ -666,13 +669,49 @@ if psutil is not None:
         except Exception:
             continue
 
+# Read SYN rate limits from BPF map (TCP only)
+syn_rates = {}
+if proto == "tcp" and syn_rate_map_path and os.path.exists(syn_rate_map_path):
+    try:
+        import subprocess
+        import json as _json
+        out = subprocess.check_output(
+            ["bpftool", "-j", "map", "dump", "pinned", syn_rate_map_path],
+            stderr=subprocess.DEVNULL,
+        )
+        def _b(v):
+            if isinstance(v, int):
+                return v & 0xFF
+            if isinstance(v, str):
+                try:
+                    return int(v, 0) & 0xFF
+                except ValueError:
+                    return 0
+            return 0
+        for row in _json.loads(out):
+            key = row.get("key", [])
+            val = row.get("value", [])
+            if isinstance(key, list) and len(key) >= 4:
+                port = _b(key[0]) | (_b(key[1]) << 8) | (_b(key[2]) << 16) | (_b(key[3]) << 24)
+                if isinstance(val, list) and len(val) >= 4:
+                    rate = _b(val[0]) | (_b(val[1]) << 8) | (_b(val[2]) << 16) | (_b(val[3]) << 24)
+                    if rate > 0:
+                        syn_rates[port] = rate
+    except Exception:
+        pass
+
 for p in sorted(set(ports)):
     try:
         svc = socket.getservbyport(p, proto)
     except Exception:
         svc = "-"
     procs = ",".join(sorted(proc_by_port.get(p, set()))) or "-"
-    print(f"  {p:5d}  {svc:<14}  {procs}")
+    if proto == "tcp":
+        rate = syn_rates.get(p)
+        rate_str = f"{rate}/s" if rate else "-"
+        print(f"  {p:5d}  {svc:<14}  {procs:<14}  {rate_str}")
+    else:
+        print(f"  {p:5d}  {svc:<14}  {procs}")
 PY
 }
 

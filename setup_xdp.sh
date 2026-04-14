@@ -267,7 +267,7 @@ pkg_install_optional() {
 package_list_for_manager() {
     case "$PKG_MANAGER" in
         apt-get)
-            echo "clang llvm libbpf-dev build-essential iproute2 curl python3 python3-pip bpftool nftables"
+            echo "clang llvm libbpf-dev build-essential iproute2 curl python3 python3-pip bpftool nftables gcc-multilib"
             ;;
         dnf|yum)
             echo "clang llvm libbpf-devel bpftool iproute curl python3 python3-pip gcc make nftables"
