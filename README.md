@@ -7,7 +7,7 @@
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   <a href="https://www.kernel.org/"><img src="https://img.shields.io/badge/Kernel-%E2%89%A54.18-blue.svg?style=flat-square" alt="Kernel >= 4.18"></a>
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
-  <a href="https://github.com/Kookiejarz/auto_xdp/actions/workflows/distro-check.yml"><img src="https://github.com/Kookiejarz/auto_xdp/actions/workflows/distro-check.yml/badge.svg" alt="Distro Checks"></a>
+  <a href="https://github.com/Kookiejarz/Auto_XDP/actions/workflows/distro-check.yml"><img src="https://github.com/Kookiejarz/Auto_XDP/actions/workflows/distro-check.yml/badge.svg" alt="Distro Checks"></a>
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   <img src="https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC-555555.svg?style=flat-square" alt="systemd and OpenRC">
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
@@ -131,13 +131,13 @@ Incoming Packet
 ## Quick Start
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/auto_xdp/refs/heads/main/setup_xdp.sh | sudo bash
+curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/heads/main/setup_xdp.sh | sudo bash
 ```
 
 ### Install a Specific Release
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/auto_xdp/refs/tags/v26.4.7a/setup_xdp.sh | sudo bash
+curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/v26.4.7a/setup_xdp.sh | sudo bash
 ```
 
 Using a tag gives you a reproducible installer version instead of tracking the latest `main` branch.
@@ -167,7 +167,7 @@ bash setup_xdp.sh --check-env
 ## Install From Source
 
 ```bash
-git clone https://github.com/Kookiejarz/auto_xdp.git
+git clone https://github.com/Kookiejarz/Auto_XDP.git
 cd auto_xdp
 
 # Auto-detect interface
@@ -560,7 +560,7 @@ Contributions are welcome! If you have a bug fix, performance improvement, or ne
 1. Fork the repository 
 2. Create a feature branch (`git checkout -b feature/my-improvement`) 
 3. Commit your changes
-4. Open a pull request For bugs or questions, please [open an issue](https://github.com/Kookiejarz/auto_xdp/issues).
+4. Open a pull request For bugs or questions, please [open an issue](https://github.com/Kookiejarz/Auto_XDP/issues).
 
 ---
 
@@ -568,9 +568,9 @@ Contributions are welcome! If you have a bug fix, performance improvement, or ne
 
 <a href="https://www.star-history.com/?repos=Kookiejarz%2Fauto_xdp&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=Kookiejarz/auto_xdp&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=Kookiejarz/auto_xdp&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=Kookiejarz/auto_xdp&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=Kookiejarz/Auto_XDP&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=Kookiejarz/Auto_XDP&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=Kookiejarz/Auto_XDP&type=date&legend=top-left" />
  </picture>
 </a>
 
