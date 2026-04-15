@@ -1,6 +1,5 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
-#include <linux/if_vlan.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
@@ -10,6 +9,14 @@
 #include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+/* struct vlan_hdr is not reliably defined in BPF compilation headers on all
+ * distros (<linux/if_vlan.h> may only forward-declare it).  Define it here
+ * directly; ETH_P_8021Q / ETH_P_8021AD come from <linux/if_ether.h>. */
+struct vlan_hdr {
+    __be16  h_vlan_TCI;
+    __be16  h_vlan_encapsulated_proto;
+};
 
 // These two macros are not exposed under the BPF compilation path of <linux/ip.h>, so define them manually
 #ifndef IP_MF
