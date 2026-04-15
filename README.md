@@ -1,5 +1,7 @@
 # Auto XDP
 
+> 🚩 The Mission: Making high-performance eBPF security accessible to everyone—without needing a PhD in Linux kernel networking.
+
 **A lightweight XDP/eBPF firewall for automatic port whitelisting and basic DDoS protection on Linux hosts.**
 
 <p align="center">
@@ -25,8 +27,7 @@
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   <img src="https://img.shields.io/badge/Alpine-supported-0D597F.svg?style=flat-square" alt="Alpine supported">
 </p>
-
-Although there are some XDP firewall solutions available, Auto XDP provides users with automatic port whitelisting, which makes maintenance easier.
+Although there are some XDP firewall solutions available, Auto XDP provides users with automatic port whitelisting, which makes maintenance significantly easier.
 
 ***⚠️ XDP only filters traffic that reaches your NIC. If your upstream bandwidth is already saturated by a volumetric attack, this tool cannot help. For large-scale DDoS mitigation, consider upstream scrubbing services or a DDoS-protected hosting provider.***
 
