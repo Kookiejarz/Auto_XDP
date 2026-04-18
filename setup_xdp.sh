@@ -638,10 +638,18 @@ compile_bpf_object() {
     local src_path="$1"
     local obj_path="$2"
 
+    local host_arch_flag=""
+    case "$TARGET_ARCH" in
+        x86)   host_arch_flag="-D__x86_64__"   ;;
+        arm64) host_arch_flag="-D__aarch64__"  ;;
+        arm)   host_arch_flag="-D__arm__"      ;;
+    esac
+
     if ! clang -O3 -g \
         -target bpf \
         -mcpu=v3 \
         "-D__TARGET_ARCH_${TARGET_ARCH}" \
+        ${host_arch_flag:+"$host_arch_flag"} \
         -fno-stack-protector \
         -Wall -Wno-unused-value \
         -I/usr/include \
