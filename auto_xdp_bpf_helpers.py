@@ -104,8 +104,8 @@ def pack_ct_key(conn) -> bytes:
 
 def cmd_seed_tcp_conntrack(map_path: str) -> int:
     if psutil is None:
-        print(0)
-        return 0
+        print("seed-tcp-conntrack failed: psutil not available", file=os.sys.stderr)
+        return 1
 
     try:
         fd = obj_get(map_path)
