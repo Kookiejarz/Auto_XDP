@@ -37,6 +37,8 @@ SERVICE_NAME="xdp-port-sync"
 RAW_URL="https://raw.githubusercontent.com/Kookiejarz/auto_xdp/main"
 TC_FILTER_PREF=49152
 PREFER_REMOTE_SOURCES=0
+OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
+SYSTEMD_RUN_DIR="${SYSTEMD_RUN_DIR:-/run/systemd/system}"
 
 case "${BASH_SOURCE[0]:-}" in
     stdin|/dev/stdin|/dev/fd/*|/proc/self/fd/*)
@@ -164,9 +166,9 @@ detect_pkg_manager() {
 }
 
 detect_os_release() {
-    if [[ -r /etc/os-release ]]; then
+    if [[ -r "$OS_RELEASE_FILE" ]]; then
         # shellcheck disable=SC1091
-        source /etc/os-release
+        source "$OS_RELEASE_FILE"
     fi
 
     DISTRO_ID="${ID:-unknown}"
@@ -180,7 +182,7 @@ detect_os_release() {
         *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" alma "*|*" amzn "*)
             DISTRO_FAMILY="rpm"
             ;;
-        *" opensuse "*|*" suse "*)
+        *" opensuse"*|*" suse "*)
             DISTRO_FAMILY="suse"
             ;;
         *" arch "*)
@@ -196,7 +198,7 @@ detect_os_release() {
 }
 
 detect_init_system() {
-    if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
+    if command -v systemctl &>/dev/null && [[ -d "$SYSTEMD_RUN_DIR" ]]; then
         SYSTEMD_AVAILABLE=1
         INIT_SYSTEM="systemd"
         return
@@ -1082,133 +1084,139 @@ run_initial_sync() {
     "$RUNNER_SCRIPT" --sync-once
 }
 
-# 1. Root check
-parse_args "$@"
+main() {
+    # 1. Root check
+    parse_args "$@"
 
-if [[ $CHECK_ENV -eq 1 ]]; then
-    detect_os_release
+    if [[ $CHECK_ENV -eq 1 ]]; then
+        detect_os_release
+        detect_pkg_manager || die "No supported package manager found."
+        detect_init_system
+        echo "distro_id=$DISTRO_ID"
+        echo "distro_name=$DISTRO_NAME"
+        echo "distro_family=$DISTRO_FAMILY"
+        echo "package_manager=$PKG_MANAGER"
+        echo "init_system=$INIT_SYSTEM"
+        exit 0
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        dry_run_report
+        exit 0
+    fi
+
+    [[ $EUID -eq 0 ]] || die "Please run this script with sudo."
+
+    # 2. Interface detection
+    if [[ -z "$IFACE" ]]; then
+        IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
+        [[ -n "$IFACE" ]] || die "Cannot detect default interface. Specify manually: sudo bash $0 eth0"
+        info "Detected interface: $IFACE"
+    fi
+    ip link show "$IFACE" &>/dev/null || die "Interface $IFACE does not exist."
+
+    # 3. Dependencies
+    info "Checking dependencies..."
     detect_pkg_manager || die "No supported package manager found."
     detect_init_system
-    echo "distro_id=$DISTRO_ID"
-    echo "distro_name=$DISTRO_NAME"
-    echo "distro_family=$DISTRO_FAMILY"
-    echo "package_manager=$PKG_MANAGER"
-    echo "init_system=$INIT_SYSTEM"
-    exit 0
-fi
 
-if [[ $DRY_RUN -eq 1 ]]; then
-    dry_run_report
-    exit 0
-fi
+    MISSING=()
+    for cmd in clang bpftool python3 curl ip tc nft; do
+        command -v "$cmd" &>/dev/null || MISSING+=("$cmd")
+    done
 
-[[ $EUID -eq 0 ]] || die "Please run this script with sudo."
+    if [[ ${#MISSING[@]} -gt 0 ]]; then
+        warn "Missing: ${MISSING[*]} — installing via $PKG_MANAGER..."
+        install_packages
+    fi
 
-# 2. Interface detection
-if [[ -z "$IFACE" ]]; then
-    IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
-    [[ -n "$IFACE" ]] || die "Cannot detect default interface. Specify manually: sudo bash $0 eth0"
-    info "Detected interface: $IFACE"
-fi
-ip link show "$IFACE" &>/dev/null || die "Interface $IFACE does not exist."
+    command -v python3 &>/dev/null || die "python3 not found after installation."
+    command -v curl &>/dev/null || die "curl not found after installation."
+    command -v ip &>/dev/null || die "ip command not found after installation."
+    ensure_psutil
+    PYTHON3_BIN=$(command -v python3)
+    ok "Base dependencies satisfied."
 
-# 3. Dependencies
-info "Checking dependencies..."
-detect_pkg_manager || die "No supported package manager found."
-detect_init_system
+    ensure_bpf_helper_bootstrap || true
 
-MISSING=()
-for cmd in clang bpftool python3 curl ip tc nft; do
-    command -v "$cmd" &>/dev/null || MISSING+=("$cmd")
-done
+    if ! command -v bpftool &>/dev/null || ! command -v clang &>/dev/null; then
+        warn "bpftool or clang still missing; XDP backend may be unavailable."
+    fi
 
-if [[ ${#MISSING[@]} -gt 0 ]]; then
-    warn "Missing: ${MISSING[*]} — installing via $PKG_MANAGER..."
-    install_packages
-fi
+    # 4. Stop existing runtime before replacing files
+    stop_existing_service
 
-command -v python3 &>/dev/null || die "python3 not found after installation."
-command -v curl &>/dev/null || die "curl not found after installation."
-command -v ip &>/dev/null || die "ip command not found after installation."
-ensure_psutil
-PYTHON3_BIN=$(command -v python3)
-ok "Base dependencies satisfied."
+    # 5. Compile XDP when available and try to deploy it now
+    compile_xdp_program || true
+    if deploy_xdp_backend; then
+        :
+    else
+        ACTIVE_BACKEND="nftables"
+        ACTIVE_XDP_MODE="none"
+        ensure_nftables_available || die "Neither XDP nor nftables backend is available."
+    fi
 
-ensure_bpf_helper_bootstrap || true
+    # 6. Install runtime and boot-time launcher
+    install_runtime_files
 
-if ! command -v bpftool &>/dev/null || ! command -v clang &>/dev/null; then
-    warn "bpftool or clang still missing; XDP backend may be unavailable."
-fi
+    # 7. Initial sync for whichever backend is active now
+    run_initial_sync
 
-# 4. Stop existing runtime before replacing files
-stop_existing_service
+    # 8. Install service for boot-time auto start
+    case "$INIT_SYSTEM" in
+        systemd)
+            install_systemd_service
+            ;;
+        openrc)
+            install_openrc_service
+            ;;
+        *)
+            warn "No supported init system detected; skipping service installation."
+            warn "Start manually: ${RUNNER_SCRIPT}"
+            ;;
+    esac
 
-# 5. Compile XDP when available and try to deploy it now
-compile_xdp_program || true
-if deploy_xdp_backend; then
-    :
-else
-    ACTIVE_BACKEND="nftables"
-    ACTIVE_XDP_MODE="none"
-    ensure_nftables_available || die "Neither XDP nor nftables backend is available."
-fi
+    # 9. Summary
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  Deployment Complete!                  ${NC}"
+    echo -e "${GREEN}════════════════════════════════════════${NC}"
+    echo ""
+    echo "  Interface      : $IFACE"
+    echo "  Active backend : $ACTIVE_BACKEND"
+    if [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
+        echo "  XDP mode       : $ACTIVE_XDP_MODE"
+        echo "  BPF maps       : $BPF_PIN_DIR/"
+        echo "  TC egress obj  : $TC_OBJ_INSTALLED"
+    else
+        echo "  nftables table : inet auto_xdp"
+    fi
+    echo "  Init system    : $INIT_SYSTEM"
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        echo "  Service        : systemctl status $SERVICE_NAME"
+    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        echo "  Service        : rc-service $SERVICE_NAME status"
+    else
+        echo "  Service        : not installed"
+    fi
+    echo "  Launcher       : $RUNNER_SCRIPT"
+    echo "  Command        : $AXDP_CMD"
+    echo ""
+    echo "  Next Commands"
+    echo "  axdp           : sudo axdp"
+    echo "  axdp watch     : sudo axdp watch"
+    echo "  axdp rates     : sudo axdp stats --rates"
+    echo "  axdp live      : sudo axdp stats --watch --rates --interval 2"
+    echo "  axdp sync      : sudo axdp sync"
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        echo "  service status : sudo axdp status"
+        echo "  service restart: sudo axdp restart"
+    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        echo "  service status : sudo axdp status"
+        echo "  service restart: sudo axdp restart"
+    fi
+}
 
-# 6. Install runtime and boot-time launcher
-install_runtime_files
-
-# 7. Initial sync for whichever backend is active now
-run_initial_sync
-
-# 8. Install service for boot-time auto start
-case "$INIT_SYSTEM" in
-    systemd)
-        install_systemd_service
-        ;;
-    openrc)
-        install_openrc_service
-        ;;
-    *)
-        warn "No supported init system detected; skipping service installation."
-        warn "Start manually: ${RUNNER_SCRIPT}"
-        ;;
-esac
-
-# 9. Summary
-echo ""
-echo -e "${GREEN}════════════════════════════════════════${NC}"
-echo -e "${GREEN}  Deployment Complete!                  ${NC}"
-echo -e "${GREEN}════════════════════════════════════════${NC}"
-echo ""
-echo "  Interface      : $IFACE"
-echo "  Active backend : $ACTIVE_BACKEND"
-if [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
-    echo "  XDP mode       : $ACTIVE_XDP_MODE"
-    echo "  BPF maps       : $BPF_PIN_DIR/"
-    echo "  TC egress obj  : $TC_OBJ_INSTALLED"
-else
-    echo "  nftables table : inet auto_xdp"
-fi
-echo "  Init system    : $INIT_SYSTEM"
-if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    echo "  Service        : systemctl status $SERVICE_NAME"
-elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    echo "  Service        : rc-service $SERVICE_NAME status"
-else
-    echo "  Service        : not installed"
-fi
-echo "  Launcher       : $RUNNER_SCRIPT"
-echo "  Command        : $AXDP_CMD"
-echo ""
-echo "  Next Commands"
-echo "  axdp           : sudo axdp"
-echo "  axdp watch     : sudo axdp watch"
-echo "  axdp rates     : sudo axdp stats --rates"
-echo "  axdp live      : sudo axdp stats --watch --rates --interval 2"
-echo "  axdp sync      : sudo axdp sync"
-if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    echo "  service status : sudo axdp status"
-    echo "  service restart: sudo axdp restart"
-elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    echo "  service status : sudo axdp status"
-    echo "  service restart: sudo axdp restart"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
