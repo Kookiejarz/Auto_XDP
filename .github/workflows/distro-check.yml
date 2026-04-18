@@ -26,7 +26,7 @@ jobs:
             image: fedora:41
             install: dnf -y install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
           - name: opensuse
-            image: opensuse/leap:15.6
+            image: opensuse/tumbleweed
             install: zypper --non-interactive refresh && zypper --non-interactive install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
           - name: arch
             image: archlinux:latest
@@ -36,7 +36,7 @@ jobs:
             install: apk add --no-cache bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
           - name: almalinux
             image: almalinux:10
-            install: dnf -y install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
+            install: dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
           - name: rockylinux
             image: rockylinux:9
             install: dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
