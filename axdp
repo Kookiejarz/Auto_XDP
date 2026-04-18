@@ -9,6 +9,7 @@ NFT_TABLE="auto_xdp"
 NFT_CHAIN="input"
 RUNNER_SCRIPT="/usr/local/bin/auto_xdp_start.sh"
 SERVICE_NAME="xdp-port-sync"
+SYSTEMD_RUN_DIR="${SYSTEMD_RUN_DIR:-/run/systemd/system}"
 
 WATCH_MODE=0
 SHOW_RATES=0
@@ -57,7 +58,7 @@ EOF
 run_service_cmd() {
     local action="$1"
 
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if command -v systemctl >/dev/null 2>&1 && [[ -d "$SYSTEMD_RUN_DIR" ]]; then
         exec systemctl "$action" "$SERVICE_NAME"
     fi
 
@@ -185,7 +186,7 @@ run_log_level() {
     set_config_var "LOG_LEVEL" "$level"
     echo "LOG_LEVEL=$level"
 
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    if command -v systemctl >/dev/null 2>&1 && [[ -d "$SYSTEMD_RUN_DIR" ]]; then
         systemctl restart "$SERVICE_NAME"
         systemctl --no-pager --full status "$SERVICE_NAME"
         return 0
@@ -1010,4 +1011,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

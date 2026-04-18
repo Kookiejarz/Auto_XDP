@@ -1,27 +1,16 @@
-name: Distro Support Checks
+name: CI / Distro Support
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  syntax:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Bash syntax check
-        run: bash -n setup_xdp.sh
-
-      - name: Python syntax check
-        run: python3 -m py_compile xdp_port_sync.py
-
-      - name: Shell syntax check for axdp
-        run: bash -n axdp
-
-  distro-check:
-    needs: syntax
+  distro-suite:
+    name: Distro Suite (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -29,44 +18,53 @@ jobs:
         include:
           - name: debian
             image: debian:12-slim
-            install: apt-get update && apt-get install -y bash curl git ca-certificates iproute2
+            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
           - name: ubuntu
             image: ubuntu:24.04
-            install: apt-get update && apt-get install -y bash curl git ca-certificates iproute2
+            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
           - name: fedora
             image: fedora:41
-            install: dnf -y install bash curl git ca-certificates iproute
+            install: dnf -y install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
           - name: opensuse
             image: opensuse/leap:15.6
-            install: zypper --non-interactive refresh && zypper --non-interactive install -y bash curl git ca-certificates iproute2
+            install: zypper --non-interactive refresh && zypper --non-interactive install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
           - name: arch
             image: archlinux:latest
-            install: pacman -Sy --noconfirm --needed bash curl git ca-certificates iproute2
+            install: pacman -Sy --noconfirm --needed bash ca-certificates coreutils curl gawk git grep python iproute2 sed
           - name: alpine
             image: alpine:3.20
-            install: apk add --no-cache bash curl git ca-certificates iproute2
+            install: apk add --no-cache bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
           - name: almalinux
             image: almalinux:10
-            install: dnf -y install bash curl git ca-certificates iproute
+            install: dnf -y install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
           - name: rockylinux
             image: rockylinux:9
-            install: dnf -y --allowerasing install bash curl git ca-certificates iproute
+            install: dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
     container:
       image: ${{ matrix.image }}
     steps:
-      - name: Install runtime dependencies
+      - name: Install base dependencies
         run: ${{ matrix.install }}
 
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Run dry-run smoke test
-        run: |
-          bash ./setup_xdp.sh --dry-run | tee /tmp/setup_xdp_dry_run.log
-          grep -q '^mode=dry-run$' /tmp/setup_xdp_dry_run.log
-          grep -q '^package_manager=' /tmp/setup_xdp_dry_run.log
-          grep -q '^init_system=' /tmp/setup_xdp_dry_run.log
-          grep -q '^planned_packages=' /tmp/setup_xdp_dry_run.log
+      - name: Run distro smoke and unit suite
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: bash ./tests/run-distro-suite.sh
 
-      - name: Validate installer help text
-        run: bash ./setup_xdp.sh --help >/dev/null
+  bpf-build:
+    name: BPF Build Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev bpftool
+
+      - name: Compile XDP and tc objects
+        run: bash ./tests/bash/test_bpf_build.sh
