@@ -62,7 +62,7 @@ exit 0
 EOF_APT
     chmod +x "$tmpdir/bin/yum" "$tmpdir/bin/apt-get"
 
-    PATH="$tmpdir/bin:$BASE_PATH"
+    PATH="$tmpdir/bin"
     OS_RELEASE_FILE="$tmpdir/os-release"
     PKG_MANAGER=""
 
@@ -78,7 +78,7 @@ test_detect_pkg_manager_fails_when_no_manager_exists() (
     tmpdir=$(mktemp -d)
     mkdir -p "$tmpdir/bin"
 
-    PATH="$tmpdir/bin:$BASE_PATH"
+    PATH="$tmpdir/bin"
     OS_RELEASE_FILE="$tmpdir/missing-os-release"
     PKG_MANAGER=""
 
