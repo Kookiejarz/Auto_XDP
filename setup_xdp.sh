@@ -509,6 +509,7 @@ xdp_maps_ready() {
         "${BPF_PIN_DIR}/udp_conntrack"
         "${BPF_PIN_DIR}/trusted_src_ips4"
         "${BPF_PIN_DIR}/trusted_src_ips6"
+        "${BPF_PIN_DIR}/udp_global_rl"
     )
     local path=""
     for path in "${required[@]}"; do
@@ -882,6 +883,7 @@ xdp_maps_ready() {
         "${BPF_PIN_DIR}/udp_conntrack"
         "${BPF_PIN_DIR}/trusted_src_ips4"
         "${BPF_PIN_DIR}/trusted_src_ips6"
+        "${BPF_PIN_DIR}/udp_global_rl"
     )
     local path=""
     for path in "${required[@]}"; do

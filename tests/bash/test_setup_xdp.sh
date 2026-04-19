@@ -230,7 +230,10 @@ test_xdp_maps_ready_requires_all_expected_pins() (
     local status=$?
     assert_eq "$status" "1" || return 1
 
-    touch "$tmpdir/trusted_src_ips"
+    touch \
+        "$tmpdir/trusted_src_ips4" \
+        "$tmpdir/trusted_src_ips6" \
+        "$tmpdir/udp_global_rl"
     xdp_maps_ready >/dev/null 2>&1
     status=$?
     assert_eq "$status" "0"
