@@ -10,6 +10,7 @@ NFT_CHAIN="input"
 RUNNER_SCRIPT="/usr/local/bin/auto_xdp_start.sh"
 SERVICE_NAME="xdp-port-sync"
 SYSTEMD_RUN_DIR="${SYSTEMD_RUN_DIR:-/run/systemd/system}"
+RAW_URL="https://raw.githubusercontent.com/Kookiejarz/auto_xdp/main"
 
 WATCH_MODE=0
 SHOW_RATES=0
@@ -30,16 +31,17 @@ usage() {
 Usage: axdp [command] [options]
 
 Commands:
-  stats [args...]   Show Auto XDP statistics
-  watch [args...]   Shorthand for: stats --watch
-  ports [args...]   Show currently allowed TCP/UDP ports
-  sync [args...]    Run one sync pass with automatic backend selection
-  log-level [LVL]   Show or change daemon log level
-  start             Start the installed service
-  stop              Stop the installed service
-  restart           Restart the installed service
-  status            Show service status
-  help              Show this help
+  stats [args...]        Show Auto XDP statistics
+  watch [args...]        Shorthand for: stats --watch
+  ports [args...]        Show currently allowed TCP/UDP ports
+  sync [args...]         Run one sync pass with automatic backend selection
+  check-update [args...] Compare installed files against GitHub and update
+  log-level [LVL]        Show or change daemon log level
+  start                  Start the installed service
+  stop                   Stop the installed service
+  restart                Restart the installed service
+  status                 Show service status
+  help                   Show this help
 
 Stats options:
   --watch              Refresh continuously
@@ -50,6 +52,9 @@ Stats options:
 Ports options:
   --watch              Refresh continuously and detect changes
   --interval SEC       Refresh interval in seconds (default: 2)
+
+Check-update options:
+  --force              Apply all updates without prompting
 
 With no command, axdp runs: stats
 EOF
@@ -973,6 +978,44 @@ run_stats() {
     render_stats 0
 }
 
+run_check_update() {
+    local force=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) force=1; shift ;;
+            -h|--help)
+                printf 'Usage: axdp check-update [--force]\n'
+                printf '  --force   Apply all updates without prompting\n'
+                exit 0
+                ;;
+            *)
+                printf 'Unknown option: %s\n' "$1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    command -v curl >/dev/null 2>&1 || { printf 'curl is required for check-update\n' >&2; exit 1; }
+
+    local setup_url="https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/heads/main/setup_xdp.sh"
+    local tmp_setup
+    tmp_setup=$(mktemp)
+    trap 'rm -f "$tmp_setup"' EXIT
+
+    printf 'Fetching setup_xdp.sh from GitHub...\n'
+    if ! curl --proto '=https' --tlsv1.2 -sSfL "$setup_url" -o "$tmp_setup"; then
+        printf 'Failed to fetch setup_xdp.sh\n' >&2
+        exit 1
+    fi
+
+    if [[ $force -eq 1 ]]; then
+        bash "$tmp_setup" --check-update --force
+    else
+        bash "$tmp_setup" --check-update
+    fi
+}
+
 main() {
     local cmd="${1:-stats}"
 
@@ -993,6 +1036,10 @@ main() {
             shift || true
             ensure_installed "$RUNNER_SCRIPT"
             exec "$RUNNER_SCRIPT" --sync-once "$@"
+            ;;
+        check-update)
+            shift || true
+            run_check_update "$@"
             ;;
         log-level)
             shift || true
