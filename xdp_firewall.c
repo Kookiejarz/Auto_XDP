@@ -10,6 +10,12 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#ifndef bool
+typedef _Bool bool;
+#define true  1
+#define false 0
+#endif
+
 /* struct vlan_hdr is not reliably defined in BPF compilation headers on all
  * distros (<linux/if_vlan.h> may only forward-declare it).  Define it here
  * directly; ETH_P_8021Q / ETH_P_8021AD come from <linux/if_ether.h>. */
