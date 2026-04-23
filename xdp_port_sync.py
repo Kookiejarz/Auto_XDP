@@ -34,8 +34,8 @@ except ImportError:
 TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
 UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
 TCP_CONNTRACK_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_conntrack"
-TRUSTED_IPS_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/trusted_src_ips4"
-TRUSTED_IPS_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/trusted_src_ips6"
+TRUSTED_IPS_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/trusted_ipv4"
+TRUSTED_IPS_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/trusted_ipv6"
 SYN_RATE_MAP_PATH     = "/sys/fs/bpf/xdp_fw/syn_rate_ports"
 UDP_RATE_MAP_PATH     = "/sys/fs/bpf/xdp_fw/udp_rate_ports"
 UDP_GLOBAL_RL_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_global_rl"
@@ -763,10 +763,12 @@ class XdpBackend(PortBackend):
         for port, rate_max in desired.items():
             if active.get(port) != rate_max:
                 if self.syn_rate_map.set(port, rate_max, dry_run):  # type: ignore[union-attr]
-                    try:
-                        svc = socket.getservbyport(port, "tcp")
-                    except OSError:
-                        svc = "unknown"
+                    svc: str = port_procs.get(port, "")
+                    if not svc:
+                        try:
+                            svc = socket.getservbyport(port, "tcp")
+                        except OSError:
+                            svc = "unknown"
                     log.info("SYN rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
 
         for port in set(active) - set(desired):
