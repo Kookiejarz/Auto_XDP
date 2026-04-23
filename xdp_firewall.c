@@ -138,7 +138,7 @@ struct {
     __type(key, struct trusted_v4_key);
     __type(value, __u32);
     __uint(map_flags, BPF_F_NO_PREALLOC);
-} trusted_src_ips4 SEC(".maps");
+} trusted_ipv4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -146,7 +146,7 @@ struct {
     __type(key, struct trusted_v6_key);
     __type(value, __u32);
     __uint(map_flags, BPF_F_NO_PREALLOC);
-} trusted_src_ips6 SEC(".maps");
+} trusted_ipv6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -671,7 +671,7 @@ static __always_inline int check_udp_ipv4(
     }
 
     struct trusted_v4_key tk4 = { .prefixlen = 32, .addr = ip->saddr };
-    __u32 *trusted = bpf_map_lookup_elem(&trusted_src_ips4, &tk4);
+    __u32 *trusted = bpf_map_lookup_elem(&trusted_ipv4, &tk4);
     if (trusted && *trusted) {
         count(CNT_UDP_PASS);
         return XDP_PASS;
@@ -730,7 +730,7 @@ static __always_inline int check_udp_ipv6(
     struct trusted_v6_key tk6;
     tk6.prefixlen = 128;
     __builtin_memcpy(tk6.addr, &ipv6->saddr, 16);
-    __u32 *trusted6 = bpf_map_lookup_elem(&trusted_src_ips6, &tk6);
+    __u32 *trusted6 = bpf_map_lookup_elem(&trusted_ipv6, &tk6);
     if (trusted6 && *trusted6) {
         count(CNT_UDP_PASS);
         return XDP_PASS;
