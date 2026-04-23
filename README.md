@@ -96,7 +96,7 @@ Incoming Packet
 - **Auto-sync whitelist**: daemon watches listening sockets and updates the active backend in real time
 - **IPv4 + IPv6 TCP conntrack hardening**: pure SYN creates temporary state; unsolicited ACK packets are dropped
 - **Kernel-side outbound state tracking**: a `tc` egress program records host-initiated IPv4/IPv6 TCP SYN packets and UDP reply tuples so return traffic can be matched at XDP without reopening the old bypasses
-- **IPv4 + IPv6 UDP hardening**: inbound server ports use `udp_whitelist`, reply traffic can be matched by `udp_conntrack`, and explicitly trusted IPv4/IPv6 sources or CIDR ranges can be allowed via `trusted_src_ips4`/`trusted_src_ips6`
+- **IPv4 + IPv6 UDP hardening**: inbound server ports use `udp_whitelist`, reply traffic can be matched by `udp_conntrack`, and explicitly trusted IPv4/IPv6 sources or CIDR ranges can be allowed via `trusted_ipv4`/`trusted_ipv6`
 - **IPv6 support**, including extension header traversal on both XDP and tc egress, plus explicit non-initial fragment drops
 - **Periodic conntrack sync (seeding established flows)**: the daemon now periodically seeds existing IPv4/IPv6 TCP sessions into `tcp_conntrack`, which helps preserve active sessions after re-attaching XDP or manual map clears.
 - **Reload-safe XDP attach**: the installer also pre-seeds existing sessions before initial attach.
@@ -211,15 +211,15 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 |:-:|:-:|:--:|:-:|:-:|
 | `tcp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
 | `udp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
-| `tcp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
-| `udp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
+| `tcp_conntrack` | LRU_HASH | 262144 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
+| `udp_conntrack` | LRU_HASH | 262144 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
 | `trusted_ipv4` | LPM_TRIE | 256 | `struct trusted_v4_key { prefixlen, addr }` (IPv4 CIDR) | `__u32` (1 = trusted) |
 | `trusted_ipv6` | LPM_TRIE | 256 | `struct trusted_v6_key { prefixlen, addr[16] }` (IPv6 CIDR) | `__u32` (1 = trusted) |
 | `pkt_counters` | PERCPU_ARRAY | 22 | `__u32` counter index | `__u64` packet count |
 | `icmp_tb` | ARRAY | 1 | `__u32` (0) | `struct icmp_token_bucket { last_ns, tokens }` |
-| `syn_rate_ports` | HASH | 64 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
+| `syn_rate_ports` | HASH | 1024 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
 | `syn_rate_map` | LRU_HASH | 65536 | `struct syn_rate_key { dest_port, saddr[4] }` | `struct syn_rate_val { window_start_ns, count }` |
-| `udp_rate_ports` | HASH | 64 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
+| `udp_rate_ports` | HASH | 1024 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
 | `udp_rate_map` | LRU_HASH | 65536 | `struct syn_rate_key { dest_port, saddr[4] }` | `struct syn_rate_val { window_start_ns, count }` |
 | `udp_global_rl` | ARRAY | 1 | `__u32` (0) | `struct udp_global_tb { lock, rate_max, window_start_ns, prev_count, curr_count }` |
 
@@ -261,10 +261,10 @@ The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/auto_xdp_
 3. **Safety Fallback**: Performs a full sync every **30 seconds** to ensure consistency.
 4. **Backend Sync**: Updates either pinned BPF maps or `nftables` sets, depending on what the host supports.
 5. **UDP Discovery Rule**: Because UDP has no `LISTEN` state, the daemon syncs unconnected bound UDP sockets (no remote peer) into `udp_whitelist`, which is a practical approximation of server-style UDP ports.
-6. **Trusted Source IPs/CIDRs**: Optional IPv4/IPv6 addresses or CIDR ranges can be synced into the XDP-side `trusted_src_ips4`/`trusted_src_ips6` LPM trie maps for reply-style UDP traffic such as DNS or NTP.
+6. **Trusted Source IPs/CIDRs**: Optional IPv4/IPv6 addresses or CIDR ranges can be synced into the XDP-side `trusted_ipv4`/`trusted_ipv6` LPM trie maps for reply-style UDP traffic such as DNS or NTP.
 7. **Backend Guard Rails**: In `auto` mode, the daemon only selects XDP when the required pinned maps are present; otherwise it falls back to `nftables` instead of crashing.
 
-Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`, and the XDP ingress path checks those maps before falling back to `tcp_whitelist`, `udp_whitelist`, or `trusted_src_ips4`/`trusted_src_ips6`.
+Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`, and the XDP ingress path checks those maps before falling back to `tcp_whitelist`, `udp_whitelist`, or `trusted_ipv4`/`trusted_ipv6`.
 
 ### Permanent Ports
 
