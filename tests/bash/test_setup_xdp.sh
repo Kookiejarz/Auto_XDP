@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]:-}")/../.." && pwd)
 BASE_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 # shellcheck source=tests/bash/testlib.sh
 source "$REPO_ROOT/tests/bash/testlib.sh"
