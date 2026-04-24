@@ -75,7 +75,7 @@ jobs:
             install: zypper --non-interactive refresh && zypper --non-interactive install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-devel bpftool gcc make
           - name: arch
             image: archlinux:latest
-            install: pacman -Sy --noconfirm --needed bash ca-certificates coreutils curl gawk git grep python sed iproute2 clang llvm libbpf base-devel sudo && useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers && su - builder -c 'git clone https://aur.archlinux.org/bpftool-bin.git /tmp/bpftool-bin && cd /tmp/bpftool-bin && makepkg -si --noconfirm'
+            install: "pacman -Sy --noconfirm --needed bash ca-certificates coreutils curl gawk git grep python sed iproute2 clang llvm libbpf base-devel sudo && useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers && su - builder -c 'git clone https://aur.archlinux.org/bpftool-bin.git /tmp/bpftool-bin && cd /tmp/bpftool-bin && makepkg -si --noconfirm'"
           - name: alpine
             image: alpine:3.20
             install: apk add --no-cache bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev bpftool build-base linux-headers
