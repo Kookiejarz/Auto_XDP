@@ -1,8 +1,6 @@
 # Auto XDP
 
-> 🚩 The Mission: Making high-performance eBPF security accessible to everyone—without needing a PhD in Linux kernel networking.
-
-**A lightweight XDP/eBPF firewall for automatic port whitelisting and DDoS protection on Linux hosts.**
+**Auto-sync a Linux host's real listening ports into XDP or nftables, so public servers stay locked down without hand-maintaining firewall rules.**
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License"></a>
@@ -27,7 +25,10 @@
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   <img src="https://img.shields.io/badge/Alpine-supported-0D597F.svg?style=flat-square" alt="Alpine supported">
 </p>
-Although there are some other XDP firewall solutions available, Auto XDP provides users with automatic port whitelisting, which makes maintenance significantly easier. Zero config, effortless management.
+
+Auto XDP is a host-side firewall for public and self-hosted Linux machines. It watches the services that are actually listening, keeps the active backend in sync automatically, preserves return traffic with a `tc` egress helper, and falls back to `nftables` when XDP cannot be attached.
+
+It is built for single-host self-protection: VPSes, public cloud instances, homelab nodes, and small Internet-facing Linux machines that keep getting scanned, probed, and hit with random L3/L4 attacks.
 
 ***⚠️ XDP only filters traffic that reaches your NIC. If your upstream bandwidth is already saturated by a volumetric attack, this tool cannot help. For large-scale DDoS mitigation, consider upstream scrubbing services or a DDoS-protected hosting provider.***
 
@@ -41,9 +42,20 @@ Although there are some other XDP firewall solutions available, Auto XDP provide
 
 ### Why Auto XDP?
 
-Personal cloud instances are constantly scanned and probed. Traditional firewalls like `iptables` work, but they process packets *after* the kernel networking stack — adding latency and CPU overhead. They also require manual firewall configurations and port controls, making host management to be more complicated.
+Personal cloud instances are constantly scanned and probed. Traditional firewalls like `iptables` and `nftables` work, but they usually rely on static allowlists that drift away from what the host is really exposing. Open a service and forget to allow it, it breaks. Stop a service and forget to close it, the hole stays open.
 
-**Auto XDP** hooks in **at the NIC driver level**, before any kernel processing. And unlike other XDP solutions, it **manages the port whitelist for you**: a daemon watches which ports are actually open on your system and keeps the active backend in sync automatically. When a host cannot run XDP, it can fall back to an `nftables` ruleset instead of failing outright.
+**Auto XDP** keeps the ingress policy aligned with the host's real listening sockets. It filters traffic at the NIC driver level when XDP is available, records outbound state so return traffic is not broken, and degrades to a synced `nftables` ruleset instead of leaving the host unprotected when XDP is unavailable.
+
+### Why not just `nftables` or `ufw`?
+
+You can. They are good tools.
+
+The difference is operational:
+
+- `nftables` / `ufw` usually start from a static ruleset that you keep in sync yourself.
+- Auto XDP starts from the host's real listening sockets and keeps the active backend aligned automatically.
+- When XDP is available, unwanted traffic is dropped before the normal kernel networking path instead of later in the stack.
+- When XDP is not available, the same control plane still drives a fallback `nftables` ruleset instead of leaving you with two separate systems to maintain.
 
 ---
 
