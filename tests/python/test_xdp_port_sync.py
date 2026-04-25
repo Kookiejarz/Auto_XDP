@@ -4,6 +4,7 @@ import subprocess
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import support
@@ -133,11 +134,18 @@ def make_proc_event_message(what: int) -> bytes:
 
 
 class XdpPortSyncTests(unittest.TestCase):
+    def test_udp_malformed_drop_only_rejects_port_zero(self):
+        source = (Path(__file__).resolve().parents[2] / "xdp_firewall.c").read_text()
+        self.assertIn("if (udp->source == 0 || udp->dest == 0) {", source)
+        self.assertNotIn("udp->source == udp->dest", source)
+
     def test_render_nft_ports_sorts_ports(self):
         self.assertEqual(xdp._render_nft_ports({443, 22, 80}), "{ 22, 80, 443 }")
 
     def test_port_rate_limit_prefers_process_name_then_service_name(self):
-        with mock.patch.object(xdp.socket, "getservbyport", side_effect=lambda port, proto: "ssh" if port == 22 else "http"):
+        with mock.patch.object(xdp.socket, "getservbyport", side_effect=lambda port, proto: "ssh" if port == 22 else "http"), \
+             mock.patch.object(xdp, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
+             mock.patch.object(xdp, "_SYN_RATE_BY_SERVICE", {"ssh": 2}):
             self.assertEqual(xdp._port_rate_limit(2222, "sshd"), 2)
             self.assertEqual(xdp._port_rate_limit(22), 2)
             self.assertEqual(xdp._port_rate_limit(80), 0)
@@ -191,17 +199,19 @@ class XdpPortSyncTests(unittest.TestCase):
 
     def test_sync_once_merges_permanent_ports_and_trusted_ips(self):
         backend = mock.Mock()
-        state = xdp.PortState(tcp={80}, udp={53}, established={b"flow"})
+        state = xdp.PortState(tcp={80}, udp={53}, sctp=set(), established={b"flow"})
 
         with mock.patch.object(xdp, "get_listening_ports", return_value=state), \
              mock.patch.object(xdp, "TCP_PERMANENT", {22: "ssh"}), \
              mock.patch.object(xdp, "UDP_PERMANENT", {123: "ntp"}), \
+             mock.patch.object(xdp, "SCTP_PERMANENT", {3868: "diameter"}), \
              mock.patch.object(xdp, "TRUSTED_SRC_IPS", {"203.0.113.8/32": "office"}):
             xdp.sync_once(backend, dry_run=True)
 
         backend.sync_ports.assert_called_once_with(
             {22, 80},
             {53, 123},
+            {3868},
             {"203.0.113.8/32"},
             {b"flow"},
             True,
@@ -211,19 +221,24 @@ class XdpPortSyncTests(unittest.TestCase):
         backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
         backend.tcp_map = FakePortMap({22, 80})
         backend.udp_map = FakePortMap({53, 9999})
+        backend.sctp_map = FakePortMap({3868, 9899})
         backend.trusted_map = FakeTrustedMap({"203.0.113.1/32"})
         backend.conntrack_map = FakeConntrackMap({b"keep"})
         backend.syn_rate_map = FakeSynRateMap({22: 1})
         backend.udp_rate_map = FakeSynRateMap()
+        backend.acl_maps = None
+        backend.bogon_cfg_map = None
         backend._sync_syn_rate = mock.Mock()
         backend._sync_udp_rate = mock.Mock()
 
         with mock.patch.object(xdp, "TCP_PERMANENT", {22: "ssh"}), \
              mock.patch.object(xdp, "UDP_PERMANENT", {53: "dns"}), \
+             mock.patch.object(xdp, "SCTP_PERMANENT", {3868: "diameter"}), \
              mock.patch.object(xdp, "TRUSTED_SRC_IPS", {"198.51.100.5/32": "office"}):
             backend.sync_ports(
                 tcp_target={22, 443},
                 udp_target={53},
+                sctp_target={3868, 2905},
                 trusted_target={"198.51.100.5/32"},
                 conntrack_target={b"keep", b"seed"},
                 dry_run=False,
@@ -231,6 +246,7 @@ class XdpPortSyncTests(unittest.TestCase):
 
         self.assertEqual(backend.tcp_map.ops, [(443, 1, False), (80, 0, False)])
         self.assertEqual(backend.udp_map.ops, [(9999, 0, False)])
+        self.assertEqual(backend.sctp_map.ops, [(2905, 1, False), (9899, 0, False)])
         self.assertEqual(backend.trusted_map.set_ops, [("198.51.100.5/32", 1, False)])
         self.assertEqual(backend.trusted_map.delete_ops, [("203.0.113.1/32", False)])
         self.assertEqual(backend.conntrack_map.ops, [(b"seed", False)])
@@ -266,7 +282,9 @@ class XdpPortSyncTests(unittest.TestCase):
 
         with mock.patch.object(xdp, "psutil", FakePsutil), \
              mock.patch.object(xdp, "_net_connections", return_value=conns), \
-             mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport):
+             mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport), \
+             mock.patch.object(xdp, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
+             mock.patch.object(xdp, "_SYN_RATE_BY_SERVICE", {"ssh": 2}):
             backend._sync_syn_rate({22, 80, 2222}, dry_run=False)
 
         self.assertCountEqual(
@@ -282,7 +300,9 @@ class XdpPortSyncTests(unittest.TestCase):
                 raise OSError("unknown service")
             return services[port]
 
-        with mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport):
+        with mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport), \
+             mock.patch.object(xdp, "_UDP_RATE_BY_PROC", {"named": 5000}), \
+             mock.patch.object(xdp, "_UDP_RATE_BY_SERVICE", {"domain": 5000, "ntp": 500}):
             self.assertEqual(xdp._udp_port_rate_limit(5353, "named"), 5000)
             self.assertEqual(xdp._udp_port_rate_limit(53), 5000)
             self.assertEqual(xdp._udp_port_rate_limit(123), 500)
@@ -298,7 +318,8 @@ class XdpPortSyncTests(unittest.TestCase):
                 raise OSError("unknown service")
             return services[port]
 
-        with mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport):
+        with mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport), \
+             mock.patch.object(xdp, "_UDP_RATE_BY_SERVICE", {"domain": 5000, "ntp": 500}):
             backend._sync_udp_rate({53, 123}, dry_run=False)
 
         self.assertCountEqual(
@@ -311,15 +332,19 @@ class XdpPortSyncTests(unittest.TestCase):
         backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
         backend.tcp_map = FakePortMap()
         backend.udp_map = FakePortMap()
+        backend.sctp_map = FakePortMap()
         backend.trusted_map = FakeTrustedMap()
         backend.conntrack_map = FakeConntrackMap()
         backend.syn_rate_map = FakeSynRateMap()
         backend.udp_rate_map = FakeSynRateMap()
+        backend.acl_maps = None
+        backend.bogon_cfg_map = None
 
         backend.close()
 
         self.assertTrue(backend.tcp_map.closed)
         self.assertTrue(backend.udp_map.closed)
+        self.assertTrue(backend.sctp_map.closed)
         self.assertTrue(backend.trusted_map.closed)
         self.assertTrue(backend.conntrack_map.closed)
         self.assertTrue(backend.syn_rate_map.closed)
@@ -330,7 +355,13 @@ class XdpPortSyncTests(unittest.TestCase):
         existing = subprocess.CompletedProcess(
             ["nft"],
             0,
-            stdout=f"set {xdp.NFT_TCP_SET}\nset {xdp.NFT_UDP_SET}\nset {xdp.NFT_TRUSTED_SET4}\nchain input\n",
+            stdout=(
+                f"set {xdp.NFT_TCP_SET}\n"
+                f"set {xdp.NFT_UDP_SET}\n"
+                f"set {xdp.NFT_SCTP_SET}\n"
+                f"set {xdp.NFT_TRUSTED_SET4}\n"
+                "chain input\n"
+            ),
         )
 
         with mock.patch.object(xdp, "_run_nft", return_value=existing) as run_nft:
@@ -356,7 +387,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend = xdp.NftablesBackend.__new__(xdp.NftablesBackend)
 
         with mock.patch.object(xdp, "_run_nft") as run_nft:
-            backend._apply_targets({443, 22}, {53}, dry_run=False)
+            backend._apply_targets({443, 22}, {53}, {3868}, dry_run=False)
 
         run_nft.assert_called_once()
         self.assertEqual(run_nft.call_args.args[0], ["-f", "-"])
@@ -364,6 +395,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertIn("flush set inet auto_xdp tcp_ports", script)
         self.assertIn("add element inet auto_xdp tcp_ports { 22, 443 }", script)
         self.assertIn("add element inet auto_xdp udp_ports { 53 }", script)
+        self.assertIn("add element inet auto_xdp sctp_ports { 3868 }", script)
 
     def test_open_backend_validates_requested_backend(self):
         with mock.patch.object(xdp.os.path, "exists", return_value=False):
@@ -436,7 +468,34 @@ class XdpPortSyncTests(unittest.TestCase):
         ]), mock.patch.object(xdp, "watch") as watch:
             xdp.main()
 
-        watch.assert_called_once_with(5, True, "auto")
+        watch.assert_called_once_with(5, True, "auto", xdp.TOML_CONFIG_PATH, {})
+
+    def test_main_watch_mode_passes_custom_config_to_watch(self):
+        with mock.patch.object(sys, "argv", [
+            "xdp_port_sync.py",
+            "--watch",
+            "--config",
+            "/tmp/test.toml",
+        ]), mock.patch.object(xdp, "watch") as watch:
+            xdp.main()
+
+        watch.assert_called_once_with(
+            mock.ANY, mock.ANY, mock.ANY, "/tmp/test.toml", {}
+        )
+
+    def test_main_watch_mode_passes_cli_trusted_ips_to_watch(self):
+        with mock.patch.object(sys, "argv", [
+            "xdp_port_sync.py",
+            "--watch",
+            "--trusted-ip", "1.2.3.4", "myhost",
+            "--trusted-ip", "10.0.0.0/8", "internal",
+        ]), mock.patch.object(xdp, "watch") as watch:
+            xdp.main()
+
+        watch.assert_called_once_with(
+            mock.ANY, mock.ANY, mock.ANY, mock.ANY,
+            {"1.2.3.4/32": "myhost", "10.0.0.0/8": "internal"},
+        )
 
 
 if __name__ == "__main__":

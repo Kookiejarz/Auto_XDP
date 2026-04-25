@@ -99,6 +99,67 @@ EOF_CFG
     assert_file_contains "$CONFIG_FILE" 'LOG_LEVEL="debug"'
 )
 
+test_config_updates_preserve_unrelated_sections() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    TOML_CONFIG="$tmpdir/config.toml"
+    reload_daemon() { :; }
+
+    cat >"$TOML_CONFIG" <<'EOF_CFG'
+[firewall]
+bogon_filter = false
+
+[permanent_ports]
+tcp = [22]
+udp = []
+sctp = [3868]
+
+[trusted_ips]
+"203.0.113.1/32" = "office"
+
+[slots]
+default_action = "drop"
+enabled = ["sctp", { proto = 47, path = "/tmp/gre_handler.o" }]
+EOF_CFG
+
+    run_trust add "198.51.100.8/32" office >/dev/null || return 1
+
+    assert_file_contains "$TOML_CONFIG" "[firewall]" || return 1
+    assert_file_contains "$TOML_CONFIG" "bogon_filter = false" || return 1
+    assert_file_contains "$TOML_CONFIG" "[slots]" || return 1
+    assert_file_contains "$TOML_CONFIG" 'default_action = "drop"' || return 1
+    assert_file_contains "$TOML_CONFIG" 'enabled = ["sctp", { proto = 47, path = "/tmp/gre_handler.o" }]' || return 1
+    assert_file_contains "$TOML_CONFIG" "sctp = [3868]" || return 1
+    assert_file_contains "$TOML_CONFIG" '"198.51.100.8/32" = "office"'
+)
+
+test_run_permanent_supports_sctp_ports() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    TOML_CONFIG="$tmpdir/config.toml"
+    reload_daemon() { :; }
+
+    cat >"$TOML_CONFIG" <<'EOF_CFG'
+[permanent_ports]
+tcp = []
+udp = []
+sctp = []
+EOF_CFG
+
+    run_permanent add sctp 3868 >/dev/null || return 1
+
+    local output
+    output=$(run_permanent list) || return 1
+    assert_contains "$output" "SCTP 3868" || return 1
+    assert_file_contains "$TOML_CONFIG" "sctp = [3868]"
+)
+
 test_detect_backend_prefers_xdp_runtime_state() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -167,15 +228,49 @@ test_cli_help_runs_without_runtime_state() (
     assert_contains "$output" "Usage: axdp"
 )
 
+test_slot_load_sctp_reuses_shared_maps() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    INSTALL_DIR="$tmpdir/install"
+    mkdir -p "$BPF_PIN_DIR/handlers" "$INSTALL_DIR/handlers" "$tmpdir/bin"
+    touch \
+        "$BPF_PIN_DIR/slot_ctx_map" \
+        "$BPF_PIN_DIR/sctp_whitelist" \
+        "$BPF_PIN_DIR/sctp_conntrack" \
+        "$BPF_PIN_DIR/proto_handlers" \
+        "$INSTALL_DIR/handlers/sctp_handler.o"
+
+    cat >"$tmpdir/bin/bpftool" <<EOF_BPFSH
+#!/bin/sh
+printf '%s\n' "\$*" >> "$tmpdir/bpftool.log"
+exit 0
+EOF_BPFSH
+    chmod +x "$tmpdir/bin/bpftool"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+    run_slot load sctp >/dev/null || return 1
+
+    assert_file_contains "$tmpdir/bpftool.log" "map name slot_ctx_map pinned $BPF_PIN_DIR/slot_ctx_map" || return 1
+    assert_file_contains "$tmpdir/bpftool.log" "map name sctp_whitelist pinned $BPF_PIN_DIR/sctp_whitelist" || return 1
+    assert_file_contains "$tmpdir/bpftool.log" "map name sctp_conntrack pinned $BPF_PIN_DIR/sctp_conntrack"
+)
+
 run_test "axdp formats human-readable counters and rates" test_format_helpers_render_human_output
 run_test "axdp parses stats flags" test_parse_stats_args_sets_expected_flags
 run_test "axdp parses ports flags" test_parse_ports_args_sets_expected_flags
 run_test "axdp sorts and diffs csv port lists" test_csv_helpers_sort_and_diff_ports
 run_test "axdp validates log levels and rewrites config" test_valid_log_level_and_config_updates
 run_test "axdp reads and updates runtime log level" test_run_log_level_reads_and_updates_config
+run_test "axdp preserves unrelated TOML sections on config update" test_config_updates_preserve_unrelated_sections
+run_test "axdp permanent supports SCTP ports" test_run_permanent_supports_sctp_ports
 run_test "axdp detects active xdp backend from runtime state" test_detect_backend_prefers_xdp_runtime_state
 run_test "axdp detects nftables fallback backend" test_detect_backend_falls_back_to_nftables
 run_test "axdp reports when no backend is active" test_detect_backend_reports_missing_state
 run_test "axdp help works without installation" test_cli_help_runs_without_runtime_state
+run_test "axdp slot load sctp reuses shared SCTP maps" test_slot_load_sctp_reuses_shared_maps
 
 finish_tests

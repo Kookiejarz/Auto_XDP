@@ -22,8 +22,9 @@
 
 // Conntrack timeouts and refresh intervals (must match XDP)
 #define TCP_TIMEOUT_NS       (300ULL * 1000000000ULL)
-#define UDP_TIMEOUT_NS       (60ULL * 1000000000ULL)
-#define CT_REFRESH_INTERVAL  (30ULL * 1000000000ULL)
+#define UDP_TIMEOUT_NS       (60ULL  * 1000000000ULL)
+#define SCTP_TIMEOUT_NS      (300ULL * 1000000000ULL)
+#define CT_REFRESH_INTERVAL  (30ULL  * 1000000000ULL)
 
 struct ct_key {
     __u8 family;
@@ -47,6 +48,18 @@ struct {
     __type(key, struct ct_key);
     __type(value, __u64);
 } udp_conntrack SEC(".maps");
+
+struct sctp_hdr {
+    __be16 sport;
+    __be16 dport;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct ct_key);
+    __type(value, __u64);
+} sctp_conntrack SEC(".maps");
 
 static __always_inline void fill_ct_key_v4(
     struct ct_key *key, __be32 saddr, __be32 daddr,
@@ -125,6 +138,7 @@ int tc_egress_track(struct __sk_buff *skb)
     struct ipv6hdr *ipv6;
     struct tcphdr *tcp;
     struct udphdr *udp;
+    struct sctp_hdr *sctp;
     struct ct_key key;
     __u32 ip_hlen;
     __u64 now;
@@ -189,6 +203,23 @@ int tc_egress_track(struct __sk_buff *skb)
                 }
             }
             return TC_ACT_OK;
+        case IPPROTO_SCTP:
+            sctp = (void *)ip + ip_hlen;
+            if ((void *)(sctp + 1) > data_end)
+                return TC_ACT_OK;
+            fill_ct_key_v4(&key, ip->daddr, ip->saddr, sctp->dport, sctp->sport);
+            now = bpf_ktime_get_ns();
+            {
+                __u64 *last_seen_sctp = bpf_map_lookup_elem(&sctp_conntrack, &key);
+                if (!last_seen_sctp) {
+                    bpf_map_update_elem(&sctp_conntrack, &key, &now, BPF_ANY);
+                } else if (now - *last_seen_sctp > SCTP_TIMEOUT_NS) {
+                    bpf_map_delete_elem(&sctp_conntrack, &key);
+                } else if (now - *last_seen_sctp > CT_REFRESH_INTERVAL) {
+                    bpf_map_update_elem(&sctp_conntrack, &key, &now, BPF_EXIST);
+                }
+            }
+            return TC_ACT_OK;
         default:
             return TC_ACT_OK;
         }
@@ -243,6 +274,22 @@ int tc_egress_track(struct __sk_buff *skb)
                 bpf_map_delete_elem(&udp_conntrack, &key);
             } else if (now - *last_seen_v6_udp > CT_REFRESH_INTERVAL) {
                 bpf_map_update_elem(&udp_conntrack, &key, &now, BPF_EXIST);
+            }
+        }
+        return TC_ACT_OK;
+    case IPPROTO_SCTP:
+        sctp = trans_data;
+        if ((void *)(sctp + 1) > data_end)
+            return TC_ACT_OK;
+        fill_ct_key_v6(&key, &ipv6->daddr, &ipv6->saddr, sctp->dport, sctp->sport);
+        {
+            __u64 *last_seen_sctp6 = bpf_map_lookup_elem(&sctp_conntrack, &key);
+            if (!last_seen_sctp6) {
+                bpf_map_update_elem(&sctp_conntrack, &key, &now, BPF_ANY);
+            } else if (now - *last_seen_sctp6 > SCTP_TIMEOUT_NS) {
+                bpf_map_delete_elem(&sctp_conntrack, &key);
+            } else if (now - *last_seen_sctp6 > CT_REFRESH_INTERVAL) {
+                bpf_map_update_elem(&sctp_conntrack, &key, &now, BPF_EXIST);
             }
         }
         return TC_ACT_OK;

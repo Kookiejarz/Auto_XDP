@@ -23,12 +23,22 @@ int xdp_gre_handler(struct xdp_md *ctx)
     if (!sc)
         return XDP_PASS;
 
+    /* Save inner_offset before the head adjustment may invalidate the
+     * metadata region.  Advance ctx->data to the GRE header so all
+     * subsequent accesses use a fixed offset — this kernel's BPF verifier
+     * rejects variable-offset packet pointer arithmetic (pkt += u16_var). */
+    __u16 inner_off = sc->inner_offset;
+    if (bpf_xdp_adjust_head(ctx, (int)inner_off))
+        return XDP_PASS;
+
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    void *gre_ptr  = data + sc->inner_offset;
-    if (gre_ptr + sizeof(struct gre_hdr) > data_end)
+    struct gre_hdr *gre = data;
+
+    if ((void *)(gre + 1) > data_end) {
+        bpf_xdp_adjust_head(ctx, -(int)inner_off);
         return XDP_PASS;
-    struct gre_hdr *gre = gre_ptr;
+    }
 
     __u16 flags_host = bpf_ntohs(gre->flags);
 
@@ -38,10 +48,11 @@ int xdp_gre_handler(struct xdp_md *ctx)
 
     /* If checksum-present flag is set, need 4 extra bytes */
     if (flags_host & GRE_FLAG_CSUM) {
-        if (gre_ptr + sizeof(struct gre_hdr) + 4 > data_end)
+        if ((void *)((char *)gre + sizeof(struct gre_hdr) + 4) > data_end)
             return XDP_DROP;
     }
 
+    bpf_xdp_adjust_head(ctx, -(int)inner_off);
     return XDP_PASS;
 }
 
