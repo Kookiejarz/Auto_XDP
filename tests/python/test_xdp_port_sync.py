@@ -7,8 +7,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import support
-
 from auto_xdp.discovery import _discovery_exclude_networks, _bind_ip_is_exposed
 from auto_xdp.bpf.maps import render_nft_ports as _render_nft_ports
 from auto_xdp import config as cfg
@@ -18,8 +16,6 @@ import auto_xdp.proc_events as proc_events_mod
 import auto_xdp.syncer as syncer_mod
 import auto_xdp.discovery as discovery_mod
 import auto_xdp.cli as cli_mod
-
-xdp = support.load_module("xdp_port_sync_test", "xdp_port_sync.py")
 
 
 def make_addr(ip: str, port: int):
