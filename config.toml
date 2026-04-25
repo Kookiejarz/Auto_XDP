@@ -3,10 +3,16 @@
 # The daemon reloads this file on SIGHUP (no restart needed).
 # To apply changes immediately: axdp restart
 
+[firewall]
+# Set to false on private/internal networks where RFC1918 source addresses are legitimate.
+bogon_filter = false
+
 [permanent_ports]
 # Ports always kept open regardless of which services are running.
+# SCTP is config-managed only; it is not auto-discovered from listening sockets.
 tcp = []
 udp = []
+sctp = []
 
 [trusted_ips]
 # Source IPs/CIDRs that bypass all firewall checks (rate limits, whitelist).
@@ -75,3 +81,16 @@ openvpn = 200
 # proto = "tcp"
 # cidr  = "10.0.0.0/8"
 # ports = [5432, 6379]
+
+
+# Protocol slot handlers (bpf_tail_call dispatch for non-TCP/UDP/ICMP traffic).
+
+[slots]
+# Action for protocols with no handler loaded.
+# "pass" preserves existing behaviour; "drop" enforces an explicit allow-list.
+default_action = "drop"
+
+# Built-in handlers to load at startup: "gre" (proto 47), "esp" (proto 50),
+# "sctp" (proto 132).  Custom handlers: { proto = N, path = "/path/to.o" }
+# enabled = ["sctp", "gre", "esp"]
+enabled = []

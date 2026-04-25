@@ -9,6 +9,7 @@
 #include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+#include "handlers/xdp_slot_ctx.h"
 
 #ifndef bool
 typedef _Bool bool;
@@ -89,7 +90,13 @@ enum xdp_counter_idx {
     CNT_TCP_MALFORM_DOFF     = 19, // TCP invalid data offset (doff < 5 or > 15 or truncated)
     CNT_TCP_MALFORM_PORT0    = 20, // TCP src or dst port is 0
     CNT_VLAN_DROP            = 21, // packet dropped: VLAN nesting exceeds VLAN_MAX_DEPTH
-    CNT_MAX                  = 22,
+    CNT_SLOT_CALL            = 22, // packets dispatched to a slot handler via tail call
+    CNT_SLOT_PASS            = 23, // slot miss: no handler, default_action=pass
+    CNT_SLOT_DROP            = 24, // slot miss: no handler, default_action=drop
+    CNT_UDP_MALFORM_PORT0    = 25, // UDP src or dst port is 0
+    CNT_UDP_MALFORM_LEN      = 26, // UDP length field < 8 or exceeds packet boundary
+    CNT_BOGON_DROP           = 27, // packet dropped: spoofed/reserved source address
+    CNT_MAX                  = 28,
 };
 
 struct {
@@ -169,6 +176,23 @@ struct {
     __type(value, __u32); // 1 = allow
 } udp_whitelist SEC(".maps");
 
+// Shared SCTP whitelist / conntrack maps.
+// The main program pins them so the optional slot handler and tc egress tracker
+// can reuse the same fds instead of creating private copies.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, __u32);
+} sctp_whitelist SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct ct_key);
+    __type(value, __u64);
+} sctp_conntrack SEC(".maps");
+
 // Global ICMP token-bucket state (single entry, protected by spin lock)
 struct icmp_token_bucket {
     struct bpf_spin_lock lock;
@@ -200,6 +224,22 @@ struct {
     __type(key, __u32);
     __type(value, struct udp_global_tb);
 } udp_global_rl SEC(".maps");
+
+// Bogon filter toggle: 0 = disabled, non-zero = enabled (default on).
+// Written at runtime by xdp_port_sync from config.toml [firewall].bogon_filter.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} bogon_cfg SEC(".maps");
+
+static __always_inline bool bogon_filter_active(void)
+{
+    __u32 key = 0;
+    __u32 *v = bpf_map_lookup_elem(&bogon_cfg, &key);
+    return !v || *v != 0;  // default on if map uninitialized
+}
 
 // Per-port SYN rate limit config, populated at runtime by xdp_port_sync.
 // Key: dest port (host byte order). Value: rate_max SYNs/window (0 = disabled).
@@ -291,6 +331,37 @@ struct {
     __type(value, struct acl_val);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } udp_acl_v6 SEC(".maps");
+
+static __always_inline bool is_bogon_v4(__be32 addr)
+{
+    __u32 a = bpf_ntohl(addr);
+    __u8  o1 = a >> 24;
+    if (o1 == 0)                                    return true; // 0.0.0.0/8
+    if (o1 == 10)                                   return true; // 10.0.0.0/8
+    if (o1 == 127)                                  return true; // 127.0.0.0/8
+    if ((a & 0xFFC00000) == 0x64400000)             return true; // 100.64.0.0/10  CGNAT
+    if ((a & 0xFFFF0000) == 0xA9FE0000)             return true; // 169.254.0.0/16 link-local
+    if ((a & 0xFFF00000) == 0xAC100000)             return true; // 172.16.0.0/12
+    if ((a & 0xFFFF0000) == 0xC0A80000)             return true; // 192.168.0.0/16
+    if ((a & 0xF0000000) == 0xE0000000)             return true; // 224.0.0.0/4    multicast
+    if ((a & 0xF0000000) == 0xF0000000)             return true; // 240.0.0.0/4    reserved
+    return false;
+}
+
+static __always_inline bool is_bogon_v6(const struct in6_addr *addr)
+{
+    __u32 w0 = bpf_ntohl(addr->in6_u.u6_addr32[0]);
+    __u32 w1 = bpf_ntohl(addr->in6_u.u6_addr32[1]);
+    __u32 w2 = bpf_ntohl(addr->in6_u.u6_addr32[2]);
+    __u32 w3 = bpf_ntohl(addr->in6_u.u6_addr32[3]);
+    if (w0 == 0 && w1 == 0 && w2 == 0 && w3 == 0)  return true; // ::/128       unspecified
+    if (w0 == 0 && w1 == 0 && w2 == 0 && w3 == 1)  return true; // ::1/128      loopback
+    if ((w0 & 0xFE000000) == 0xFC000000)            return true; // fc00::/7     unique-local
+    if ((w0 & 0xFFC00000) == 0xFE800000)            return true; // fe80::/10    link-local
+    if ((w0 & 0xFF000000) == 0xFF000000)            return true; // ff00::/8     multicast
+    if (w0 == 0 && w1 == 0 && w2 == 0x0000FFFF)    return true; // ::ffff:0:0/96 IPv4-mapped
+    return false;
+}
 
 static __always_inline bool is_trusted_v4(__be32 saddr)
 {
@@ -501,10 +572,14 @@ static __always_inline int check_tcp_conntrack(
     __u64 now = bpf_ktime_get_ns();
     __u64 *last_seen;
 
-    // 1. RST: evict conntrack entry, then pass to the kernel.
-    // Dropping RST would prevent the kernel from delivering ECONNRESET to
-    // the application, leaving the socket open until a read/write timeout.
+    // 1. RST: bare RST (no ACK) is a common reset-injection vector — drop it.
+    // RST+ACK is the normal half-close acknowledgement and must be passed so
+    // the kernel can deliver ECONNRESET to the application.
     if (tcp_flags & 0x04) {
+        if (!(tcp_flags & 0x10)) {
+            count(CNT_TCP_DROP);
+            return XDP_DROP;
+        }
         bpf_map_delete_elem(&tcp_conntrack, key);
         count(CNT_TCP_ESTABLISHED);
         return XDP_PASS;
@@ -654,6 +729,30 @@ static __always_inline int tcp_malformed_drop(struct tcphdr *tcp, void *data_end
     return XDP_PASS;
 }
 
+static __always_inline int udp_malformed_drop(struct udphdr *udp, void *data_end)
+{
+    // Port 0 is reserved and never valid for UDP endpoints.
+    if (udp->source == 0 || udp->dest == 0) {
+        count(CNT_UDP_MALFORM_PORT0);
+        count(CNT_UDP_DROP);
+        return XDP_DROP;
+    }
+
+    // This kernel's BPF verifier loses range tracking after both be16 (from
+    // bpf_ntohs) and ALU32 OR BPF_X (register OR), making any subsequent
+    // packet-pointer add on ulen fail verification. The callers already
+    // verified (udp + 1) <= data_end so memory safety is guaranteed; the
+    // upper-bound check is a semantic validation the firewall never needs
+    // because it never accesses bytes past the UDP header.
+    if (bpf_ntohs(udp->len) < 8) {
+        count(CNT_UDP_MALFORM_LEN);
+        count(CNT_UDP_DROP);
+        return XDP_DROP;
+    }
+
+    return XDP_PASS;
+}
+
 static __always_inline int check_tcp_ipv4(
     struct iphdr *ip, void *trans_data, void *data_end)
 {
@@ -661,7 +760,7 @@ static __always_inline int check_tcp_ipv4(
     struct ct_key key;
 
     if ((void *)(tcp + 1) > data_end)
-        return XDP_PASS;
+        return XDP_DROP;
 
     if (tcp_malformed_drop(tcp, data_end) == XDP_DROP)
         return XDP_DROP;
@@ -700,7 +799,7 @@ static __always_inline int check_tcp_ipv6(
     struct ct_key key;
 
     if ((void *)(tcp + 1) > data_end)
-        return XDP_PASS;
+        return XDP_DROP;
 
     if (tcp_malformed_drop(tcp, data_end) == XDP_DROP)
         return XDP_DROP;
@@ -741,7 +840,10 @@ static __always_inline int check_udp_ipv4(
     __u64 *last_seen;
 
     if ((void *)(udp + 1) > data_end)
-        return XDP_PASS;
+        return XDP_DROP;
+
+    if (udp_malformed_drop(udp, data_end) == XDP_DROP)
+        return XDP_DROP;
 
     __u32 dest_port = (__u32)bpf_ntohs(udp->dest);
 
@@ -806,7 +908,10 @@ static __always_inline int check_udp_ipv6(
     __u64 *last_seen;
 
     if ((void *)(udp + 1) > data_end)
-        return XDP_PASS;
+        return XDP_DROP;
+
+    if (udp_malformed_drop(udp, data_end) == XDP_DROP)
+        return XDP_DROP;
 
     __u32 dest_port = (__u32)bpf_ntohs(udp->dest);
 
@@ -949,6 +1054,73 @@ static __always_inline __u8 skip_ipv6_exthdr(
     return nexthdr;
 }
 
+// 256-entry prog_array: index = final IP protocol number (post ext-hdr traversal).
+// Userspace loads handler .o files and updates this map to enable per-protocol
+// inspection without modifying the main program.
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, __u32);
+} proto_handlers SEC(".maps");
+
+// Default action when bpf_tail_call() returns (no handler in slot).
+// 0 = XDP_PASS (default, backward-compatible), 1 = XDP_DROP (strict mode).
+// Configurable at runtime via bpftool or axdp; mirrors config.toml [slots].default_action.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} slot_def_action SEC(".maps");
+
+// Write parsed context into XDP metadata (native mode) or slot_ctx_map
+// (generic/skb fallback), then tail-call the registered handler.
+// If no handler is loaded for ip_proto, bpf_tail_call() returns and we
+// apply slot_def_action.  Called only from the main program's default
+// branches, after all extension headers have been traversed.
+static __always_inline int dispatch_to_slot(
+    struct xdp_md *ctx, __u8 family, __u8 ip_proto,
+    __u16 l3_offset, __u16 inner_offset,
+    __u32 *saddr, __u32 *daddr)
+{
+    __u32 zero = 0;
+    struct xdp_slot_ctx *sc;
+
+    if (bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct xdp_slot_ctx)) == 0) {
+        void *meta = (void *)(long)ctx->data_meta;
+        void *data = (void *)(long)ctx->data;
+        sc = (meta + sizeof(struct xdp_slot_ctx) <= data)
+             ? (struct xdp_slot_ctx *)meta : NULL;
+    } else {
+        sc = bpf_map_lookup_elem(&slot_ctx_map, &zero);
+    }
+
+    if (sc) {
+        sc->family       = family;
+        sc->ip_proto     = ip_proto;
+        sc->l3_offset    = l3_offset;
+        sc->inner_offset = inner_offset;
+        sc->_pad         = 0;
+        sc->saddr[0] = saddr[0]; sc->saddr[1] = saddr[1];
+        sc->saddr[2] = saddr[2]; sc->saddr[3] = saddr[3];
+        sc->daddr[0] = daddr[0]; sc->daddr[1] = daddr[1];
+        sc->daddr[2] = daddr[2]; sc->daddr[3] = daddr[3];
+    }
+
+    count(CNT_SLOT_CALL);
+    bpf_tail_call(ctx, &proto_handlers, (__u32)ip_proto);
+
+    // bpf_tail_call returned: slot is empty or call failed.
+    __u32 *action = bpf_map_lookup_elem(&slot_def_action, &zero);
+    if (action && *action == 1) {
+        count(CNT_SLOT_DROP);
+        return XDP_DROP;
+    }
+    count(CNT_SLOT_PASS);
+    return XDP_PASS;
+}
+
 // Strip up to VLAN_MAX_DEPTH 802.1Q/802.1AD tags from the Ethernet frame.
 // Returns false if the packet is truncated mid-tag (caller should XDP_PASS).
 // After a successful return, if *eth_proto is still 0x8100/0x88a8 the nesting
@@ -1021,23 +1193,49 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
         if (trans_data >= data_end)
             return XDP_PASS;
 
+        if (bogon_filter_active() && is_bogon_v4(ip->saddr)) {
+            count(CNT_BOGON_DROP);
+            return XDP_DROP;
+        }
+
         switch (ip->protocol) {
         case IPPROTO_TCP:
             return check_tcp_ipv4(ip, trans_data, data_end);
         case IPPROTO_UDP:
             return check_udp_ipv4(ip, trans_data, data_end);
         case IPPROTO_ICMP: {
-            if (!is_trusted_v4(ip->saddr) && icmp_rate_limit() == XDP_DROP) {
+            struct icmphdr *icmp = trans_data;
+            if ((void *)(icmp + 1) > data_end) {
+                count(CNT_IPV4_OTHER);
+                return XDP_PASS;
+            }
+            __u8 icmp_type = icmp->type;
+            // Control-plane messages required for PMTU discovery, traceroute,
+            // and error feedback — never rate-limit these.
+            if (icmp_type == ICMP_DEST_UNREACH  ||
+                icmp_type == ICMP_TIME_EXCEEDED  ||
+                icmp_type == ICMP_PARAMETERPROB) {
+                count(CNT_IPV4_OTHER);
+                return XDP_PASS;
+            }
+            // Echo request from untrusted source: token-bucket rate limit.
+            if (icmp_type == ICMP_ECHO &&
+                !is_trusted_v4(ip->saddr) &&
+                icmp_rate_limit() == XDP_DROP) {
                 count(CNT_ICMP_DROP);
                 return XDP_DROP;
             }
             count(CNT_IPV4_OTHER);
             return XDP_PASS;
         }
-        default:
-            // Pass other IPv4 protocols (IGMP, GRE, etc.)
-            count(CNT_IPV4_OTHER);
-            return XDP_PASS;
+        default: {
+            __u16 l3_off    = (__u16)((void *)ip - data);
+            __u16 inner_off = (__u16)(trans_data - data);
+            __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
+            __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
+            return dispatch_to_slot(ctx, CT_FAMILY_IPV4, ip->protocol,
+                                    l3_off, inner_off, s, d);
+        }
         }
     }
 
@@ -1060,6 +1258,11 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
 
         if (trans_data >= data_end)
             return XDP_PASS;
+
+        if (bogon_filter_active() && is_bogon_v6(&ipv6->saddr)) {
+            count(CNT_BOGON_DROP);
+            return XDP_DROP;
+        }
 
         switch (nexthdr) {
         case IPPROTO_TCP:
@@ -1084,10 +1287,17 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
             count(CNT_IPV6_OTHER);
             return XDP_PASS;
         }
-        default:
-            // Other IPv6 protocols pass freely
-            count(CNT_IPV6_OTHER);
-            return XDP_PASS;
+        default: {
+            // nexthdr is the final protocol after skip_ipv6_exthdr() —
+            // never an extension header type (Routing/Fragment/Dest-Opts).
+            __u16 l3_off    = (__u16)((void *)ipv6 - data);
+            __u16 inner_off = (__u16)(trans_data - data);
+            __u32 s[4], d[4];
+            __builtin_memcpy(s, &ipv6->saddr, 16);
+            __builtin_memcpy(d, &ipv6->daddr, 16);
+            return dispatch_to_slot(ctx, CT_FAMILY_IPV6, nexthdr,
+                                    l3_off, inner_off, s, d);
+        }
         }
     }
 

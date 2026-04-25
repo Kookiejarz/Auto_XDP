@@ -83,6 +83,7 @@ SYNC_INTERVAL=30
 INSTALL_DIR="/usr/local/lib/auto_xdp"
 CONFIG_DIR="/etc/auto_xdp"
 CONFIG_FILE="${CONFIG_DIR}/auto_xdp.env"
+TOML_CONFIG="${CONFIG_DIR}/config.toml"
 SYNC_SCRIPT="/usr/local/bin/xdp_port_sync.py"
 AXDP_CMD="/usr/local/bin/axdp"
 RUNNER_SCRIPT="/usr/local/bin/auto_xdp_start.sh"
@@ -329,7 +330,8 @@ pkg_install_optional() {
 package_list_for_manager() {
     case "$PKG_MANAGER" in
         apt-get)
-            echo "clang llvm libbpf-dev build-essential iproute2 curl python3 python3-pip bpftool nftables gcc-multilib"
+            # bpftool removed as a standalone package on Ubuntu 24.04+ (Noble); installed separately
+            echo "clang llvm libbpf-dev build-essential iproute2 curl python3 python3-pip nftables gcc-multilib"
             ;;
         dnf|yum)
             echo "clang llvm libbpf-devel bpftool iproute curl python3 python3-pip gcc make nftables"
@@ -369,6 +371,16 @@ optional_package_list_for_manager() {
     esac
 }
 
+install_bpftool_apt() {
+    command -v bpftool &>/dev/null && return 0
+    # Ubuntu <24.04 has a standalone bpftool package; 24.04+ (Noble) ships it
+    # inside linux-tools-$(uname -r) + linux-tools-common.
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool 2>/dev/null; then
+        return 0
+    fi
+    pkg_install_optional "linux-tools-$(uname -r)" linux-tools-common
+}
+
 install_packages() {
     local package_list=()
     local optional_list=()
@@ -382,6 +394,8 @@ install_packages() {
         [[ -n "$optional_package" ]] || continue
         pkg_install_optional "$optional_package"
     done
+
+    [[ "$PKG_MANAGER" == "apt-get" ]] && install_bpftool_apt
 }
 
 ensure_psutil() {
@@ -592,11 +606,16 @@ xdp_maps_ready() {
         "${BPF_PIN_DIR}/prog"
         "${BPF_PIN_DIR}/tcp_whitelist"
         "${BPF_PIN_DIR}/udp_whitelist"
+        "${BPF_PIN_DIR}/sctp_whitelist"
         "${BPF_PIN_DIR}/tcp_conntrack"
         "${BPF_PIN_DIR}/udp_conntrack"
+        "${BPF_PIN_DIR}/sctp_conntrack"
         "${BPF_PIN_DIR}/trusted_ipv4"
         "${BPF_PIN_DIR}/trusted_ipv6"
         "${BPF_PIN_DIR}/udp_global_rl"
+        "${BPF_PIN_DIR}/proto_handlers"
+        "${BPF_PIN_DIR}/slot_ctx_map"
+        "${BPF_PIN_DIR}/slot_def_action"
     )
     local path=""
     for path in "${required[@]}"; do
@@ -642,17 +661,6 @@ cleanup_existing_xdp() {
     mkdir -p "$BPF_PIN_DIR"
 }
 
-pin_program_maps() {
-    local prog_id="$1"
-    [[ -n "$BPF_HELPER_BOOTSTRAP" ]] || {
-        warn "BPF helper is not available for bootstrap pinning."
-        return 1
-    }
-    "$PYTHON3_BIN" "$BPF_HELPER_BOOTSTRAP" pin-maps \
-        --prog-id "$prog_id" \
-        --pin-dir "$BPF_PIN_DIR" || return 1
-}
-
 seed_existing_tcp_conntrack() {
     local map_path="${BPF_PIN_DIR}/tcp_conntrack"
     local seeded=""
@@ -693,34 +701,155 @@ load_tc_egress_program() {
     local tc_prog_path="${BPF_PIN_DIR}/tc_egress_prog"
 
     if ! command -v tc &>/dev/null; then
-        warn "tc not found; TCP/UDP reply tracking on egress will be skipped."
+        warn "tc not found; TCP/UDP/SCTP reply tracking on egress will be skipped."
         return 1
     fi
 
     rm -f "$tc_prog_path"
     if [[ ! -f "$TC_OBJ_INSTALLED" ]]; then
-        warn "tc egress object not found; TCP/UDP reply tracking on egress will be skipped."
+        warn "tc egress object not found; TCP/UDP/SCTP reply tracking on egress will be skipped."
         return 1
     fi
 
     if ! bpftool prog load "$TC_OBJ_INSTALLED" "$tc_prog_path" \
         type classifier \
         map name tcp_conntrack pinned "${BPF_PIN_DIR}/tcp_conntrack" \
-        map name udp_conntrack pinned "${BPF_PIN_DIR}/udp_conntrack" >/dev/null 2>&1; then
-        warn "Failed to load tc egress program; outbound TCP/UDP reply tracking will be limited."
+        map name udp_conntrack pinned "${BPF_PIN_DIR}/udp_conntrack" \
+        map name sctp_conntrack pinned "${BPF_PIN_DIR}/sctp_conntrack" >/dev/null 2>&1; then
+        warn "Failed to load tc egress program; outbound TCP/UDP/SCTP reply tracking will be limited."
         return 1
     fi
 
     tc qdisc add dev "$IFACE" clsact 2>/dev/null || true
     if ! tc filter replace dev "$IFACE" egress pref "$TC_FILTER_PREF" \
         bpf direct-action object-pinned "$tc_prog_path" >/dev/null 2>&1; then
-        warn "Failed to attach tc egress filter; outbound TCP/UDP reply tracking will be limited."
+        warn "Failed to attach tc egress filter; outbound TCP/UDP/SCTP reply tracking will be limited."
         rm -f "$tc_prog_path"
         return 1
     fi
 
-    info "Attached tc egress TCP/UDP tracker on $IFACE."
+    info "Attached tc egress TCP/UDP/SCTP tracker on $IFACE."
     return 0
+}
+
+load_slot_handlers() {
+    local handlers_dir="${INSTALL_DIR}/handlers"
+
+    [[ -e "${BPF_PIN_DIR}/proto_handlers" ]] || {
+        warn "proto_handlers map not pinned; skipping slot handler loading."
+        return 0
+    }
+
+    # Apply default_action from config.toml.
+    local default_action="pass"
+    if command -v python3 &>/dev/null && [[ -f "$TOML_CONFIG" ]]; then
+        default_action=$(python3 -c "
+import sys
+try:
+    import tomllib
+    with open('${TOML_CONFIG}', 'rb') as f:
+        cfg = tomllib.load(f)
+    print(cfg.get('slots', {}).get('default_action', 'pass'))
+except Exception:
+    print('pass')
+" 2>/dev/null) || default_action="pass"
+    fi
+    local action_val=0
+    [[ "$default_action" == "drop" ]] && action_val=1
+    bpftool map update pinned "${BPF_PIN_DIR}/slot_def_action" \
+        key 0 0 0 0 value "$action_val" 0 0 0 2>/dev/null \
+        && info "Slot default_action: ${default_action}" \
+        || warn "Failed to set slot default_action"
+
+    # Load handlers listed under [slots].enabled in config.toml.
+    local enabled_json="[]"
+    if command -v python3 &>/dev/null && [[ -f "$TOML_CONFIG" ]]; then
+        enabled_json=$(python3 -c "
+import sys, json
+try:
+    import tomllib
+    with open('${TOML_CONFIG}', 'rb') as f:
+        cfg = tomllib.load(f)
+    print(json.dumps(cfg.get('slots', {}).get('enabled', [])))
+except Exception:
+    print('[]')
+" 2>/dev/null) || enabled_json="[]"
+    fi
+
+    [[ "$enabled_json" == "[]" ]] && return 0
+    [[ -d "$handlers_dir" ]] || {
+        warn "Handlers dir $handlers_dir not found; skipping slot loading."
+        return 0
+    }
+
+    local slot_pin_dir="${BPF_PIN_DIR}/handlers"
+    mkdir -p "$slot_pin_dir"
+
+    python3 - "$enabled_json" "$handlers_dir" "$slot_pin_dir" \
+              "${BPF_PIN_DIR}" <<'PYEOF'
+import sys, json, subprocess, os
+
+enabled = json.loads(sys.argv[1])
+handlers_dir = sys.argv[2]
+slot_pin_dir = sys.argv[3]
+bpf_pin_dir  = sys.argv[4]
+
+BUILTIN = {"gre": (47, "gre_handler.o"),
+           "esp": (50, "esp_handler.o"),
+           "sctp": (132, "sctp_handler.o")}
+
+for entry in enabled:
+    if isinstance(entry, str):
+        if entry not in BUILTIN:
+            print(f"  [WARN] Unknown built-in handler: {entry}", file=sys.stderr)
+            continue
+        proto, obj_name = BUILTIN[entry]
+        obj_path = os.path.join(handlers_dir, obj_name)
+    elif isinstance(entry, dict):
+        proto    = int(entry["proto"])
+        obj_path = entry["path"]
+    else:
+        continue
+
+    if not os.path.exists(obj_path):
+        print(f"  [WARN] Handler not found: {obj_path}", file=sys.stderr)
+        continue
+
+    pin_path = os.path.join(slot_pin_dir, f"proto_{proto}")
+    ctx_map  = os.path.join(bpf_pin_dir, "slot_ctx_map")
+    load_cmd = [
+        "bpftool", "prog", "load", obj_path, pin_path,
+        "type", "xdp",
+        "map", "name", "slot_ctx_map", "pinned", ctx_map,
+    ]
+    if proto == 132:
+        sctp_whitelist = os.path.join(bpf_pin_dir, "sctp_whitelist")
+        sctp_conntrack = os.path.join(bpf_pin_dir, "sctp_conntrack")
+        if not (os.path.exists(sctp_whitelist) and os.path.exists(sctp_conntrack)):
+            print("  [WARN] Shared SCTP maps not pinned; skipping proto 132", file=sys.stderr)
+            continue
+        load_cmd.extend([
+            "map", "name", "sctp_whitelist", "pinned", sctp_whitelist,
+            "map", "name", "sctp_conntrack", "pinned", sctp_conntrack,
+        ])
+
+    r = subprocess.run(load_cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  [WARN] Failed to load proto {proto}: {r.stderr.strip()}", file=sys.stderr)
+        continue
+
+    k = f"{proto} 0 0 0"
+    r2 = subprocess.run(
+        ["bpftool", "map", "update", "pinned",
+         os.path.join(bpf_pin_dir, "proto_handlers"),
+         "key", *k.split(), "value", "pinned", pin_path],
+        capture_output=True, text=True)
+    if r2.returncode != 0:
+        print(f"  [WARN] Failed to register proto {proto}: {r2.stderr.strip()}", file=sys.stderr)
+        os.unlink(pin_path)
+    else:
+        print(f"  Loaded slot handler: proto {proto} ({obj_path})")
+PYEOF
 }
 
 compile_bpf_object() {
@@ -804,6 +933,19 @@ compile_xdp_program() {
     fi
     cp "$TC_OBJ" "$TC_OBJ_INSTALLED"
     ok "Compiled -> $TC_OBJ"
+
+    # Compile slot handler library if handlers/ directory exists.
+    if [[ -d "handlers" ]] && command -v make &>/dev/null; then
+        info "Compiling slot handlers..."
+        if make -C handlers --no-print-directory \
+                CLANG="clang" 2>/dev/null; then
+            mkdir -p "${INSTALL_DIR}/handlers"
+            cp handlers/*.o "${INSTALL_DIR}/handlers/" 2>/dev/null || true
+            ok "Slot handlers compiled and installed"
+        else
+            warn "Slot handler compilation failed; handlers will be unavailable"
+        fi
+    fi
     return 0
 }
 
@@ -817,24 +959,13 @@ deploy_xdp_backend() {
     cleanup_existing_xdp
 
     info "Loading XDP program onto $IFACE..."
-    if ! bpftool prog load "$XDP_OBJ_INSTALLED" "$BPF_PIN_DIR/prog" type xdp; then
+    if ! bpftool prog load "$XDP_OBJ_INSTALLED" "$BPF_PIN_DIR/prog" type xdp \
+            pinmaps "$BPF_PIN_DIR"; then
         warn "bpftool prog load failed; falling back from XDP."
         rm -rf "$BPF_PIN_DIR"
         return 1
     fi
 
-    PROG_ID=$(bpftool -j prog show pinned "$BPF_PIN_DIR/prog" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])") || {
-        warn "Unable to inspect loaded XDP program."
-        rm -rf "$BPF_PIN_DIR"
-        return 1
-    }
-    info "Loaded program ID: $PROG_ID"
-
-    if ! pin_program_maps "$PROG_ID"; then
-        warn "Map pinning failed; falling back from XDP."
-        rm -rf "$BPF_PIN_DIR"
-        return 1
-    fi
     if ! xdp_maps_ready; then
         warn "Pinned XDP maps are incomplete after pinning; falling back from XDP."
         rm -rf "$BPF_PIN_DIR"
@@ -843,6 +974,7 @@ deploy_xdp_backend() {
 
     seed_existing_tcp_conntrack
     load_tc_egress_program || true
+    load_slot_handlers || true
 
     if ip link set dev "$IFACE" xdp pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
         ACTIVE_BACKEND="xdp"
@@ -913,6 +1045,8 @@ XDP_OBJ_PATH="${XDP_OBJ_INSTALLED}"
 TC_OBJ_PATH="${TC_OBJ_INSTALLED}"
 PREFERRED_BACKEND="auto"
 BPF_HELPER_SCRIPT="${BPF_HELPER_INSTALLED}"
+TOML_CONFIG="${CONFIG_DIR}/config.toml"
+HANDLERS_DIR="${INSTALL_DIR}/handlers"
 export BPF_PIN_DIR
 EOF_CFG
 }
@@ -961,11 +1095,6 @@ ensure_bpffs() {
     fi
 }
 
-pin_program_maps() {
-    local prog_id="$1"
-    "$PYTHON3_BIN" "$BPF_HELPER_SCRIPT" pin-maps --prog-id "$prog_id" --pin-dir "$BPF_PIN_DIR" >/dev/null
-}
-
 cleanup_tc_egress_filter() {
     command -v tc &>/dev/null || return 0
     tc filter del dev "$IFACE" egress pref 49152 2>/dev/null || true
@@ -976,11 +1105,16 @@ xdp_maps_ready() {
         "${BPF_PIN_DIR}/prog"
         "${BPF_PIN_DIR}/tcp_whitelist"
         "${BPF_PIN_DIR}/udp_whitelist"
+        "${BPF_PIN_DIR}/sctp_whitelist"
         "${BPF_PIN_DIR}/tcp_conntrack"
         "${BPF_PIN_DIR}/udp_conntrack"
+        "${BPF_PIN_DIR}/sctp_conntrack"
         "${BPF_PIN_DIR}/trusted_ipv4"
         "${BPF_PIN_DIR}/trusted_ipv6"
         "${BPF_PIN_DIR}/udp_global_rl"
+        "${BPF_PIN_DIR}/proto_handlers"
+        "${BPF_PIN_DIR}/slot_ctx_map"
+        "${BPF_PIN_DIR}/slot_def_action"
     )
     local path=""
     for path in "${required[@]}"; do
@@ -1015,7 +1149,8 @@ load_tc_egress_program() {
     if ! bpftool prog load "$TC_OBJ_PATH" "$tc_prog_path" \
         type classifier \
         map name tcp_conntrack pinned "${BPF_PIN_DIR}/tcp_conntrack" \
-        map name udp_conntrack pinned "${BPF_PIN_DIR}/udp_conntrack" >/dev/null 2>&1; then
+        map name udp_conntrack pinned "${BPF_PIN_DIR}/udp_conntrack" \
+        map name sctp_conntrack pinned "${BPF_PIN_DIR}/sctp_conntrack" >/dev/null 2>&1; then
         return 1
     fi
 
@@ -1026,6 +1161,119 @@ load_tc_egress_program() {
         return 1
     fi
     return 0
+}
+
+load_slot_handlers() {
+    [[ -e "${BPF_PIN_DIR}/proto_handlers" ]] || return 0
+
+    local default_action="pass"
+    if [[ -f "$TOML_CONFIG" ]]; then
+        default_action=$("$PYTHON3_BIN" -c "
+import sys
+try:
+    import tomllib
+    with open('${TOML_CONFIG}', 'rb') as f:
+        cfg = tomllib.load(f)
+    print(cfg.get('slots', {}).get('default_action', 'pass'))
+except Exception:
+    print('pass')
+" 2>/dev/null) || default_action="pass"
+    fi
+    local action_val=0
+    [[ "$default_action" == "drop" ]] && action_val=1
+    bpftool map update pinned "${BPF_PIN_DIR}/slot_def_action" \
+        key 0 0 0 0 value "$action_val" 0 0 0 2>/dev/null \
+        && echo "[auto_xdp] slot default_action: ${default_action}" \
+        || echo "[auto_xdp] failed to set slot_def_action" >&2
+
+    local enabled_json="[]"
+    if [[ -f "$TOML_CONFIG" ]]; then
+        enabled_json=$("$PYTHON3_BIN" -c "
+import sys, json
+try:
+    import tomllib
+    with open('${TOML_CONFIG}', 'rb') as f:
+        cfg = tomllib.load(f)
+    print(json.dumps(cfg.get('slots', {}).get('enabled', [])))
+except Exception:
+    print('[]')
+" 2>/dev/null) || enabled_json="[]"
+    fi
+
+    [[ "$enabled_json" == "[]" ]] && return 0
+    [[ -d "$HANDLERS_DIR" ]] || {
+        echo "[auto_xdp] handlers dir $HANDLERS_DIR not found; skipping slot loading." >&2
+        return 0
+    }
+
+    local slot_pin_dir="${BPF_PIN_DIR}/handlers"
+    mkdir -p "$slot_pin_dir"
+
+    "$PYTHON3_BIN" - "$enabled_json" "$HANDLERS_DIR" "$slot_pin_dir" \
+              "${BPF_PIN_DIR}" <<'PYEOF'
+import sys, json, subprocess, os
+
+enabled = json.loads(sys.argv[1])
+handlers_dir = sys.argv[2]
+slot_pin_dir = sys.argv[3]
+bpf_pin_dir  = sys.argv[4]
+
+BUILTIN = {"gre": (47, "gre_handler.o"),
+           "esp": (50, "esp_handler.o"),
+           "sctp": (132, "sctp_handler.o")}
+
+for entry in enabled:
+    if isinstance(entry, str):
+        if entry not in BUILTIN:
+            print(f"  [WARN] Unknown built-in handler: {entry}", file=sys.stderr)
+            continue
+        proto, obj_name = BUILTIN[entry]
+        obj_path = os.path.join(handlers_dir, obj_name)
+    elif isinstance(entry, dict):
+        proto    = int(entry["proto"])
+        obj_path = entry["path"]
+    else:
+        continue
+
+    if not os.path.exists(obj_path):
+        print(f"  [WARN] Handler not found: {obj_path}", file=sys.stderr)
+        continue
+
+    pin_path = os.path.join(slot_pin_dir, f"proto_{proto}")
+    ctx_map  = os.path.join(bpf_pin_dir, "slot_ctx_map")
+    load_cmd = [
+        "bpftool", "prog", "load", obj_path, pin_path,
+        "type", "xdp",
+        "map", "name", "slot_ctx_map", "pinned", ctx_map,
+    ]
+    if proto == 132:
+        sctp_whitelist = os.path.join(bpf_pin_dir, "sctp_whitelist")
+        sctp_conntrack = os.path.join(bpf_pin_dir, "sctp_conntrack")
+        if not (os.path.exists(sctp_whitelist) and os.path.exists(sctp_conntrack)):
+            print("  [WARN] Shared SCTP maps not pinned; skipping proto 132", file=sys.stderr)
+            continue
+        load_cmd.extend([
+            "map", "name", "sctp_whitelist", "pinned", sctp_whitelist,
+            "map", "name", "sctp_conntrack", "pinned", sctp_conntrack,
+        ])
+
+    r = subprocess.run(load_cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  [WARN] Failed to load proto {proto}: {r.stderr.strip()}", file=sys.stderr)
+        continue
+
+    k = f"{proto} 0 0 0"
+    r2 = subprocess.run(
+        ["bpftool", "map", "update", "pinned",
+         os.path.join(bpf_pin_dir, "proto_handlers"),
+         "key", *k.split(), "value", "pinned", pin_path],
+        capture_output=True, text=True)
+    if r2.returncode != 0:
+        print(f"  [WARN] Failed to register proto {proto}: {r2.stderr.strip()}", file=sys.stderr)
+        os.unlink(pin_path)
+    else:
+        print(f"  Loaded slot handler: proto {proto} ({obj_path})")
+PYEOF
 }
 
 ensure_xdp_loaded() {
@@ -1051,16 +1299,8 @@ ensure_xdp_loaded() {
     rm -rf "$BPF_PIN_DIR"
     mkdir -p "$BPF_PIN_DIR"
 
-    bpftool prog load "$XDP_OBJ_PATH" "$BPF_PIN_DIR/prog" type xdp >/dev/null 2>&1 || return 1
-    local prog_id
-    prog_id=$(bpftool -j prog show pinned "$BPF_PIN_DIR/prog" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])") || {
-        cleanup_failed_load
-        return 1
-    }
-    pin_program_maps "$prog_id" || {
-        cleanup_failed_load
-        return 1
-    }
+    bpftool prog load "$XDP_OBJ_PATH" "$BPF_PIN_DIR/prog" type xdp \
+        pinmaps "$BPF_PIN_DIR" >/dev/null 2>&1 || return 1
     xdp_maps_ready || {
         echo "[auto_xdp] pinned XDP maps incomplete after pinning; fallback to nftables" >&2
         cleanup_failed_load
@@ -1068,6 +1308,7 @@ ensure_xdp_loaded() {
     }
     seed_existing_tcp_conntrack
     load_tc_egress_program || true
+    load_slot_handlers || true
 
     if ip link set dev "$IFACE" xdp pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
         echo "native" > "${RUN_STATE_DIR}/xdp_mode"

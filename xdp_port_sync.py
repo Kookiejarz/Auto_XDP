@@ -44,12 +44,14 @@ TOML_CONFIG_PATH = "/etc/auto_xdp/config.toml"
 
 TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
 UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
+SCTP_MAP_PATH = "/sys/fs/bpf/xdp_fw/sctp_whitelist"
 TCP_CONNTRACK_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_conntrack"
 TRUSTED_IPS_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/trusted_ipv4"
 TRUSTED_IPS_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/trusted_ipv6"
 SYN_RATE_MAP_PATH     = "/sys/fs/bpf/xdp_fw/syn_rate_ports"
 UDP_RATE_MAP_PATH     = "/sys/fs/bpf/xdp_fw/udp_rate_ports"
 UDP_GLOBAL_RL_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_global_rl"
+BOGON_CFG_MAP_PATH     = "/sys/fs/bpf/xdp_fw/bogon_cfg"
 TCP_ACL_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/tcp_acl_v4"
 TCP_ACL_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/tcp_acl_v6"
 UDP_ACL_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/udp_acl_v4"
@@ -62,18 +64,18 @@ REQUIRED_XDP_MAP_PATHS = (
     TRUSTED_IPS_MAP_PATH6,
 )
 
-# All rate-limit heuristics and access-control settings are loaded from
-# /etc/auto_xdp/config.toml at startup (and on SIGHUP).  These dicts are
-# populated by apply_toml_config(); do not add hardcoded values here.
 _SYN_RATE_BY_PROC:    dict[str, int] = {}
 _SYN_RATE_BY_SERVICE: dict[str, int] = {}
 _UDP_RATE_BY_PROC:    dict[str, int] = {}
 _UDP_RATE_BY_SERVICE: dict[str, int] = {}
 
+BOGON_FILTER_ENABLED: bool = True
+
 NFT_FAMILY = "inet"
 NFT_TABLE = "auto_xdp"
 NFT_TCP_SET = "tcp_ports"
 NFT_UDP_SET = "udp_ports"
+NFT_SCTP_SET = "sctp_ports"
 NFT_TRUSTED_SET4 = "trusted_v4"
 NFT_TRUSTED_SET6 = "trusted_v6"
 
@@ -83,11 +85,21 @@ BACKEND_NFTABLES = "nftables"
 
 TCP_PERMANENT:   dict[int, str] = {}
 UDP_PERMANENT:   dict[int, str] = {}
+SCTP_PERMANENT:  dict[int, str] = {}
 TRUSTED_SRC_IPS: dict[str, str] = {}
 ACL_RULES:       list[dict]     = []
 
 _ACL_MAX_PORTS = 64
 _ACL_VAL_SIZE  = 4 + _ACL_MAX_PORTS * 2  # u32 count + u16 ports[64] = 132 bytes
+
+
+def _normalize_cidr(cidr_str: str) -> str:
+    """Return the canonical network address form of a CIDR, e.g. 10.0.0.5/24 → 10.0.0.0/24."""
+    if ":" in cidr_str:
+        net = ipaddress.IPv6Network(cidr_str, strict=False)
+    else:
+        net = ipaddress.IPv4Network(cidr_str, strict=False)
+    return f"{net.network_address}/{net.prefixlen}"
 
 
 def load_toml_config(path: str = TOML_CONFIG_PATH) -> dict:
@@ -110,31 +122,31 @@ def apply_toml_config(cfg: dict) -> None:
     Called at startup and on SIGHUP.  Always does a full reset so that
     deletions in the config file take effect without a restart.
     """
-    global TCP_PERMANENT, UDP_PERMANENT, TRUSTED_SRC_IPS, ACL_RULES
+    global TCP_PERMANENT, UDP_PERMANENT, SCTP_PERMANENT, ACL_RULES
     global _SYN_RATE_BY_PROC, _SYN_RATE_BY_SERVICE, _UDP_RATE_BY_PROC, _UDP_RATE_BY_SERVICE
+    global BOGON_FILTER_ENABLED
 
-    TCP_PERMANENT   = {}
-    UDP_PERMANENT   = {}
-    TRUSTED_SRC_IPS = {}
-    ACL_RULES       = []
-    _SYN_RATE_BY_PROC    = {}
-    _SYN_RATE_BY_SERVICE = {}
-    _UDP_RATE_BY_PROC    = {}
-    _UDP_RATE_BY_SERVICE = {}
+    TCP_PERMANENT = {}
+    UDP_PERMANENT = {}
+    SCTP_PERMANENT = {}
+    TRUSTED_SRC_IPS.clear()
+    ACL_RULES = []
 
     perm = cfg.get("permanent_ports", {})
     for p in perm.get("tcp", []):
         TCP_PERMANENT[int(p)] = "config"
     for p in perm.get("udp", []):
         UDP_PERMANENT[int(p)] = "config"
+    for p in perm.get("sctp", []):
+        SCTP_PERMANENT[int(p)] = "config"
 
     for cidr, label in cfg.get("trusted_ips", {}).items():
-        TRUSTED_SRC_IPS[cidr] = str(label)
+        TRUSTED_SRC_IPS[_normalize_cidr(cidr)] = str(label)
 
     for rule in cfg.get("acl", []):
         ACL_RULES.append({
             "proto": rule["proto"],
-            "cidr":  rule["cidr"],
+            "cidr":  _normalize_cidr(rule["cidr"]),
             "ports": [int(p) for p in rule.get("ports", [])],
         })
 
@@ -143,6 +155,8 @@ def apply_toml_config(cfg: dict) -> None:
     _SYN_RATE_BY_SERVICE = {k: int(v) for k, v in rl.get("syn_by_service", {}).items()}
     _UDP_RATE_BY_PROC    = {k: int(v) for k, v in rl.get("udp_by_proc",    {}).items()}
     _UDP_RATE_BY_SERVICE = {k: int(v) for k, v in rl.get("udp_by_service", {}).items()}
+
+    BOGON_FILTER_ENABLED = bool(cfg.get("firewall", {}).get("bogon_filter", True))
 
 
 # Wait this long after an EXEC/EXIT event before scanning,
@@ -384,7 +398,7 @@ class BpfLpmMap:
             return self.delete(cidr_str, dry_run)
         if dry_run:
             log.info("[DRY] %s cidr %s -> 1", self.path, cidr_str)
-            self._cache.add(cidr_str)
+            self._cache.add(_normalize_cidr(cidr_str))
             return True
         try:
             normalized = self._update(cidr_str, 1)
@@ -397,7 +411,7 @@ class BpfLpmMap:
     def delete(self, cidr_str: str, dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s delete cidr %s", self.path, cidr_str)
-            self._cache.discard(cidr_str)
+            self._cache.discard(_normalize_cidr(cidr_str))
             return True
         try:
             normalized = self._delete_key(cidr_str)
@@ -405,7 +419,7 @@ class BpfLpmMap:
             return True
         except OSError as exc:
             if exc.errno == errno.ENOENT:
-                self._cache.discard(cidr_str)
+                self._cache.discard(_normalize_cidr(cidr_str))
                 return True
             log.warning("BPF delete failed cidr=%s: %s", cidr_str, exc)
             return False
@@ -838,6 +852,7 @@ class PortBackend:
         self,
         tcp_target: set[int],
         udp_target: set[int],
+        sctp_target: set[int],
         trusted_target: set[str],
         conntrack_target: set[bytes],
         dry_run: bool,
@@ -856,27 +871,38 @@ class XdpBackend(PortBackend):
         self.udp_map = BpfArrayMap(UDP_MAP_PATH)
         self.trusted_map = BpfTrustedMaps(TRUSTED_IPS_MAP_PATH4, TRUSTED_IPS_MAP_PATH6)
         self.conntrack_map = BpfConntrackMap(TCP_CONNTRACK_MAP_PATH)
+        self.syn_rate_map: BpfSynRatePortsMap | None = None
+        self.udp_rate_map: BpfSynRatePortsMap | None = None
+        self.acl_maps: BpfAclMaps | None = None
+        self.bogon_cfg_map: BpfArrayMap | None = None
+        self.sctp_map: BpfArrayMap | None = None
         try:
-            self.syn_rate_map: BpfSynRatePortsMap | None = BpfSynRatePortsMap(SYN_RATE_MAP_PATH)
+            self.syn_rate_map = BpfSynRatePortsMap(SYN_RATE_MAP_PATH)
             log.debug("syn_rate_ports map opened; per-service SYN rate limiting active.")
         except OSError as exc:
             log.debug("syn_rate_ports map unavailable (%s); SYN rate limiting inactive.", exc)
-            self.syn_rate_map = None
         try:
-            self.udp_rate_map: BpfSynRatePortsMap | None = BpfSynRatePortsMap(UDP_RATE_MAP_PATH)
+            self.udp_rate_map = BpfSynRatePortsMap(UDP_RATE_MAP_PATH)
             log.debug("udp_rate_ports map opened; per-source UDP rate limiting active.")
         except OSError as exc:
             log.debug("udp_rate_ports map unavailable (%s); UDP rate limiting inactive.", exc)
-            self.udp_rate_map = None
         try:
-            self.acl_maps: BpfAclMaps | None = BpfAclMaps(
+            self.acl_maps = BpfAclMaps(
                 TCP_ACL_MAP_PATH4, TCP_ACL_MAP_PATH6,
                 UDP_ACL_MAP_PATH4, UDP_ACL_MAP_PATH6,
             )
             log.debug("ACL maps opened; per-CIDR port ACL active.")
         except OSError as exc:
             log.debug("ACL maps unavailable (%s); per-CIDR ACL inactive.", exc)
-            self.acl_maps = None
+        try:
+            self.bogon_cfg_map = BpfArrayMap(BOGON_CFG_MAP_PATH)
+        except OSError as exc:
+            log.debug("bogon_cfg map unavailable (%s); bogon filter toggle inactive.", exc)
+        try:
+            self.sctp_map = BpfArrayMap(SCTP_MAP_PATH)
+            log.debug("sctp_whitelist map opened; SCTP whitelist sync active.")
+        except OSError as exc:
+            log.debug("sctp_whitelist map unavailable (%s); SCTP whitelist sync inactive.", exc)
 
     def close(self) -> None:
         self.tcp_map.close()
@@ -889,11 +915,16 @@ class XdpBackend(PortBackend):
             self.udp_rate_map.close()
         if self.acl_maps is not None:
             self.acl_maps.close()
+        if self.bogon_cfg_map is not None:
+            self.bogon_cfg_map.close()
+        if self.sctp_map is not None:
+            self.sctp_map.close()
 
     def sync_ports(
         self,
         tcp_target: set[int],
         udp_target: set[int],
+        sctp_target: set[int],
         trusted_target: set[str],
         conntrack_target: set[bytes],
         dry_run: bool,
@@ -901,9 +932,11 @@ class XdpBackend(PortBackend):
         changed = False
         tcp_permanent = set(TCP_PERMANENT)
         udp_permanent = set(UDP_PERMANENT)
+        sctp_permanent = set(SCTP_PERMANENT)
         trusted_permanent = set(TRUSTED_SRC_IPS)
         active_tcp = self.tcp_map.active_ports()
         active_udp = self.udp_map.active_ports()
+        active_sctp = self.sctp_map.active_ports() if self.sctp_map is not None else set()
         active_trusted = self.trusted_map.active_keys()
         active_conntrack = self.conntrack_map.active_keys()
 
@@ -928,6 +961,18 @@ class XdpBackend(PortBackend):
             if self.udp_map.set(port, 0, dry_run):
                 log.debug("UDP -%d  (stopped)", port)
                 changed = True
+
+        if self.sctp_map is not None:
+            for port in sorted(sctp_target - active_sctp):
+                tag = f" [{SCTP_PERMANENT[port]}]" if port in SCTP_PERMANENT else ""
+                if self.sctp_map.set(port, 1, dry_run):
+                    log.info("SCTP +%d%s", port, tag)
+                    changed = True
+
+            for port in sorted(active_sctp - sctp_target - sctp_permanent):
+                if self.sctp_map.set(port, 0, dry_run):
+                    log.info("SCTP -%d  (stopped)", port)
+                    changed = True
 
         # HASH maps need delete, not write-zero, when trust entries disappear.
         for ip_str in sorted(trusted_target - active_trusted):
@@ -959,6 +1004,9 @@ class XdpBackend(PortBackend):
 
         if self.acl_maps is not None:
             self._sync_acl(dry_run)
+
+        if self.bogon_cfg_map is not None:
+            self.bogon_cfg_map.set(0, 1 if BOGON_FILTER_ENABLED else 0, dry_run)
 
     def _sync_acl(self, dry_run: bool) -> None:
         if self.acl_maps is None:
@@ -1064,6 +1112,7 @@ class NftablesBackend(PortBackend):
             raise RuntimeError("nft command not found")
         self._tcp_cache: set[int] = set()
         self._udp_cache: set[int] = set()
+        self._sctp_cache: set[int] = set()
         self._trusted_cache: set[str] = set()
         self._ensure_ruleset()
 
@@ -1072,7 +1121,7 @@ class NftablesBackend(PortBackend):
         if result.returncode == 0:
             body = result.stdout
             if all(marker in body for marker in (
-                f"set {NFT_TCP_SET}", f"set {NFT_UDP_SET}",
+                f"set {NFT_TCP_SET}", f"set {NFT_UDP_SET}", f"set {NFT_SCTP_SET}",
                 f"set {NFT_TRUSTED_SET4}", "chain input",
             )):
                 return
@@ -1084,6 +1133,10 @@ class NftablesBackend(PortBackend):
     }}
 
     set {NFT_UDP_SET} {{
+        type inet_service
+    }}
+
+    set {NFT_SCTP_SET} {{
         type inet_service
     }}
 
@@ -1109,16 +1162,24 @@ class NftablesBackend(PortBackend):
         tcp flags & (syn | ack) == syn tcp dport @{NFT_TCP_SET} accept
         udp sport {{ 53, 67, 123, 443, 547 }} accept
         udp dport @{NFT_UDP_SET} accept
+        sctp dport @{NFT_SCTP_SET} accept
         counter drop
     }}
 }}
 """
         _run_nft(["-f", "-"], input_text=script, check=True)
 
-    def _apply_targets(self, tcp_target: set[int], udp_target: set[int], dry_run: bool) -> None:
+    def _apply_targets(
+        self,
+        tcp_target: set[int],
+        udp_target: set[int],
+        sctp_target: set[int],
+        dry_run: bool,
+    ) -> None:
         lines = [
             f"flush set {NFT_FAMILY} {NFT_TABLE} {NFT_TCP_SET}",
             f"flush set {NFT_FAMILY} {NFT_TABLE} {NFT_UDP_SET}",
+            f"flush set {NFT_FAMILY} {NFT_TABLE} {NFT_SCTP_SET}",
         ]
         if tcp_target:
             lines.append(
@@ -1127,6 +1188,10 @@ class NftablesBackend(PortBackend):
         if udp_target:
             lines.append(
                 f"add element {NFT_FAMILY} {NFT_TABLE} {NFT_UDP_SET} {_render_nft_ports(udp_target)}"
+            )
+        if sctp_target:
+            lines.append(
+                f"add element {NFT_FAMILY} {NFT_TABLE} {NFT_SCTP_SET} {_render_nft_ports(sctp_target)}"
             )
         script = "\n".join(lines) + "\n"
 
@@ -1171,6 +1236,7 @@ class NftablesBackend(PortBackend):
         self,
         tcp_target: set[int],
         udp_target: set[int],
+        sctp_target: set[int],
         trusted_target: set[str],
         conntrack_target: set[bytes],
         dry_run: bool,
@@ -1202,10 +1268,19 @@ class NftablesBackend(PortBackend):
             log.info("UDP -%d  (stopped)", port)
             changed = True
 
-        self._apply_targets(tcp_target, udp_target, dry_run)
+        for port in sorted(sctp_target - self._sctp_cache):
+            tag = f" [{SCTP_PERMANENT[port]}]" if port in SCTP_PERMANENT else ""
+            log.info("SCTP +%d%s", port, tag)
+            changed = True
+        for port in sorted(self._sctp_cache - sctp_target - set(SCTP_PERMANENT)):
+            log.info("SCTP -%d  (stopped)", port)
+            changed = True
+
+        self._apply_targets(tcp_target, udp_target, sctp_target, dry_run)
         self._apply_trusted(trusted_target, dry_run)
         self._tcp_cache = set(tcp_target)
         self._udp_cache = set(udp_target)
+        self._sctp_cache = set(sctp_target)
         self._trusted_cache = set(trusted_target)
 
         if not changed:
@@ -1216,6 +1291,7 @@ class NftablesBackend(PortBackend):
 class PortState:
     tcp: set[int] = field(default_factory=set)
     udp: set[int] = field(default_factory=set)
+    sctp: set[int] = field(default_factory=set)
     established: set[bytes] = field(default_factory=set)
 
 
@@ -1255,6 +1331,11 @@ def get_listening_ports() -> PortState:
             if conn.raddr:
                 continue
             state.udp.add(conn.laddr.port)
+        elif conn.type == socket.SOCK_SEQPACKET:
+            # Treat SOCK_SEQPACKET listeners as config-visible SCTP-style ports.
+            if conn.raddr:
+                continue
+            state.sctp.add(conn.laddr.port)
     return state
 
 
@@ -1262,9 +1343,10 @@ def sync_once(backend: PortBackend, dry_run: bool) -> None:
     current = get_listening_ports()
     tcp_target = current.tcp | set(TCP_PERMANENT)
     udp_target = current.udp | set(UDP_PERMANENT)
+    sctp_target = current.sctp | set(SCTP_PERMANENT)
     trusted_target = set(TRUSTED_SRC_IPS)
     conntrack_target = current.established
-    backend.sync_ports(tcp_target, udp_target, trusted_target, conntrack_target, dry_run)
+    backend.sync_ports(tcp_target, udp_target, sctp_target, trusted_target, conntrack_target, dry_run)
 
 
 _NETLINK_CONNECTOR = 11
@@ -1351,7 +1433,7 @@ def open_backend(name: str) -> PortBackend:
     return backend
 
 
-def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TOML_CONFIG_PATH) -> None:
+def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TOML_CONFIG_PATH, cli_trusted_ips: dict[str, str] | None = None) -> None:
     backend = None
     nl = None
 
@@ -1409,6 +1491,8 @@ def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TO
                 reload_requested = False
                 log.info("SIGHUP received — reloading config from %s", config_path)
                 apply_toml_config(load_toml_config(config_path))
+                if cli_trusted_ips:
+                    TRUSTED_SRC_IPS.update(cli_trusted_ips)
                 last_sync_t = 0.0  # force sync on next iteration
 
             now = time.monotonic()
@@ -1504,16 +1588,19 @@ def main() -> None:
 
     apply_toml_config(load_toml_config(args.config))
 
+    cli_trusted_ips: dict[str, str] = {}
     try:
         for ip_str, label in args.trusted_ip:
-            TRUSTED_SRC_IPS[_parse_trusted_ip(ip_str)] = label
+            cidr = _parse_trusted_ip(ip_str)
+            TRUSTED_SRC_IPS[cidr] = label
+            cli_trusted_ips[cidr] = label
     except argparse.ArgumentTypeError as exc:
         p.error(str(exc))
 
     backend = None
     try:
         if args.watch:
-            watch(args.interval, args.dry_run, args.backend, args.config)
+            watch(args.interval, args.dry_run, args.backend, args.config, cli_trusted_ips)
         else:
             backend = open_backend(args.backend)
             sync_once(backend, args.dry_run)

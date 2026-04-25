@@ -223,8 +223,10 @@ test_xdp_maps_ready_requires_all_expected_pins() (
         "$tmpdir/prog" \
         "$tmpdir/tcp_whitelist" \
         "$tmpdir/udp_whitelist" \
+        "$tmpdir/sctp_whitelist" \
         "$tmpdir/tcp_conntrack" \
-        "$tmpdir/udp_conntrack"
+        "$tmpdir/udp_conntrack" \
+        "$tmpdir/sctp_conntrack"
 
     xdp_maps_ready >/dev/null 2>&1
     local status=$?
@@ -233,10 +235,46 @@ test_xdp_maps_ready_requires_all_expected_pins() (
     touch \
         "$tmpdir/trusted_ipv4" \
         "$tmpdir/trusted_ipv6" \
-        "$tmpdir/udp_global_rl"
+        "$tmpdir/udp_global_rl" \
+        "$tmpdir/proto_handlers" \
+        "$tmpdir/slot_ctx_map" \
+        "$tmpdir/slot_def_action"
     xdp_maps_ready >/dev/null 2>&1
     status=$?
     assert_eq "$status" "0"
+)
+
+test_load_tc_egress_program_reuses_sctp_conntrack_map() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    TC_OBJ_INSTALLED="$tmpdir/tc_flow_track.o"
+    IFACE="eth9"
+    mkdir -p "$BPF_PIN_DIR" "$tmpdir/bin"
+    touch "$TC_OBJ_INSTALLED" \
+        "$BPF_PIN_DIR/tcp_conntrack" \
+        "$BPF_PIN_DIR/udp_conntrack" \
+        "$BPF_PIN_DIR/sctp_conntrack"
+
+    cat >"$tmpdir/bin/bpftool" <<EOF_BPFSH
+#!/bin/sh
+printf '%s\n' "\$*" >> "$tmpdir/bpftool.log"
+exit 0
+EOF_BPFSH
+    cat >"$tmpdir/bin/tc" <<EOF_TCSH
+#!/bin/sh
+printf '%s\n' "\$*" >> "$tmpdir/tc.log"
+exit 0
+EOF_TCSH
+    chmod +x "$tmpdir/bin/bpftool" "$tmpdir/bin/tc"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+    load_tc_egress_program || return 1
+
+    assert_file_contains "$tmpdir/bpftool.log" "map name sctp_conntrack pinned $BPF_PIN_DIR/sctp_conntrack"
 )
 
 run_test "setup_xdp detects distro families" test_detect_os_release_maps_supported_families
@@ -248,5 +286,6 @@ run_test "setup_xdp dry-run report emits CI fields" test_dry_run_report_emits_ci
 run_test "setup_xdp confirmation handles force and no-tty abort" test_confirm_yes_no_force_and_no_tty_abort_modes
 run_test "setup_xdp prefers local files when available" test_fetch_local_or_remote_uses_local_copy_without_network
 run_test "setup_xdp validates pinned map set completeness" test_xdp_maps_ready_requires_all_expected_pins
+run_test "setup_xdp reuses SCTP conntrack map for tc egress" test_load_tc_egress_program_reuses_sctp_conntrack_map
 
 finish_tests
