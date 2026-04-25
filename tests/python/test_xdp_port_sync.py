@@ -11,6 +11,7 @@ from unittest import mock
 import support
 
 from auto_xdp.discovery import _discovery_exclude_networks, _bind_ip_is_exposed
+import auto_xdp.proc_events as proc_events_mod
 
 xdp = support.load_module("xdp_port_sync_test", "xdp_port_sync.py")
 
@@ -132,9 +133,9 @@ class FakeUdpPortMap(FakeSynRateMap):
 
 def make_proc_event_message(what: int) -> bytes:
     payload = struct.pack("I", what)
-    cn = struct.pack("IIIIHH", xdp._CN_IDX_PROC, 1, 0, 0, len(payload), 0) + payload
-    msg_len = xdp._NLMSG_HDRLEN + len(cn)
-    hdr = struct.pack("IHHII", msg_len, xdp._NLMSG_MIN_TYPE, 0, 0, 0)
+    cn = struct.pack("IIIIHH", proc_events_mod._CN_IDX_PROC, 1, 0, 0, len(payload), 0) + payload
+    msg_len = proc_events_mod._NLMSG_HDRLEN + len(cn)
+    hdr = struct.pack("IHHII", msg_len, proc_events_mod._NLMSG_MIN_TYPE, 0, 0, 0)
     padded_len = (msg_len + 3) & ~3
     return hdr + cn + (b"\x00" * (padded_len - msg_len))
 
@@ -537,14 +538,14 @@ class XdpPortSyncTests(unittest.TestCase):
         nft_backend.assert_called_once_with()
 
     def test_drain_proc_events_detects_exec_and_exit_notifications(self):
-        payload = make_proc_event_message(xdp._PROC_EVENT_EXEC)
+        payload = make_proc_event_message(proc_events_mod._PROC_EVENT_EXEC)
 
         class FakeSocket:
             def recv(self, size):
                 return payload
 
         fake_sock = FakeSocket()
-        with mock.patch.object(xdp.select, "select", side_effect=[([fake_sock], [], []), ([], [], [])]):
+        with mock.patch.object(proc_events_mod.select, "select", side_effect=[([fake_sock], [], []), ([], [], [])]):
             triggered = xdp.drain_proc_events(fake_sock)
 
         self.assertTrue(triggered)
