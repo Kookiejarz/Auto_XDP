@@ -76,7 +76,7 @@ step_warn() {
 IFACE=""
 IFACES=()
 ALL_IFACES=0
-XDP_SRC="xdp_firewall.c"
+XDP_SRC="bpf/xdp_firewall.c"
 XDP_OBJ="xdp_firewall.o"
 TC_SRC="tc_flow_track.c"
 TC_OBJ="tc_flow_track.o"
