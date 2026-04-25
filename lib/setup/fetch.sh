@@ -65,7 +65,8 @@ fetch_local_or_remote() {
 
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
         info "Installer is running from stdin; fetching ${remote_name} from GitHub..."
-        curl -fsSL "${RAW_URL}/${remote_name}" -o "$target_path"
+        mkdir -p "$(dirname "$target_path")"
+        curl -fsSL "${RAW_URL}/${remote_name}" -o "$target_path" || return 1
         return 0
     fi
 
@@ -137,5 +138,6 @@ fetch_local_or_remote() {
     fi
 
     info "Fetching ${remote_name} from GitHub..."
+    mkdir -p "$(dirname "$target_path")"
     curl -fsSL "${RAW_URL}/${remote_name}" -o "$target_path"
 }
