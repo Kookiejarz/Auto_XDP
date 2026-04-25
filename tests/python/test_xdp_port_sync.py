@@ -14,6 +14,8 @@ from auto_xdp.bpf.maps import render_nft_ports as _render_nft_ports
 from auto_xdp import config as cfg
 import auto_xdp.backends.nftables as nftables_mod
 import auto_xdp.proc_events as proc_events_mod
+import auto_xdp.syncer as syncer_mod
+import auto_xdp.discovery as discovery_mod
 
 xdp = support.load_module("xdp_port_sync_test", "xdp_port_sync.py")
 
@@ -242,7 +244,7 @@ class XdpPortSyncTests(unittest.TestCase):
              mock.patch("auto_xdp.discovery._net_connections", return_value=fake_connections), \
              mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_LOOPBACK", True), \
              mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_BIND_CIDRS", ["10.0.0.0/8", "fd00::/8"]):
-            state = xdp.get_listening_ports()
+            state = discovery_mod.get_listening_ports()
 
         self.assertEqual(state.tcp, {22, 443})
         self.assertEqual(state.udp, {53})
@@ -250,14 +252,14 @@ class XdpPortSyncTests(unittest.TestCase):
 
     def test_sync_once_merges_permanent_ports_and_trusted_ips(self):
         backend = mock.Mock()
-        state = xdp.PortState(tcp={80}, udp={53}, sctp=set(), established={b"flow"})
+        state = discovery_mod.PortState(tcp={80}, udp={53}, sctp=set(), established={b"flow"})
 
-        with mock.patch.object(xdp, "get_listening_ports", return_value=state), \
-             mock.patch.object(xdp, "_net_connections", return_value=[]), \
-             mock.patch.object(xdp, "TCP_PERMANENT", {22: "ssh"}), \
-             mock.patch.object(xdp, "UDP_PERMANENT", {123: "ntp"}), \
-             mock.patch.object(xdp, "SCTP_PERMANENT", {3868: "diameter"}), \
-             mock.patch.object(xdp, "TRUSTED_SRC_IPS", {"203.0.113.8/32": "office"}):
+        with mock.patch.object(syncer_mod, "get_listening_ports", return_value=state), \
+             mock.patch.object(syncer_mod, "_net_connections", return_value=[]), \
+             mock.patch.object(syncer_mod, "TCP_PERMANENT", {22: "ssh"}), \
+             mock.patch.object(syncer_mod, "UDP_PERMANENT", {123: "ntp"}), \
+             mock.patch.object(syncer_mod, "SCTP_PERMANENT", {3868: "diameter"}), \
+             mock.patch.object(syncer_mod, "TRUSTED_SRC_IPS", {"203.0.113.8/32": "office"}):
             xdp.sync_once(backend, dry_run=True)
 
         backend.sync_ports.assert_called_once_with(
@@ -517,7 +519,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertIn("add element inet auto_xdp sctp_ports { 3868 }", script)
 
     def test_open_backend_validates_requested_backend(self):
-        with mock.patch.object(xdp.os.path, "exists", return_value=False):
+        with mock.patch.object(syncer_mod.os.path, "exists", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "required XDP maps missing"):
                 xdp.open_backend(xdp.BACKEND_XDP)
 
@@ -527,14 +529,14 @@ class XdpPortSyncTests(unittest.TestCase):
     def test_open_backend_prefers_xdp_and_falls_back_to_nftables(self):
         exists_map = {path: True for path in xdp.REQUIRED_XDP_MAP_PATHS}
 
-        with mock.patch.object(xdp.os.path, "exists", side_effect=lambda path: exists_map.get(path, False)), \
-             mock.patch.object(xdp, "XdpBackend", return_value="xdp-backend") as xdp_backend:
+        with mock.patch.object(syncer_mod.os.path, "exists", side_effect=lambda path: exists_map.get(path, False)), \
+             mock.patch.object(syncer_mod, "XdpBackend", return_value="xdp-backend") as xdp_backend:
             backend = xdp.open_backend(xdp.BACKEND_AUTO)
         self.assertEqual(backend, "xdp-backend")
         xdp_backend.assert_called_once_with()
 
-        with mock.patch.object(xdp.os.path, "exists", return_value=False), \
-             mock.patch.object(xdp, "NftablesBackend", return_value="nft-backend") as nft_backend:
+        with mock.patch.object(syncer_mod.os.path, "exists", return_value=False), \
+             mock.patch.object(syncer_mod, "NftablesBackend", return_value="nft-backend") as nft_backend:
             backend = xdp.open_backend(xdp.BACKEND_AUTO)
         self.assertEqual(backend, "nft-backend")
         nft_backend.assert_called_once_with()
@@ -548,7 +550,7 @@ class XdpPortSyncTests(unittest.TestCase):
 
         fake_sock = FakeSocket()
         with mock.patch.object(proc_events_mod.select, "select", side_effect=[([fake_sock], [], []), ([], [], [])]):
-            triggered = xdp.drain_proc_events(fake_sock)
+            triggered = proc_events_mod.drain_proc_events(fake_sock)
 
         self.assertTrue(triggered)
 
