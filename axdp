@@ -791,10 +791,10 @@ diff_csv() {
     local mode="$3" # added|removed
     case "$mode" in
         added)
-            comm -13 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | xargs
+            comm -13 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | tr '\n' ' ' | sed 's/ $//'
             ;;
         removed)
-            comm -23 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | xargs
+            comm -23 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | tr '\n' ' ' | sed 's/ $//'
             ;;
     esac
 }
@@ -1084,7 +1084,57 @@ except ImportError:
     try:
         import tomli as tomllib
     except ImportError:
-        sys.exit("tomllib/tomli not available; install Python 3.11+ or: pip install tomli")
+        import re as _re
+
+        def _tok(s):
+            items, cur, depth, in_str, esc, sc = [], [], 0, False, False, None
+            for c in s[1:-1]:
+                if esc: cur.append(c); esc = False; continue
+                if c == '\\' and in_str: cur.append(c); esc = True; continue
+                if c in ('"', "'") and not in_str: in_str = True; sc = c; cur.append(c); continue
+                if c == sc and in_str: in_str = False; sc = None; cur.append(c); continue
+                if not in_str:
+                    if c in ('[', '{'): depth += 1
+                    elif c in (']', '}'): depth -= 1
+                    elif c == ',' and depth == 0: items.append(''.join(cur).strip()); cur = []; continue
+                cur.append(c)
+            if cur: items.append(''.join(cur).strip())
+            return [i for i in items if i]
+
+        def _val(s):
+            s = s.strip()
+            if s.startswith('"'):
+                try: return json.loads(s)
+                except Exception: return s[1:-1]
+            if s.startswith("'"): return s[1:-1]
+            if s == 'true': return True
+            if s == 'false': return False
+            if s.startswith('['): return [_val(i) for i in _tok(s)]
+            if s.startswith('{'):
+                return {k.strip(): _val(v) for k, sep, v in
+                        (p.partition('=') for p in _tok(s)) if sep}
+            try: return int(s)
+            except ValueError: pass
+            try: return float(s)
+            except ValueError: return s
+
+        def _parse_toml(text):
+            root = cur = {}
+            for raw in text.splitlines():
+                line = raw.strip()
+                if not line or line.startswith('#'): continue
+                m = _re.match(r'^\[([^\[\]]+)\]$', line)
+                if m:
+                    cur = root
+                    for k in m.group(1).split('.'): cur = cur.setdefault(k.strip(), {})
+                    continue
+                m = _re.match(r'^([A-Za-z0-9_-]+)\s*=\s*(.+)$', line)
+                if m: cur[m.group(1)] = _val(m.group(2).strip())
+            return root
+
+        class tomllib:
+            @staticmethod
+            def load(f): return _parse_toml(f.read().decode())
 
 with open(path, "rb") as f:
     data = tomllib.load(f)

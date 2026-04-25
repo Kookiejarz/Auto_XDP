@@ -340,7 +340,7 @@ package_list_for_manager() {
             echo "clang llvm libbpf-devel bpftool iproute2 curl python3 python3-pip gcc make nftables"
             ;;
         pacman)
-            echo "clang llvm libbpf iproute2 curl python python-pip bpftool base-devel nftables"
+            echo "clang llvm libbpf iproute2 curl python python-pip bpf base-devel nftables"
             ;;
         apk)
             echo "clang llvm libbpf-dev bpftool iproute2 curl python3 py3-pip build-base nftables"
