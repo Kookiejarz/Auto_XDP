@@ -25,14 +25,6 @@ from auto_xdp.discovery import (
 )
 from auto_xdp.proc_events import open_proc_connector, drain_proc_events
 from auto_xdp.backends import NftablesBackend, PortBackend, XdpBackend
-from auto_xdp.bpf.maps import render_nft_ports as _render_nft_ports
-from auto_xdp.policy import (
-    _port_rate_limit,
-    _syn_aggregate_rate_limit,
-    _tcp_conn_limit,
-    _udp_port_rate_limit,
-    _udp_aggregate_byte_limit,
-)
 
 TOML_CONFIG_PATH = cfg.TOML_CONFIG_PATH
 REQUIRED_XDP_MAP_PATHS = cfg.REQUIRED_XDP_MAP_PATHS
@@ -43,13 +35,6 @@ TCP_PERMANENT = cfg.TCP_PERMANENT
 UDP_PERMANENT = cfg.UDP_PERMANENT
 SCTP_PERMANENT = cfg.SCTP_PERMANENT
 TRUSTED_SRC_IPS = cfg.TRUSTED_SRC_IPS
-NFT_FAMILY = cfg.NFT_FAMILY
-NFT_TABLE = cfg.NFT_TABLE
-NFT_TCP_SET = cfg.NFT_TCP_SET
-NFT_UDP_SET = cfg.NFT_UDP_SET
-NFT_SCTP_SET = cfg.NFT_SCTP_SET
-NFT_TRUSTED_SET4 = cfg.NFT_TRUSTED_SET4
-NFT_TRUSTED_SET6 = cfg.NFT_TRUSTED_SET6
 
 
 # Wait this long after an EXEC/EXIT event before scanning,
