@@ -158,6 +158,8 @@ source_setup_lib "lib/setup/detect.sh"
 source_setup_lib "lib/setup/packages.sh"
 source_setup_lib "lib/setup/fetch.sh"
 source_setup_lib "lib/setup/build.sh"
+source_setup_lib "lib/setup/backend_xdp.sh"
+source_setup_lib "lib/setup/backend_nft.sh"
 
 auto_xdp_shared_info() {
     info "$@"

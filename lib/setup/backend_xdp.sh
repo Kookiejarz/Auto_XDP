@@ -1,0 +1,107 @@
+# lib/setup/backend_xdp.sh — XDP attach/detach backend helpers
+# Sourced by setup_xdp.sh after build.sh and runtime_common.
+
+cleanup_existing_xdp() {
+    cleanup_tc_egress_filter
+
+    local iface any_xdp=0
+    for iface in "${IFACES[@]}"; do
+        if ip -d link show dev "$iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
+            any_xdp=1
+            break
+        fi
+    done
+
+    if [[ $any_xdp -eq 1 ]]; then
+        local iface_list="${IFACES[*]}"
+        warn "Existing XDP program detected on one or more interfaces: $iface_list"
+        if confirm_yes_no "Unload the existing XDP program from all interfaces and continue? [y/N] " "abort"; then
+            :
+        else
+            confirm_rc=$?
+            case "$confirm_rc" in
+                2)
+                    die "Cannot confirm unloading because no interactive TTY is available. Re-run with --force."
+                    ;;
+                *)
+                    die "Aborted before unloading the existing XDP program."
+                    ;;
+            esac
+        fi
+
+        for iface in "${IFACES[@]}"; do
+            info "Detaching XDP from $iface..."
+            ip link set dev "$iface" xdp off 2>/dev/null || true
+            ip link set dev "$iface" xdp generic off 2>/dev/null || true
+        done
+
+        for iface in "${IFACES[@]}"; do
+            if ip -d link show dev "$iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
+                die "Failed to clear the existing XDP program from $iface. Detach it manually and rerun."
+            fi
+        done
+        ok "Existing XDP program removed from all interfaces."
+    fi
+
+    if [[ -d "$BPF_PIN_DIR" ]]; then
+        warn "Removing old BPF pin directory $BPF_PIN_DIR..."
+        rm -rf "$BPF_PIN_DIR"
+    fi
+    mkdir -p "$BPF_PIN_DIR"
+}
+
+deploy_xdp_backend() {
+    if [[ ! -f "$XDP_OBJ_INSTALLED" ]]; then
+        warn "Compiled XDP object not found; skipping XDP backend."
+        return 1
+    fi
+
+    ensure_bpffs
+    cleanup_existing_xdp
+
+    info "Loading XDP program (shared across ${#IFACES[@]} interface(s))..."
+    if ! bpftool prog load "$XDP_OBJ_INSTALLED" "$BPF_PIN_DIR/prog" type xdp \
+            pinmaps "$BPF_PIN_DIR"; then
+        warn "bpftool prog load failed; falling back from XDP."
+        rm -rf "$BPF_PIN_DIR"
+        return 1
+    fi
+
+    if ! xdp_maps_ready; then
+        warn "Pinned XDP maps are incomplete after pinning; falling back from XDP."
+        rm -rf "$BPF_PIN_DIR"
+        return 1
+    fi
+
+    seed_existing_tcp_conntrack
+    load_tc_egress_program || true
+    load_slot_handlers || true
+
+    local iface attached=0
+    ACTIVE_XDP_MODE="native"
+    for iface in "${IFACES[@]}"; do
+        if ip link set dev "$iface" xdp pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
+            ok "XDP attached in native mode on $iface"
+            attached=$((attached + 1))
+        elif ip link set dev "$iface" xdp generic pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
+            ok "XDP attached in generic mode on $iface"
+            ACTIVE_XDP_MODE="generic"
+            attached=$((attached + 1))
+        else
+            warn "Failed to attach XDP to $iface (skipping this interface)"
+        fi
+    done
+
+    if [[ $attached -gt 0 ]]; then
+        ACTIVE_BACKEND="xdp"
+        return 0
+    fi
+
+    warn "XDP could not be attached to any interface — using nftables fallback."
+    cleanup_tc_egress_filter
+    for iface in "${IFACES[@]}"; do
+        ip link set dev "$iface" xdp off 2>/dev/null || true
+    done
+    rm -rf "$BPF_PIN_DIR"
+    return 1
+}
