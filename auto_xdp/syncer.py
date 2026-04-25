@@ -60,7 +60,7 @@ def open_backend(name: str) -> PortBackend:
             return backend
         except OSError as exc:
             log.warning("XDP backend unavailable (%s); trying nftables.", exc)
-    elif missing_xdp_maps:
+    else:
         log.warning("XDP maps incomplete (%s); trying nftables.", ", ".join(missing_xdp_maps))
 
     backend = NftablesBackend()
