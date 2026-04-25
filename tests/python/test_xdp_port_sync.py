@@ -144,7 +144,7 @@ def make_proc_event_message(what: int) -> bytes:
 
 class XdpPortSyncTests(unittest.TestCase):
     def test_udp_malformed_drop_only_rejects_port_zero(self):
-        source = (Path(__file__).resolve().parents[2] / "xdp_firewall.c").read_text()
+        source = (Path(__file__).resolve().parents[2] / "bpf" / "include" / "parse.h").read_text()
         self.assertRegex(
             source,
             r"if\s*\(\s*udp->source\s*==\s*0\s*\|\|\s*udp->dest\s*==\s*0\s*\)",

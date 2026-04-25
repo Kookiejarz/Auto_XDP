@@ -35,6 +35,8 @@ compile_bpf_object() {
         -I/usr/include \
         -I"$ASM_INC" \
         -I/usr/include/bpf \
+        -Ibpf/include \
+        -I. \
         -c "$src_path" -o "$obj_path"; then
         return 1
     fi
