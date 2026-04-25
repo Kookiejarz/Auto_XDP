@@ -158,17 +158,17 @@ When the installer is executed from `stdin` (`curl | bash`), it prefers the matc
 
 ## Automated Distro Checks
 
-The repository includes a GitHub Actions matrix that installs basic runtime tools in supported Linux container images and runs a non-destructive `setup_xdp.sh --dry-run` smoke test.
+The repository includes a GitHub Actions matrix that installs each supported distro's native build dependencies inside that distro's own container image and compiles the BPF objects there directly.
 
-The installer reads `/etc/os-release` to classify the distro family before choosing the matching package-manager and dependency set.
+This CI is meant to answer one question clearly: does this distro's native toolchain and header layout build `xdp_firewall.c`, `tc_flow_track.c`, and the slot handlers successfully?
 
-You can also run the non-destructive smoke test locally:
+You can run the same native compile check locally on a machine that already has the build dependencies installed:
 
 ```bash
-bash setup_xdp.sh --dry-run
+bash ./tests/bash/test_bpf_build.sh
 ```
 
-If you only want the package-manager and init-system probe, use:
+If you only want the package-manager and init-system probe from the installer, use:
 
 ```bash
 bash setup_xdp.sh --check-env
