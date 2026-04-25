@@ -10,6 +10,8 @@ from unittest import mock
 import support
 
 from auto_xdp.discovery import _discovery_exclude_networks, _bind_ip_is_exposed
+from auto_xdp.bpf.maps import render_nft_ports as _render_nft_ports
+from auto_xdp import config as cfg
 import auto_xdp.backends.nftables as nftables_mod
 import auto_xdp.proc_events as proc_events_mod
 
@@ -150,16 +152,16 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertNotIn("udp->source == udp->dest", source)
 
     def test_render_nft_ports_sorts_ports(self):
-        self.assertEqual(xdp._render_nft_ports({443, 22, 80}), "{ 22, 80, 443 }")
+        self.assertEqual(_render_nft_ports({443, 22, 80}), "{ 22, 80, 443 }")
 
     def test_port_rate_limit_prefers_process_name_then_service_name(self):
         import auto_xdp.policy as policy
         with mock.patch.object(policy.socket, "getservbyport", side_effect=lambda port, proto: "ssh" if port == 22 else "http"), \
              mock.patch.object(policy, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
              mock.patch.object(policy, "_SYN_RATE_BY_SERVICE", {"ssh": 2}):
-            self.assertEqual(xdp._port_rate_limit(2222, "sshd"), 2)
-            self.assertEqual(xdp._port_rate_limit(22), 2)
-            self.assertEqual(xdp._port_rate_limit(80), 0)
+            self.assertEqual(policy._port_rate_limit(2222, "sshd"), 2)
+            self.assertEqual(policy._port_rate_limit(22), 2)
+            self.assertEqual(policy._port_rate_limit(80), 0)
 
     def test_bind_ip_is_exposed_keeps_wildcard_but_filters_loopback_and_private(self):
         with mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_LOOPBACK", True), \
@@ -365,10 +367,10 @@ class XdpPortSyncTests(unittest.TestCase):
         with mock.patch.object(policy.socket, "getservbyport", side_effect=fake_getservbyport), \
              mock.patch.object(policy, "_UDP_RATE_BY_PROC", {"named": 5000}), \
              mock.patch.object(policy, "_UDP_RATE_BY_SERVICE", {"domain": 5000, "ntp": 500}):
-            self.assertEqual(xdp._udp_port_rate_limit(5353, "named"), 5000)
-            self.assertEqual(xdp._udp_port_rate_limit(53), 5000)
-            self.assertEqual(xdp._udp_port_rate_limit(123), 500)
-            self.assertEqual(xdp._udp_port_rate_limit(12345), 0)
+            self.assertEqual(policy._udp_port_rate_limit(5353, "named"), 5000)
+            self.assertEqual(policy._udp_port_rate_limit(53), 5000)
+            self.assertEqual(policy._udp_port_rate_limit(123), 500)
+            self.assertEqual(policy._udp_port_rate_limit(12345), 0)
 
     def test_syn_aggregate_and_tcp_conn_limits_derive_from_syn_rate(self):
         import auto_xdp.policy as policy
@@ -376,10 +378,10 @@ class XdpPortSyncTests(unittest.TestCase):
              mock.patch.object(policy, "_SYN_RATE_BY_SERVICE", {"ssh": 2}), \
              mock.patch.object(policy, "_SYN_AGG_RATE_BY_SERVICE", {}), \
              mock.patch.object(policy, "_TCP_CONN_BY_SERVICE", {}):
-            self.assertEqual(xdp._syn_aggregate_rate_limit(22), 16)
-            self.assertEqual(xdp._tcp_conn_limit(22), 32)
-            self.assertEqual(xdp._syn_aggregate_rate_limit(80), 0)
-            self.assertEqual(xdp._tcp_conn_limit(80), 0)
+            self.assertEqual(policy._syn_aggregate_rate_limit(22), 16)
+            self.assertEqual(policy._tcp_conn_limit(22), 32)
+            self.assertEqual(policy._syn_aggregate_rate_limit(80), 0)
+            self.assertEqual(policy._tcp_conn_limit(80), 0)
 
     def test_udp_aggregate_byte_limit_uses_explicit_or_derived_values(self):
         import auto_xdp.policy as policy
@@ -392,9 +394,9 @@ class XdpPortSyncTests(unittest.TestCase):
         with mock.patch.object(policy.socket, "getservbyport", side_effect=fake_getservbyport), \
              mock.patch.object(policy, "_UDP_RATE_BY_SERVICE", {"domain": 5000, "ntp": 500}), \
              mock.patch.object(policy, "_UDP_AGG_BYTES_BY_SERVICE", {"ntp": 900000}):
-            self.assertEqual(xdp._udp_aggregate_byte_limit(53), 6000000)
-            self.assertEqual(xdp._udp_aggregate_byte_limit(123), 900000)
-            self.assertEqual(xdp._udp_aggregate_byte_limit(9999), 0)
+            self.assertEqual(policy._udp_aggregate_byte_limit(53), 6000000)
+            self.assertEqual(policy._udp_aggregate_byte_limit(123), 900000)
+            self.assertEqual(policy._udp_aggregate_byte_limit(9999), 0)
 
     def test_xdp_backend_sync_udp_rate_sets_rates_for_udp_ports(self):
         import auto_xdp.policy as policy
@@ -473,10 +475,10 @@ class XdpPortSyncTests(unittest.TestCase):
             ["nft"],
             0,
             stdout=(
-                f"set {xdp.NFT_TCP_SET}\n"
-                f"set {xdp.NFT_UDP_SET}\n"
-                f"set {xdp.NFT_SCTP_SET}\n"
-                f"set {xdp.NFT_TRUSTED_SET4}\n"
+                f"set {cfg.NFT_TCP_SET}\n"
+                f"set {cfg.NFT_UDP_SET}\n"
+                f"set {cfg.NFT_SCTP_SET}\n"
+                f"set {cfg.NFT_TRUSTED_SET4}\n"
                 "chain input\n"
             ),
         )
@@ -484,7 +486,7 @@ class XdpPortSyncTests(unittest.TestCase):
         with mock.patch.object(nftables_mod, "_run_nft", return_value=existing) as run_nft:
             backend._ensure_ruleset()
 
-        run_nft.assert_called_once_with(["list", "table", xdp.NFT_FAMILY, xdp.NFT_TABLE], check=False)
+        run_nft.assert_called_once_with(["list", "table", cfg.NFT_FAMILY, cfg.NFT_TABLE], check=False)
 
     def test_nftables_backend_ensure_ruleset_recreates_incomplete_ruleset(self):
         backend = xdp.NftablesBackend.__new__(xdp.NftablesBackend)
@@ -495,10 +497,10 @@ class XdpPortSyncTests(unittest.TestCase):
         with mock.patch.object(nftables_mod, "_run_nft", side_effect=[existing, deleted, created]) as run_nft:
             backend._ensure_ruleset()
 
-        self.assertEqual(run_nft.call_args_list[1], mock.call(["delete", "table", xdp.NFT_FAMILY, xdp.NFT_TABLE], check=True))
+        self.assertEqual(run_nft.call_args_list[1], mock.call(["delete", "table", cfg.NFT_FAMILY, cfg.NFT_TABLE], check=True))
         create_call = run_nft.call_args_list[2]
         self.assertEqual(create_call.args[0], ["-f", "-"])
-        self.assertIn(f"set {xdp.NFT_TCP_SET}", create_call.kwargs["input_text"])
+        self.assertIn(f"set {cfg.NFT_TCP_SET}", create_call.kwargs["input_text"])
 
     def test_nftables_backend_apply_targets_flushes_and_reloads_sets(self):
         backend = xdp.NftablesBackend.__new__(xdp.NftablesBackend)
