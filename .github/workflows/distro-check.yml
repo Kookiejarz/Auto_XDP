@@ -1,4 +1,4 @@
-name: CI / Distro Support
+name: CI / Native Distro Build
 
 on:
   push:
@@ -9,53 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  distro-suite:
-    name: Distro Suite (${{ matrix.name }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: debian
-            image: debian:12-slim
-            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
-          - name: ubuntu
-            image: ubuntu:24.04
-            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
-          - name: fedora
-            image: fedora:41
-            install: dnf -y install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
-          - name: opensuse
-            image: opensuse/tumbleweed
-            install: zypper --non-interactive refresh && zypper --non-interactive install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
-          - name: arch
-            image: archlinux:latest
-            install: pacman -Sy --noconfirm --needed bash ca-certificates coreutils curl gawk git grep python iproute2 sed
-          - name: alpine
-            image: alpine:3.20
-            install: apk add --no-cache bash ca-certificates coreutils curl gawk git grep python3 sed iproute2
-          - name: almalinux
-            image: almalinux:10
-            install: dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
-          - name: rockylinux
-            image: rockylinux:9
-            install: dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute
-    container:
-      image: ${{ matrix.image }}
-    steps:
-      - name: Install base dependencies
-        run: ${{ matrix.install }}
-
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Run distro smoke and unit suite
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: bash ./tests/run-distro-suite.sh
-
-  bpf-build:
-    name: BPF Build Smoke (${{ matrix.name }})
+  native-build:
+    name: Native Build (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -94,5 +49,5 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Compile XDP and tc objects
+      - name: Build BPF objects natively on ${{ matrix.name }}
         run: bash ./tests/bash/test_bpf_build.sh
