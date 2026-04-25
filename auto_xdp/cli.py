@@ -9,17 +9,17 @@ from auto_xdp import config as cfg
 from auto_xdp.config import apply_toml_config, load_toml_config
 from auto_xdp.syncer import open_backend, sync_once, watch
 
-DEFAULT_LOG_LEVEL = os.environ.get("BASIC_XDP_LOG_LEVEL", "WARNING").upper()
-
-logging.basicConfig(
-    level=getattr(logging, DEFAULT_LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 log = logging.getLogger(__name__)
 
 
 def main() -> None:
+    DEFAULT_LOG_LEVEL = os.environ.get("BASIC_XDP_LOG_LEVEL", "WARNING").upper()
+    logging.basicConfig(
+        level=getattr(logging, DEFAULT_LOG_LEVEL, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     def _parse_trusted_ip(ip_str: str) -> str:
         try:
             return cfg.normalize_cidr(ip_str)
@@ -92,7 +92,10 @@ def main() -> None:
     backend = None
     try:
         if args.watch:
-            watch(args.interval, args.dry_run, args.backend, args.config, cli_trusted_ips, cli_log_level=args.log_level)
+            watch(
+                args.interval, args.dry_run, args.backend, args.config,
+                cli_trusted_ips, cli_log_level=args.log_level,
+            )
         else:
             backend = open_backend(args.backend)
             sync_once(backend, args.dry_run)
