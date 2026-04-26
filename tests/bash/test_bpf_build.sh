@@ -21,6 +21,12 @@ PREFER_REMOTE_SOURCES=0
 CHECK_UPDATES=0
 
 fetch_local_or_remote() {
+    local local_path="$1"
+    local target_path="$3"
+    if [[ -f "$local_path" ]]; then
+        mkdir -p "$(dirname "$target_path")"
+        [[ "$local_path" == "$target_path" ]] || cp "$local_path" "$target_path"
+    fi
     return 0
 }
 
