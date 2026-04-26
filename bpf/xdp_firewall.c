@@ -1,5 +1,5 @@
 /* bpf/xdp_firewall.c — XDP entry point.
- * All helpers live in bpf/include/*.h (single translation unit). */
+ * All helpers live under bpf/include/ as one translation unit. */
 
 #include "include/common.h"
 #include "include/keys.h"

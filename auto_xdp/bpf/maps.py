@@ -14,9 +14,11 @@ from auto_xdp import config as cfg
 from auto_xdp.bpf.syscall import (
     BPF_MAP_DELETE_ELEM,
     BPF_MAP_GET_NEXT_KEY,
+    BPF_MAP_LOOKUP_BATCH,
     BPF_MAP_LOOKUP_ELEM,
     BPF_MAP_UPDATE_ELEM,
     bpf,
+    map_max_entries,
     obj_get,
 )
 
@@ -46,6 +48,7 @@ class BpfArrayMap:
     def __init__(self, path: str) -> None:
         self.path = path
         self.fd = obj_get(path)
+        self._max_entries: int = map_max_entries(self.fd)
         self._cache: set[int] = set()
 
         self._key = ctypes.create_string_buffer(4)
@@ -80,12 +83,37 @@ class BpfArrayMap:
         return struct.unpack_from("=I", self._val, 0)[0]
 
     def _load_cache(self) -> None:
-        for port in range(65536):
-            try:
-                if self._lookup(port):
-                    self._cache.add(port)
-            except OSError:
-                continue
+        n = self._max_entries
+        keys_buf = ctypes.create_string_buffer(4 * n)
+        vals_buf = ctypes.create_string_buffer(4 * n)
+        out_batch = ctypes.create_string_buffer(4)
+        attr = ctypes.create_string_buffer(56)
+        # BPF_MAP_LOOKUP_BATCH attr: in_batch, out_batch, keys, values, count, map_fd, elem_flags, flags
+        struct.pack_into(
+            "=QQQQIIQQ", attr, 0,
+            0,
+            ctypes.cast(out_batch, ctypes.c_void_p).value or 0,
+            ctypes.cast(keys_buf, ctypes.c_void_p).value or 0,
+            ctypes.cast(vals_buf, ctypes.c_void_p).value or 0,
+            n, self.fd, 0, 0,
+        )
+        try:
+            bpf(BPF_MAP_LOOKUP_BATCH, attr)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                # Kernel too old or other error; fall back to sequential scan.
+                for port in range(n):
+                    try:
+                        if self._lookup(port):
+                            self._cache.add(port)
+                    except OSError:
+                        continue
+                return
+            # ENOENT: end of map; kernel has written the fetched count back to attr.
+        fetched = struct.unpack_from("=I", attr, 32)[0]
+        for i in range(fetched):
+            if struct.unpack_from("=I", vals_buf, i * 4)[0]:
+                self._cache.add(struct.unpack_from("=I", keys_buf, i * 4)[0])
 
     def active_ports(self) -> set[int]:
         return set(self._cache)
@@ -443,13 +471,14 @@ class BpfConntrackMap:
         self._next_key = ctypes.create_string_buffer(40)
         self._val = ctypes.create_string_buffer(8)
         self._attr = ctypes.create_string_buffer(128)
+        self._delete_attr = ctypes.create_string_buffer(128)
         self._next_attr = ctypes.create_string_buffer(128)
         k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
         next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
         v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
         struct.pack_into("=I4xQQQ", self._attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
         struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
-        self._load_cache()
 
     def close(self) -> None:
         if self.fd >= 0:
@@ -490,6 +519,38 @@ class BpfConntrackMap:
     def refresh_cache(self) -> None:
         self._cache.clear()
         self._load_cache()
+
+    def delete(self, key_bytes: bytes, dry_run: bool = False) -> bool:
+        if dry_run:
+            self._cache.discard(key_bytes)
+            return True
+        try:
+            ctypes.memmove(self._key, key_bytes, 40)
+            bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
+            self._cache.discard(key_bytes)
+            return True
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                self._cache.discard(key_bytes)
+                return True
+            log.warning("BPF conntrack delete failed: %s", exc)
+            return False
+
+    def delete_dest_ports(self, ports: set[int], dry_run: bool = False) -> int:
+        if not ports:
+            return 0
+
+        matches = [
+            key_raw
+            for key_raw in self._iter_raw_keys()
+            if struct.unpack_from("!H", key_raw, 6)[0] in ports
+        ]
+
+        deleted = 0
+        for key_raw in matches:
+            if self.delete(key_raw, dry_run):
+                deleted += 1
+        return deleted
 
     def set(self, key_bytes: bytes, dry_run: bool = False) -> bool:
         if dry_run:

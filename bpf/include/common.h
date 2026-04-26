@@ -10,7 +10,7 @@
 #include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include "handlers/xdp_slot_ctx.h"
+#include "../../handlers/xdp_slot_ctx.h"
 
 #ifndef bool
 typedef _Bool bool;
