@@ -123,6 +123,7 @@ compile_xdp_program() {
     for _hdr in "${_bpf_headers[@]}"; do
         fetch_local_or_remote "bpf/include/${_hdr}" "bpf/include/${_hdr}" "bpf/include/${_hdr}" || true
     done
+    fetch_local_or_remote "handlers/xdp_slot_ctx.h" "handlers/xdp_slot_ctx.h" "handlers/xdp_slot_ctx.h" || true
 
     info "Compiling ${XDP_SRC}..."
     if ! resolve_bpf_build_env || [[ -z "$ASM_INC" ]]; then

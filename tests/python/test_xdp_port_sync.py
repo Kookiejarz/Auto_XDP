@@ -12,6 +12,7 @@ from auto_xdp.bpf.maps import render_nft_ports as _render_nft_ports
 from auto_xdp import config as cfg
 import auto_xdp.backends as backends_mod
 import auto_xdp.backends.nftables as nftables_mod
+import auto_xdp.bpf.maps as bpf_maps_mod
 import auto_xdp.proc_events as proc_events_mod
 import auto_xdp.syncer as syncer_mod
 import auto_xdp.discovery as discovery_mod
@@ -91,6 +92,7 @@ class FakeConntrackMap:
     def __init__(self, active=None):
         self._active = set(active or [])
         self.ops = []
+        self.delete_port_ops = []
         self.closed = False
 
     def active_keys(self):
@@ -100,6 +102,10 @@ class FakeConntrackMap:
         self.ops.append((key, dry_run))
         self._active.add(key)
         return True
+
+    def delete_dest_ports(self, ports, dry_run=False):
+        self.delete_port_ops.append((set(ports), dry_run))
+        return len(self._active)
 
     def close(self):
         self.closed = True
@@ -277,6 +283,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.sctp_map = FakePortMap({3868, 9899})
         backend.trusted_map = FakeTrustedMap({"203.0.113.1/32"})
         backend.conntrack_map = FakeConntrackMap({b"keep"})
+        backend.udp_conntrack_map = FakeConntrackMap({b"udp-keep"})
         backend.syn_rate_map = FakeSynRateMap({22: 1})
         backend.syn_agg_rate_map = FakeSynRateMap()
         backend.tcp_conn_limit_map = FakeSynRateMap()
@@ -309,11 +316,36 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(backend.trusted_map.set_ops, [("198.51.100.5/32", 1, False)])
         self.assertEqual(backend.trusted_map.delete_ops, [("203.0.113.1/32", False)])
         self.assertEqual(backend.conntrack_map.ops, [])
+        self.assertEqual(backend.conntrack_map.delete_port_ops, [({80}, False)])
+        self.assertEqual(backend.udp_conntrack_map.delete_port_ops, [({9999}, False)])
         backend._sync_syn_rate.assert_called_once_with({22, 443}, False, None)
         backend._sync_syn_agg_rate.assert_called_once_with({22, 443}, False, None)
         backend._sync_tcp_conn_limit.assert_called_once_with({22, 443}, False, None)
         backend._sync_udp_rate.assert_called_once_with({53}, False, None)
         backend._sync_udp_agg_rate.assert_called_once_with({53}, False, None)
+
+    def test_bpf_conntrack_map_delete_dest_ports_matches_ct_key_dport(self):
+        conntrack = bpf_maps_mod.BpfConntrackMap.__new__(bpf_maps_mod.BpfConntrackMap)
+        deleted = []
+
+        def ct_key(dest_port: int) -> bytes:
+            key = bytearray(40)
+            key[0] = 2
+            struct.pack_into("!H", key, 6, dest_port)
+            return bytes(key)
+
+        conntrack._iter_raw_keys = mock.Mock(return_value=iter([
+            ct_key(22),
+            ct_key(80),
+            ct_key(443),
+        ]))
+        conntrack.delete = mock.Mock(side_effect=lambda key, dry_run=False: deleted.append((key, dry_run)) or True)
+
+        removed = bpf_maps_mod.BpfConntrackMap.delete_dest_ports(conntrack, {80, 443}, dry_run=False)
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(len(deleted), 2)
+        self.assertEqual({struct.unpack_from("!H", key, 6)[0] for key, _ in deleted}, {80, 443})
 
     def test_xdp_backend_sync_syn_rate_uses_proc_names_and_service_names(self):
         import auto_xdp.policy as policy

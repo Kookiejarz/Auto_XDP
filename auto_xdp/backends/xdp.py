@@ -33,6 +33,7 @@ class XdpBackend(PortBackend):
         self.udp_map = BpfArrayMap(cfg.UDP_MAP_PATH)
         self.trusted_map = BpfTrustedMaps(cfg.TRUSTED_IPS_MAP_PATH4, cfg.TRUSTED_IPS_MAP_PATH6)
         self.conntrack_map = BpfConntrackMap(cfg.TCP_CONNTRACK_MAP_PATH)
+        self.udp_conntrack_map = BpfConntrackMap(cfg.UDP_CONNTRACK_MAP_PATH)
         self.syn_rate_map: BpfSynRatePortsMap | None = None
         self.syn_agg_rate_map: BpfSynRatePortsMap | None = None
         self.tcp_conn_limit_map: BpfSynRatePortsMap | None = None
@@ -89,6 +90,9 @@ class XdpBackend(PortBackend):
         self.udp_map.close()
         self.trusted_map.close()
         self.conntrack_map.close()
+        udp_conntrack_map = getattr(self, "udp_conntrack_map", None)
+        if udp_conntrack_map is not None:
+            udp_conntrack_map.close()
         if self.syn_rate_map is not None:
             self.syn_rate_map.close()
         if self.syn_agg_rate_map is not None:
@@ -126,6 +130,8 @@ class XdpBackend(PortBackend):
         active_sctp = self.sctp_map.active_ports() if self.sctp_map is not None else set()
         active_trusted = self.trusted_map.active_keys()
         _ = conntrack_target
+        closed_tcp_ports = active_tcp - tcp_target - tcp_permanent
+        closed_udp_ports = active_udp - udp_target - udp_permanent
 
         for port in sorted(tcp_target - active_tcp):
             tag = f" [{cfg.TCP_PERMANENT[port]}]" if port in cfg.TCP_PERMANENT else ""
@@ -133,10 +139,20 @@ class XdpBackend(PortBackend):
                 log.debug("TCP +%d%s", port, tag)
                 changed = True
 
-        for port in sorted(active_tcp - tcp_target - tcp_permanent):
+        for port in sorted(closed_tcp_ports):
             if self.tcp_map.set(port, 0, dry_run):
                 log.debug("TCP -%d  (stopped)", port)
                 changed = True
+
+        if closed_tcp_ports:
+            deleted = self.conntrack_map.delete_dest_ports(closed_tcp_ports, dry_run)
+            if deleted:
+                log.info(
+                    "TCP conntrack -%d entr%s for closed port(s): %s",
+                    deleted,
+                    "y" if deleted == 1 else "ies",
+                    ", ".join(str(port) for port in sorted(closed_tcp_ports)),
+                )
 
         for port in sorted(udp_target - active_udp):
             tag = f" [{cfg.UDP_PERMANENT[port]}]" if port in cfg.UDP_PERMANENT else ""
@@ -144,10 +160,20 @@ class XdpBackend(PortBackend):
                 log.debug("UDP +%d%s", port, tag)
                 changed = True
 
-        for port in sorted(active_udp - udp_target - udp_permanent):
+        for port in sorted(closed_udp_ports):
             if self.udp_map.set(port, 0, dry_run):
                 log.debug("UDP -%d  (stopped)", port)
                 changed = True
+
+        if closed_udp_ports:
+            deleted = self.udp_conntrack_map.delete_dest_ports(closed_udp_ports, dry_run)
+            if deleted:
+                log.info(
+                    "UDP conntrack -%d entr%s for closed port(s): %s",
+                    deleted,
+                    "y" if deleted == 1 else "ies",
+                    ", ".join(str(port) for port in sorted(closed_udp_ports)),
+                )
 
         if self.sctp_map is not None:
             for port in sorted(sctp_target - active_sctp):
