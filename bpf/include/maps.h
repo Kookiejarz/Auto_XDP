@@ -74,10 +74,10 @@ struct {
     __type(value, struct icmp_token_bucket);
 } icmp_tb SEC(".maps");
 
-// Global UDP two-bucket sliding-window rate limiter state.
-// byte_rate_max is runtime-configurable via bpftool; set to 0 to disable.
+// Per-CPU UDP two-bucket sliding-window rate limiter state.
+// byte_rate_max is runtime-configurable; set to 0 to disable.
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct udp_global_tb);

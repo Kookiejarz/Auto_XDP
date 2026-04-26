@@ -314,9 +314,11 @@ static __always_inline int allow_new_tcp_syn(struct ct_key *key, __u32 dest_port
     return XDP_PASS;
 }
 
-// Global UDP sliding-window rate limiter.
+// Per-CPU UDP sliding-window rate limiter.
 // Uses a two-bucket approximation: maintains current and previous 1-second
 // buckets and computes a weighted estimate of the last 1 second's byte count.
+// Each CPU updates only its own local bucket, so the result is an approximate
+// global cap that favors throughput over strict cross-CPU accuracy.
 // Avoids integer division by comparing scaled values:
 //   prev_bytes*(WINDOW-elapsed) + curr_bytes*WINDOW  vs  byte_rate_max*WINDOW
 static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes)
@@ -326,10 +328,7 @@ static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes)
     if (!tb)
         return XDP_PASS;
 
-    bpf_spin_lock(&tb->lock);
-
     if (tb->byte_rate_max == 0) {
-        bpf_spin_unlock(&tb->lock);
         return XDP_PASS;
     }
 
@@ -337,7 +336,6 @@ static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes)
         tb->window_start_ns = now;
         tb->prev_bytes = 0;
         tb->curr_bytes = pkt_bytes;
-        bpf_spin_unlock(&tb->lock);
         return XDP_PASS;
     }
 
@@ -350,7 +348,6 @@ static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes)
         tb->window_start_ns = now;
         tb->prev_bytes = 0;
         tb->curr_bytes = pkt_bytes;
-        bpf_spin_unlock(&tb->lock);
         return XDP_PASS;
     }
 
@@ -374,7 +371,5 @@ static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes)
         tb->curr_bytes += pkt_bytes;
         ret = XDP_PASS;
     }
-
-    bpf_spin_unlock(&tb->lock);
     return ret;
 }

@@ -28,11 +28,11 @@ struct icmp_token_bucket {
     __u64 last_refill_ns; // ktime_ns of last refill; 0 = uninitialized
 };
 
-// Global UDP two-bucket sliding-window rate limiter state.
-// byte_rate_max is runtime-configurable via bpftool; set to 0 to disable.
+// Per-CPU UDP two-bucket sliding-window rate limiter state.
+// byte_rate_max is runtime-configurable; set to 0 to disable.
 struct udp_global_tb {
-    struct bpf_spin_lock lock;
     __u32 byte_rate_max;     // max bytes per 1-second window; 0 = disabled
+    __u32 _pad;
     __u64 window_start_ns;   // ktime_ns of current bucket's start; 0 = uninit
     __u64 prev_bytes;        // byte count in the previous 1-second bucket
     __u64 curr_bytes;        // byte count in the current 1-second bucket
