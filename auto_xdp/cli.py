@@ -91,17 +91,12 @@ def main() -> None:
     except argparse.ArgumentTypeError as exc:
         p.error(str(exc))
 
-    backend = None
-    try:
-        if args.watch:
-            watch(
-                args.dry_run, args.backend, args.config,
-                cli_trusted_ips, cli_log_level=args.log_level,
-            )
-        else:
-            backend = open_backend(args.backend)
+    if args.watch:
+        watch(
+            args.dry_run, args.backend, args.config,
+            cli_trusted_ips, cli_log_level=args.log_level,
+        )
+    else:
+        with open_backend(args.backend) as backend:
             sync_once(backend, args.dry_run)
             log.info("Sync completed.")
-    finally:
-        if backend is not None:
-            backend.close()

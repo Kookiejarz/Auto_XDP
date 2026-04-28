@@ -9,6 +9,9 @@
 # Set to false on private/internal networks where RFC1918 source addresses are legitimate.
 bogon_filter = false
 
+[under_attack]
+enabled = true
+
 [daemon]
 # Log verbosity for the Python sync daemon: debug, info, warning, error.
 log_level = "warning"
@@ -153,7 +156,21 @@ default_action = "drop"
 # enabled = ["sctp", "gre", "esp"]
 enabled = []
 
+[port_handlers]
+[port_handlers.tcp]
+
+[port_handlers.udp]
+
 [xdp]
 # Remove stale conntrack entries after N consecutive reconcile rounds miss them.
 # Only affects userspace-managed TCP conntrack seeding/cleanup logic.
 conntrack_stale_reconciles = 2
+
+[xdp.runtime]
+tcp_timeout_seconds = 300
+udp_timeout_seconds = 60
+conntrack_refresh_seconds = 30
+icmp_burst_packets = 100
+icmp_rate_pps = 100
+udp_global_window_seconds = 1
+rate_window_seconds = 1

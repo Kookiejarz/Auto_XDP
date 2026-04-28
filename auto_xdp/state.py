@@ -32,6 +32,18 @@ class DesiredState:
     udp_agg_rate_limits: dict[int, int] = field(default_factory=dict)
     acl_rules: dict[tuple[str, str], frozenset[int]] = field(default_factory=dict)
     bogon_filter_enabled: bool = False
+    drop_events_enabled: bool = True
+    rate_limit_source_prefix_v4: int = 32
+    rate_limit_source_prefix_v6: int = 128
+    xdp_runtime_config: tuple[int, int, int, int, int, int, int] = (
+        300_000_000_000,
+        60_000_000_000,
+        30_000_000_000,
+        100,
+        10_000_000,
+        1_000_000_000,
+        1_000_000_000,
+    )
 
 
 @dataclass
@@ -50,6 +62,10 @@ class AppliedState:
     udp_agg_rate_limits: dict[int, int] = field(default_factory=dict)
     acl_rules: dict[tuple[str, str], frozenset[int]] = field(default_factory=dict)
     bogon_filter_enabled: bool | None = None
+    drop_events_enabled: bool | None = None
+    rate_limit_source_prefix_v4: int = 32
+    rate_limit_source_prefix_v6: int = 128
+    xdp_runtime_config: tuple[int, int, int, int, int, int, int] | None = None
 
 
 @dataclass
@@ -77,6 +93,7 @@ class ReconcilePlan:
     acl_rules_to_upsert: dict[tuple[str, str], frozenset[int]] = field(default_factory=dict)
     acl_rules_to_remove: set[tuple[str, str]] = field(default_factory=set)
     bogon_filter_update: bool | None = None
+    drop_events_update: bool | None = None
 
     def is_noop(self) -> bool:
         return not any((
@@ -103,6 +120,7 @@ class ReconcilePlan:
             self.acl_rules_to_upsert,
             self.acl_rules_to_remove,
             self.bogon_filter_update is not None,
+            self.drop_events_update is not None,
         ))
 
 
@@ -168,4 +186,6 @@ def compute_reconcile_plan(desired: DesiredState, applied: AppliedState) -> Reco
     )
     if applied.bogon_filter_enabled is None or applied.bogon_filter_enabled != desired.bogon_filter_enabled:
         plan.bogon_filter_update = desired.bogon_filter_enabled
+    if applied.drop_events_enabled is None or applied.drop_events_enabled != desired.drop_events_enabled:
+        plan.drop_events_update = desired.drop_events_enabled
     return plan
