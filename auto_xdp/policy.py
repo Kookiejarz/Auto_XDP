@@ -4,6 +4,27 @@ from auto_xdp import config as cfg
 from auto_xdp.services import service_name
 from auto_xdp.state import DesiredState, ObservedState
 
+_NS_PER_SECOND = 1_000_000_000
+
+
+def _seconds_to_ns(value: float) -> int:
+    return int(value * _NS_PER_SECOND)
+
+
+def _xdp_runtime_config() -> tuple[int, int, int, int, int, int, int]:
+    icmp_ns_per_token = 0
+    if cfg.XDP_ICMP_RATE_PPS > 0:
+        icmp_ns_per_token = max(1, int(_NS_PER_SECOND / cfg.XDP_ICMP_RATE_PPS))
+    return (
+        _seconds_to_ns(cfg.XDP_TCP_TIMEOUT_SECONDS),
+        _seconds_to_ns(cfg.XDP_UDP_TIMEOUT_SECONDS),
+        _seconds_to_ns(cfg.XDP_CONNTRACK_REFRESH_SECONDS),
+        cfg.XDP_ICMP_BURST_PACKETS,
+        icmp_ns_per_token,
+        _seconds_to_ns(cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS),
+        _seconds_to_ns(cfg.XDP_RATE_WINDOW_SECONDS),
+    )
+
 
 def _resolve_service_limit(
     port: int,
@@ -115,4 +136,8 @@ def resolve_desired_state(observed: ObservedState) -> DesiredState:
         ),
         acl_rules=_desired_acl_rules(),
         bogon_filter_enabled=cfg.BOGON_FILTER_ENABLED,
+        drop_events_enabled=cfg.DROP_EVENTS_ENABLED,
+        rate_limit_source_prefix_v4=cfg.RATE_LIMIT_SOURCE_PREFIX_V4,
+        rate_limit_source_prefix_v6=cfg.RATE_LIMIT_SOURCE_PREFIX_V6,
+        xdp_runtime_config=_xdp_runtime_config(),
     )

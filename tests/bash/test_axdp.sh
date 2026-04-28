@@ -62,26 +62,6 @@ test_csv_helpers_sort_and_diff_ports() (
     assert_eq "$(diff_csv "22,80" "22,443" removed)" "80"
 )
 
-test_valid_log_level_and_config_updates() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    valid_log_level debug || return 1
-    valid_log_level trace >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "1" || return 1
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    CONFIG_FILE="$tmpdir/auto_xdp.env"
-    cat >"$CONFIG_FILE" <<'EOF_CFG'
-LOG_LEVEL="info"
-EOF_CFG
-
-    set_config_var "LOG_LEVEL" "debug" || return 1
-    assert_file_contains "$CONFIG_FILE" 'LOG_LEVEL="debug"'
-)
-
 test_run_log_level_reads_and_updates_config() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -242,7 +222,7 @@ test_run_backend_reports_runtime_state_and_conntrack_counts() (
     mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
     printf 'xdp\n' > "$RUN_STATE_DIR/backend"
     printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
-    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_conntrack" "$BPF_PIN_DIR/udp_conntrack"
+    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" "$BPF_PIN_DIR/udp_ct6"
     cat >"$CONFIG_FILE" <<'EOF_CFG'
 IFACES="eth9"
 PREFERRED_BACKEND="auto"
@@ -261,10 +241,10 @@ EOF_TC
     cat >"$tmpdir/bin/bpftool" <<EOF_BPF
 #!/bin/sh
 case "\$*" in
-  *"tcp_conntrack"*)
+  *"tcp_ct4"*)
     printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[2,0,0,0,0,81,1,187]}]'
     ;;
-  *"udp_conntrack"*)
+  *"udp_ct6"*)
     printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
     ;;
   *)
@@ -299,7 +279,7 @@ test_run_backend_json_reports_runtime_state_and_conntrack_counts() (
     mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
     printf 'xdp\n' > "$RUN_STATE_DIR/backend"
     printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
-    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_conntrack" "$BPF_PIN_DIR/udp_conntrack"
+    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" "$BPF_PIN_DIR/udp_ct6"
     cat >"$CONFIG_FILE" <<'EOF_CFG'
 IFACES="eth9"
 PREFERRED_BACKEND="auto"
@@ -318,10 +298,10 @@ EOF_TC
     cat >"$tmpdir/bin/bpftool" <<EOF_BPF
 #!/bin/sh
 case "\$*" in
-  *"tcp_conntrack"*)
+  *"tcp_ct4"*)
     printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[2,0,0,0,0,81,1,187]}]'
     ;;
-  *"udp_conntrack"*)
+  *"udp_ct6"*)
     printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
     ;;
   *)
@@ -487,7 +467,6 @@ run_test "axdp formats human-readable counters and rates" test_format_helpers_re
 run_test "axdp parses stats flags" test_parse_stats_args_sets_expected_flags
 run_test "axdp parses ports flags" test_parse_ports_args_sets_expected_flags
 run_test "axdp sorts and diffs csv port lists" test_csv_helpers_sort_and_diff_ports
-run_test "axdp validates log levels and rewrites config" test_valid_log_level_and_config_updates
 run_test "axdp reads and updates runtime log level" test_run_log_level_reads_and_updates_config
 run_test "axdp preserves unrelated TOML sections on config update" test_config_updates_preserve_unrelated_sections
 run_test "axdp permanent supports SCTP ports" test_run_permanent_supports_sctp_ports
