@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import math
 import os
 import re
+import struct
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,6 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from auto_xdp import config as cfg
+from auto_xdp.bpf.syscall import (
+    BPF_MAP_DELETE_ELEM,
+    BPF_MAP_GET_NEXT_KEY,
+    BPF_MAP_LOOKUP_ELEM,
+    bpf,
+    obj_get,
+)
 
 try:
     import tomllib  # Python 3.11+
@@ -30,6 +41,26 @@ _BUILTIN_SLOT_INFO = {
     "esp": (50, "esp_handler.o"),
     "sctp": (132, "sctp_handler.o"),
 }
+_BUILTIN_SLOT_ARTIFACTS = {
+    "gre_handler.c",
+    "gre_handler.o",
+    "esp_handler.c",
+    "esp_handler.o",
+    "sctp_handler.c",
+    "sctp_handler.o",
+}
+_CUSTOM_SLOT_ARTIFACT_RE = re.compile(r"^custom_\d+_.+\.(?:c|o)$")
+_CUSTOM_PORT_ARTIFACT_RE = re.compile(r"^custom_(?:tcp|udp)_\d+_.+\.(?:c|o)$")
+_PORT_HANDLER_MARKERS = (
+    "tcp_ct4",
+    "tcp_ct6",
+    "tcp_pd4",
+    "tcp_pd6",
+    "udp_hv4",
+    "udp_hv6",
+    "hblk4",
+    "hblk6",
+)
 _DEFAULT_CONFIG_TEMPLATE = """\
 # Auto XDP configuration — /etc/auto_xdp/config.toml
 # Manage via: axdp trust / axdp acl / axdp permanent
@@ -41,6 +72,12 @@ _DEFAULT_CONFIG_TEMPLATE = """\
 # Set to false only on environments where private/internal source ranges are expected.
 # Set to false on private/internal networks where RFC1918 source addresses are legitimate.
 bogon_filter = false
+
+[under_attack]
+# under_attack mode favors survivability under high packet rates.
+# When enabled, drop telemetry is disabled in the XDP data path to avoid
+# per-drop ringbuf writes and reduce hot-path CPU cost.
+enabled = false
 
 [daemon]
 # Log verbosity for the Python sync daemon: debug, info, warning, error.
@@ -83,6 +120,13 @@ sctp = []
 # Lookup order: syn_by_proc (process name) → syn_by_service (IANA name).
 # Ports absent from both tables are not rate-limited (e.g. HTTP/HTTPS).
 # These limits apply only to new inbound TCP SYN traffic.
+
+[rate_limits]
+# Source grouping for per-source rate limits.
+# Defaults preserve per-IP behavior: IPv4 /32 and IPv6 /128.
+# Set to 24/64, for example, to make all sources in each CIDR share one bucket.
+source_cidr_v4 = 32
+source_cidr_v6 = 128
 
 [rate_limits.syn_by_proc]
 # Key: process name as seen on the local host.
@@ -186,10 +230,29 @@ default_action = "drop"
 # enabled = ["sctp", "gre", "esp"]
 enabled = []
 
+[port_handlers.tcp]
+# Per-port TCP handlers: "PORT" = "/path/to/handler.o" or ".c".
+# Example:
+# "25565" = "/usr/local/lib/auto_xdp/handlers/minecraft_handler.o"
+
+[port_handlers.udp]
+# Per-port UDP handlers: "PORT" = "/path/to/handler.o" or ".c".
+
 [xdp]
 # Remove stale conntrack entries after N consecutive reconcile rounds miss them.
 # Only affects userspace-managed TCP conntrack seeding/cleanup logic.
 conntrack_stale_reconciles = 2
+
+[xdp.runtime]
+# Hot-updated XDP data-path tunables. Set a duration to 0 to let the BPF
+# program use its compiled default.
+tcp_timeout_seconds = 300
+udp_timeout_seconds = 60
+conntrack_refresh_seconds = 30
+icmp_burst_packets = 100
+icmp_rate_pps = 100
+udp_global_window_seconds = 1
+rate_window_seconds = 1
 """
 
 
@@ -251,9 +314,13 @@ def _parse_toml_fallback(text: str) -> dict[str, Any]:
         if raw.startswith('"'):
             try:
                 return json.loads(raw)
-            except Exception:
+            except json.JSONDecodeError:
+                if not raw.endswith('"') or len(raw) < 2:
+                    raise ValueError(f"Malformed string value in config: {raw!r}")
                 return raw[1:-1]
         if raw.startswith("'"):
+            if not raw.endswith("'") or len(raw) < 2:
+                raise ValueError(f"Malformed string value in config: {raw!r}")
             return raw[1:-1]
         if raw == "true":
             return True
@@ -408,16 +475,6 @@ def _slot_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     return bpf_pin_dir, install_dir, handlers_dir
 
 
-def _run_bpftool(cmd: list[str], fail_msg: str) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        if detail:
-            print(detail, file=sys.stderr)
-        raise RuntimeError(fail_msg)
-    return result
-
-
 def _run_checked(cmd: list[str], fail_msg: str) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -484,18 +541,21 @@ def _resolve_asm_include(target_arch: str) -> str | None:
     return "/usr/include"
 
 
-def _compile_custom_slot_source(source_path: Path, proto: int, handlers_dir: Path) -> Path:
+def _compile_handler_source(
+    source_path: Path, proto: int | str, handlers_dir: Path, port: int | None = None
+) -> Path:
     if not source_path.is_file():
         raise RuntimeError(f"Handler source not found: {source_path}")
     if source_path.suffix != ".c":
         raise RuntimeError(f"Unsupported handler source type: {source_path}")
 
     handlers_dir.mkdir(parents=True, exist_ok=True)
-    output_path = handlers_dir / f"custom_{proto}_{source_path.stem}.o"
+    stem = f"custom_{proto}_{port}_{source_path.stem}.o" if port is not None else f"custom_{proto}_{source_path.stem}.o"
+    output_path = handlers_dir / stem
     target_arch, host_arch_flag = _resolve_target_arch()
     asm_inc = _resolve_asm_include(target_arch)
     if asm_inc is None:
-        raise RuntimeError("ASM headers not found; cannot compile slot handler source.")
+        raise RuntimeError("ASM headers not found; cannot compile handler source.")
 
     cmd = [
         "clang",
@@ -526,6 +586,179 @@ def _compile_custom_slot_source(source_path: Path, proto: int, handlers_dir: Pat
     )
     _run_checked(cmd, f"Failed to compile {source_path}")
     return output_path
+
+
+def _normalize_handler_port(value: int) -> int:
+    if value <= 0 or value > 65535:
+        raise ValueError(f"invalid port: {value}")
+    return value
+
+
+def _port_handler_map_path(bpf_pin_dir: Path, proto: str) -> Path:
+    return bpf_pin_dir / ("tcp_port_handlers" if proto == "tcp" else "udp_port_handlers")
+
+
+def _port_handler_dir(bpf_pin_dir: Path, proto: str, port: int) -> Path:
+    return bpf_pin_dir / "port_handlers" / proto / str(port)
+
+
+class _BpfPendingConntrackMap:
+    def __init__(self, path: Path, key_len: int) -> None:
+        self.path = path
+        self.fd = obj_get(str(path))
+        self._key = bytearray(key_len)
+        self._next_key = bytearray(key_len)
+        self._value = bytearray(4)
+        self._lookup_attr = bytearray(128)
+        self._delete_attr = bytearray(128)
+        self._next_attr = bytearray(128)
+        self._key_buf = memoryview(self._key)
+        self._next_key_buf = memoryview(self._next_key)
+        key_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._key))
+        next_key_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._next_key))
+        value_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._value))
+        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, key_ptr, value_ptr)
+        struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, key_ptr)
+        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_key_ptr)
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self) -> _BpfPendingConntrackMap:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _iter_keys(self) -> list[bytes]:
+        result: list[bytes] = []
+        current_ptr = 0
+        while True:
+            next_key_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._next_key))
+            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr, next_key_ptr)
+            try:
+                bpf(BPF_MAP_GET_NEXT_KEY, self._next_attr)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    break
+                raise
+            key_raw = bytes(self._next_key_buf)
+            result.append(key_raw)
+            self._key_buf[:] = key_raw
+            current_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._key))
+        return result
+
+    def _lookup_value(self, key_raw: bytes) -> int:
+        self._key_buf[:] = key_raw
+        bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+        return struct.unpack_from("=I", self._value, 0)[0]
+
+    def delete_for_port(self, dest_port: int) -> int:
+        deleted = 0
+        for key_raw in self._iter_keys():
+            try:
+                if self._lookup_value(key_raw) != dest_port:
+                    continue
+                self._key_buf[:] = key_raw
+                bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
+                deleted += 1
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    continue
+                raise
+        return deleted
+
+    def delete_key_port(self, dest_port: int, dport_offset: int = 2) -> int:
+        deleted = 0
+        for key_raw in self._iter_keys():
+            try:
+                if struct.unpack_from("!H", key_raw, dport_offset)[0] != dest_port:
+                    continue
+                self._key_buf[:] = key_raw
+                bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
+                deleted += 1
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    continue
+                raise
+        return deleted
+
+
+def _flush_tcp_pending_for_port(bpf_pin_dir: Path, port: int) -> int:
+    deleted = 0
+    for name, key_len in (("tcp_pd4", 12), ("tcp_pd6", 36)):
+        pending_path = bpf_pin_dir / name
+        if not pending_path.exists():
+            continue
+        with _BpfPendingConntrackMap(pending_path, key_len) as pending_map:
+            deleted += pending_map.delete_for_port(port)
+    return deleted
+
+
+def _flush_udp_validated_for_port(bpf_pin_dir: Path, port: int) -> int:
+    deleted = 0
+    for name, key_len in (("udp_hv4", 12), ("udp_hv6", 36)):
+        map_path = bpf_pin_dir / name
+        if not map_path.exists():
+            continue
+        with _BpfPendingConntrackMap(map_path, key_len) as validated:
+            deleted += validated.delete_key_port(port)
+    return deleted
+
+
+def _cleanup_existing_port_handler(bpf_pin_dir: Path, proto: str, port: int) -> None:
+    map_path = _port_handler_map_path(bpf_pin_dir, proto)
+    subprocess.run(
+        [
+            "bpftool",
+            "map",
+            "delete",
+            "pinned",
+            str(map_path),
+            "key",
+            str(port),
+            "0",
+            "0",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proto == "tcp":
+        _flush_tcp_pending_for_port(bpf_pin_dir, port)
+    else:
+        _flush_udp_validated_for_port(bpf_pin_dir, port)
+    pin_dir = _port_handler_dir(bpf_pin_dir, proto, port)
+    shutil.rmtree(pin_dir, ignore_errors=True)
+
+
+def _port_handler_config_update(config_path: Path, proto: str, port: int, path: str | None) -> None:
+    cfg_path, data = _load_config(str(config_path))
+    port_handlers = data.setdefault("port_handlers", {})
+    table = port_handlers.setdefault(proto, {})
+    if path is None:
+        table.pop(str(port), None)
+    else:
+        table[str(port)] = path
+    _write_toml(cfg_path, data)
+
+
+def _iter_configured_port_handlers(config_path: Path) -> list[tuple[str, int, str]]:
+    _, data = _load_config(str(config_path))
+    port_handlers = data.get("port_handlers", {})
+    results: list[tuple[str, int, str]] = []
+    for proto in ("tcp", "udp"):
+        table = port_handlers.get(proto, {})
+        if not isinstance(table, dict):
+            continue
+        for raw_port, raw_path in table.items():
+            port = _normalize_handler_port(int(raw_port))
+            path = str(raw_path)
+            if path:
+                results.append((proto, port, path))
+    return sorted(results, key=lambda item: (item[0], item[1]))
 
 
 def _cmd_config_show(args: argparse.Namespace) -> int:
@@ -564,6 +797,28 @@ def _cmd_log_level(args: argparse.Namespace) -> int:
     daemon["log_level"] = level
     _write_toml(path, data)
     print(f"daemon.log_level={level}")
+    return 0
+
+
+def _cmd_under_attack(args: argparse.Namespace) -> int:
+    path, data = _load_config(args.config)
+    under_attack = data.setdefault("under_attack", {})
+
+    if not args.mode:
+        enabled = bool(under_attack.get("enabled", False))
+        print("on" if enabled else "off")
+        return 0
+
+    mode = args.mode.lower()
+    if mode not in {"on", "off"}:
+        print(f"Invalid under_attack mode: {mode}", file=sys.stderr)
+        print("Valid values: on, off", file=sys.stderr)
+        return 1
+
+    enabled = mode == "on"
+    under_attack["enabled"] = enabled
+    _write_toml(path, data)
+    print(f"under_attack.enabled={'true' if enabled else 'false'}")
     return 0
 
 
@@ -726,28 +981,65 @@ def _cmd_slot_disable(args: argparse.Namespace) -> int:
     return 0
 
 
+def _looks_like_port_handler_source(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return any(marker in text for marker in _PORT_HANDLER_MARKERS)
+
+
+def _iter_available_port_handler_files(handlers_dir: Path) -> list[Path]:
+    if not handlers_dir.is_dir():
+        return []
+
+    candidates: dict[str, Path] = {}
+    for path in handlers_dir.iterdir():
+        if not path.is_file() or path.suffix not in {".c", ".o"}:
+            continue
+        if path.name in _BUILTIN_SLOT_ARTIFACTS or _CUSTOM_SLOT_ARTIFACT_RE.match(path.name):
+            continue
+
+        include = False
+        if _CUSTOM_PORT_ARTIFACT_RE.match(path.name):
+            include = True
+        elif path.suffix == ".c":
+            include = _looks_like_port_handler_source(path)
+        else:
+            source_peer = path.with_suffix(".c")
+            include = source_peer.is_file() and _looks_like_port_handler_source(source_peer)
+
+        if not include:
+            continue
+
+        key = path.stem
+        current = candidates.get(key)
+        if current is None or (current.suffix != ".o" and path.suffix == ".o"):
+            candidates[key] = path
+
+    return [candidates[key] for key in sorted(candidates)]
+
+
 def _cmd_slot_list(args: argparse.Namespace) -> int:
     bpf_pin_dir, _, handlers_dir = _slot_paths(args)
     slot_pin_dir = bpf_pin_dir / "handlers"
     proto_handlers = bpf_pin_dir / "proto_handlers"
 
     if not proto_handlers.exists():
-        print("XDP not loaded (proto_handlers map not found).")
-        return 1
-
-    print("Loaded handlers:")
-    found = False
-    for pin in sorted(slot_pin_dir.glob("proto_*")):
-        if not pin.is_file():
-            continue
-        proto = pin.name.removeprefix("proto_")
-        name = _slot_prog_name(pin)
-        print(f"  proto {proto:<5} {name}")
-        found = True
-    if not found:
-        print("  (none)")
-
-    print("")
+        print("Loaded handlers:\n  XDP not running (proto_handlers map not found).\n")
+    else:
+        print("Loaded handlers:")
+        found = False
+        for pin in sorted(slot_pin_dir.glob("proto_*")):
+            if not pin.is_file():
+                continue
+            proto = pin.name.removeprefix("proto_")
+            name = _slot_prog_name(pin)
+            print(f"  proto {proto:<5} {name}")
+            found = True
+        if not found:
+            print("  (none)")
+        print("")
     print("Available handlers:")
     for name in ("gre", "esp", "sctp"):
         proto, obj_name = _BUILTIN_SLOT_INFO[name]
@@ -760,12 +1052,6 @@ def _cmd_slot_list(args: argparse.Namespace) -> int:
                 print(f"  {name:<6} (proto {proto})")
         else:
             print(f"  {name:<6} (proto {proto})  [.o not found: {obj_path}]")
-
-    if handlers_dir.is_dir():
-        for obj in sorted(handlers_dir.glob("*.o")):
-            if obj.name in {"gre_handler.o", "esp_handler.o", "sctp_handler.o"}:
-                continue
-            print(f"  custom  {obj}")
     return 0
 
 
@@ -789,7 +1075,7 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
         custom_path = Path(args.path)
         if custom_path.suffix == ".c":
             try:
-                obj_path = _compile_custom_slot_source(custom_path, proto, handlers_dir)
+                obj_path = _compile_handler_source(custom_path, proto, handlers_dir)
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -851,8 +1137,8 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
         )
 
     try:
-        _run_bpftool(load_cmd, f"Failed to load {obj_path}")
-        _run_bpftool(
+        _run_checked(load_cmd, f"Failed to load {obj_path}")
+        _run_checked(
             [
                 "bpftool",
                 "map",
@@ -936,12 +1222,1157 @@ def _cmd_slot_unload(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_port_handler_list(args: argparse.Namespace) -> int:
+    bpf_pin_dir, _, handlers_dir = _slot_paths(args)
+    base_dir = bpf_pin_dir / "port_handlers"
+    configured = _iter_configured_port_handlers(Path(args.config))
+    available = _iter_available_port_handler_files(handlers_dir)
+
+    print("Loaded per-port handlers:")
+    found = False
+    for proto in ("tcp", "udp"):
+        proto_dir = base_dir / proto
+        if not proto_dir.is_dir():
+            continue
+        port_dirs = [item for item in proto_dir.iterdir() if item.is_dir() and item.name.isdigit()]
+        for port_dir in sorted(port_dirs, key=lambda item: int(item.name)):
+            if not port_dir.is_dir():
+                continue
+            prog_pin = port_dir / "prog"
+            if not prog_pin.exists():
+                continue
+            name = _slot_prog_name(prog_pin)
+            print(f"  {proto.upper():<3}  {port_dir.name:<5}  {name}")
+            found = True
+    if not found:
+        print("  (none)")
+
+    print("")
+    print("Configured per-port handlers:")
+    if not configured:
+        print("  (none)")
+    else:
+        for proto, port, path in configured:
+            print(f"  {proto.upper():<3}  {port:<5}  {path}")
+
+    print("")
+    print("Available local port handler files:")
+    if not available:
+        print("  (none)")
+        return 0
+    for path in available:
+        print(f"  {path.stem:<20} {path}")
+    return 0
+
+
+def _cmd_port_handler_load(args: argparse.Namespace) -> int:
+    path = Path(args.config)
+    bpf_pin_dir, _, handlers_dir = _slot_paths(args)
+    proto = str(args.proto).lower()
+    port = _normalize_handler_port(int(args.port))
+    slot_ctx_map = bpf_pin_dir / "slot_ctx_map"
+    handler_map = _port_handler_map_path(bpf_pin_dir, proto)
+
+    source_path = Path(args.path)
+    if source_path.suffix == ".c":
+        try:
+            obj_path = _compile_handler_source(source_path, proto, handlers_dir, port=port)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    else:
+        obj_path = source_path
+
+    if not obj_path.is_file():
+        print(f"Handler object not found: {obj_path}", file=sys.stderr)
+        return 1
+    obj_path = obj_path.resolve()
+    if not slot_ctx_map.exists():
+        print("XDP not loaded (slot_ctx_map not found). Run setup first.", file=sys.stderr)
+        return 1
+    if not handler_map.exists():
+        print(f"XDP not loaded ({handler_map.name} map not found).", file=sys.stderr)
+        return 1
+
+    shared_maps = [
+        ("slot_ctx_map", slot_ctx_map),
+        ("hblk4", bpf_pin_dir / "hblk4"),
+        ("hblk6", bpf_pin_dir / "hblk6"),
+    ]
+    if proto == "tcp":
+        shared_maps.extend(
+            [
+                ("tcp_ct4", bpf_pin_dir / "tcp_ct4"),
+                ("tcp_ct6", bpf_pin_dir / "tcp_ct6"),
+                ("tcp_pd4", bpf_pin_dir / "tcp_pd4"),
+                ("tcp_pd6", bpf_pin_dir / "tcp_pd6"),
+            ]
+        )
+    else:
+        shared_maps.extend(
+            [
+                ("udp_hv4", bpf_pin_dir / "udp_hv4"),
+                ("udp_hv6", bpf_pin_dir / "udp_hv6"),
+            ]
+        )
+
+    missing = [name for name, map_path in shared_maps if not map_path.exists()]
+    if missing:
+        print(f"XDP not loaded completely (missing pinned maps: {', '.join(missing)}).", file=sys.stderr)
+        return 1
+
+    pin_dir = _port_handler_dir(bpf_pin_dir, proto, port)
+    prog_pin = pin_dir / "prog"
+    pin_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_existing_port_handler(bpf_pin_dir, proto, port)
+    pin_dir.mkdir(parents=True, exist_ok=True)
+
+    load_cmd = [
+        "bpftool",
+        "prog",
+        "load",
+        str(obj_path),
+        str(prog_pin),
+        "type",
+        "xdp",
+        "pinmaps",
+        str(pin_dir),
+    ]
+    for name, map_path in shared_maps:
+        load_cmd.extend(["map", "name", name, "pinned", str(map_path)])
+
+    try:
+        _run_checked(load_cmd, f"Failed to load {obj_path}")
+        _run_checked(
+            [
+                "bpftool",
+                "map",
+                "update",
+                "pinned",
+                str(handler_map),
+                "key",
+                str(port),
+                "0",
+                "0",
+                "0",
+                "value",
+                "pinned",
+                str(prog_pin),
+            ],
+            f"Failed to register {proto} handler for port {port}",
+        )
+    except RuntimeError as exc:
+        shutil.rmtree(pin_dir, ignore_errors=True)
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if not args.no_config_update:
+        _ensure_config_exists(path)
+        _port_handler_config_update(path, proto, port, str(obj_path))
+    print(f"Loaded {proto.upper()} handler for port {port} from {obj_path}")
+    if not args.no_config_update:
+        print(f"  config: {path}")
+    return 0
+
+
+def _summarize_conntrack_maps(paths: list[str], limit: int) -> tuple[int, list[tuple[int, int, int, int]]]:
+    """Returns (total_entries, [(dport, total, v4, v6), ...]) sorted by total desc."""
+    rows: list[Any] = []
+    for path in paths:
+        try:
+            out = subprocess.check_output(
+                ["bpftool", "-j", "map", "dump", "pinned", path],
+                stderr=subprocess.DEVNULL,
+            )
+            data = json.loads(out)
+        except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+            data = []
+        if isinstance(data, list):
+            rows.extend(data)
+
+    stats: dict[int, dict[str, int]] = {}
+
+    def _to_int(v: Any) -> int:
+        if isinstance(v, str):
+            return int(v, 0)
+        return int(v)
+
+    for row in rows:
+        key = row.get("key", [])
+        if not isinstance(key, list):
+            continue
+        try:
+            if len(key) >= 8:
+                family = _to_int(key[0])
+                dport = (_to_int(key[6]) << 8) | _to_int(key[7])
+            elif len(key) >= 4:
+                family = 2 if len(key) == 12 else 10
+                dport = (_to_int(key[2]) << 8) | _to_int(key[3])
+            else:
+                continue
+        except (ValueError, IndexError, TypeError):
+            continue
+        entry = stats.setdefault(dport, {"total": 0, "v4": 0, "v6": 0})
+        entry["total"] += 1
+        if family == 2:
+            entry["v4"] += 1
+        elif family == 10:
+            entry["v6"] += 1
+
+    sorted_ports = sorted(stats.items(), key=lambda item: (-item[1]["total"], item[0]))[:limit]
+    result = [(dport, entry["total"], entry["v4"], entry["v6"]) for dport, entry in sorted_ports]
+    return len(rows), result
+
+
+def _render_conntrack_section(label: str, total: int, port_rows: list[tuple[int, int, int, int]]) -> None:
+    print(f"{label} conntrack:")
+    for dport, count, v4, v6 in port_rows:
+        print(f"  dport {dport:<5} total={count:<4} ipv4={v4:<4} ipv6={v6}")
+    if total == 0:
+        print("  (none)")
+    print(f"  total={total}")
+
+
+def _autodetect_iface() -> str:
+    """Return the default-route interface name, or raise RuntimeError."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "show", "default"], stderr=subprocess.DEVNULL, text=True
+        )
+    except (subprocess.CalledProcessError, OSError):
+        out = ""
+    for line in out.splitlines():
+        parts = line.split()
+        # format: default via ... dev IFACE ...
+        if "dev" in parts:
+            idx = parts.index("dev")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    raise RuntimeError("Could not detect interface. Use --iface IFACE.")
+
+
+def _detect_backend(
+    bpf_pin_dir: str,
+    run_state_dir: str,
+    iface: str,
+    nft_family: str,
+    nft_table: str,
+) -> str:
+    """Returns 'xdp' or 'nftables', raises RuntimeError if neither found."""
+    pkt_counters = Path(bpf_pin_dir) / "pkt_counters"
+
+    def _iface_has_xdp(iface_name: str) -> bool:
+        if not iface_name:
+            return False
+        try:
+            out = subprocess.check_output(
+                ["ip", "-d", "link", "show", "dev", iface_name],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            return bool(re.search(r"xdp|xdpgeneric|xdpoffload", out))
+        except (subprocess.CalledProcessError, OSError):
+            return False
+
+    def _nft_table_exists() -> bool:
+        if not shutil.which("nft"):
+            return False
+        result = subprocess.run(
+            ["nft", "list", "table", nft_family, nft_table],
+            capture_output=True,
+        )
+        return result.returncode == 0
+
+    def _check_xdp() -> bool:
+        return pkt_counters.exists() or _iface_has_xdp(iface)
+
+    def _check_xdp_last_resort() -> bool:
+        return pkt_counters.exists()
+
+    # Read hint from run-state file
+    candidate = ""
+    backend_file = Path(run_state_dir) / "backend"
+    if backend_file.is_file():
+        try:
+            candidate = backend_file.read_text().strip()
+        except OSError:
+            candidate = ""
+
+    if candidate == "xdp" and _check_xdp():
+        return "xdp"
+    if candidate == "nftables" and _nft_table_exists():
+        return "nftables"
+
+    # Fall back to auto-detect
+    if _check_xdp():
+        return "xdp"
+    if _nft_table_exists():
+        return "nftables"
+    if _check_xdp_last_resort():
+        return "xdp"
+
+    raise RuntimeError("No active Auto XDP backend detected.")
+
+
+def _read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
+    """Returns (tcp_ports, udp_ports) from BPF whitelist maps."""
+    tcp_map = str(Path(bpf_pin_dir) / "tcp_whitelist")
+    udp_map = str(Path(bpf_pin_dir) / "udp_whitelist")
+
+    for p in (tcp_map, udp_map):
+        if not Path(p).exists():
+            raise RuntimeError(f"XDP whitelist maps not found under {bpf_pin_dir}")
+
+    def _as_int(v: Any) -> int:
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            try:
+                return int(v, 0)
+            except ValueError:
+                return 0
+        return 0
+
+    def _key_to_port(key: Any) -> int:
+        if isinstance(key, int):
+            return key
+        if isinstance(key, list):
+            return int.from_bytes(
+                bytes(_as_int(b) & 0xFF for b in key[:4]), "little"
+            )
+        return _as_int(key)
+
+    def _dump_map(path: str) -> list[int]:
+        try:
+            out = subprocess.check_output(
+                ["bpftool", "-j", "map", "dump", "pinned", path],
+                stderr=subprocess.DEVNULL,
+            )
+            rows = json.loads(out)
+        except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+            return []
+        ports: list[int] = []
+        for row in rows:
+            if _as_int(row.get("value", 0)) <= 0:
+                continue
+            port = _key_to_port(row.get("key", 0))
+            if 0 < port <= 65535:
+                ports.append(port)
+        return sorted(set(ports))
+
+    return _dump_map(tcp_map), _dump_map(udp_map)
+
+
+def _read_nft_ports(nft_family: str, nft_table: str) -> tuple[list[int], list[int]]:
+    """Returns (tcp_ports, udp_ports) from nft sets."""
+    if not shutil.which("nft"):
+        raise RuntimeError("nft command not found")
+
+    def _read_set(set_name: str) -> list[int]:
+        try:
+            out = subprocess.check_output(
+                ["nft", "-j", "list", "set", nft_family, nft_table, set_name],
+                stderr=subprocess.DEVNULL,
+            )
+            data = json.loads(out)
+        except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+            return []
+        ports: set[int] = set()
+        for item in data.get("nftables", []):
+            e = item.get("element")
+            if not e:
+                continue
+            for v in e.get("elem", []):
+                if isinstance(v, int) and 0 < v <= 65535:
+                    ports.add(v)
+        return sorted(ports)
+
+    return _read_set("tcp_ports"), _read_set("udp_ports")
+
+
+def _lookup_port_procs(proto: str, ports: list[int]) -> dict[int, set[str]]:
+    """Returns {port: set_of_process_names} by scanning /proc/net/{tcp,udp}."""
+    proc_by_port: dict[int, set[str]] = {p: set() for p in ports}
+
+    def _parse_proc_net(path: str, state_filter: str, check_no_remote: bool = False) -> dict[int, int]:
+        result: dict[int, int] = {}
+        try:
+            with open(path) as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    local, remote, st, inode_str = parts[1], parts[2], parts[3], parts[9]
+                    if st != state_filter:
+                        continue
+                    if check_no_remote and not remote.endswith(":0000"):
+                        continue
+                    port = int(local.split(":")[1], 16)
+                    if port > 0:
+                        result[port] = int(inode_str)
+        except OSError:
+            pass
+        return result
+
+    if proto == "tcp":
+        port_to_inode: dict[int, int] = {}
+        port_to_inode.update(_parse_proc_net("/proc/net/tcp", "0A"))
+        port_to_inode.update(_parse_proc_net("/proc/net/tcp6", "0A"))
+    else:
+        port_to_inode = {}
+        port_to_inode.update(_parse_proc_net("/proc/net/udp", "07", check_no_remote=True))
+        port_to_inode.update(_parse_proc_net("/proc/net/udp6", "07", check_no_remote=True))
+
+    wanted_inodes = {inode for port, inode in port_to_inode.items() if port in proc_by_port}
+    inode_map: dict[int, str] = {}
+    if wanted_inodes:
+        try:
+            for entry in os.scandir("/proc"):
+                if not entry.name.isdigit():
+                    continue
+                pid = entry.name
+                try:
+                    for fd_entry in os.scandir(f"/proc/{pid}/fd"):
+                        try:
+                            link = os.readlink(fd_entry.path)
+                            if link.startswith("socket:["):
+                                inode = int(link[8:-1])
+                                if inode in wanted_inodes:
+                                    with open(f"/proc/{pid}/comm") as cf:
+                                        inode_map[inode] = cf.read().strip()
+                                    wanted_inodes.discard(inode)
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+                if not wanted_inodes:
+                    break
+        except OSError:
+            pass
+
+    for port, inode in port_to_inode.items():
+        if port in proc_by_port and inode in inode_map:
+            proc_by_port[port].add(inode_map[inode])
+
+    return proc_by_port
+
+
+def _read_rate_map(map_path: str) -> dict[int, int]:
+    """Returns {port: rate_per_sec} from a BPF rate map."""
+    rates: dict[int, int] = {}
+    if not map_path or not Path(map_path).exists():
+        return rates
+
+    def _b(v: Any) -> int:
+        if isinstance(v, int):
+            return v & 0xFF
+        if isinstance(v, str):
+            try:
+                return int(v, 0) & 0xFF
+            except ValueError:
+                return 0
+        return 0
+
+    try:
+        out = subprocess.check_output(
+            ["bpftool", "-j", "map", "dump", "pinned", map_path],
+            stderr=subprocess.DEVNULL,
+        )
+        for row in json.loads(out):
+            key = row.get("key", [])
+            val = row.get("value", [])
+            if isinstance(key, list) and len(key) >= 4:
+                port = _b(key[0]) | (_b(key[1]) << 8) | (_b(key[2]) << 16) | (_b(key[3]) << 24)
+                if isinstance(val, list) and len(val) >= 4:
+                    rate = _b(val[0]) | (_b(val[1]) << 8) | (_b(val[2]) << 16) | (_b(val[3]) << 24)
+                    if rate > 0:
+                        rates[port] = rate
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError, ValueError):
+        pass
+    return rates
+
+
+def _print_port_lines(
+    proto: str,
+    ports: list[int],
+    proc_map: dict[int, set[str]],
+    port_rates: dict[int, int],
+) -> None:
+    """Prints the port table rows."""
+    import socket as _socket
+
+    if not ports:
+        print("  (none)")
+        return
+    for p in sorted(set(ports)):
+        try:
+            svc = _socket.getservbyport(p, proto)
+        except OSError:
+            svc = "-"
+        procs = ",".join(sorted(proc_map.get(p, set()))) or "-"
+        rate = port_rates.get(p)
+        rate_str = f"{rate}/s" if rate else "-"
+        print(f"  {p:5d}  {svc:<14}  {procs:<14}  {rate_str}")
+
+
+def _collect_ports(
+    backend: str,
+    bpf_pin_dir: str,
+    nft_family: str,
+    nft_table: str,
+) -> tuple[list[int], list[int]]:
+    if backend == "xdp":
+        return _read_xdp_ports(bpf_pin_dir)
+    if backend == "nftables":
+        return _read_nft_ports(nft_family, nft_table)
+    raise RuntimeError("No active backend detected.")
+
+
+def _diff_port_lists(old: list[int], new: list[int]) -> tuple[list[int], list[int]]:
+    old_set = set(old)
+    new_set = set(new)
+    added = sorted(new_set - old_set)
+    removed = sorted(old_set - new_set)
+    return added, removed
+
+
+def _cmd_ports(args: argparse.Namespace) -> int:
+    """Handler for the ports subcommand."""
+    bpf_pin_dir: str = args.bpf_pin_dir
+    run_state_dir: str = args.run_state_dir
+    nft_family: str = args.nft_family
+    nft_table: str = args.nft_table
+    iface: str = args.iface or ""
+
+    # Auto-detect interface if not provided
+    if not iface:
+        try:
+            iface = _autodetect_iface()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    # Detect backend
+    try:
+        backend = _detect_backend(bpf_pin_dir, run_state_dir, iface, nft_family, nft_table)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    # Initial port read
+    try:
+        tcp_ports, udp_ports = _collect_ports(backend, bpf_pin_dir, nft_family, nft_table)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    syn_rate_map = str(Path(bpf_pin_dir) / "syn_rate_ports")
+    udp_rate_map = str(Path(bpf_pin_dir) / "udp_rate_ports")
+
+    def _render_current(tcp: list[int], udp: list[int]) -> None:
+        tcp_procs = _lookup_port_procs("tcp", tcp)
+        udp_procs = _lookup_port_procs("udp", udp)
+        tcp_rates = _read_rate_map(syn_rate_map)
+        udp_rates = _read_rate_map(udp_rate_map)
+        print(f"Backend   : {backend}")
+        print(f"Interface : {iface}")
+        print("TCP allow :")
+        _print_port_lines("tcp", tcp, tcp_procs, tcp_rates)
+        print("UDP allow :")
+        _print_port_lines("udp", udp, udp_procs, udp_rates)
+
+    _render_current(tcp_ports, udp_ports)
+
+    if not args.watch:
+        return 0
+
+    import time as _time
+    import datetime as _datetime
+
+    prev_tcp = tcp_ports
+    prev_udp = udp_ports
+
+    try:
+        while True:
+            _time.sleep(args.interval)
+            try:
+                new_backend = _detect_backend(bpf_pin_dir, run_state_dir, iface, nft_family, nft_table)
+                new_tcp, new_udp = _collect_ports(new_backend, bpf_pin_dir, nft_family, nft_table)
+            except RuntimeError:
+                continue
+
+            if new_tcp == prev_tcp and new_udp == prev_udp:
+                continue
+
+            now_ts = _datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            added_tcp, removed_tcp = _diff_port_lists(prev_tcp, new_tcp)
+            added_udp, removed_udp = _diff_port_lists(prev_udp, new_udp)
+
+            print("")
+            print(f"[{now_ts}] Port whitelist updated")
+            if added_tcp:
+                print(f"  TCP + {' '.join(str(p) for p in added_tcp)}")
+            if removed_tcp:
+                print(f"  TCP - {' '.join(str(p) for p in removed_tcp)}")
+            if added_udp:
+                print(f"  UDP + {' '.join(str(p) for p in added_udp)}")
+            if removed_udp:
+                print(f"  UDP - {' '.join(str(p) for p in removed_udp)}")
+            print("")
+
+            tcp_procs = _lookup_port_procs("tcp", new_tcp)
+            udp_procs = _lookup_port_procs("udp", new_udp)
+            tcp_rates = _read_rate_map(syn_rate_map)
+            udp_rates = _read_rate_map(udp_rate_map)
+            print("TCP allow :")
+            _print_port_lines("tcp", new_tcp, tcp_procs, tcp_rates)
+            print("UDP allow :")
+            _print_port_lines("udp", new_udp, udp_procs, udp_rates)
+
+            prev_tcp = new_tcp
+            prev_udp = new_udp
+    except KeyboardInterrupt:
+        return 0
+
+    return 0
+
+
+def _cmd_conntrack(args: argparse.Namespace) -> int:
+    """Handler for the conntrack subcommand."""
+    bpf_pin_dir = args.bpf_pin_dir
+    target = args.target
+    limit = args.limit
+
+    has_bpftool = shutil.which("bpftool") is not None
+
+    def _summarize(paths: list[str]) -> tuple[int, list[tuple[int, int, int, int]]]:
+        if not has_bpftool:
+            return 0, []
+        return _summarize_conntrack_maps(paths, limit)
+
+    if target in ("tcp", "all"):
+        total, port_rows = _summarize([
+            f"{bpf_pin_dir}/tcp_ct4",
+            f"{bpf_pin_dir}/tcp_ct6",
+        ])
+        _render_conntrack_section("TCP", total, port_rows)
+
+    if target == "all":
+        print("")
+
+    if target in ("udp", "all"):
+        total, port_rows = _summarize([
+            f"{bpf_pin_dir}/udp_ct4",
+            f"{bpf_pin_dir}/udp_ct6",
+        ])
+        _render_conntrack_section("UDP", total, port_rows)
+
+    return 0
+
+
+def _cmd_port_handler_unload(args: argparse.Namespace) -> int:
+    path = Path(args.config)
+    bpf_pin_dir, _, _ = _slot_paths(args)
+    proto = str(args.proto).lower()
+    port = _normalize_handler_port(int(args.port))
+
+    _cleanup_existing_port_handler(bpf_pin_dir, proto, port)
+    print(f"Unloaded {proto.upper()} handler for port {port}")
+    if not args.no_config_update and path.exists():
+        _port_handler_config_update(path, proto, port, None)
+        print(f"  config: {path}")
+    return 0
+
+
+_NFT_CHAIN = "input"
+
+_XDP_COUNTER_NAMES = [
+    "TCP_NEW_ALLOW",
+    "TCP_ESTABLISHED",
+    "TCP_DROP",
+    "UDP_PASS",
+    "UDP_DROP",
+    "IPv4_OTHER",
+    "IPv6_ICMP",
+    "FRAG_DROP",
+    "ARP_NON_IP",
+    "TCP_CT_MISS",
+    "ICMP_DROP",
+    "SYN_RATE_DROP",
+    "UDP_RATE_DROP",
+    "UDP_GBL_DROP",
+    "TCP_NULL",
+    "TCP_XMAS",
+    "TCP_SYN_FIN",
+    "TCP_SYN_RST",
+    "TCP_RST_FIN",
+    "TCP_BAD_DOFF",
+    "TCP_PORT0",
+    "VLAN_DROP",
+    "SLOT_CALL",
+    "SLOT_PASS",
+    "SLOT_DROP",
+    "UDP_PORT0",
+    "UDP_BAD_LEN",
+    "BOGON_DROP",
+    "TCP_CONN_LIMIT_DROP",
+    "SYN_AGG_RATE_DROP",
+    "UDP_AGG_RATE_DROP",
+    "HANDLER_BLOCK_DROP",
+]
+
+_XDP_DROP_INDEXES = {2, 4, 7, 10, 21, 24, 27}
+
+
+def _human_bytes(value: int) -> str:
+    if value == -1:
+        return "-"
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    val = float(value)
+    idx = 0
+    while val >= 1024 and idx < len(units) - 1:
+        val /= 1024
+        idx += 1
+    if idx == 0:
+        return f"{val:.0f} {units[idx]}"
+    return f"{val:.2f} {units[idx]}"
+
+
+def _human_bps(value: int) -> str:
+    if value == -1:
+        return "-"
+    units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"]
+    val = float(value)
+    idx = 0
+    while val >= 1000 and idx < len(units) - 1:
+        val /= 1000
+        idx += 1
+    if idx == 0:
+        return f"{val:.0f} {units[idx]}"
+    return f"{val:.2f} {units[idx]}"
+
+
+def _format_rate(packet_delta: int, byte_delta: int, elapsed: float) -> str:
+    if packet_delta == -1 or elapsed == 0:
+        return "-"
+    pps = packet_delta / elapsed
+    if byte_delta == -1:
+        return f"{pps:.2f} pps / -"
+    bps = int(byte_delta * 8 / elapsed)
+    return f"{pps:.2f} pps / {_human_bps(bps)}"
+
+
+def _read_xdp_rows(bpf_pin_dir: str) -> list[tuple[str, int, int]]:
+    map_path = Path(bpf_pin_dir) / "pkt_counters"
+    if not map_path.exists():
+        raise RuntimeError(f"XDP counters not found at {map_path}")
+
+    if not shutil.which("bpftool"):
+        raise RuntimeError("bpftool not found; cannot read XDP counters")
+
+    try:
+        out = subprocess.check_output(
+            ["bpftool", "-j", "map", "dump", "pinned", str(map_path)],
+            stderr=subprocess.DEVNULL,
+        )
+        data = json.loads(out)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(f"Failed to read XDP counters: {exc}") from exc
+
+    def _sum_percpu(v: Any) -> int:
+        if isinstance(v, list):
+            total = 0
+            for e in v:
+                if isinstance(e, dict):
+                    total += int(e.get("value", 0))
+                elif isinstance(e, str):
+                    try:
+                        total += int(e, 0)
+                    except ValueError:
+                        pass
+                elif isinstance(e, int):
+                    total += e
+            return total
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            try:
+                return int(v, 0)
+            except ValueError:
+                return 0
+        return 0
+
+    def _parse_key(key: Any) -> int:
+        if isinstance(key, int):
+            return key
+        if isinstance(key, str):
+            try:
+                return int(key, 0)
+            except ValueError:
+                return -1
+        if isinstance(key, list):
+            b = bytes((int(b, 0) if isinstance(b, str) else b) & 0xFF for b in key[:4])
+            return int.from_bytes(b, "little")
+        return -1
+
+    key_packets: dict[int, int] = {}
+    for row in data:
+        v = row.get("values", row.get("value", 0))
+        packets = _sum_percpu(v)
+        k = _parse_key(row.get("key", -1))
+        if k >= 0:
+            key_packets[k] = key_packets.get(k, 0) + packets
+
+    rows: list[tuple[str, int, int]] = []
+    total = 0
+    drop_total = 0
+    for idx in range(len(_XDP_COUNTER_NAMES)):
+        packets = key_packets.get(idx, 0)
+        total += packets
+        if idx in _XDP_DROP_INDEXES:
+            drop_total += packets
+        rows.append((_XDP_COUNTER_NAMES[idx], packets, -1))
+
+    for idx in sorted(key_packets.keys()):
+        if idx >= 32:
+            rows.append((f"COUNTER_{idx}", key_packets[idx], -1))
+
+    rows.append(("XDP_TOTAL", total, -1))
+    rows.append(("XDP_DROP_TOTAL", drop_total, -1))
+    return rows
+
+
+def _read_xdp_map_id(bpf_pin_dir: str) -> str:
+    map_path = str(Path(bpf_pin_dir) / "pkt_counters")
+    try:
+        result = subprocess.run(
+            ["bpftool", "map", "show", "pinned", map_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return "-"
+        first_line = result.stdout.splitlines()[0] if result.stdout.strip() else ""
+        m = re.match(r"^(\d+):", first_line)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    return "-"
+
+
+def _read_nft_rows(nft_family: str, nft_table: str, nft_chain: str) -> list[tuple[str, int, int]]:
+    try:
+        result = subprocess.run(
+            ["nft", "-a", "list", "chain", nft_family, nft_table, nft_chain],
+            capture_output=True,
+            text=True,
+        )
+        text = result.stdout
+    except OSError:
+        text = ""
+    m = re.search(r"counter packets (\d+) bytes (\d+) drop", text)
+    if not m:
+        return [("NFT_DROP", 0, 0)]
+    return [("NFT_DROP", int(m.group(1)), int(m.group(2)))]
+
+
+def _read_iface_row(iface: str) -> tuple[str, int, int] | None:
+    stats_dir = Path(f"/sys/class/net/{iface}/statistics")
+    rx_pkt = stats_dir / "rx_packets"
+    rx_bytes = stats_dir / "rx_bytes"
+    try:
+        packets = int(rx_pkt.read_text().strip())
+        b = int(rx_bytes.read_text().strip())
+        return ("IFACE_RX", packets, b)
+    except OSError:
+        return None
+
+
+def _load_stats_state(state_file: Path) -> dict:
+    try:
+        return json.loads(state_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_stats_state(state_file: Path, data: dict) -> None:
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(str(state_file) + f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(state_file)
+    except OSError:
+        pass
+
+
+def _apply_xdp_accumulator(
+    rows: list[tuple[str, int, int]],
+    backend: str,
+    iface: str,
+    map_id: str,
+    state_file: Path,
+) -> list[tuple[str, int, int]]:
+    if backend != "xdp" or map_id == "-":
+        return rows
+
+    # Find current totals
+    current_total: int | None = None
+    current_drop: int | None = None
+    for name, packets, _ in rows:
+        if name == "XDP_TOTAL":
+            current_total = packets
+        elif name == "XDP_DROP_TOTAL":
+            current_drop = packets
+
+    if current_total is None or current_drop is None:
+        return rows
+
+    state = _load_stats_state(state_file)
+    prev_backend = state.get("backend", "")
+    prev_iface = state.get("iface", "")
+    prev_map_id = state.get("map_id", "")
+    prev_raw_total = state.get("raw_total")
+    prev_raw_drop = state.get("raw_drop")
+    prev_acc_total = state.get("acc_total")
+    prev_acc_drop = state.get("acc_drop")
+
+    acc_total = current_total
+    acc_drop = current_drop
+
+    same_context = (
+        prev_backend == backend
+        and prev_iface == iface
+        and prev_map_id == map_id
+        and isinstance(prev_raw_total, int)
+        and isinstance(prev_raw_drop, int)
+        and isinstance(prev_acc_total, int)
+        and isinstance(prev_acc_drop, int)
+    )
+    if same_context:
+        if current_total >= prev_raw_total:
+            acc_total = prev_acc_total + (current_total - prev_raw_total)
+        else:
+            acc_total = prev_acc_total + current_total
+        if current_drop >= prev_raw_drop:
+            acc_drop = prev_acc_drop + (current_drop - prev_raw_drop)
+        else:
+            acc_drop = prev_acc_drop + current_drop
+
+    _save_stats_state(
+        state_file,
+        {
+            "backend": backend,
+            "iface": iface,
+            "map_id": map_id,
+            "raw_total": current_total,
+            "raw_drop": current_drop,
+            "acc_total": acc_total,
+            "acc_drop": acc_drop,
+        },
+    )
+
+    updated = []
+    for name, packets, b in rows:
+        if name == "XDP_TOTAL":
+            updated.append(("XDP_TOTAL", acc_total, b))
+        elif name == "XDP_DROP_TOTAL":
+            updated.append(("XDP_DROP_TOTAL", acc_drop, b))
+        else:
+            updated.append((name, packets, b))
+    return updated
+
+
+def _collect_stats_rows(
+    backend: str,
+    bpf_pin_dir: str,
+    iface: str,
+    nft_family: str,
+    nft_table: str,
+    state_file: Path,
+) -> tuple[list[tuple[str, int, int]], str]:
+    map_id = "-"
+    if backend == "xdp":
+        rows = _read_xdp_rows(bpf_pin_dir)
+        map_id = _read_xdp_map_id(bpf_pin_dir)
+        iface_row = _read_iface_row(iface)
+        rows = _apply_xdp_accumulator(rows, backend, iface, map_id, state_file)
+    else:
+        rows = _read_nft_rows(nft_family, nft_table, _NFT_CHAIN)
+        iface_row = _read_iface_row(iface)
+
+    if iface_row is not None:
+        rows = list(rows) + [iface_row]
+
+    return rows, map_id
+
+
+def _render_stats(
+    rows: list[tuple[str, int, int]],
+    prev: dict[str, tuple[int, int]],
+    backend: str,
+    iface: str,
+    map_id: str,
+    show_rates: bool,
+    elapsed: float,
+) -> None:
+    import datetime as _datetime
+
+    print(f"Backend   : {backend}")
+    print(f"Interface : {iface}")
+    if backend == "xdp":
+        print(f"Map ID    : {map_id}")
+    print(f"Updated   : {_datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+    print("")
+
+    # Header
+    header = f"{'Metric':<12}  {'Packets':<15}  {'Bytes':<12}"
+    sep = f"{'------------':<12}  {'---------------':<15}  {'------------':<12}"
+    if show_rates:
+        header += f"  {'Rate':<24}"
+        sep += f"  {'------------------------':<24}"
+    print(header)
+    print(sep)
+
+    reset_hints: list[str] = []
+    for name, packets, b in rows:
+        prev_packets, prev_bytes = prev.get(name, (-1, -1))
+
+        # Detect reset
+        if prev_packets >= 0 and packets < prev_packets:
+            reset_hints.append(f"{name}:{prev_packets}->{packets}")
+
+        line = f"{name:<12}  {packets:<15}  {_human_bytes(b):<12}"
+
+        if show_rates:
+            if prev_packets >= 0:
+                packet_delta = packets - prev_packets
+                if packet_delta < 0:
+                    packet_delta = -1
+                if b == -1 or prev_bytes == -1:
+                    byte_delta = -1
+                else:
+                    byte_delta = b - prev_bytes
+                    if byte_delta < 0:
+                        byte_delta = -1
+                rate = _format_rate(packet_delta, byte_delta, elapsed)
+            else:
+                rate = "-"
+            line += f"  {rate:<24}"
+
+        print(line)
+
+    if reset_hints:
+        print(f"\nResetHint : {', '.join(reset_hints)}")
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    import time as _time
+
+    iface = args.iface or ""
+    if not iface:
+        try:
+            iface = _autodetect_iface()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    try:
+        backend = _detect_backend(args.bpf_pin_dir, args.run_state_dir, iface, args.nft_family, args.nft_table)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    state_file = Path(args.run_state_dir) / "axdp_stats.json"
+    interval: float = args.interval
+    show_rates: bool = args.rates
+    watch: bool = args.watch
+    render_mode: str = args.render  # "append" or "screen"
+
+    def collect() -> tuple[list[tuple[str, int, int]], str]:
+        return _collect_stats_rows(backend, args.bpf_pin_dir, iface, args.nft_family, args.nft_table, state_file)
+
+    def rows_to_prev(rows: list[tuple[str, int, int]]) -> dict[str, tuple[int, int]]:
+        return {name: (packets, b) for name, packets, b in rows}
+
+    if watch:
+        try:
+            rows, map_id = collect()
+            prev = rows_to_prev(rows)
+            prev_ts = _time.monotonic()
+
+            if render_mode == "screen":
+                print("\033[H\033[2J", end="", flush=True)
+
+            while True:
+                _time.sleep(interval)
+                cur_ts = _time.monotonic()
+                elapsed = cur_ts - prev_ts if show_rates else 0.0
+                try:
+                    rows, map_id = collect()
+                except RuntimeError as exc:
+                    print(str(exc), file=sys.stderr)
+                    _time.sleep(interval)
+                    continue
+
+                if render_mode == "screen":
+                    print("\033[H", end="", flush=True)
+                else:
+                    import datetime as _dt
+                    print(f"===== {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} =====")
+
+                _render_stats(rows, prev if show_rates else {}, backend, iface, map_id, show_rates, elapsed)
+
+                if render_mode == "screen":
+                    print("\033[J", end="", flush=True)
+                else:
+                    print("")
+
+                prev = rows_to_prev(rows)
+                prev_ts = cur_ts
+        except KeyboardInterrupt:
+            return 0
+        return 0
+
+    if show_rates:
+        try:
+            rows, map_id = collect()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        prev = rows_to_prev(rows)
+        prev_ts = _time.monotonic()
+        _time.sleep(interval)
+        cur_ts = _time.monotonic()
+        elapsed = cur_ts - prev_ts
+        try:
+            rows, map_id = collect()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        _render_stats(rows, prev, backend, iface, map_id, show_rates, elapsed)
+        return 0
+
+    try:
+        rows, map_id = collect()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    _render_stats(rows, {}, backend, iface, map_id, show_rates=False, elapsed=0.0)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin_cli")
     parser.add_argument("--config", required=True)
     parser.add_argument("--bpf-pin-dir", default="/sys/fs/bpf/xdp_fw")
     parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp")
     parser.add_argument("--handlers-dir")
+    parser.add_argument("--run-state-dir", default="/run/auto_xdp")
+    parser.add_argument("--nft-family", default="inet")
+    parser.add_argument("--nft-table", default="auto_xdp")
+    parser.add_argument("--iface", default="")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     config_cmd = subparsers.add_parser("config")
@@ -954,6 +2385,10 @@ def build_parser() -> argparse.ArgumentParser:
     log_level = subparsers.add_parser("log-level")
     log_level.add_argument("level", nargs="?")
     log_level.set_defaults(func=_cmd_log_level)
+
+    under_attack = subparsers.add_parser("under-attack")
+    under_attack.add_argument("mode", nargs="?")
+    under_attack.set_defaults(func=_cmd_under_attack)
 
     trust = subparsers.add_parser("trust")
     trust_sub = trust.add_subparsers(dest="subcommand", required=True)
@@ -1019,6 +2454,40 @@ def build_parser() -> argparse.ArgumentParser:
     slot_disable = subparsers.add_parser("slot-disable")
     slot_disable.add_argument("proto", type=int)
     slot_disable.set_defaults(func=_cmd_slot_disable)
+
+    port_handler = subparsers.add_parser("port-handler")
+    port_handler_sub = port_handler.add_subparsers(dest="subcommand", required=True)
+    port_handler_list = port_handler_sub.add_parser("list")
+    port_handler_list.set_defaults(func=_cmd_port_handler_list)
+    port_handler_load = port_handler_sub.add_parser("load")
+    port_handler_load.add_argument("proto", choices=["tcp", "udp"])
+    port_handler_load.add_argument("port", type=int)
+    port_handler_load.add_argument("path")
+    port_handler_load.add_argument("--no-config-update", action="store_true")
+    port_handler_load.set_defaults(func=_cmd_port_handler_load)
+    port_handler_unload = port_handler_sub.add_parser("unload")
+    port_handler_unload.add_argument("proto", choices=["tcp", "udp"])
+    port_handler_unload.add_argument("port", type=int)
+    port_handler_unload.add_argument("--no-config-update", action="store_true")
+    port_handler_unload.set_defaults(func=_cmd_port_handler_unload)
+
+    conntrack_cmd = subparsers.add_parser("conntrack")
+    conntrack_cmd.add_argument("target", nargs="?", choices=["tcp", "udp", "all"], default="all")
+    conntrack_cmd.add_argument("--limit", type=int, default=10)
+    conntrack_cmd.set_defaults(func=_cmd_conntrack)
+
+    ports_cmd = subparsers.add_parser("ports")
+    ports_cmd.add_argument("--watch", action="store_true")
+    ports_cmd.add_argument("--interval", type=float, default=2.0)
+    ports_cmd.set_defaults(func=_cmd_ports)
+
+    stats_cmd = subparsers.add_parser("stats")
+    stats_cmd.add_argument("--watch", action="store_true")
+    stats_cmd.add_argument("--rates", action="store_true")
+    stats_cmd.add_argument("--interval", type=float, default=1.0)
+    stats_cmd.add_argument("--render", choices=["append", "screen"], default="append")
+    stats_cmd.add_argument("--interface", dest="iface")
+    stats_cmd.set_defaults(func=_cmd_stats)
 
     return parser
 
