@@ -1,7 +1,10 @@
 #pragma once
 #include "common.h"
 
-struct ct_key {
+// Generic parsed 5-tuple used on the packet path. Map-facing keys below are
+// split by address family so IPv4 traffic does not hash or compare zeroed IPv6
+// words on every lookup/update.
+struct flow_key {
     __u8 family;
     __u8 pad[3];
     __be16 sport;
@@ -9,6 +12,20 @@ struct ct_key {
     __u32 saddr[4];
     __u32 daddr[4];
 } __attribute__((aligned(8)));
+
+struct ct_key_v4 {
+    __be16 sport;
+    __be16 dport;
+    __be32 saddr;
+    __be32 daddr;
+};
+
+struct ct_key_v6 {
+    __be16 sport;
+    __be16 dport;
+    __u32 saddr[4];
+    __u32 daddr[4];
+};
 
 struct trusted_v4_key {
     __u32 prefixlen;
@@ -28,31 +45,58 @@ struct icmp_token_bucket {
     __u64 last_refill_ns; // ktime_ns of last refill; 0 = uninitialized
 };
 
-// Per-CPU UDP two-bucket sliding-window rate limiter state.
-// byte_rate_max is runtime-configurable; set to 0 to disable.
-struct udp_global_tb {
-    __u32 byte_rate_max;     // max bytes per 1-second window; 0 = disabled
-    __u32 _pad;
-    __u64 window_start_ns;   // ktime_ns of current bucket's start; 0 = uninit
-    __u64 prev_bytes;        // byte count in the previous 1-second bucket
-    __u64 curr_bytes;        // byte count in the current 1-second bucket
+// Global UDP sliding-window rate limiter: shared state, spinlock-protected.
+// byte_rate_max is runtime-configurable via bpftool; set to 0 to disable.
+// Spinlock must be the first field so the BPF verifier can locate it without BTF.
+struct udp_global_state {
+    struct bpf_spin_lock lock;  // offset 0
+    __u32 byte_rate_max;        // offset 4 — max bytes/s; 0 = disabled
+    __u64 window_start_ns;      // offset 8  — ktime_ns of current bucket; 0 = uninit
+    __u64 prev_bytes;           // offset 16 — byte count in previous 1-s bucket
+    __u64 curr_bytes;           // offset 24 — byte count in current 1-s bucket
+};
+
+// Per-CPU local byte accumulator for the two-level UDP global rate limiter.
+// Each CPU accumulates bytes here without any locking and flushes to the shared
+// udp_global_state only when the batch threshold is reached.
+struct udp_percpu_local {
+    __u64 local_bytes;
 };
 
 // Per-port SYN rate limit config, populated at runtime by xdp_port_sync.
 // Key: dest port (host byte order). Value: rate_max SYNs/window (0 = disabled).
 // Ports absent from this map are NOT rate-limited (e.g. HTTP/HTTPS).
 struct syn_rate_port_cfg {
-    __u32 rate_max; // max SYNs per source IP per cfg_syn_window_ns; 0 = skip
+    __u32 rate_max; // max SYNs per source IP per configured rate window; 0 = skip
     __u32 _pad;
 };
 
+struct tcp_port_policy_cfg {
+    __u32 syn_rate_max;
+    __u32 syn_agg_rate_max;
+    __u32 conn_limit_max;
+    __u32 source_prefix_v4;
+    __u32 source_prefix_v6;
+    __u32 _pad;
+};
+
+struct udp_port_policy_cfg {
+    __u32 rate_max;
+    __u32 agg_rate_max;
+    __u32 source_prefix_v4;
+    __u32 source_prefix_v6;
+    __u32 _pad0;
+    __u32 _pad1;
+};
+
 // Per-IP SYN rate limiter state
-struct syn_rate_key {
-    __u8  family;
-    __u8  pad[3];
-    __u32 addr[4]; // IPv4: addr[0] only; IPv6: all 4 words
-    __u32 _pad2;   // explicit: makes aligned(8) trailing pad visible (20→24 bytes)
-} __attribute__((aligned(8)));
+struct syn_rate_key_v4 {
+    __be32 addr;
+};
+
+struct syn_rate_key_v6 {
+    __u32 addr[4];
+};
 
 struct syn_rate_val {
     __u64 window_start_ns;
@@ -60,26 +104,30 @@ struct syn_rate_val {
     __u32 _pad;
 };
 
-struct prefix_rate_key {
-    __u8  family;
-    __u8  pad[3];
-    __u32 addr[4];   // IPv4: masked /24 in addr[0]; IPv6: masked /64 in addr[0..1]
+struct prefix_rate_key_v4 {
+    __be32 addr;
     __u32 dest_port;
-    __u32 _pad2;
-} __attribute__((aligned(8)));
+};
+
+struct prefix_rate_key_v6 {
+    __u32 addr[4];
+    __u32 dest_port;
+};
 
 struct prefix_rate_val {
     __u64 window_start_ns;
     __u64 units;
 };
 
-struct tcp_src_conn_key {
-    __u8  family;
-    __u8  pad[3];
+struct tcp_src_conn_key_v4 {
+    __be32 addr;
+    __u32 dest_port;
+};
+
+struct tcp_src_conn_key_v6 {
     __u32 addr[4];
     __u32 dest_port;
-    __u32 _pad2;
-} __attribute__((aligned(8)));
+};
 
 struct tcp_src_conn_val {
     __u64 last_seen_ns;

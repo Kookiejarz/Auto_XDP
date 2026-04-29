@@ -38,32 +38,75 @@ struct vlan_hdr {
 #define VLAN_MAX_DEPTH 4
 #define CT_FAMILY_IPV4 2
 #define CT_FAMILY_IPV6 10
+#define NS_PER_SEC 1000000000ULL
 
 
-// Runtime-configurable constants in .rodata.
-// Defaults match the original behaviour.  A libbpf/skeleton loader can
-// override these before bpf_object__load(), allowing tuning without
-// recompilation.  volatile const prevents LLVM from folding them into
-// immediates; always cache into a local variable when used more than once
-// in a single function.
+// Runtime tunables. Userspace writes this map from config.toml; zero fields
+// fall back to defaults so old loaders remain compatible.
+struct xdp_runtime_cfg {
+    __u64 tcp_timeout_ns;
+    __u64 udp_timeout_ns;
+    __u64 ct_refresh_ns;
+    __u64 icmp_token_max;
+    __u64 icmp_ns_per_token;
+    __u64 udp_global_window_ns;
+    __u64 rate_window_ns;
+};
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct xdp_runtime_cfg);
+} xdp_runtime_cfg SEC(".maps");
 
-// Conntrack timeouts and refresh intervals (nanoseconds)
-volatile const __u64 cfg_tcp_timeout_ns    = 300ULL * 1000000000ULL; // 5 min
-volatile const __u64 cfg_udp_timeout_ns    = 60ULL  * 1000000000ULL; // 1 min
-volatile const __u64 cfg_ct_refresh_ns     = 30ULL  * 1000000000ULL; // 30 s
+static __always_inline struct xdp_runtime_cfg *runtime_cfg(void)
+{
+    __u32 key = 0;
+    return bpf_map_lookup_elem(&xdp_runtime_cfg, &key);
+}
 
-// ICMP token-bucket rate limiter
-volatile const __u64 cfg_icmp_token_max    = 100ULL; // burst capacity (packets)
-volatile const __u64 cfg_icmp_ns_per_token = 1000000000ULL / 100ULL; // 10 ms
+static __always_inline __u64 runtime_tcp_timeout_ns(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && cfg->tcp_timeout_ns ? cfg->tcp_timeout_ns : 300ULL * NS_PER_SEC;
+}
 
-// Global UDP sliding-window and per-IP SYN/UDP rate-limit window (nanoseconds)
-volatile const __u64 cfg_udp_global_window_ns = 1000000000ULL; // 1 s
-volatile const __u64 cfg_syn_window_ns        = 1000000000ULL; // 1 s
+static __always_inline __u64 runtime_udp_timeout_ns(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && cfg->udp_timeout_ns ? cfg->udp_timeout_ns : 60ULL * NS_PER_SEC;
+}
 
-// bogon_cfg and slot_def_action remain BPF maps: both are written at
-// runtime (Python / bpftool post-load) and therefore cannot be placed in
-// the frozen .rodata section without switching to a pre-load skeleton.
+static __always_inline __u64 runtime_ct_refresh_ns(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && cfg->ct_refresh_ns ? cfg->ct_refresh_ns : 30ULL * NS_PER_SEC;
+}
+
+static __always_inline __u64 runtime_icmp_token_max(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && cfg->icmp_token_max ? cfg->icmp_token_max : 100ULL;
+}
+
+static __always_inline __u64 runtime_icmp_ns_per_token(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && cfg->icmp_ns_per_token ? cfg->icmp_ns_per_token : NS_PER_SEC / 100ULL;
+}
+
+static __always_inline __u64 runtime_udp_global_window_ns(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && cfg->udp_global_window_ns ? cfg->udp_global_window_ns : NS_PER_SEC;
+}
+
+static __always_inline __u64 runtime_rate_window_ns(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && cfg->rate_window_ns ? cfg->rate_window_ns : NS_PER_SEC;
+}
 
 // default 10,000 pps; 0 = disabled (documented; actual value lives in map)
 #define UDP_GLOBAL_DEFAULT_RATE  10000U
@@ -111,7 +154,8 @@ enum xdp_counter_idx {
     CNT_TCP_CONN_LIMIT_DROP  = 28, // TCP SYN dropped by per-source concurrent connection limit
     CNT_SYN_AGG_RATE_DROP    = 29, // TCP SYN dropped by per-prefix aggregate rate limiter
     CNT_UDP_AGG_RATE_DROP    = 30, // UDP dropped by per-prefix byte-rate limiter
-    CNT_MAX                  = 31,
+    CNT_HANDLER_BLOCK_DROP   = 31, // dropped: src IP in handler_blocked map
+    CNT_MAX                  = 32,
 };
 
 struct {
@@ -145,12 +189,30 @@ struct {
     __uint(max_entries, 1 << 22); // 4 MiB
 } pkt_ringbuf SEC(".maps");
 
+// Observability runtime flags.
+// Bit 0: emit_drop() writes ringbuf events when set; skip event emission when clear.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} observability_cfg SEC(".maps");
+
+static __always_inline bool drop_events_enabled(void)
+{
+    __u32 key = 0;
+    __u32 *flags = bpf_map_lookup_elem(&observability_cfg, &key);
+    return !flags || (*flags & 0x1);
+}
+
 static __always_inline void emit_drop(
     __u8 proto, __u8 family,
     __u32 *src_ip, __u32 *dst_ip,
     __be16 sport, __be16 dport,
     __u8 reason)
 {
+    if (!drop_events_enabled())
+        return;
     struct pkt_event *e = bpf_ringbuf_reserve(&pkt_ringbuf, sizeof(*e), 0);
     if (!e) return;
     e->ts_ns    = bpf_ktime_get_ns();
@@ -163,4 +225,30 @@ static __always_inline void emit_drop(
     __builtin_memcpy(e->src_ip, src_ip, 16);
     __builtin_memcpy(e->dst_ip, dst_ip, 16);
     bpf_ringbuf_submit(e, 0);
+}
+
+// Byte/packet counters (called exactly once per packet — no double-counting).
+// index 0 = total bytes, 1 = drop bytes, 2 = total packets, 3 = drop packets.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 4);
+    __type(key, __u32);
+    __type(value, __u64);
+} byte_counters SEC(".maps");
+
+static __always_inline void count_bytes(bool is_drop, __u32 pkt_len) {
+    __u32 key = 0;
+    __u64 *val = bpf_map_lookup_elem(&byte_counters, &key);
+    if (val) (*val) += pkt_len;
+    key = 2;
+    val = bpf_map_lookup_elem(&byte_counters, &key);
+    if (val) (*val) += 1;
+    if (is_drop) {
+        key = 1;
+        val = bpf_map_lookup_elem(&byte_counters, &key);
+        if (val) (*val) += pkt_len;
+        key = 3;
+        val = bpf_map_lookup_elem(&byte_counters, &key);
+        if (val) (*val) += 1;
+    }
 }
