@@ -30,6 +30,8 @@ static __always_inline int dispatch_to_slot(
         sc->ip_proto     = ip_proto;
         sc->l3_offset    = l3_offset;
         sc->inner_offset = inner_offset;
+        sc->sport        = 0;
+        sc->dport        = 0;
         sc->_pad         = 0;
         sc->saddr[0] = saddr[0]; sc->saddr[1] = saddr[1];
         sc->saddr[2] = saddr[2]; sc->saddr[3] = saddr[3];
