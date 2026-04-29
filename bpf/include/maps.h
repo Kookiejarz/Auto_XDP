@@ -262,6 +262,19 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } udp_acl_v6 SEC(".maps");
 
+// Allowed outer IPv4 source addresses for 6in4 tunnels (RFC 4213, proto 41).
+// Key: outer source IPv4 in network byte order. Value: 1 = allow.
+// XDP passes proto-41 packets only from IPs present here; all others are
+// dropped at line rate before the kernel spends CPU on SIT decapsulation.
+// Populated at runtime from config.toml [tunnel].sit4_endpoints.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);
+    __type(key, __be32);
+    __type(value, __u32);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} sit4_endpoints SEC(".maps");
+
 // 256-entry prog_array: index = final IP protocol number (post ext-hdr traversal).
 // Userspace loads handler .o files and updates this map to enable per-protocol
 // inspection without modifying the main program.

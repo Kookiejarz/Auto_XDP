@@ -44,10 +44,29 @@ def run_nft(args: list[str], input_text: str | None = None, check: bool = True) 
     )
 
 
-class BpfArrayMap:
+class BpfBaseMap:
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class BpfFdMap(BpfBaseMap):
     def __init__(self, path: str) -> None:
         self.path = path
         self.fd = obj_get(path)
+
+    def close(self) -> None:
+        fd = getattr(self, "fd", -1)
+        if fd >= 0:
+            os.close(fd)
+            self.fd = -1
+
+
+class BpfArrayMap(BpfFdMap):
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
         self._max_entries: int = map_max_entries(self.fd)
         self._cache: set[int] = set()
 
@@ -60,17 +79,6 @@ class BpfArrayMap:
         struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
         struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
         self._load_cache()
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def _update(self, port: int, val: int) -> None:
         struct.pack_into("=I", self._key, 0, port)
@@ -134,10 +142,48 @@ class BpfArrayMap:
             return False
 
 
-class BpfLpmMap:
+class BpfRuntimeConfigMap(BpfFdMap):
+    _STRUCT_FMT = "=QQQQQQQ"
+    _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self._key = ctypes.create_string_buffer(4)
+        self._val = ctypes.create_string_buffer(self._STRUCT_SIZE)
+        self._update_attr = ctypes.create_string_buffer(128)
+        self._lookup_attr = ctypes.create_string_buffer(128)
+        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
+        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
+
+    def get(self) -> tuple[int, int, int, int, int, int, int] | None:
+        try:
+            struct.pack_into("=I", self._key, 0, 0)
+            bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+            return struct.unpack_from(self._STRUCT_FMT, self._val, 0)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                log.warning("BPF runtime config lookup failed path=%s: %s", self.path, exc)
+            return None
+
+    def set(self, fields: tuple[int, int, int, int, int, int, int], dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info("[DRY] %s runtime_config=%s", self.path, fields)
+            return True
+        try:
+            struct.pack_into("=I", self._key, 0, 0)
+            struct.pack_into(self._STRUCT_FMT, self._val, 0, *fields)
+            bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
+            return True
+        except OSError as exc:
+            log.warning("BPF runtime config update failed path=%s: %s", self.path, exc)
+            return False
+
+
+class BpfLpmMap(BpfFdMap):
     def __init__(self, path: str, family: int) -> None:
-        self.path = path
-        self.fd = obj_get(path)
+        super().__init__(path)
         self._family = family
         self._addr_len = 4 if family == socket.AF_INET else 16
         self._key_len = 4 + self._addr_len
@@ -157,17 +203,6 @@ class BpfLpmMap:
         struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
         struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
         self._load_cache()
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def _pack_key(self, cidr_str: str) -> str:
         if self._family == socket.AF_INET:
@@ -262,14 +297,16 @@ class BpfLpmMap:
             return False
 
 
-class BpfTrustedMaps:
+class BpfTrustedMaps(BpfBaseMap):
     def __init__(self, path4: str, path6: str) -> None:
         self._map4 = BpfLpmMap(path4, socket.AF_INET)
         self._map6 = BpfLpmMap(path6, socket.AF_INET6)
 
     def close(self) -> None:
-        self._map4.close()
-        self._map6.close()
+        if (map4 := getattr(self, "_map4", None)) is not None:
+            map4.close()
+        if (map6 := getattr(self, "_map6", None)) is not None:
+            map6.close()
 
     def active_keys(self) -> set[str]:
         return self._map4.active_keys() | self._map6.active_keys()
@@ -285,10 +322,9 @@ class BpfTrustedMaps:
         return self._map4.delete(cidr_str, dry_run)
 
 
-class BpfAclMap:
+class BpfAclMap(BpfFdMap):
     def __init__(self, path: str, family: int) -> None:
-        self.path = path
-        self.fd = obj_get(path)
+        super().__init__(path)
         self._family = family
         self._addr_len = 4 if family == socket.AF_INET else 16
         self._key_len = 4 + self._addr_len
@@ -308,17 +344,6 @@ class BpfAclMap:
         struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
         struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
         self._load_cache()
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def _pack_key(self, cidr_str: str) -> str:
         if self._family == socket.AF_INET:
@@ -406,17 +431,13 @@ class BpfAclMap:
             return True
         except OSError as exc:
             if exc.errno == errno.ENOENT:
-                if self._family == socket.AF_INET:
-                    net = ipaddress.IPv4Network(cidr_str, strict=False)
-                else:
-                    net = ipaddress.IPv6Network(cidr_str, strict=False)
-                self._cache.pop(f"{net.network_address}/{net.prefixlen}", None)
+                self._cache.pop(normalized, None)
                 return True
             log.warning("BPF ACL delete failed cidr=%s: %s", cidr_str, exc)
             return False
 
 
-class BpfAclMaps:
+class BpfAclMaps(BpfBaseMap):
     def __init__(self, tcp4: str, tcp6: str, udp4: str, udp6: str) -> None:
         self._tcp4 = BpfAclMap(tcp4, socket.AF_INET)
         self._tcp6 = BpfAclMap(tcp6, socket.AF_INET6)
@@ -424,8 +445,9 @@ class BpfAclMaps:
         self._udp6 = BpfAclMap(udp6, socket.AF_INET6)
 
     def close(self) -> None:
-        for m in (self._tcp4, self._tcp6, self._udp4, self._udp6):
-            m.close()
+        for attr in ("_tcp4", "_tcp6", "_udp4", "_udp6"):
+            if (map_obj := getattr(self, attr, None)) is not None:
+                map_obj.close()
 
     def _map_for(self, proto: str, cidr: str) -> BpfAclMap:
         is6 = ":" in cidr
@@ -452,13 +474,14 @@ class BpfAclMaps:
         return result
 
 
-class BpfConntrackMap:
-    def __init__(self, path: str) -> None:
-        self.path = path
-        self.fd = obj_get(path)
+class BpfConntrackMap(BpfFdMap):
+    def __init__(self, path: str, key_len: int, dport_offset: int = 2) -> None:
+        super().__init__(path)
+        self._key_len = key_len
+        self._dport_offset = dport_offset
         self._cache: set[bytes] = set()
-        self._key = ctypes.create_string_buffer(40)
-        self._next_key = ctypes.create_string_buffer(40)
+        self._key = ctypes.create_string_buffer(key_len)
+        self._next_key = ctypes.create_string_buffer(key_len)
         self._val = ctypes.create_string_buffer(8)
         self._attr = ctypes.create_string_buffer(128)
         self._lookup_attr = ctypes.create_string_buffer(128)
@@ -473,17 +496,6 @@ class BpfConntrackMap:
         struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
         self._load_cache()
 
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
     def active_keys(self) -> set[bytes]:
         return set(self._cache)
 
@@ -497,9 +509,9 @@ class BpfConntrackMap:
                 if exc.errno == errno.ENOENT:
                     break
                 raise
-            key_raw = bytes(self._next_key.raw[:40])
+            key_raw = bytes(self._next_key.raw[:self._key_len])
             yield key_raw
-            ctypes.memmove(self._key, key_raw, 40)
+            ctypes.memmove(self._key, key_raw, self._key_len)
             current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
 
     def _load_cache(self) -> None:
@@ -517,7 +529,7 @@ class BpfConntrackMap:
         present: set[bytes] = set()
         for key_bytes in keys:
             try:
-                ctypes.memmove(self._key, key_bytes, 40)
+                ctypes.memmove(self._key, key_bytes, self._key_len)
                 bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
                 self._cache.add(key_bytes)
                 present.add(key_bytes)
@@ -535,7 +547,7 @@ class BpfConntrackMap:
             log.info("[DRY] %s delete conntrack entry", self.path)
             return True
         try:
-            ctypes.memmove(self._key, key_bytes, 40)
+            ctypes.memmove(self._key, key_bytes, self._key_len)
             bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
             self._cache.discard(key_bytes)
             return True
@@ -553,7 +565,7 @@ class BpfConntrackMap:
         matches = [
             key_raw
             for key_raw in self._cache
-            if struct.unpack_from("!H", key_raw, 6)[0] in ports
+            if struct.unpack_from("!H", key_raw, self._dport_offset)[0] in ports
         ]
 
         deleted = 0
@@ -562,12 +574,31 @@ class BpfConntrackMap:
                 deleted += 1
         return deleted
 
+    def gc_expired(self, timeout_ns: int) -> int:
+        now = time.monotonic_ns()
+        all_keys = list(self._iter_raw_keys())
+        to_delete: list[bytes] = []
+        for key_raw in all_keys:
+            try:
+                ctypes.memmove(self._key, key_raw, self._key_len)
+                bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+                last_seen = struct.unpack_from("=Q", self._val, 0)[0]
+                if now - last_seen > timeout_ns:
+                    to_delete.append(key_raw)
+            except OSError:
+                continue
+        deleted = 0
+        for key_raw in to_delete:
+            if self.delete(key_raw):
+                deleted += 1
+        return deleted
+
     def set(self, key_bytes: bytes, dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s seed conntrack entry", self.path)
             return True
         try:
-            ctypes.memmove(self._key, key_bytes, 40)
+            ctypes.memmove(self._key, key_bytes, self._key_len)
             struct.pack_into("=Q", self._val, 0, time.monotonic_ns())
             bpf(BPF_MAP_UPDATE_ELEM, self._attr)
             self._cache.add(key_bytes)
@@ -577,10 +608,52 @@ class BpfConntrackMap:
             return False
 
 
-class BpfSynRatePortsMap:
+class BpfConntrackMaps(BpfBaseMap):
+    def __init__(self, path_v4: str, path_v6: str) -> None:
+        self._map4 = BpfConntrackMap(path_v4, 12)
+        self._map6 = BpfConntrackMap(path_v6, 36)
+
+    def close(self) -> None:
+        if (map4 := getattr(self, "_map4", None)) is not None:
+            map4.close()
+        if (map6 := getattr(self, "_map6", None)) is not None:
+            map6.close()
+
+    def active_keys(self) -> set[bytes]:
+        return self._map4.active_keys() | self._map6.active_keys()
+
+    def refresh_cache(self) -> None:
+        self._map4.refresh_cache()
+        self._map6.refresh_cache()
+
+    def existing_keys(self, keys: set[bytes]) -> set[bytes]:
+        keys_v4 = {key for key in keys if len(key) == 12}
+        keys_v6 = {key for key in keys if len(key) == 36}
+        return self._map4.existing_keys(keys_v4) | self._map6.existing_keys(keys_v6)
+
+    def _pick_map(self, key_bytes: bytes) -> BpfConntrackMap:
+        if len(key_bytes) == 12:
+            return self._map4
+        if len(key_bytes) == 36:
+            return self._map6
+        raise ValueError(f"Unsupported conntrack key length: {len(key_bytes)}")
+
+    def delete(self, key_bytes: bytes, dry_run: bool = False) -> bool:
+        return self._pick_map(key_bytes).delete(key_bytes, dry_run)
+
+    def gc_expired(self, timeout_ns: int) -> int:
+        return self._map4.gc_expired(timeout_ns) + self._map6.gc_expired(timeout_ns)
+
+    def delete_dest_ports(self, ports: set[int], dry_run: bool = False) -> int:
+        return self._map4.delete_dest_ports(ports, dry_run) + self._map6.delete_dest_ports(ports, dry_run)
+
+    def set(self, key_bytes: bytes, dry_run: bool = False) -> bool:
+        return self._pick_map(key_bytes).set(key_bytes, dry_run)
+
+
+class BpfSynRatePortsMap(BpfFdMap):
     def __init__(self, path: str) -> None:
-        self.path = path
-        self.fd = obj_get(path)
+        super().__init__(path)
         self._max_entries: int = map_max_entries(self.fd)
         self._cache: dict[int, int] = {}
         self._key = ctypes.create_string_buffer(4)
@@ -592,17 +665,6 @@ class BpfSynRatePortsMap:
         struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
         struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
         self._load_cache()
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def _load_cache(self) -> None:
         n = self._max_entries
@@ -660,4 +722,211 @@ class BpfSynRatePortsMap:
                 self._cache.pop(port, None)
                 return True
             log.warning("BPF port config delete failed path=%s port=%d: %s", self.path, port, exc)
+            return False
+
+
+class BpfPortPolicyMap(BpfFdMap):
+    _STRUCT_FMT = "=IIIIII"
+    _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self._max_entries: int = map_max_entries(self.fd)
+        self._cache: dict[int, tuple[int, int, int, int, int, int]] = {}
+        self._key = ctypes.create_string_buffer(4)
+        self._val = ctypes.create_string_buffer(self._STRUCT_SIZE)
+        self._update_attr = ctypes.create_string_buffer(128)
+        self._delete_attr = ctypes.create_string_buffer(128)
+        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
+        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
+        self._load_cache()
+
+    def _load_cache(self) -> None:
+        n = self._max_entries
+        keys_buf = ctypes.create_string_buffer(4 * n)
+        vals_buf = ctypes.create_string_buffer(self._STRUCT_SIZE * n)
+        out_batch = ctypes.create_string_buffer(4)
+        attr = ctypes.create_string_buffer(56)
+        struct.pack_into(
+            "=QQQQIIQQ", attr, 0,
+            0,
+            ctypes.cast(out_batch, ctypes.c_void_p).value or 0,
+            ctypes.cast(keys_buf, ctypes.c_void_p).value or 0,
+            ctypes.cast(vals_buf, ctypes.c_void_p).value or 0,
+            n, self.fd, 0, 0,
+        )
+        try:
+            bpf(BPF_MAP_LOOKUP_BATCH, attr)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                return
+        fetched = struct.unpack_from("=I", attr, 32)[0]
+        for i in range(fetched):
+            port = struct.unpack_from("=I", keys_buf, i * 4)[0]
+            self._cache[port] = struct.unpack_from(self._STRUCT_FMT, vals_buf, i * self._STRUCT_SIZE)
+
+    def active_structs(self) -> dict[int, tuple[int, int, int, int, int, int]]:
+        return dict(self._cache)
+
+    def set_fields(self, port: int, fields: tuple[int, int, int, int, int, int], dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info("[DRY] %s port %d fields=%s", self.path, port, fields)
+            return True
+        try:
+            struct.pack_into("=I", self._key, 0, port)
+            struct.pack_into(self._STRUCT_FMT, self._val, 0, *fields)
+            bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
+            self._cache[port] = fields
+            return True
+        except OSError as exc:
+            log.warning("BPF port policy update failed path=%s port=%d: %s", self.path, port, exc)
+            return False
+
+    def ensure_prefixes(self, ports: set[int], prefix_v4: int, prefix_v6: int, dry_run: bool = False) -> None:
+        for port in sorted(ports):
+            current = self._cache.get(port)
+            if current is None:
+                continue
+            updated = list(current)
+            updated[3] = prefix_v4
+            updated[4] = prefix_v6
+            fields = tuple(updated)
+            if fields != current:
+                self.set_fields(port, fields, dry_run)
+
+    def delete(self, port: int, dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info("[DRY] %s delete port %d", self.path, port)
+            return True
+        try:
+            struct.pack_into("=I", self._key, 0, port)
+            bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
+            self._cache.pop(port, None)
+            return True
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                self._cache.pop(port, None)
+                return True
+            log.warning("BPF port policy delete failed path=%s port=%d: %s", self.path, port, exc)
+            return False
+
+
+class BpfPortPolicyViewMap:
+    def __init__(self, backing: BpfPortPolicyMap, field_index: int, path: str) -> None:
+        self._backing = backing
+        self._field_index = field_index
+        self.path = path
+
+    def active(self) -> dict[int, int]:
+        return {
+            port: fields[self._field_index]
+            for port, fields in self._backing.active_structs().items()
+            if fields[self._field_index] != 0
+        }
+
+    def set(self, port: int, rate_max: int, dry_run: bool = False) -> bool:
+        current = self._backing.active_structs().get(
+            port,
+            (0, 0, 0, cfg.RATE_LIMIT_SOURCE_PREFIX_V4, cfg.RATE_LIMIT_SOURCE_PREFIX_V6, 0),
+        )
+        updated = list(current)
+        updated[self._field_index] = rate_max
+        fields = tuple(updated)
+        if fields[:3] == (0, 0, 0):
+            return self._backing.delete(port, dry_run)
+        return self._backing.set_fields(port, fields, dry_run)
+
+    def delete(self, port: int, dry_run: bool = False) -> bool:
+        current = self._backing.active_structs().get(port)
+        if current is None:
+            return self._backing.delete(port, dry_run)
+        updated = list(current)
+        updated[self._field_index] = 0
+        fields = tuple(updated)
+        if fields[:3] == (0, 0, 0):
+            return self._backing.delete(port, dry_run)
+        return self._backing.set_fields(port, fields, dry_run)
+
+
+class BpfSit4EndpointsMap(BpfFdMap):
+    """Hash map: outer IPv4 source → allowed (1) for 6in4 tunnel endpoints.
+
+    Key: 4-byte network-order IPv4 address (__be32).
+    Value: 4-byte __u32 (1 = allow).
+    """
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self._cache: set[str] = set()
+        self._key = ctypes.create_string_buffer(4)
+        self._next_key = ctypes.create_string_buffer(4)
+        self._val = ctypes.create_string_buffer(4)
+        self._update_attr = ctypes.create_string_buffer(128)
+        self._lookup_attr = ctypes.create_string_buffer(128)
+        self._delete_attr = ctypes.create_string_buffer(128)
+        self._next_attr = ctypes.create_string_buffer(128)
+        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        nk_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
+        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
+        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
+        struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
+        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, nk_ptr)
+        self._load_cache()
+
+    def _pack_key(self, ip_str: str) -> None:
+        ctypes.memmove(self._key, socket.inet_aton(ip_str), 4)
+
+    def _load_cache(self) -> None:
+        current_ptr = 0
+        while True:
+            struct.pack_into(
+                "=I4xQQ", self._next_attr, 0, self.fd,
+                current_ptr,
+                ctypes.cast(self._next_key, ctypes.c_void_p).value or 0,
+            )
+            try:
+                bpf(BPF_MAP_GET_NEXT_KEY, self._next_attr)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    break
+                raise
+            key_raw = bytes(self._next_key.raw[:4])
+            self._cache.add(socket.inet_ntoa(key_raw))
+            ctypes.memmove(self._key, key_raw, 4)
+            current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+
+    def active_keys(self) -> set[str]:
+        return set(self._cache)
+
+    def set(self, ip_str: str, dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info("[DRY] %s sit4 +%s", self.path, ip_str)
+            return True
+        try:
+            self._pack_key(ip_str)
+            struct.pack_into("=I", self._val, 0, 1)
+            bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
+            self._cache.add(ip_str)
+            return True
+        except OSError as exc:
+            log.warning("BPF sit4_endpoints update failed ip=%s: %s", ip_str, exc)
+            return False
+
+    def delete(self, ip_str: str, dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info("[DRY] %s sit4 -%s", self.path, ip_str)
+            return True
+        try:
+            self._pack_key(ip_str)
+            bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
+            self._cache.discard(ip_str)
+            return True
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                self._cache.discard(ip_str)
+                return True
+            log.warning("BPF sit4_endpoints delete failed ip=%s: %s", ip_str, exc)
             return False
