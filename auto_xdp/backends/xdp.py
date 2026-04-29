@@ -10,7 +10,11 @@ from auto_xdp.backends.base import BackendStatus, PortBackend
 from auto_xdp.bpf.maps import (
     BpfAclMaps,
     BpfArrayMap,
-    BpfConntrackMap,
+    BpfConntrackMaps,
+    BpfPortPolicyMap,
+    BpfPortPolicyViewMap,
+    BpfRuntimeConfigMap,
+    BpfSit4EndpointsMap,
     BpfSynRatePortsMap,
     BpfTrustedMaps,
 )
@@ -82,42 +86,36 @@ class XdpBackend(PortBackend):
         self.tcp_map = BpfArrayMap(cfg.TCP_MAP_PATH)
         self.udp_map = BpfArrayMap(cfg.UDP_MAP_PATH)
         self.trusted_map = BpfTrustedMaps(cfg.TRUSTED_IPS_MAP_PATH4, cfg.TRUSTED_IPS_MAP_PATH6)
-        self.conntrack_map = BpfConntrackMap(cfg.TCP_CONNTRACK_MAP_PATH)
-        self.udp_conntrack_map = BpfConntrackMap(cfg.UDP_CONNTRACK_MAP_PATH)
+        self.conntrack_map = BpfConntrackMaps(cfg.TCP_CONNTRACK_MAP_PATH4, cfg.TCP_CONNTRACK_MAP_PATH6)
+        self.udp_conntrack_map = BpfConntrackMaps(cfg.UDP_CONNTRACK_MAP_PATH4, cfg.UDP_CONNTRACK_MAP_PATH6)
         self._conntrack_stale_rounds: dict[bytes, int] = {}
+        self._tcp_policy_map: BpfPortPolicyMap | None = None
+        self._udp_policy_map: BpfPortPolicyMap | None = None
         self.syn_rate_map: BpfSynRatePortsMap | None = None
         self.syn_agg_rate_map: BpfSynRatePortsMap | None = None
         self.tcp_conn_limit_map: BpfSynRatePortsMap | None = None
         self.udp_rate_map: BpfSynRatePortsMap | None = None
         self.udp_agg_rate_map: BpfSynRatePortsMap | None = None
         self.acl_maps: BpfAclMaps | None = None
+        self.runtime_config_map: BpfRuntimeConfigMap | None = None
         self.bogon_cfg_map: BpfArrayMap | None = None
+        self.observability_cfg_map: BpfArrayMap | None = None
         self.sctp_map: BpfArrayMap | None = None
         try:
-            self.syn_rate_map = BpfSynRatePortsMap(cfg.SYN_RATE_MAP_PATH)
-            log.debug("syn_rate_ports map opened; per-service SYN rate limiting active.")
+            self._tcp_policy_map = BpfPortPolicyMap(cfg.TCP_PORT_POLICY_MAP_PATH)
+            self.syn_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 0, cfg.TCP_PORT_POLICY_MAP_PATH)
+            self.syn_agg_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 1, cfg.TCP_PORT_POLICY_MAP_PATH)
+            self.tcp_conn_limit_map = BpfPortPolicyViewMap(self._tcp_policy_map, 2, cfg.TCP_PORT_POLICY_MAP_PATH)
+            log.debug("tcp_port_policies map opened; TCP per-port policy active.")
         except OSError as exc:
-            log.debug("syn_rate_ports map unavailable (%s); SYN rate limiting inactive.", exc)
+            log.debug("tcp_port_policies map unavailable (%s); TCP per-port policy inactive.", exc)
         try:
-            self.syn_agg_rate_map = BpfSynRatePortsMap(cfg.SYN_AGG_RATE_MAP_PATH)
-            log.debug("syn_agg_rate_ports map opened; per-prefix SYN aggregate limiting active.")
+            self._udp_policy_map = BpfPortPolicyMap(cfg.UDP_PORT_POLICY_MAP_PATH)
+            self.udp_rate_map = BpfPortPolicyViewMap(self._udp_policy_map, 0, cfg.UDP_PORT_POLICY_MAP_PATH)
+            self.udp_agg_rate_map = BpfPortPolicyViewMap(self._udp_policy_map, 1, cfg.UDP_PORT_POLICY_MAP_PATH)
+            log.debug("udp_port_policies map opened; UDP per-port policy active.")
         except OSError as exc:
-            log.debug("syn_agg_rate_ports map unavailable (%s); per-prefix SYN aggregate limiting inactive.", exc)
-        try:
-            self.tcp_conn_limit_map = BpfSynRatePortsMap(cfg.TCP_CONN_LIMIT_MAP_PATH)
-            log.debug("tcp_conn_limit_ports map opened; per-source TCP concurrency limits active.")
-        except OSError as exc:
-            log.debug("tcp_conn_limit_ports map unavailable (%s); TCP concurrency limits inactive.", exc)
-        try:
-            self.udp_rate_map = BpfSynRatePortsMap(cfg.UDP_RATE_MAP_PATH)
-            log.debug("udp_rate_ports map opened; per-source UDP rate limiting active.")
-        except OSError as exc:
-            log.debug("udp_rate_ports map unavailable (%s); UDP rate limiting inactive.", exc)
-        try:
-            self.udp_agg_rate_map = BpfSynRatePortsMap(cfg.UDP_AGG_RATE_MAP_PATH)
-            log.debug("udp_agg_rate_ports map opened; byte-based UDP aggregate limiting active.")
-        except OSError as exc:
-            log.debug("udp_agg_rate_ports map unavailable (%s); byte-based UDP aggregate limiting inactive.", exc)
+            log.debug("udp_port_policies map unavailable (%s); UDP per-port policy inactive.", exc)
         try:
             self.acl_maps = BpfAclMaps(
                 cfg.TCP_ACL_MAP_PATH4, cfg.TCP_ACL_MAP_PATH6,
@@ -127,44 +125,64 @@ class XdpBackend(PortBackend):
         except OSError as exc:
             log.debug("ACL maps unavailable (%s); per-CIDR ACL inactive.", exc)
         try:
+            self.runtime_config_map = BpfRuntimeConfigMap(cfg.XDP_RUNTIME_CFG_MAP_PATH)
+            log.debug("xdp_runtime_cfg map opened; runtime tuning active.")
+        except OSError as exc:
+            log.debug("xdp_runtime_cfg map unavailable (%s); runtime tuning inactive.", exc)
+        try:
             self.bogon_cfg_map = BpfArrayMap(cfg.BOGON_CFG_MAP_PATH)
         except OSError as exc:
             log.debug("bogon_cfg map unavailable (%s); bogon filter toggle inactive.", exc)
+        try:
+            self.observability_cfg_map = BpfArrayMap(cfg.OBSERVABILITY_CFG_MAP_PATH)
+        except OSError as exc:
+            log.debug("observability_cfg map unavailable (%s); drop-event toggle inactive.", exc)
         try:
             self.sctp_map = BpfArrayMap(cfg.SCTP_MAP_PATH)
             log.debug("sctp_whitelist map opened; SCTP whitelist sync active.")
         except OSError as exc:
             log.debug("sctp_whitelist map unavailable (%s); SCTP whitelist sync inactive.", exc)
+        self.sit4_map: BpfSit4EndpointsMap | None = None
+        try:
+            self.sit4_map = BpfSit4EndpointsMap(cfg.SIT4_ENDPOINTS_MAP_PATH)
+            log.debug("sit4_endpoints map opened; 6in4 tunnel endpoint control active.")
+        except OSError as exc:
+            log.debug("sit4_endpoints map unavailable (%s); 6in4 tunnel endpoint sync inactive.", exc)
+
+    def run_ct_gc(self) -> None:
+        tcp_timeout_ns = int(cfg.XDP_TCP_TIMEOUT_SECONDS * 1e9)
+        deleted = self.conntrack_map.gc_expired(tcp_timeout_ns)
+        if deleted:
+            log.info("TCP conntrack GC: evicted %d stale entr%s", deleted, "y" if deleted == 1 else "ies")
+        udp_timeout_ns = int(cfg.XDP_UDP_TIMEOUT_SECONDS * 1e9)
+        deleted = self.udp_conntrack_map.gc_expired(udp_timeout_ns)
+        if deleted:
+            log.info("UDP conntrack GC: evicted %d stale entr%s", deleted, "y" if deleted == 1 else "ies")
 
     def close(self) -> None:
         self.tcp_map.close()
         self.udp_map.close()
         self.trusted_map.close()
         self.conntrack_map.close()
-        udp_conntrack_map = getattr(self, "udp_conntrack_map", None)
-        if udp_conntrack_map is not None:
-            udp_conntrack_map.close()
-        if self.syn_rate_map is not None:
-            self.syn_rate_map.close()
-        if self.syn_agg_rate_map is not None:
-            self.syn_agg_rate_map.close()
-        if self.tcp_conn_limit_map is not None:
-            self.tcp_conn_limit_map.close()
-        if self.udp_rate_map is not None:
-            self.udp_rate_map.close()
-        if self.udp_agg_rate_map is not None:
-            self.udp_agg_rate_map.close()
+        self.udp_conntrack_map.close()
+        if self._tcp_policy_map is not None:
+            self._tcp_policy_map.close()
+        if self._udp_policy_map is not None:
+            self._udp_policy_map.close()
         if self.acl_maps is not None:
             self.acl_maps.close()
+        if self.runtime_config_map is not None:
+            self.runtime_config_map.close()
         if self.bogon_cfg_map is not None:
             self.bogon_cfg_map.close()
+        if self.observability_cfg_map is not None:
+            self.observability_cfg_map.close()
         if self.sctp_map is not None:
             self.sctp_map.close()
+        if self.sit4_map is not None:
+            self.sit4_map.close()
 
     def get_applied_state(self) -> AppliedState:
-        bogon_enabled = None
-        if self.bogon_cfg_map is not None:
-            bogon_enabled = bool(self.bogon_cfg_map.get(0))
         return AppliedState(
             tcp_ports=self.tcp_map.active_ports(),
             udp_ports=self.udp_map.active_ports(),
@@ -177,7 +195,9 @@ class XdpBackend(PortBackend):
             udp_rate_limits=self.udp_rate_map.active() if self.udp_rate_map is not None else {},
             udp_agg_rate_limits=self.udp_agg_rate_map.active() if self.udp_agg_rate_map is not None else {},
             acl_rules=self.acl_maps.active_entries() if self.acl_maps is not None else {},
-            bogon_filter_enabled=bogon_enabled,
+            bogon_filter_enabled=bool(self.bogon_cfg_map.get(0)) if self.bogon_cfg_map is not None else None,
+            drop_events_enabled=bool(self.observability_cfg_map.get(0)) if self.observability_cfg_map is not None else None,
+            xdp_runtime_config=self.runtime_config_map.get() if self.runtime_config_map is not None else None,
         )
 
     def build_reconcile_plan(
@@ -185,8 +205,6 @@ class XdpBackend(PortBackend):
         desired_state: DesiredState,
         applied_state: AppliedState,
     ) -> ReconcilePlan:
-        if not hasattr(self, "_conntrack_stale_rounds"):
-            self._conntrack_stale_rounds = {}
         plan = super().build_reconcile_plan(desired_state, applied_state)
         present_desired = self.conntrack_map.existing_keys(desired_state.conntrack_entries)
         plan.conntrack_entries_to_add = desired_state.conntrack_entries - present_desired
@@ -355,11 +373,51 @@ class XdpBackend(PortBackend):
                 "udp_agg",
             )
 
+        if self._tcp_policy_map is not None:
+            tcp_policy_ports = (
+                set(desired_state.tcp_syn_rate_limits)
+                | set(desired_state.tcp_syn_agg_rate_limits)
+                | set(desired_state.tcp_conn_limits)
+            )
+            self._tcp_policy_map.ensure_prefixes(
+                tcp_policy_ports,
+                desired_state.rate_limit_source_prefix_v4,
+                desired_state.rate_limit_source_prefix_v6,
+                dry_run,
+            )
+
+        if self._udp_policy_map is not None:
+            udp_policy_ports = set(desired_state.udp_rate_limits) | set(desired_state.udp_agg_rate_limits)
+            self._udp_policy_map.ensure_prefixes(
+                udp_policy_ports,
+                desired_state.rate_limit_source_prefix_v4,
+                desired_state.rate_limit_source_prefix_v6,
+                dry_run,
+            )
+
         if self.acl_maps is not None:
             self._apply_acl_delta(plan, dry_run)
 
+        if (
+            self.runtime_config_map is not None
+            and desired_state.xdp_runtime_config != self.runtime_config_map.get()
+        ):
+            self.runtime_config_map.set(desired_state.xdp_runtime_config, dry_run)
+
         if self.bogon_cfg_map is not None and plan.bogon_filter_update is not None:
             self.bogon_cfg_map.set(0, 1 if plan.bogon_filter_update else 0, dry_run)
+        if self.observability_cfg_map is not None and plan.drop_events_update is not None:
+            self.observability_cfg_map.set(0, 1 if plan.drop_events_update else 0, dry_run)
+
+        if self.sit4_map is not None:
+            desired_sit4 = set(cfg.SIT4_ENDPOINTS)
+            current_sit4 = self.sit4_map.active_keys()
+            for ip_str in sorted(desired_sit4 - current_sit4):
+                if self.sit4_map.set(ip_str, dry_run):
+                    log.info("SIT4 +%s (6in4 tunnel endpoint added)", ip_str)
+            for ip_str in sorted(current_sit4 - desired_sit4):
+                if self.sit4_map.delete(ip_str, dry_run):
+                    log.info("SIT4 -%s (6in4 tunnel endpoint removed)", ip_str)
 
     def reconcile(
         self,
@@ -367,7 +425,7 @@ class XdpBackend(PortBackend):
         dry_run: bool,
         observed_state: ObservedState | None = None,
     ) -> None:
-        stale_rounds_snapshot = dict(getattr(self, "_conntrack_stale_rounds", {}))
+        stale_rounds_snapshot = dict(self._conntrack_stale_rounds)
         try:
             super().reconcile(desired_state, dry_run, observed_state)
         finally:
