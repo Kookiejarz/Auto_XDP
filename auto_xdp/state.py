@@ -14,6 +14,7 @@ class ObservedState:
     established: set[bytes] = field(default_factory=set)
     tcp_processes: dict[int, str] = field(default_factory=dict)
     udp_processes: dict[int, str] = field(default_factory=dict)
+    udp_sock_opts: dict[int, frozenset[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -35,7 +36,7 @@ class DesiredState:
     drop_events_enabled: bool = True
     rate_limit_source_prefix_v4: int = 32
     rate_limit_source_prefix_v6: int = 128
-    xdp_runtime_config: tuple[int, int, int, int, int, int, int] = (
+    xdp_runtime_config: tuple[int, int, int, int, int, int, int, int] = (
         300_000_000_000,
         60_000_000_000,
         30_000_000_000,
@@ -43,6 +44,7 @@ class DesiredState:
         10_000_000,
         1_000_000_000,
         1_000_000_000,
+        30_000_000_000,
     )
 
 
@@ -65,7 +67,7 @@ class AppliedState:
     drop_events_enabled: bool | None = None
     rate_limit_source_prefix_v4: int = 32
     rate_limit_source_prefix_v6: int = 128
-    xdp_runtime_config: tuple[int, int, int, int, int, int, int] | None = None
+    xdp_runtime_config: tuple[int, int, int, int, int, int, int, int] | None = None
 
 
 @dataclass

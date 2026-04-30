@@ -11,7 +11,7 @@ def _seconds_to_ns(value: float) -> int:
     return int(value * _NS_PER_SECOND)
 
 
-def _xdp_runtime_config() -> tuple[int, int, int, int, int, int, int]:
+def _xdp_runtime_config() -> tuple[int, int, int, int, int, int, int, int]:
     icmp_ns_per_token = 0
     if cfg.XDP_ICMP_RATE_PPS > 0:
         icmp_ns_per_token = max(1, int(_NS_PER_SECOND / cfg.XDP_ICMP_RATE_PPS))
@@ -23,6 +23,7 @@ def _xdp_runtime_config() -> tuple[int, int, int, int, int, int, int]:
         icmp_ns_per_token,
         _seconds_to_ns(cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS),
         _seconds_to_ns(cfg.XDP_RATE_WINDOW_SECONDS),
+        _seconds_to_ns(cfg.XDP_SYN_TIMEOUT_SECONDS),
     )
 
 

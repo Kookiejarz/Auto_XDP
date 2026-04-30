@@ -25,6 +25,10 @@ from auto_xdp.bpf.syscall import (
 
 log = logging.getLogger(__name__)
 
+# Bit 63 is set in the conntrack ktime value for half-open (SYN-only) entries.
+# Linux ktime_get_ns() won't reach 2^63 ns (~292 years uptime), so bit 63 is safe.
+_CT_SYN_PENDING = 1 << 63
+
 
 def render_nft_ports(ports: set[int]) -> str:
     return "{ " + ", ".join(str(port) for port in sorted(ports)) + " }"
@@ -143,7 +147,7 @@ class BpfArrayMap(BpfFdMap):
 
 
 class BpfRuntimeConfigMap(BpfFdMap):
-    _STRUCT_FMT = "=QQQQQQQ"
+    _STRUCT_FMT = "=QQQQQQQQ"
     _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
 
     def __init__(self, path: str) -> None:
@@ -157,7 +161,7 @@ class BpfRuntimeConfigMap(BpfFdMap):
         struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
         struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
 
-    def get(self) -> tuple[int, int, int, int, int, int, int] | None:
+    def get(self) -> tuple[int, int, int, int, int, int, int, int] | None:
         try:
             struct.pack_into("=I", self._key, 0, 0)
             bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
@@ -167,7 +171,7 @@ class BpfRuntimeConfigMap(BpfFdMap):
                 log.warning("BPF runtime config lookup failed path=%s: %s", self.path, exc)
             return None
 
-    def set(self, fields: tuple[int, int, int, int, int, int, int], dry_run: bool = False) -> bool:
+    def set(self, fields: tuple[int, int, int, int, int, int, int, int], dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s runtime_config=%s", self.path, fields)
             return True
@@ -574,7 +578,7 @@ class BpfConntrackMap(BpfFdMap):
                 deleted += 1
         return deleted
 
-    def gc_expired(self, timeout_ns: int) -> int:
+    def gc_expired(self, timeout_ns: int, syn_timeout_ns: int | None = None) -> int:
         now = time.monotonic_ns()
         all_keys = list(self._iter_raw_keys())
         to_delete: list[bytes] = []
@@ -582,8 +586,11 @@ class BpfConntrackMap(BpfFdMap):
             try:
                 ctypes.memmove(self._key, key_raw, self._key_len)
                 bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-                last_seen = struct.unpack_from("=Q", self._val, 0)[0]
-                if now - last_seen > timeout_ns:
+                raw = struct.unpack_from("=Q", self._val, 0)[0]
+                ts = raw & ~_CT_SYN_PENDING
+                is_half_open = bool(raw & _CT_SYN_PENDING)
+                limit = (syn_timeout_ns if syn_timeout_ns is not None else timeout_ns) if is_half_open else timeout_ns
+                if now - ts > limit:
                     to_delete.append(key_raw)
             except OSError:
                 continue
@@ -641,8 +648,11 @@ class BpfConntrackMaps(BpfBaseMap):
     def delete(self, key_bytes: bytes, dry_run: bool = False) -> bool:
         return self._pick_map(key_bytes).delete(key_bytes, dry_run)
 
-    def gc_expired(self, timeout_ns: int) -> int:
-        return self._map4.gc_expired(timeout_ns) + self._map6.gc_expired(timeout_ns)
+    def gc_expired(self, timeout_ns: int, syn_timeout_ns: int | None = None) -> int:
+        return (
+            self._map4.gc_expired(timeout_ns, syn_timeout_ns=syn_timeout_ns)
+            + self._map6.gc_expired(timeout_ns, syn_timeout_ns=syn_timeout_ns)
+        )
 
     def delete_dest_ports(self, ports: set[int], dry_run: bool = False) -> int:
         return self._map4.delete_dest_ports(ports, dry_run) + self._map6.delete_dest_ports(ports, dry_run)

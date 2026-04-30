@@ -118,6 +118,10 @@ def _count_conntrack_entries(map_path: Path) -> int:
     return len(rows) if isinstance(rows, list) else 0
 
 
+def _count_conntrack_entries_many(*map_paths: Path) -> int:
+    return sum(_count_conntrack_entries(path) for path in map_paths)
+
+
 def _configured_ifaces(env: dict[str, str]) -> list[str]:
     if env.get("IFACES"):
         return env["IFACES"].split()
@@ -172,8 +176,14 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
         xdp_attach=xdp_attach,
         tc_egress=tc_egress,
         conntrack={
-            "tcp": _count_conntrack_entries(ctx.bpf_pin_dir / "tcp_conntrack"),
-            "udp": _count_conntrack_entries(ctx.bpf_pin_dir / "udp_conntrack"),
+            "tcp": _count_conntrack_entries_many(
+                ctx.bpf_pin_dir / "tcp_ct4",
+                ctx.bpf_pin_dir / "tcp_ct6",
+            ),
+            "udp": _count_conntrack_entries_many(
+                ctx.bpf_pin_dir / "udp_ct4",
+                ctx.bpf_pin_dir / "udp_ct6",
+            ),
         },
     )
 
