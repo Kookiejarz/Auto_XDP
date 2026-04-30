@@ -224,10 +224,7 @@ for e in json.load(sys.stdin).get('tree', []):
         fetch_local_or_remote "$rel" "$rel" "$target" || return 1
     done
 
-    fetch_local_or_remote \
-        "auto_xdp/xdp_required_maps.txt" \
-        "auto_xdp/xdp_required_maps.txt" \
-        "${pkg_root}/xdp_required_maps.txt" || return 1
+    cp "${INSTALL_DIR}/xdp_required_maps.txt" "${pkg_root}/xdp_required_maps.txt" || return 1
 }
 
 install_runner_script() {
@@ -237,15 +234,27 @@ install_runner_script() {
     chmod +x "$RUNNER_SCRIPT"
 }
 
+install_xdp_required_maps() {
+    mkdir -p "$INSTALL_DIR"
+    if ! fetch_local_or_remote \
+            "auto_xdp/xdp_required_maps.txt" \
+            "auto_xdp/xdp_required_maps.txt" \
+            "${INSTALL_DIR}/xdp_required_maps.txt"; then
+        die "Failed to install auto_xdp/xdp_required_maps.txt"
+    fi
+}
+
+install_xdp_required_maps_step() {
+    step_begin "Installing XDP required maps list"
+    install_xdp_required_maps
+    step_ok
+}
+
 install_runtime_common_script() {
     if ! fetch_local_or_remote "$RUNTIME_COMMON_SRC" "$RUNTIME_COMMON_SRC" "$BPF_RUNTIME_COMMON_INSTALLED"; then
         die "Failed to install ${RUNTIME_COMMON_SRC}"
     fi
     chmod +x "$BPF_RUNTIME_COMMON_INSTALLED"
-
-    if ! fetch_local_or_remote "auto_xdp/xdp_required_maps.txt" "auto_xdp/xdp_required_maps.txt" "${INSTALL_DIR}/xdp_required_maps.txt"; then
-        die "Failed to install auto_xdp/xdp_required_maps.txt"
-    fi
 }
 
 install_sync_script() {
@@ -282,6 +291,16 @@ install_slot_handler_sdk() {
     local rel=""
 
     cleanup_installed_handler_sdk
+
+    if [[ -n "${BUILD_STAGING_DIR:-}" && -d "${BUILD_STAGING_DIR}/handlers" ]]; then
+        local _staged=()
+        mapfile -t -d '' _staged < <(find "${BUILD_STAGING_DIR}/handlers" -maxdepth 1 \
+            -type f \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) -print0)
+        if [[ ${#_staged[@]} -gt 0 ]]; then
+            cp "${_staged[@]}" "${handlers_root}/"
+            return 0
+        fi
+    fi
 
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
         local api_url
