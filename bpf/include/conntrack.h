@@ -104,14 +104,19 @@ static __always_inline int check_tcp_conntrack(
                       key->sport, key->dport, (__u8)CNT_TCP_CT_MISS);
             return XDP_DROP;
         }
-        if (now - *last_seen > runtime_tcp_timeout_ns()) {
-            tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
-            tcp_src_conn_record_close(key, now, dest_port);
-            count(CNT_TCP_CT_MISS);
-            count(CNT_TCP_DROP);
-            emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
-                      key->sport, key->dport, (__u8)CNT_TCP_CT_MISS);
-            return XDP_DROP;
+        {
+            __u64 raw = *last_seen;
+            __u64 ts = raw & ~CT_SYN_PENDING;
+            __u64 ct_to = (raw & CT_SYN_PENDING) ? runtime_syn_timeout_ns() : runtime_tcp_timeout_ns();
+            if (now - ts > ct_to) {
+                tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
+                tcp_src_conn_record_close(key, now, dest_port);
+                count(CNT_TCP_CT_MISS);
+                count(CNT_TCP_DROP);
+                emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
+                          key->sport, key->dport, (__u8)CNT_TCP_CT_MISS);
+                return XDP_DROP;
+            }
         }
         tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
         tcp_src_conn_record_close(key, now, dest_port);
@@ -120,13 +125,16 @@ static __always_inline int check_tcp_conntrack(
     }
 
     if (tcp_flags & 0x10) {
-        __u64 tcp_timeout = runtime_tcp_timeout_ns();
         __u64 ct_refresh = runtime_ct_refresh_ns();
 
         last_seen = tcp_conntrack_lookup(ipv4, &key_v4, &key_v6);
         if (last_seen) {
-            __u64 age = now - *last_seen;
-            if (age > tcp_timeout) {
+            __u64 raw = *last_seen;
+            bool is_half_open = raw & CT_SYN_PENDING;
+            __u64 ts = raw & ~CT_SYN_PENDING;
+            __u64 age = now - ts;
+            __u64 ct_timeout = is_half_open ? runtime_syn_timeout_ns() : runtime_tcp_timeout_ns();
+            if (age > ct_timeout) {
                 tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
                 tcp_src_conn_record_close(key, now, dest_port);
                 count(CNT_TCP_CT_MISS);
@@ -143,7 +151,9 @@ static __always_inline int check_tcp_conntrack(
                 return XDP_PASS;
             }
 
-            if (age > ct_refresh) {
+            if (is_half_open || age > ct_refresh) {
+                // Half-open: promote to established immediately on first ACK.
+                // Established: refresh timestamp after ct_refresh interval.
                 tcp_conntrack_update(ipv4, &key_v4, &key_v6, now, BPF_EXIST);
                 tcp_src_conn_record_activity(key, now, dest_port);
             }

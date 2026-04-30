@@ -35,6 +35,11 @@ struct vlan_hdr {
 #define CT_FAMILY_IPV6 10
 #define VLAN_MAX_DEPTH 4
 
+// Shared conntrack flag constants (CT_SYN_PENDING).  Also included by the XDP
+// ingress program via bpf/include/common.h — single source of truth for the
+// bit encoding used in the tcp_ct4/tcp_ct6 maps.
+#include "ct_flags.h"
+
 // Conntrack timeouts and refresh intervals (must match XDP)
 #define TCP_TIMEOUT_NS       (300ULL * 1000000000ULL)
 #define UDP_TIMEOUT_NS       (60ULL  * 1000000000ULL)
@@ -262,11 +267,13 @@ int tc_egress_track(struct __sk_buff *skb)
                 } else {
                     __u64 *last_seen = bpf_map_lookup_elem(&tcp_ct4, &map_key);
                     if (last_seen) {
+                        __u64 ts = *last_seen & ~CT_SYN_PENDING;
                         if ((tcp_flags & 0x04) ||
-                            now - *last_seen > TCP_TIMEOUT_NS) {
+                            now - ts > TCP_TIMEOUT_NS) {
                             bpf_map_delete_elem(&tcp_ct4, &map_key);
-                        } else if (now - *last_seen > CT_REFRESH_INTERVAL) {
-                            bpf_map_update_elem(&tcp_ct4, &map_key, &now, BPF_EXIST);
+                        } else if (now - ts > CT_REFRESH_INTERVAL) {
+                            __u64 new_val = (*last_seen & CT_SYN_PENDING) | now;
+                            bpf_map_update_elem(&tcp_ct4, &map_key, &new_val, BPF_EXIST);
                         }
                     }
                 }
@@ -337,11 +344,13 @@ int tc_egress_track(struct __sk_buff *skb)
             } else {
                 __u64 *last_seen = bpf_map_lookup_elem(&tcp_ct6, &map_key);
                 if (last_seen) {
+                    __u64 ts = *last_seen & ~CT_SYN_PENDING;
                     if ((tcp_flags & 0x04) ||
-                        now - *last_seen > TCP_TIMEOUT_NS) {
+                        now - ts > TCP_TIMEOUT_NS) {
                         bpf_map_delete_elem(&tcp_ct6, &map_key);
-                    } else if (now - *last_seen > CT_REFRESH_INTERVAL) {
-                        bpf_map_update_elem(&tcp_ct6, &map_key, &now, BPF_EXIST);
+                    } else if (now - ts > CT_REFRESH_INTERVAL) {
+                        __u64 new_val = (*last_seen & CT_SYN_PENDING) | now;
+                        bpf_map_update_elem(&tcp_ct6, &map_key, &new_val, BPF_EXIST);
                     }
                 }
             }

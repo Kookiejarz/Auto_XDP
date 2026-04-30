@@ -41,6 +41,9 @@ struct vlan_hdr {
 #define NS_PER_SEC 1000000000ULL
 
 
+// CT_SYN_PENDING and other shared conntrack flags (also included by tc_flow_track.c).
+#include "ct_flags.h"
+
 // Runtime tunables. Userspace writes this map from config.toml; zero fields
 // fall back to defaults so old loaders remain compatible.
 struct xdp_runtime_cfg {
@@ -51,6 +54,7 @@ struct xdp_runtime_cfg {
     __u64 icmp_ns_per_token;
     __u64 udp_global_window_ns;
     __u64 rate_window_ns;
+    __u64 syn_timeout_ns;   // half-open (SYN-only) TTL; default 30s
 };
 
 struct {
@@ -70,6 +74,12 @@ static __always_inline __u64 runtime_tcp_timeout_ns(void)
 {
     struct xdp_runtime_cfg *cfg = runtime_cfg();
     return cfg && cfg->tcp_timeout_ns ? cfg->tcp_timeout_ns : 300ULL * NS_PER_SEC;
+}
+
+static __always_inline __u64 runtime_syn_timeout_ns(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && cfg->syn_timeout_ns ? cfg->syn_timeout_ns : 30ULL * NS_PER_SEC;
 }
 
 static __always_inline __u64 runtime_udp_timeout_ns(void)
