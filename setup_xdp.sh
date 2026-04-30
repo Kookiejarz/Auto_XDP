@@ -192,7 +192,9 @@ main() {
     compile_bpf_objects_step
     deploy_backend_step
     install_runtime_files_step
+    restore_compiled_slot_handlers_step
     load_configured_slot_handlers_step
+    load_configured_port_handlers_step
     run_initial_sync_step
     install_runtime_service_step
     cleanup_build_artifacts_step

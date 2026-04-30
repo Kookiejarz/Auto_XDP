@@ -13,6 +13,49 @@ RUNTIME_COMMON_SCRIPT="/usr/local/lib/auto_xdp/auto_xdp_runtime_common.sh"
 # shellcheck disable=SC1091
 source "$CONFIG_FILE"
 
+append_pythonpath_once() {
+    local path="$1"
+
+    [[ -n "$path" ]] || return 0
+    case ":${PYTHONPATH:-}:" in
+        *":${path}:"*)
+            return 0
+            ;;
+    esac
+    PYTHONPATH="${path}${PYTHONPATH:+:${PYTHONPATH}}"
+}
+
+discover_python_lib_dir() {
+    local script_dir candidate
+    local -a candidates=()
+
+    if [[ -n "${PYTHON_LIB_DIR:-}" ]]; then
+        candidates+=("${PYTHON_LIB_DIR}")
+    fi
+    if [[ -n "${INSTALL_DIR:-}" ]]; then
+        candidates+=("${INSTALL_DIR}/python" "${INSTALL_DIR}")
+    fi
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+    script_dir="$(cd "${script_dir}/.." && pwd)"
+    candidates+=("${script_dir}" "${script_dir}/python")
+
+    for candidate in "${candidates[@]}"; do
+        [[ -f "${candidate}/auto_xdp/__init__.py" ]] || continue
+        printf '%s\n' "$candidate"
+        return 0
+    done
+
+    if [[ -n "${PYTHON_LIB_DIR:-}" ]]; then
+        printf '%s\n' "${PYTHON_LIB_DIR}"
+    elif [[ -n "${INSTALL_DIR:-}" ]]; then
+        printf '%s\n' "${INSTALL_DIR}/python"
+    fi
+}
+
+PYTHON_LIB_DIR="$(discover_python_lib_dir)"
+export PYTHON_LIB_DIR
+append_pythonpath_once "${PYTHON_LIB_DIR}"
 export PYTHONPATH="${PYTHONPATH:-}"
 
 [[ -f "$RUNTIME_COMMON_SCRIPT" ]] || {
@@ -121,12 +164,30 @@ ensure_xdp_loaded() {
                 || echo "[auto_xdp] warning: could not re-attach XDP to $_iface" >&2
             fi
         done
+        load_port_handlers || true
+        auto_tune_interface_parallelism || true
         [[ $_any_missing -eq 1 ]] && echo "[auto_xdp] re-attached XDP to missing interfaces" >&2
         echo "existing" > "${RUN_STATE_DIR}/xdp_mode"
         return 0
     fi
 
     [[ -f "$BPF_PIN_DIR/prog" ]] && echo "[auto_xdp] existing XDP maps incomplete; reloading runtime objects" >&2
+
+    # Explicitly detach old programs before removing their pins so that the
+    # kernel reference count drops to zero immediately. Without this step:
+    #  - If the old XDP was native and the new load falls back to generic,
+    #    ip-link only replaces the generic slot; the old native program keeps
+    #    its interface reference and becomes a zombie.
+    #  - If tc filter replace fails later, the old tc program keeps its filter
+    #    reference and also becomes a zombie.
+    # Detach first, then wipe pins, so no window exists where a program has
+    # neither a pin nor an interface reference yet isn't freed.
+    cleanup_tc_egress_filter
+    for _iface in "${_IFACES[@]}"; do
+        ip link set dev "$_iface" xdp off 2>/dev/null || true
+        ip link set dev "$_iface" xdp generic off 2>/dev/null || true
+        ip link set dev "$_iface" xdp offload off 2>/dev/null || true
+    done
 
     rm -rf "$BPF_PIN_DIR"
     mkdir -p "$BPF_PIN_DIR"
@@ -141,6 +202,7 @@ ensure_xdp_loaded() {
     seed_existing_tcp_conntrack
     load_tc_egress_program || true
     load_slot_handlers || true
+    load_port_handlers || true
 
     local _iface _attached=0 _xdp_mode="native" _native_err _generic_err
     for _iface in "${_IFACES[@]}"; do
@@ -160,6 +222,7 @@ ensure_xdp_loaded() {
     done
 
     [[ $_attached -gt 0 ]] || { cleanup_failed_load; return 1; }
+    auto_tune_interface_parallelism || true
     echo "$_xdp_mode" > "${RUN_STATE_DIR}/xdp_mode"
     return 0
 }

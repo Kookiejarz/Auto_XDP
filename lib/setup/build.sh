@@ -220,11 +220,22 @@ compile_xdp_program() {
     _source_root="$BUILD_STAGING_DIR"
     _handlers_dir="${_source_root}/handlers"
 
-    local _bpf_headers=(common.h keys.h maps.h trust_acl.h rate_limit.h port_dispatch.h conntrack.h parse.h slots.h)
     local _hdr
-    for _hdr in "${_bpf_headers[@]}"; do
-        stage_build_source "bpf/include/${_hdr}" "bpf/include/${_hdr}" "bpf/include/${_hdr}" || true
-    done
+    if [[ $PREFER_REMOTE_SOURCES -eq 0 ]] && [[ -d "bpf/include" ]]; then
+        # Local checkout: stage every header present on disk so new files are
+        # picked up automatically without touching this list.
+        for _hdr in bpf/include/*.h; do
+            [[ -f "$_hdr" ]] || continue
+            stage_build_source "$_hdr" "$_hdr" "$_hdr" || true
+        done
+    else
+        # curl | bash: build.sh itself was fetched from GitHub, so this list
+        # matches the remote repo's bpf/include/ at the same commit.
+        local _bpf_headers=(ct_flags.h common.h keys.h maps.h trust_acl.h rate_limit.h port_dispatch.h conntrack.h parse.h slots.h)
+        for _hdr in "${_bpf_headers[@]}"; do
+            stage_build_source "bpf/include/${_hdr}" "bpf/include/${_hdr}" "bpf/include/${_hdr}" || true
+        done
+    fi
     local _handlers_ready=0
     if prepare_slot_handler_sources; then
         _handlers_ready=1

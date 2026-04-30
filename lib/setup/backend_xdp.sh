@@ -4,17 +4,21 @@
 cleanup_existing_xdp() {
     cleanup_tc_egress_filter
 
-    local iface any_xdp=0
-    for iface in "${IFACES[@]}"; do
+    # Scan ALL system interfaces, not just IFACES: a previous install may have
+    # attached XDP to different interfaces. Only detaching IFACES leaves old
+    # programs attached, keeping their map references alive and leaking map
+    # generations on every reinstall.
+    local iface any_xdp=0 xdp_ifaces=()
+    for iface in $(ls /sys/class/net/ 2>/dev/null); do
         if ip -d link show dev "$iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
+            xdp_ifaces+=("$iface")
             any_xdp=1
-            break
         fi
     done
 
     if [[ $any_xdp -eq 1 ]]; then
-        local iface_list="${IFACES[*]}"
-        warn "Existing XDP program detected on one or more interfaces: $iface_list"
+        local iface_list="${xdp_ifaces[*]}"
+        warn "Existing XDP program detected on: $iface_list"
         if confirm_yes_no "Unload the existing XDP program from all interfaces and continue? [y/N] " "abort"; then
             :
         else
@@ -29,14 +33,21 @@ cleanup_existing_xdp() {
             esac
         fi
 
-        for iface in "${IFACES[@]}"; do
+        for iface in "${xdp_ifaces[@]}"; do
             ip link set dev "$iface" xdp off 2>/dev/null || true
             ip link set dev "$iface" xdp generic off 2>/dev/null || true
+            ip link set dev "$iface" xdp offload off 2>/dev/null || true
         done
 
-        for iface in "${IFACES[@]}"; do
+        # Verify detach; fall back to bpftool if ip link wasn't enough.
+        for iface in "${xdp_ifaces[@]}"; do
             if ip -d link show dev "$iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
-                die "Failed to clear the existing XDP program from $iface. Detach it manually and rerun."
+                warn "ip link could not clear XDP from $iface; trying bpftool..."
+                bpftool net detach xdp dev "$iface" 2>/dev/null || true
+                bpftool net detach xdpgeneric dev "$iface" 2>/dev/null || true
+                if ip -d link show dev "$iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
+                    die "Failed to clear the existing XDP program from $iface. Detach it manually and rerun."
+                fi
             fi
         done
     fi
