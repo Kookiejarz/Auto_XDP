@@ -151,7 +151,8 @@ class XdpBackend(PortBackend):
 
     def run_ct_gc(self) -> None:
         tcp_timeout_ns = int(cfg.XDP_TCP_TIMEOUT_SECONDS * 1e9)
-        deleted = self.conntrack_map.gc_expired(tcp_timeout_ns)
+        syn_timeout_ns = int(cfg.XDP_SYN_TIMEOUT_SECONDS * 1e9)
+        deleted = self.conntrack_map.gc_expired(tcp_timeout_ns, syn_timeout_ns=syn_timeout_ns)
         if deleted:
             log.info("TCP conntrack GC: evicted %d stale entr%s", deleted, "y" if deleted == 1 else "ies")
         udp_timeout_ns = int(cfg.XDP_UDP_TIMEOUT_SECONDS * 1e9)

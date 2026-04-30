@@ -22,25 +22,11 @@ BACKEND_AUTO = "auto"
 BACKEND_XDP = "xdp"
 BACKEND_NFTABLES = "nftables"
 
-TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
-UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
-SCTP_MAP_PATH = "/sys/fs/bpf/xdp_fw/sctp_whitelist"
-TCP_CONNTRACK_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/tcp_ct4"
-TCP_CONNTRACK_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/tcp_ct6"
-UDP_CONNTRACK_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/udp_ct4"
-UDP_CONNTRACK_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/udp_ct6"
-TRUSTED_IPS_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/trusted_ipv4"
-TRUSTED_IPS_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/trusted_ipv6"
-TCP_PORT_POLICY_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_port_policies"
-UDP_PORT_POLICY_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_port_policies"
-UDP_GLOBAL_RL_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_global_rl"
-XDP_RUNTIME_CFG_MAP_PATH = "/sys/fs/bpf/xdp_fw/xdp_runtime_cfg"
-BOGON_CFG_MAP_PATH = "/sys/fs/bpf/xdp_fw/bogon_cfg"
-OBSERVABILITY_CFG_MAP_PATH = "/sys/fs/bpf/xdp_fw/observability_cfg"
-TCP_ACL_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/tcp_acl_v4"
-TCP_ACL_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/tcp_acl_v6"
-UDP_ACL_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/udp_acl_v4"
-UDP_ACL_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/udp_acl_v6"
+# Compiled-in defaults — single source of truth for TOML fallbacks
+_BPF_PIN_DIR = "/sys/fs/bpf/xdp_fw"
+_NFT_FAMILY = "inet"
+_NFT_TABLE = "auto_xdp"
+
 XDP_OBJ_PATH = os.environ.get("XDP_OBJ_PATH", "")
 TC_OBJ_PATH = os.environ.get("TC_OBJ_PATH", "")
 
@@ -69,13 +55,15 @@ XDP_CONNTRACK_STALE_RECONCILES = 2
 XDP_TCP_TIMEOUT_SECONDS = 300.0
 XDP_UDP_TIMEOUT_SECONDS = 60.0
 XDP_CONNTRACK_REFRESH_SECONDS = 30.0
+XDP_CONNTRACK_GC_INTERVAL_SECONDS = 300.0
 XDP_ICMP_BURST_PACKETS = 100
 XDP_ICMP_RATE_PPS = 100.0
 XDP_UDP_GLOBAL_WINDOW_SECONDS = 1.0
 XDP_RATE_WINDOW_SECONDS = 1.0
+XDP_SYN_TIMEOUT_SECONDS = 30.0
 
-NFT_FAMILY = "inet"
-NFT_TABLE = "auto_xdp"
+NFT_FAMILY = _NFT_FAMILY
+NFT_TABLE = _NFT_TABLE
 NFT_TCP_SET = "tcp_ports"
 NFT_UDP_SET = "udp_ports"
 NFT_SCTP_SET = "sctp_ports"
@@ -87,6 +75,7 @@ UDP_PERMANENT: dict[int, str] = {}
 SCTP_PERMANENT: dict[int, str] = {}
 TRUSTED_SRC_IPS: dict[str, str] = {}
 ACL_RULES: list[dict] = []
+SIT4_ENDPOINTS: list[str] = []
 
 ACL_MAX_PORTS = 64
 ACL_VAL_SIZE = 4 + ACL_MAX_PORTS * 2
@@ -158,7 +147,47 @@ def load_required_xdp_map_names() -> tuple[str, ...]:
 
 
 REQUIRED_XDP_MAP_NAMES = load_required_xdp_map_names()
-REQUIRED_XDP_MAP_PATHS = tuple(f"/sys/fs/bpf/xdp_fw/{name}" for name in REQUIRED_XDP_MAP_NAMES)
+
+
+def _set_bpf_pin_dir(pin_dir: str) -> None:
+    """Update BPF_PIN_DIR and every derived map-path global in one place."""
+    global BPF_PIN_DIR
+    global TCP_MAP_PATH, UDP_MAP_PATH, SCTP_MAP_PATH
+    global TCP_CONNTRACK_MAP_PATH4, TCP_CONNTRACK_MAP_PATH6
+    global UDP_CONNTRACK_MAP_PATH4, UDP_CONNTRACK_MAP_PATH6
+    global TRUSTED_IPS_MAP_PATH4, TRUSTED_IPS_MAP_PATH6
+    global TCP_PORT_POLICY_MAP_PATH, UDP_PORT_POLICY_MAP_PATH
+    global UDP_GLOBAL_RL_MAP_PATH, XDP_RUNTIME_CFG_MAP_PATH
+    global BOGON_CFG_MAP_PATH, OBSERVABILITY_CFG_MAP_PATH
+    global TCP_ACL_MAP_PATH4, TCP_ACL_MAP_PATH6
+    global UDP_ACL_MAP_PATH4, UDP_ACL_MAP_PATH6
+    global SIT4_ENDPOINTS_MAP_PATH
+    global REQUIRED_XDP_MAP_PATHS
+    BPF_PIN_DIR = pin_dir
+    TCP_MAP_PATH = f"{pin_dir}/tcp_whitelist"
+    UDP_MAP_PATH = f"{pin_dir}/udp_whitelist"
+    SCTP_MAP_PATH = f"{pin_dir}/sctp_whitelist"
+    TCP_CONNTRACK_MAP_PATH4 = f"{pin_dir}/tcp_ct4"
+    TCP_CONNTRACK_MAP_PATH6 = f"{pin_dir}/tcp_ct6"
+    UDP_CONNTRACK_MAP_PATH4 = f"{pin_dir}/udp_ct4"
+    UDP_CONNTRACK_MAP_PATH6 = f"{pin_dir}/udp_ct6"
+    TRUSTED_IPS_MAP_PATH4 = f"{pin_dir}/trusted_ipv4"
+    TRUSTED_IPS_MAP_PATH6 = f"{pin_dir}/trusted_ipv6"
+    TCP_PORT_POLICY_MAP_PATH = f"{pin_dir}/tcp_port_policies"
+    UDP_PORT_POLICY_MAP_PATH = f"{pin_dir}/udp_port_policies"
+    UDP_GLOBAL_RL_MAP_PATH = f"{pin_dir}/udp_global_rl"
+    XDP_RUNTIME_CFG_MAP_PATH = f"{pin_dir}/xdp_runtime_cfg"
+    BOGON_CFG_MAP_PATH = f"{pin_dir}/bogon_cfg"
+    OBSERVABILITY_CFG_MAP_PATH = f"{pin_dir}/observability_cfg"
+    TCP_ACL_MAP_PATH4 = f"{pin_dir}/tcp_acl_v4"
+    TCP_ACL_MAP_PATH6 = f"{pin_dir}/tcp_acl_v6"
+    UDP_ACL_MAP_PATH4 = f"{pin_dir}/udp_acl_v4"
+    UDP_ACL_MAP_PATH6 = f"{pin_dir}/udp_acl_v6"
+    SIT4_ENDPOINTS_MAP_PATH = f"{pin_dir}/sit4_endpoints"
+    REQUIRED_XDP_MAP_PATHS = tuple(f"{pin_dir}/{n}" for n in REQUIRED_XDP_MAP_NAMES)
+
+
+_set_bpf_pin_dir(_BPF_PIN_DIR)
 
 
 def normalize_cidr(cidr_str: str) -> str:
@@ -256,14 +285,18 @@ def apply_toml_config(cfg: dict) -> None:
     global PREFERRED_BACKEND, XDP_CONNTRACK_STALE_RECONCILES
     global RATE_LIMIT_SOURCE_PREFIX_V4, RATE_LIMIT_SOURCE_PREFIX_V6
     global XDP_TCP_TIMEOUT_SECONDS, XDP_UDP_TIMEOUT_SECONDS
-    global XDP_CONNTRACK_REFRESH_SECONDS, XDP_ICMP_BURST_PACKETS, XDP_ICMP_RATE_PPS
+    global XDP_CONNTRACK_REFRESH_SECONDS, XDP_CONNTRACK_GC_INTERVAL_SECONDS
+    global XDP_ICMP_BURST_PACKETS, XDP_ICMP_RATE_PPS
     global XDP_UDP_GLOBAL_WINDOW_SECONDS, XDP_RATE_WINDOW_SECONDS
+    global XDP_SYN_TIMEOUT_SECONDS
+    global NFT_FAMILY, NFT_TABLE
 
     TCP_PERMANENT.clear()
     UDP_PERMANENT.clear()
     SCTP_PERMANENT.clear()
     TRUSTED_SRC_IPS.clear()
     ACL_RULES.clear()
+    SIT4_ENDPOINTS.clear()
 
     _SYN_RATE_BY_PROC.clear()
     _SYN_RATE_BY_SERVICE.clear()
@@ -289,6 +322,13 @@ def apply_toml_config(cfg: dict) -> None:
 
     for cidr, label in cfg.get("trusted_ips", {}).items():
         TRUSTED_SRC_IPS[normalize_cidr(cidr)] = str(label)
+
+    for ep in cfg.get("tunnel", {}).get("sit4_endpoints", []):
+        try:
+            ip = ipaddress.IPv4Address(str(ep))
+            SIT4_ENDPOINTS.append(str(ip))
+        except ValueError:
+            log.warning("Invalid tunnel.sit4_endpoints entry %r; skipping.", ep)
 
     for rule in cfg.get("acl", []):
         ACL_RULES.append({
@@ -341,6 +381,12 @@ def apply_toml_config(cfg: dict) -> None:
     )
 
     xdp = cfg.get("xdp", {})
+    _set_bpf_pin_dir(str(xdp.get("bpf_pin_dir", _BPF_PIN_DIR)).rstrip("/"))
+
+    nftables = cfg.get("nftables", {})
+    NFT_FAMILY = str(nftables.get("family", _NFT_FAMILY))
+    NFT_TABLE = str(nftables.get("table", _NFT_TABLE))
+
     XDP_CONNTRACK_STALE_RECONCILES = _coerce_positive_int(
         xdp.get("conntrack_stale_reconciles", 2),
         "xdp.conntrack_stale_reconciles",
@@ -362,6 +408,11 @@ def apply_toml_config(cfg: dict) -> None:
         "xdp.runtime.conntrack_refresh_seconds",
         30.0,
     )
+    XDP_CONNTRACK_GC_INTERVAL_SECONDS = _coerce_nonnegative_float(
+        xdp_runtime.get("conntrack_gc_interval_seconds", 300.0),
+        "xdp.runtime.conntrack_gc_interval_seconds",
+        300.0,
+    )
     XDP_ICMP_BURST_PACKETS = _coerce_positive_int(
         xdp_runtime.get("icmp_burst_packets", 100),
         "xdp.runtime.icmp_burst_packets",
@@ -381,4 +432,9 @@ def apply_toml_config(cfg: dict) -> None:
         xdp_runtime.get("rate_window_seconds", 1.0),
         "xdp.runtime.rate_window_seconds",
         1.0,
+    )
+    XDP_SYN_TIMEOUT_SECONDS = _coerce_nonnegative_float(
+        xdp_runtime.get("syn_timeout_seconds", 30.0),
+        "xdp.runtime.syn_timeout_seconds",
+        30.0,
     )

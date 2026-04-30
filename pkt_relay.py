@@ -34,7 +34,7 @@ except ImportError:
     except ImportError:
         tomllib = None  # type: ignore[assignment]
 
-# ── paths & defaults ────────────────────────────────────────────────────────
+# paths & defaults
 
 TOML_CONFIG_PATH   = "/etc/auto_xdp/config.toml"
 RINGBUF_PIN_PATH   = "/sys/fs/bpf/xdp_fw/pkt_ringbuf"
@@ -47,13 +47,13 @@ MAX_HISTORY_SEND   = 5_000      # cap history batch sent on client connect
 
 PAGE_SIZE = mmap.PAGESIZE
 
-# ── ring buffer record constants ─────────────────────────────────────────────
+# ring buffer record constants
 
 _BUSY_BIT    = 1 << 31
 _DISCARD_BIT = 1 << 30
 _HDR_SZ      = 8               # u32 hdr + u32 pad
 
-# ── event decoding tables ────────────────────────────────────────────────────
+# event decoding tables
 
 _PROTO_NAMES: dict[int, str] = {
     1:   "ICMP",
@@ -91,7 +91,7 @@ _PKT_EVENT_SIZE = 48   # sizeof(struct pkt_event)
 _AF_INET        = 2
 _AF_INET6       = 10
 
-# ── BPF syscall helpers (mirrors xdp_port_sync.py) ───────────────────────────
+# BPF syscall helpers (mirrors xdp_port_sync.py)
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 _NR_BPF: int = {
@@ -130,7 +130,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── config ───────────────────────────────────────────────────────────────────
+# config
 
 def _load_toml(path: str) -> dict:
     if tomllib is None:
@@ -140,7 +140,7 @@ def _load_toml(path: str) -> dict:
             return tomllib.load(f)
     except FileNotFoundError:
         return {}
-    except Exception as exc:
+    except OSError as exc:
         log.warning("Failed to load %s: %s", path, exc)
         return {}
 
@@ -149,7 +149,7 @@ def _ringbuf_cfg(toml: dict) -> dict:
     return toml.get("ringbuf", {})
 
 
-# ── event decoder ────────────────────────────────────────────────────────────
+# event decoder
 
 def decode_event(raw: bytes) -> dict | None:
     """Decode a 48-byte pkt_event struct into a JSON-serialisable dict."""
@@ -188,7 +188,7 @@ def decode_event(raw: bytes) -> dict | None:
     }
 
 
-# ── ring buffer reader ────────────────────────────────────────────────────────
+# ring buffer reader
 
 class RingBufReader:
     """Consumes a pinned BPF_MAP_TYPE_RINGBUF via mmap."""
@@ -252,7 +252,7 @@ class RingBufReader:
         os.close(self._fd)
 
 
-# ── relay server ──────────────────────────────────────────────────────────────
+# relay server
 
 class RelayServer:
     """Accepts Unix socket clients and streams DROP events to them."""
@@ -275,7 +275,7 @@ class RelayServer:
         self._server: socket.socket | None = None
         self._running = False
 
-    # ── internal helpers ──────────────────────────────────────────────────
+    # internal helpers
 
     def _open_server(self) -> None:
         os.makedirs(os.path.dirname(self._sock_path) or ".", exist_ok=True)
@@ -336,7 +336,7 @@ class RelayServer:
         for fd in dead:
             self._drop_client(fd)
 
-    # ── main loop ─────────────────────────────────────────────────────────
+    # main loop
 
     def run(self) -> None:
         self._open_server()
@@ -401,7 +401,7 @@ class RelayServer:
         log.info("pkt_relay stopped")
 
 
-# ── PID file ─────────────────────────────────────────────────────────────────
+# PID file
 
 def _write_pid(path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -416,7 +416,7 @@ def _remove_pid(path: str) -> None:
         pass
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# entry point
 
 def main() -> None:
     ap = argparse.ArgumentParser(

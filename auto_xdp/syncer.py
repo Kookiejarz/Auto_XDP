@@ -9,7 +9,7 @@ import time
 from auto_xdp import config as cfg
 from auto_xdp.backends import NftablesBackend, PortBackend, XdpBackend
 from auto_xdp.config import apply_toml_config, load_toml_config
-from auto_xdp.discovery import _net_connections, get_listening_ports
+from auto_xdp.discovery import get_listening_ports
 from auto_xdp.policy import resolve_desired_state
 from auto_xdp.proc_events import drain_proc_events, open_proc_connector
 
@@ -23,11 +23,7 @@ TRUSTED_SRC_IPS = cfg.TRUSTED_SRC_IPS
 
 
 def observe_system_state():
-    try:
-        all_conns = _net_connections(kind="inet") if (_net_connections is not None) else []
-    except Exception:
-        all_conns = []
-    return get_listening_ports(cached_conns=all_conns)
+    return get_listening_ports()
 
 
 def sync_once(backend: PortBackend, dry_run: bool) -> None:
@@ -87,6 +83,7 @@ def watch(
     nl = None
 
     last_event_t = 0.0
+    last_gc_t = 0.0
     reload_requested = False
 
     def _on_sighup(signum: int, frame: object) -> None:
@@ -104,7 +101,7 @@ def watch(
                     log.info("Backend initialized.")
                     sync_once(backend, dry_run)
                     last_event_t = 0.0
-                except Exception as exc:
+                except OSError as exc:
                     log.error("Failed to open backend: %s. Retrying in 5s...", exc)
                     time.sleep(5)
                     continue
@@ -149,14 +146,21 @@ def watch(
                 log.debug("Sync triggered by event.")
                 try:
                     sync_once(backend, dry_run)
-                except Exception as exc:
+                except (OSError, RuntimeError) as exc:
                     log.error("Sync error: %s", exc)
-                    if isinstance(exc, (OSError, RuntimeError)):
-                        log.warning("Backend may be broken; will attempt to re-initialize.")
-                        backend.close()
-                        backend = None
+                    log.warning("Backend may be broken; will attempt to re-initialize.")
+                    backend.close()
+                    backend = None
 
                 last_event_t = 0.0
+
+            gc_interval = cfg.XDP_CONNTRACK_GC_INTERVAL_SECONDS
+            if gc_interval > 0 and (time.monotonic() - last_gc_t >= gc_interval):
+                try:
+                    backend.run_ct_gc()
+                except OSError as exc:
+                    log.warning("Conntrack GC error: %s", exc)
+                last_gc_t = time.monotonic()
 
     except KeyboardInterrupt:
         log.info("Shutting down.")

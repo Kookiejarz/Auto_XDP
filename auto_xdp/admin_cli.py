@@ -1402,11 +1402,11 @@ def _summarize_conntrack_maps(paths: list[str], limit: int) -> tuple[int, list[t
         if not isinstance(key, list):
             continue
         try:
-            if len(key) >= 8:
-                family = _to_int(key[0])
-                dport = (_to_int(key[6]) << 8) | _to_int(key[7])
-            elif len(key) >= 4:
-                family = 2 if len(key) == 12 else 10
+            if len(key) == 12:
+                family = 2   # ct_key_v4: sport[0:2], dport[2:4], saddr[4:8], daddr[8:12]
+                dport = (_to_int(key[2]) << 8) | _to_int(key[3])
+            elif len(key) == 36:
+                family = 10  # ct_key_v6: sport[0:2], dport[2:4], saddr[4:20], daddr[20:36]
                 dport = (_to_int(key[2]) << 8) | _to_int(key[3])
             else:
                 continue
@@ -1640,8 +1640,12 @@ def _lookup_port_procs(proto: str, ports: list[int]) -> dict[int, set[str]]:
                                 inode = int(link[8:-1])
                                 if inode in wanted_inodes:
                                     with open(f"/proc/{pid}/comm") as cf:
-                                        inode_map[inode] = cf.read().strip()
-                                    wanted_inodes.discard(inode)
+                                        proc_name = cf.read().strip()
+                                    prev = inode_map.get(inode)
+                                    if prev is None or prev == "systemd":
+                                        inode_map[inode] = proc_name
+                                    if proc_name != "systemd":
+                                        wanted_inodes.discard(inode)
                         except OSError:
                             pass
                 except OSError:
@@ -1963,6 +1967,68 @@ def _format_rate(packet_delta: int, byte_delta: int, elapsed: float) -> str:
     return f"{pps:.2f} pps / {_human_bps(bps)}"
 
 
+def _read_byte_counters(bpf_pin_dir: str) -> tuple[int, int, int, int]:
+    """Return (total_bytes, drop_bytes, total_pkts, drop_pkts); -1 when unavailable."""
+    map_path = Path(bpf_pin_dir) / "byte_counters"
+    if not map_path.exists():
+        return -1, -1, -1, -1
+    try:
+        out = subprocess.check_output(
+            ["bpftool", "-j", "map", "dump", "pinned", str(map_path)],
+            stderr=subprocess.DEVNULL,
+        )
+        data = json.loads(out)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+        return -1, -1, -1, -1
+
+    key_vals: dict[int, int] = {}
+    for row in data:
+        k = row.get("key")
+        if isinstance(k, int):
+            idx = k
+        elif isinstance(k, list):
+            b = bytes((int(x, 0) if isinstance(x, str) else x) & 0xFF for x in k[:4])
+            idx = int.from_bytes(b, "little")
+        else:
+            continue
+        v = row.get("values", row.get("value", 0))
+        if isinstance(v, list):
+            total = 0
+            for e in v:
+                if isinstance(e, dict):
+                    val = e.get("value", 0)
+                    if isinstance(val, list):
+                        raw = bytes((int(b, 0) if isinstance(b, str) else int(b)) & 0xFF for b in val)
+                        total += int.from_bytes(raw, "little")
+                    elif isinstance(val, int):
+                        total += val
+                    elif isinstance(val, str):
+                        try:
+                            total += int(val, 0)
+                        except ValueError:
+                            pass
+                elif isinstance(e, str):
+                    try:
+                        total += int(e, 0)
+                    except ValueError:
+                        pass
+                elif isinstance(e, int):
+                    total += e
+        elif isinstance(v, int):
+            total = v
+        else:
+            total = 0
+        key_vals[idx] = key_vals.get(idx, 0) + total
+
+    total_bytes = key_vals.get(0, 0)
+    drop_bytes = key_vals.get(1, 0)
+    # Indices 2/3 (total_pkts/drop_pkts) present only in BPF objects built after
+    # byte_counters was expanded from 2 to 4 entries.
+    total_pkts = key_vals.get(2, -1)
+    drop_pkts = key_vals.get(3, -1)
+    return total_bytes, drop_bytes, total_pkts, drop_pkts
+
+
 def _read_xdp_rows(bpf_pin_dir: str) -> list[tuple[str, int, int]]:
     map_path = Path(bpf_pin_dir) / "pkt_counters"
     if not map_path.exists():
@@ -1980,12 +2046,28 @@ def _read_xdp_rows(bpf_pin_dir: str) -> list[tuple[str, int, int]]:
     except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as exc:
         raise RuntimeError(f"Failed to read XDP counters: {exc}") from exc
 
+    def _bytelist_to_int(lst: list) -> int:
+        try:
+            raw = bytes((int(b, 0) if isinstance(b, str) else int(b)) & 0xFF for b in lst)
+            return int.from_bytes(raw, "little")
+        except (ValueError, TypeError):
+            return 0
+
     def _sum_percpu(v: Any) -> int:
         if isinstance(v, list):
             total = 0
             for e in v:
                 if isinstance(e, dict):
-                    total += int(e.get("value", 0))
+                    val = e.get("value", 0)
+                    if isinstance(val, list):
+                        total += _bytelist_to_int(val)
+                    elif isinstance(val, int):
+                        total += val
+                    elif isinstance(val, str):
+                        try:
+                            total += int(val, 0)
+                        except ValueError:
+                            pass
                 elif isinstance(e, str):
                     try:
                         total += int(e, 0)
@@ -2001,6 +2083,8 @@ def _read_xdp_rows(bpf_pin_dir: str) -> list[tuple[str, int, int]]:
                 return int(v, 0)
             except ValueError:
                 return 0
+        if isinstance(v, list):
+            return _bytelist_to_int(v)
         return 0
 
     def _parse_key(key: Any) -> int:
@@ -2038,8 +2122,13 @@ def _read_xdp_rows(bpf_pin_dir: str) -> list[tuple[str, int, int]]:
         if idx >= 32:
             rows.append((f"COUNTER_{idx}", key_packets[idx], -1))
 
-    rows.append(("XDP_TOTAL", total, -1))
-    rows.append(("XDP_DROP_TOTAL", drop_total, -1))
+    total_bytes, drop_bytes, total_pkts, drop_pkts = _read_byte_counters(bpf_pin_dir)
+    # Use byte_counters packet counts when available: they are incremented exactly
+    # once per packet, unlike pkt_counters where some paths fire two count() calls.
+    xdp_total = total_pkts if total_pkts >= 0 else total
+    xdp_drop = drop_pkts if drop_pkts >= 0 else drop_total
+    rows.append(("XDP_TOTAL", xdp_total, total_bytes))
+    rows.append(("XDP_DROP_TOTAL", xdp_drop, drop_bytes))
     return rows
 
 
@@ -2114,17 +2203,21 @@ def _apply_xdp_accumulator(
     map_id: str,
     state_file: Path,
 ) -> list[tuple[str, int, int]]:
-    if backend != "xdp" or map_id == "-":
+    if backend != "xdp":
         return rows
 
     # Find current totals
     current_total: int | None = None
     current_drop: int | None = None
-    for name, packets, _ in rows:
+    current_total_bytes: int = -1
+    current_drop_bytes: int = -1
+    for name, packets, b in rows:
         if name == "XDP_TOTAL":
             current_total = packets
+            current_total_bytes = b
         elif name == "XDP_DROP_TOTAL":
             current_drop = packets
+            current_drop_bytes = b
 
     if current_total is None or current_drop is None:
         return rows
@@ -2137,19 +2230,35 @@ def _apply_xdp_accumulator(
     prev_raw_drop = state.get("raw_drop")
     prev_acc_total = state.get("acc_total")
     prev_acc_drop = state.get("acc_drop")
+    prev_raw_total_bytes = state.get("raw_total_bytes")
+    prev_raw_drop_bytes = state.get("raw_drop_bytes")
+    prev_acc_total_bytes = state.get("acc_total_bytes")
+    prev_acc_drop_bytes = state.get("acc_drop_bytes")
 
     acc_total = current_total
     acc_drop = current_drop
+    acc_total_bytes = current_total_bytes
+    acc_drop_bytes = current_drop_bytes
 
     same_context = (
         prev_backend == backend
         and prev_iface == iface
         and prev_map_id == map_id
+        and prev_map_id != "-"
+        and map_id != "-"
         and isinstance(prev_raw_total, int)
         and isinstance(prev_raw_drop, int)
         and isinstance(prev_acc_total, int)
         and isinstance(prev_acc_drop, int)
     )
+    # map_id changed (BPF reload) or bpftool failed — preserve history if same iface
+    same_iface = (
+        prev_backend == backend
+        and prev_iface == iface
+        and isinstance(prev_acc_total, int)
+        and isinstance(prev_acc_drop, int)
+    )
+
     if same_context:
         if current_total >= prev_raw_total:
             acc_total = prev_acc_total + (current_total - prev_raw_total)
@@ -2159,6 +2268,56 @@ def _apply_xdp_accumulator(
             acc_drop = prev_acc_drop + (current_drop - prev_raw_drop)
         else:
             acc_drop = prev_acc_drop + current_drop
+
+        if (
+            current_total_bytes >= 0
+            and isinstance(prev_raw_total_bytes, int) and prev_raw_total_bytes >= 0
+            and isinstance(prev_acc_total_bytes, int) and prev_acc_total_bytes >= 0
+        ):
+            if current_total_bytes >= prev_raw_total_bytes:
+                acc_total_bytes = prev_acc_total_bytes + (current_total_bytes - prev_raw_total_bytes)
+            else:
+                acc_total_bytes = prev_acc_total_bytes + current_total_bytes
+
+        if (
+            current_drop_bytes >= 0
+            and isinstance(prev_raw_drop_bytes, int) and prev_raw_drop_bytes >= 0
+            and isinstance(prev_acc_drop_bytes, int) and prev_acc_drop_bytes >= 0
+        ):
+            if current_drop_bytes >= prev_raw_drop_bytes:
+                acc_drop_bytes = prev_acc_drop_bytes + (current_drop_bytes - prev_raw_drop_bytes)
+            else:
+                acc_drop_bytes = prev_acc_drop_bytes + current_drop_bytes
+
+    elif same_iface:
+        # map_id changed (BPF reload) or bpftool couldn't get map_id:
+        # treat current raw as new counts on top of previous accumulated total
+        acc_total = prev_acc_total + current_total
+        acc_drop = prev_acc_drop + current_drop
+
+        if (
+            current_total_bytes >= 0
+            and isinstance(prev_acc_total_bytes, int) and prev_acc_total_bytes >= 0
+        ):
+            acc_total_bytes = prev_acc_total_bytes + current_total_bytes
+
+        if (
+            current_drop_bytes >= 0
+            and isinstance(prev_acc_drop_bytes, int) and prev_acc_drop_bytes >= 0
+        ):
+            acc_drop_bytes = prev_acc_drop_bytes + current_drop_bytes
+
+    # Don't persist state when map_id is unknown — we can't detect future context changes
+    if map_id == "-":
+        updated = []
+        for name, packets, b in rows:
+            if name == "XDP_TOTAL":
+                updated.append(("XDP_TOTAL", acc_total, acc_total_bytes))
+            elif name == "XDP_DROP_TOTAL":
+                updated.append(("XDP_DROP_TOTAL", acc_drop, acc_drop_bytes))
+            else:
+                updated.append((name, packets, b))
+        return updated
 
     _save_stats_state(
         state_file,
@@ -2170,15 +2329,19 @@ def _apply_xdp_accumulator(
             "raw_drop": current_drop,
             "acc_total": acc_total,
             "acc_drop": acc_drop,
+            "raw_total_bytes": current_total_bytes,
+            "raw_drop_bytes": current_drop_bytes,
+            "acc_total_bytes": acc_total_bytes,
+            "acc_drop_bytes": acc_drop_bytes,
         },
     )
 
     updated = []
     for name, packets, b in rows:
         if name == "XDP_TOTAL":
-            updated.append(("XDP_TOTAL", acc_total, b))
+            updated.append(("XDP_TOTAL", acc_total, acc_total_bytes))
         elif name == "XDP_DROP_TOTAL":
-            updated.append(("XDP_DROP_TOTAL", acc_drop, b))
+            updated.append(("XDP_DROP_TOTAL", acc_drop, acc_drop_bytes))
         else:
             updated.append((name, packets, b))
     return updated
