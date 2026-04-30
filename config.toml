@@ -7,7 +7,7 @@
 # Drop packets with obviously invalid or reserved source addresses.
 # Set to false only on environments where private/internal source ranges are expected.
 # Set to false on private/internal networks where RFC1918 source addresses are legitimate.
-bogon_filter = false
+bogon_filter = true
 
 [under_attack]
 enabled = true
@@ -18,7 +18,7 @@ log_level = "warning"
 
 # Event debounce window before reconciling after proc connector activity.
 # Larger values reduce churn during bursty process/socket changes.
-debounce_seconds = 0.4
+debounce_seconds = 0.5
 
 # Preferred runtime backend: auto, xdp, nftables.
 # auto = choose the best available backend at runtime.
@@ -144,6 +144,14 @@ openvpn = 200
 
 # Protocol slot handlers (bpf_tail_call dispatch for non-TCP/UDP/ICMP traffic).
 
+[tunnel]
+# Outer IPv4 source addresses of 6in4 (proto 41) remote tunnel endpoints.
+# XDP passes protocol-41 packets only from these IPs; all others are dropped
+# at line rate before the kernel spends any CPU on SIT decapsulation.
+# Obtain the remote endpoint IP from your tunnel provider (e.g. Hurricane Electric).
+# Example: sit4_endpoints = ["216.218.226.238"]
+sit4_endpoints = []
+
 [slots]
 # Action for protocols with no handler loaded.
 # "pass" preserves existing behaviour; "drop" enforces an explicit allow-list.
@@ -162,6 +170,11 @@ enabled = []
 [port_handlers.udp]
 
 [xdp]
+# BPF map pin directory. All map paths are derived from this prefix.
+# Change this only if you mount bpffs at a non-standard location.
+# Requires daemon restart to take effect.
+bpf_pin_dir = "/sys/fs/bpf/xdp_fw"
+
 # Remove stale conntrack entries after N consecutive reconcile rounds miss them.
 # Only affects userspace-managed TCP conntrack seeding/cleanup logic.
 conntrack_stale_reconciles = 2
@@ -170,7 +183,21 @@ conntrack_stale_reconciles = 2
 tcp_timeout_seconds = 300
 udp_timeout_seconds = 60
 conntrack_refresh_seconds = 30
+# Interval between full conntrack map GC sweeps (seconds). Set to 0 to disable.
+# Ideal GC interval will help optimize performance on LRU map, reducing memory usage.
+conntrack_gc_interval_seconds = 300
 icmp_burst_packets = 100
 icmp_rate_pps = 100
 udp_global_window_seconds = 1
 rate_window_seconds = 1
+# Half-open (SYN-only) conntrack TTL. Entries with no ACK seen after this
+# duration are expired faster than tcp_timeout_seconds, freeing slots under
+# SYN flood. Increase if serving clients over high-latency links (>100ms RTT).
+syn_timeout_seconds = 20
+
+[nftables]
+# nftables table family and name used in fallback mode.
+# Only relevant when the nftables backend is active instead of XDP.
+# Requires daemon restart to take effect.
+family = "inet"
+table = "auto_xdp"

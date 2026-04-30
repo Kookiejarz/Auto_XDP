@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-xdp"
+version = "26.5.1"
+description = "Auto-sync Linux listening ports into XDP or nftables."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MPL-2.0" }
+authors = [
+    { name = "Yunheng Liu", email = "liu@liuu.org" },
+]
+
+[project.scripts]
+xdp-port-sync = "auto_xdp.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["auto_xdp*"]
+
+[tool.setuptools.package-data]
+auto_xdp = ["xdp_required_maps.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
