@@ -19,26 +19,21 @@ int xdp_esp_handler(struct xdp_md *ctx)
     if (!sc)
         return XDP_PASS;
 
-    /* Advance ctx->data to the ESP header to avoid variable-offset packet
-     * pointer arithmetic that this kernel's BPF verifier rejects. */
     __u16 inner_off = sc->inner_offset;
-    if (bpf_xdp_adjust_head(ctx, (int)inner_off))
+    if (inner_off > 256)
         return XDP_PASS;
 
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    struct esp_hdr *esp = data;
+    struct esp_hdr *esp = data + inner_off;
 
-    if ((void *)(esp + 1) > data_end) {
-        bpf_xdp_adjust_head(ctx, -(int)inner_off);
+    if ((void *)(esp + 1) > data_end)
         return XDP_PASS;
-    }
 
     /* RFC 4303 §2.1: SPI values 0x00–0xFF are reserved */
     if (bpf_ntohl(esp->spi) < 256)
         return XDP_DROP;
 
-    bpf_xdp_adjust_head(ctx, -(int)inner_off);
     return XDP_PASS;
 }
 

@@ -61,27 +61,21 @@ int xdp_sctp_handler(struct xdp_md *ctx)
     if (!sc)
         return XDP_PASS;
 
-    /* Copy all needed sc fields before bpf_xdp_adjust_head may shrink the
-     * metadata region and invalidate the sc pointer. */
     __u16 inner_off = sc->inner_offset;
     __u8  family    = sc->family;
     __u32 saddr[4], daddr[4];
     __builtin_memcpy(saddr, sc->saddr, 16);
     __builtin_memcpy(daddr, sc->daddr, 16);
 
-    /* Advance ctx->data to the SCTP header to avoid variable-offset packet
-     * pointer arithmetic that this kernel's BPF verifier rejects. */
-    if (bpf_xdp_adjust_head(ctx, (int)inner_off))
+    if (inner_off > 256)
         return XDP_PASS;
 
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    struct sctp_hdr *sctp = data;
+    struct sctp_hdr *sctp = data + inner_off;
 
-    if ((void *)(sctp + 1) > data_end) {
-        bpf_xdp_adjust_head(ctx, -(int)inner_off);
+    if ((void *)(sctp + 1) > data_end)
         return XDP_PASS;
-    }
 
     // 1. Conntrack: reply to an outbound SCTP connection we initiated.
     struct ct_key key;
@@ -89,20 +83,16 @@ int xdp_sctp_handler(struct xdp_md *ctx)
     __u64 *last_seen = bpf_map_lookup_elem(&sctp_conntrack, &key);
     if (last_seen) {
         __u64 now = bpf_ktime_get_ns();
-        if (now - *last_seen <= SCTP_TIMEOUT_NS) {
-            bpf_xdp_adjust_head(ctx, -(int)inner_off);
+        if (now - *last_seen <= SCTP_TIMEOUT_NS)
             return XDP_PASS;
-        }
         bpf_map_delete_elem(&sctp_conntrack, &key);
     }
 
     // 2. Whitelist: inbound SCTP to an open port.
     __u32 dport = bpf_ntohs(sctp->dport);
     __u32 *allowed = bpf_map_lookup_elem(&sctp_whitelist, &dport);
-    if (allowed && *allowed == 1) {
-        bpf_xdp_adjust_head(ctx, -(int)inner_off);
+    if (allowed && *allowed == 1)
         return XDP_PASS;
-    }
 
     return XDP_DROP;
 }

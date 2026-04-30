@@ -14,19 +14,23 @@
  *  l3_offset    : byte offset from ctx->data to the IP/IPv6 header
  *  inner_offset : byte offset from ctx->data to the first byte past
  *                 all IP options / IPv6 extension headers (L4 payload)
+ *  sport/dport  : source/destination port (network byte order);
+ *                 0 for non-TCP/UDP protocol-level handlers
  *  saddr/daddr  : parsed source/destination addresses;
  *                 IPv4 uses word [0] only, IPv6 uses all four words
  *
- * Size is 40 bytes (multiple of 4 — satisfies bpf_xdp_adjust_meta alignment).
+ * Size is 44 bytes (multiple of 4 — satisfies bpf_xdp_adjust_meta alignment).
  */
 struct xdp_slot_ctx {
-    __u8  family;
-    __u8  ip_proto;
-    __u16 l3_offset;
-    __u16 inner_offset;
-    __u16 _pad;
-    __u32 saddr[4];
-    __u32 daddr[4];
+    __u8   family;
+    __u8   ip_proto;
+    __u16  l3_offset;
+    __u16  inner_offset;
+    __be16 sport;
+    __be16 dport;
+    __u16  _pad;
+    __u32  saddr[4];
+    __u32  daddr[4];
 };
 
 /*
