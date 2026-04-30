@@ -6,6 +6,7 @@ TOML_CONFIG="/etc/auto_xdp/config.toml"
 RUN_STATE_DIR="/run/auto_xdp"
 BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 INSTALL_DIR="/usr/local/lib/auto_xdp"
+PYTHON_LIB_DIR="${INSTALL_DIR}/python"
 NFT_FAMILY="inet"
 NFT_TABLE="auto_xdp"
 NFT_CHAIN="input"
@@ -32,6 +33,7 @@ Commands:
   sync [args...]         Run one sync pass with automatic backend selection
   check-update [args...] Compare installed files against GitHub and update
   log-level [LVL]        Show or change daemon log level
+  under-attack [on|off] Show or change under-attack mode
   start                  Start the installed service
   stop                   Stop the installed service
   restart                Restart the installed service
@@ -110,7 +112,7 @@ load_config() {
 }
 
 run_admin_config() {
-    python3 -m auto_xdp.admin_cli \
+    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.admin_cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
@@ -118,7 +120,7 @@ run_admin_config() {
 }
 
 run_admin_runtime() {
-    python3 -m auto_xdp.admin.main \
+    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.admin.main \
         --env-config "$CONFIG_FILE" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --run-state-dir "$RUN_STATE_DIR" \
@@ -137,6 +139,20 @@ run_log_level() {
 
     [[ -f "$TOML_CONFIG" ]] || run_config init
     run_admin_config log-level "$level"
+    reload_daemon
+    return 0
+}
+
+run_under_attack() {
+    local mode="${1:-}"
+
+    if [[ -z "$mode" ]]; then
+        run_admin_config under-attack
+        return $?
+    fi
+
+    [[ -f "$TOML_CONFIG" ]] || run_config init
+    run_admin_config under-attack "$mode"
     reload_daemon
     return 0
 }
@@ -341,47 +357,7 @@ run_backend() {
 }
 
 run_conntrack() {
-    local target="all"
-    local limit=10
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            tcp|udp|all)
-                target="$1"
-                shift
-                ;;
-            --limit)
-                [[ $# -ge 2 ]] || {
-                    echo "Missing value for --limit" >&2
-                    exit 1
-                }
-                limit="$2"
-                shift 2
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            *)
-                echo "Unknown conntrack option: $1" >&2
-                exit 1
-                ;;
-        esac
-    done
-
-    case "$target" in
-        tcp)
-            render_conntrack_summary "TCP" "${BPF_PIN_DIR}/tcp_conntrack" "$limit"
-            ;;
-        udp)
-            render_conntrack_summary "UDP" "${BPF_PIN_DIR}/udp_conntrack" "$limit"
-            ;;
-        all)
-            render_conntrack_summary "TCP" "${BPF_PIN_DIR}/tcp_conntrack" "$limit"
-            echo ""
-            render_conntrack_summary "UDP" "${BPF_PIN_DIR}/udp_conntrack" "$limit"
-            ;;
-    esac
+    run_admin_config conntrack "$@"
 }
 
 
@@ -819,8 +795,7 @@ run_ports() {
 }
 
 run_stats() {
-    prepare_python_runtime
-    "$PYTHON3_BIN" -m auto_xdp.admin_cli \
+    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.admin_cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
@@ -1024,6 +999,10 @@ main() {
         log-level)
             shift || true
             run_log_level "$@"
+            ;;
+        under-attack)
+            shift || true
+            run_under_attack "$@"
             ;;
         config)
             shift || true
