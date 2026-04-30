@@ -3,7 +3,7 @@
 **Auto-sync a Linux host's real listening ports into XDP or nftables, so public servers stay locked down without hand-maintaining firewall rules.**
 
 <p align="center">
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=flat-square" alt="License"></a>
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   <a href="https://www.kernel.org/"><img src="https://img.shields.io/badge/Kernel-%E2%89%A54.18-blue.svg?style=flat-square" alt="Kernel >= 4.18"></a>
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
@@ -114,7 +114,7 @@ Incoming Packet
 - **Reload-safe XDP attach**: the installer also pre-seeds existing sessions before initial attach.
 - **Pinned BPF maps** that survive reloads and can be updated at runtime 
 - **ICMP token-bucket rate limiter**: XDP-level protection against ICMP/ICMPv6 ping floods; 100 pps burst cap with per-second token refill, while ARP and IPv6 NDP control traffic (RS/RA/NS/NA) are always passed
-- **Per-IP SYN rate limiting (anti-brute-force)**: configurable per-port SYN rate limit tracked per source IP in a 1-second fixed window; stricter defaults for SSH/MySQL, higher for mail services
+- **Per-source SYN/UDP rate limiting (anti-brute-force)**: configurable per-port limits tracked per source IP by default, or per configured source CIDR via `rate_limits.source_cidr_v4` / `source_cidr_v6`
 - **Boot-time loader**: restores protection on reboot instead of only syncing userspace state
 - **Systemd + OpenRC support**: installs the service automatically when either init system is present
 - **Configurable daemon verbosity**: `axdp log-level debug|info|warning|error` updates the installed service config and restarts it
@@ -319,6 +319,21 @@ python3 /usr/local/bin/xdp_port_sync.py --backend auto \
 ```
 
 `--trusted-ip` is synced to both backends: XDP writes to the `trusted_ipv4`/`trusted_ipv6` LPM trie maps; `nftables` writes to equivalent `trusted_v4`/`trusted_v6` sets in the `auto_xdp` table.
+
+### XDP Runtime Tuning
+
+Runtime data-path tunables live in `/etc/auto_xdp/config.toml` and are synced into the `xdp_runtime_cfg` map by the daemon:
+
+```toml
+[xdp.runtime]
+tcp_timeout_seconds = 300
+udp_timeout_seconds = 60
+conntrack_refresh_seconds = 30
+icmp_burst_packets = 100
+icmp_rate_pps = 100
+udp_global_window_seconds = 1
+rate_window_seconds = 1
+```
 
 ### Daemon Management
 
