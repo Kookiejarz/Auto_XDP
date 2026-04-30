@@ -624,13 +624,18 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
 
     last_seen = rl_tcp_conntrack_lookup(ipv4, &key_v4, &key_v6);
     if (last_seen) {
-        __u64 age = now - *last_seen;
-        if (age > runtime_tcp_timeout_ns()) {
+        __u64 raw = *last_seen;
+        bool is_half_open = raw & CT_SYN_PENDING;
+        __u64 ts = raw & ~CT_SYN_PENDING;
+        __u64 age = now - ts;
+        __u64 ct_timeout = is_half_open ? runtime_syn_timeout_ns() : runtime_tcp_timeout_ns();
+        if (age > ct_timeout) {
             rl_tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
             tcp_src_conn_record_close(key, now, dest_port);
         } else {
             if (age > runtime_ct_refresh_ns()) {
-                rl_tcp_conntrack_update(ipv4, &key_v4, &key_v6, now, BPF_EXIST);
+                __u64 new_val = is_half_open ? (now | CT_SYN_PENDING) : now;
+                rl_tcp_conntrack_update(ipv4, &key_v4, &key_v6, new_val, BPF_EXIST);
                 tcp_src_conn_record_activity(key, now, dest_port);
             }
             count(CNT_TCP_NEW_ALLOW);
@@ -641,7 +646,7 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
     if (!prechecked && precheck_new_tcp_syn(key, dest_port, bypass_rate, now) == XDP_DROP)
         return XDP_DROP;
 
-    rl_tcp_conntrack_update(ipv4, &key_v4, &key_v6, now, BPF_ANY);
+    rl_tcp_conntrack_update(ipv4, &key_v4, &key_v6, now | CT_SYN_PENDING, BPF_ANY);
     tcp_src_conn_record_new(key, now, dest_port);
     count(CNT_TCP_NEW_ALLOW);
     return XDP_PASS;
