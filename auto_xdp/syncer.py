@@ -131,6 +131,10 @@ def watch(
             if reload_requested:
                 reload_requested = False
                 log.warning("SIGHUP received — reloading config from %s", config_path)
+                _old_pin_dir = cfg.BPF_PIN_DIR
+                _old_nft_family = cfg.NFT_FAMILY
+                _old_nft_table = cfg.NFT_TABLE
+                _old_preferred = cfg.PREFERRED_BACKEND
                 apply_toml_config(load_toml_config(config_path))
                 if cli_trusted_ips:
                     TRUSTED_SRC_IPS.update(cli_trusted_ips)
@@ -138,6 +142,20 @@ def watch(
                     _lvl = getattr(logging, cfg.LOG_LEVEL.upper(), logging.WARNING)
                     logging.getLogger().setLevel(_lvl)
                     log.setLevel(_lvl)
+                _backend_stale = (
+                    cfg.BPF_PIN_DIR != _old_pin_dir
+                    or cfg.NFT_FAMILY != _old_nft_family
+                    or cfg.NFT_TABLE != _old_nft_table
+                )
+                if cfg.PREFERRED_BACKEND != _old_preferred and backend_name == _old_preferred:
+                    backend_name = cfg.PREFERRED_BACKEND
+                    _backend_stale = True
+                if _backend_stale and backend is not None:
+                    log.warning(
+                        "Backend-critical config changed; closing backend for rebuild."
+                    )
+                    backend.close()
+                    backend = None
                 last_event_t = time.monotonic() - cfg.DEBOUNCE_SECONDS
 
             if last_event_t and (time.monotonic() - last_event_t >= cfg.DEBOUNCE_SECONDS):
