@@ -190,6 +190,7 @@ main() {
     confirm_existing_install_step
     stop_existing_service_step
     compile_bpf_objects_step
+    install_xdp_required_maps_step
     deploy_backend_step
     install_runtime_files_step
     restore_compiled_slot_handlers_step
