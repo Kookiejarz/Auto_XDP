@@ -4,60 +4,69 @@
 # To apply changes immediately: axdp restart
 
 [firewall]
-# Drop packets with obviously invalid or reserved source addresses.
-# Set to false only on environments where private/internal source ranges are expected.
-# Set to false on private/internal networks where RFC1918 source addresses are legitimate.
+# Drop packets with obviously invalid or reserved source addresses
+# (RFC1918, loopback, multicast, etc.). Disable only on private networks
+# where these source ranges are legitimately expected inbound.
 bogon_filter = true
 
 [under_attack]
+# When enabled, the daemon tightens rate limits and drops marginal traffic
+# automatically during detected flood conditions.
 enabled = true
 
 [daemon]
 # Log verbosity for the Python sync daemon: debug, info, warning, error.
 log_level = "warning"
 
-# Event debounce window before reconciling after proc connector activity.
-# Larger values reduce churn during bursty process/socket changes.
+# How long (seconds) to wait for process/socket change events to settle
+# before triggering a reconcile. Larger values reduce churn during
+# bursty process restarts; smaller values react faster to port changes.
 debounce_seconds = 0.5
 
 # Preferred runtime backend: auto, xdp, nftables.
-# auto = choose the best available backend at runtime.
-# xdp  = require XDP mode when possible.
-# nftables = force nftables fallback mode.
+# auto      = choose the best available backend at runtime.
+# xdp       = require XDP mode; fail if unavailable.
+# nftables  = force nftables fallback regardless of XDP availability.
 preferred_backend = "auto"
 
 [discovery]
-# Exclude loopback-only listeners from exposure discovery.
-# When true, listeners bound only to 127.0.0.0/8 or ::1 are ignored.
+# When true, services bound only to 127.0.0.0/8 or ::1 are ignored;
+# they are unreachable from outside anyway.
 exclude_loopback = true
 
-# Exclude listeners bound to these addresses/CIDRs from automatic exposure.
-# Useful for admin sockets, VPN-only services, or addresses handled elsewhere.
+# Source CIDRs whose bound listeners are excluded from auto-discovery.
+# Useful for admin sockets, VPN-only services, or addresses managed elsewhere.
+# Example: exclude_bind_cidrs = ["10.0.0.0/8"]
 exclude_bind_cidrs = []
 
 [permanent_ports]
-# Ports always kept open regardless of which services are running.
-# SCTP is config-managed only; it is not auto-discovered from listening sockets.
-# Use these when a port must stay allowed even if the owning process is temporarily absent.
-tcp = []
-udp = []
-sctp = []
+# Ports always kept open regardless of whether the owning process is running.
+# SCTP ports are config-managed only — not auto-discovered from sockets.
+tcp  = []   # e.g. [80, 443]
+udp  = []   # e.g. [53, 123]
+sctp = []   # e.g. [5060]
 
 [trusted_ips]
-# Source IPs/CIDRs that bypass all firewall checks (rate limits, whitelist).
-# Format:  "CIDR" = "label"
-# "10.0.0.0/8" = "internal network"
-# Trusted sources are allowed before whitelist and rate-limit checks.
+# Source IPs/CIDRs with elevated handling.
+# XDP TCP: trusted sources may pass pure SYN packets even when the port was not
+# auto-discovered, and they bypass SYN rate limits.
+# XDP UDP: trusted sources do NOT open closed UDP ports; the destination UDP
+# port must already be whitelisted. Once whitelisted, trusted sources bypass
+# UDP rate limits and port handlers.
+# nftables fallback: trusted sources are accepted before port checks.
+# Format: "CIDR" = "label"
+# "10.0.0.0/8"    = "internal network"
+# "203.0.113.5/32" = "monitoring host"
 
-# SYN rate limits (new connections per second per source IP).
-# Lookup order: syn_by_proc (process name) → syn_by_service (IANA name).
-# Ports absent from both tables are not rate-limited (e.g. HTTP/HTTPS).
-# These limits apply only to new inbound TCP SYN traffic.
+
+# TCP rate limits
+# New SYN packets allowed per second per source IP.
+# Lookup order: syn_by_proc (process name) → syn_by_service (IANA service name).
+# Ports absent from both tables are not SYN-rate-limited.
 
 [rate_limits.syn_by_proc]
-# Key: process name as seen on the local host.
-# Value: allowed new SYN packets per second per source IP for ports owned by that process.
-sshd           = 2
+# Key: process name as reported by /proc. Value: max new SYNs/s per source IP.
+sshd           = 2    # SSH brute-force protection
 vsftpd         = 10
 proftpd        = 10
 "pure-ftpd"    = 10
@@ -73,8 +82,7 @@ xrdp           = 2
 telnetd        = 2
 
 [rate_limits.syn_by_service]
-# Key: service name from /etc/services when no per-process override exists.
-# Value: allowed new SYN packets per second per source IP.
+# Fallback when no per-process match exists. Key: IANA service name from /etc/services.
 ssh             = 2
 ftp             = 10
 "ftp-data"      = 10
@@ -89,115 +97,166 @@ mysql           = 2
 postgresql      = 2
 redis           = 2
 mongodb         = 2
-"ms-wbt-server" = 2
+"ms-wbt-server" = 2   # RDP
 vnc             = 2
 telnet          = 2
 
 [rate_limits.syn_agg_by_proc]
-# Optional per-process aggregate SYN rate limits.
-# These apply across source prefixes, not just a single IP.
+# Aggregate SYN rate cap across all source IPs for a given process's ports.
+# Useful to bound total SYN flood volume even when per-IP rate is low.
+# Format: process_name = max_syns_per_second  (across all sources combined)
 
 [rate_limits.syn_agg_by_service]
-# Optional service-name fallback for aggregate SYN rate limits.
+# Same as syn_agg_by_proc but keyed by IANA service name. Used when no
+# per-process match exists.
 
 [rate_limits.tcp_conn_by_proc]
-# Optional per-process cap on concurrent tracked TCP connections per source.
+# Max concurrent tracked TCP connections per source IP, per process's ports.
+# Helps prevent one client from monopolising connection table slots.
+# Format: process_name = max_concurrent_connections_per_source_ip
 
 [rate_limits.tcp_conn_by_service]
-# Optional service-name fallback for TCP concurrent connection caps.
+# Fallback concurrent connection cap keyed by IANA service name.
 
 
-# UDP rate limits (packets per second per source IP).
-# UDP is stateless at the protocol level, so these controls help bound abuse.
+# UDP rate limits
+# UDP is connectionless, so rate limits are the primary abuse control.
 
 [rate_limits.udp_by_proc]
-# Key: process name.
-# Value: allowed UDP packets per second per source IP for ports owned by that process.
-named   = 5000
+# Max UDP packets per second per source IP for ports owned by this process.
+named   = 5000   # DNS — high volume expected from resolvers
 unbound = 5000
 dnsmasq = 5000
 openvpn = 200
 
 [rate_limits.udp_by_service]
-# Service-name fallback for UDP per-source packet rate limits.
-domain  = 5000
-ntp     = 500
-isakmp  = 100
+# Fallback per-source UDP packet rate cap keyed by IANA service name.
+domain  = 5000   # DNS
+ntp     = 500    # NTP amplification mitigation
+isakmp  = 100    # IKE/VPN negotiation
 openvpn = 200
 
 [rate_limits.udp_agg_bytes_by_proc]
-# Optional per-process aggregate UDP byte-rate caps across source prefixes.
+# Aggregate UDP byte rate cap (bytes/s) across all sources for this process's ports.
+# Blocks amplification floods where many sources each stay under the per-IP limit.
+# Format: process_name = max_bytes_per_second
 
 [rate_limits.udp_agg_bytes_by_service]
-# Service-name fallback for aggregate UDP byte-rate caps.
+# Fallback aggregate UDP byte-rate cap keyed by IANA service name.
 
-# Per-CIDR port ACL rules.
-# These bypass rate limiting and take priority over the port whitelist.
-# Ports do NOT need to be in the whitelist — ACL is a zero-trust path.
-# Use ACL when a service should be reachable only from specific source ranges.
 
+# Per-CIDR port ACL
+# XDP TCP ACL entries explicitly allow matching source CIDRs to reach listed
+# TCP ports even when those ports were not auto-discovered, and bypass TCP SYN
+# rate limits.
+# XDP UDP ACL entries do not open closed UDP ports; the destination UDP port
+# must already be whitelisted. Once whitelisted, matching ACL entries bypass
+# UDP rate limits and port handlers.
+#
 # [[acl]]
-# proto = "tcp"
-# cidr  = "10.0.0.0/8"
-# ports = [5432, 6379]
+# proto = "tcp"          # "tcp" or "udp"
+# cidr  = "10.0.0.0/8"  # source CIDR to allow
+# ports = [5432, 6379]   # destination ports covered by this ACL
 
 
-# Protocol slot handlers (bpf_tail_call dispatch for non-TCP/UDP/ICMP traffic).
+# Protocol slot handlers
+# bpf_tail_call dispatch table for non-TCP/UDP/ICMP protocols (GRE, ESP, SCTP…).
 
 [tunnel]
-# Outer IPv4 source addresses of 6in4 (proto 41) remote tunnel endpoints.
-# XDP passes protocol-41 packets only from these IPs; all others are dropped
-# at line rate before the kernel spends any CPU on SIT decapsulation.
+# Allowed outer IPv4 source addresses for 6in4 (protocol 41) tunnel endpoints.
+# XDP passes proto-41 only from these IPs; all others are dropped at line rate
+# before the kernel wastes CPU on SIT decapsulation.
 # Obtain the remote endpoint IP from your tunnel provider (e.g. Hurricane Electric).
 # Example: sit4_endpoints = ["216.218.226.238"]
 sit4_endpoints = []
 
 [slots]
-# Action for protocols with no handler loaded.
-# "pass" preserves existing behaviour; "drop" enforces an explicit allow-list.
-# This affects non-TCP/UDP/ICMP traffic dispatched through the slot table.
+# Action when a non-TCP/UDP/ICMP packet arrives and no handler is loaded.
+# "pass" = forward to kernel (backward-compatible default before handlers existed).
+# "drop" = enforce an explicit allow-list; unknown protocols are blocked.
 default_action = "drop"
 
-# Built-in handlers to load at startup: "gre" (proto 47), "esp" (proto 50),
-# "sctp" (proto 132).  Custom handlers: { proto = N, path = "/path/to.o" }
-# Use built-ins by name, or point custom entries at compiled BPF object files.
-# enabled = ["sctp", "gre", "esp"]
+# Built-in handlers to load at startup.
+# Named options: "gre" (proto 47), "esp" (proto 50), "sctp" (proto 132).
+# Custom handlers: { proto = N, path = "/path/to/handler.o" }
+# Example: enabled = ["sctp", "gre"]
 enabled = []
 
 [port_handlers]
+# Per-port BPF tail-call handlers for deep packet inspection.
+# Handlers run after the main whitelist/rate-limit pass for the port.
+
 [port_handlers.tcp]
+# Example: 443 = "/usr/lib/auto_xdp/handlers/tls_sni.o"
 
 [port_handlers.udp]
+# Example: 53 = "/usr/lib/auto_xdp/handlers/dns_validate.o"
+
+
+# XDP backend
 
 [xdp]
-# BPF map pin directory. All map paths are derived from this prefix.
-# Change this only if you mount bpffs at a non-standard location.
+# BPF map pin directory. All per-map pin paths are derived from this prefix.
+# Change only if bpffs is mounted at a non-standard location.
 # Requires daemon restart to take effect.
 bpf_pin_dir = "/sys/fs/bpf/xdp_fw"
 
-# Remove stale conntrack entries after N consecutive reconcile rounds miss them.
-# Only affects userspace-managed TCP conntrack seeding/cleanup logic.
+# How many consecutive reconcile rounds a conntrack entry must be absent from
+# the observed socket table before the daemon removes it from the BPF map.
+# Higher values tolerate brief process restarts without dropping active flows.
 conntrack_stale_reconciles = 2
 
 [xdp.runtime]
+# How long (seconds) an established TCP flow's conntrack entry stays valid
+# without seeing new packets. Flows idle longer than this are evicted.
 tcp_timeout_seconds = 300
+
+# How long (seconds) a UDP conntrack entry (created by TC egress tracking)
+# remains valid. Shorter than TCP since UDP is connectionless.
 udp_timeout_seconds = 60
+
+# Minimum interval (seconds) between conntrack timestamp refreshes.
+# Entries seen more recently than this are not re-stamped, reducing write load.
 conntrack_refresh_seconds = 30
-# Interval between full conntrack map GC sweeps (seconds). Set to 0 to disable.
-# Ideal GC interval will help optimize performance on LRU map, reducing memory usage.
+
+# Interval (seconds) between full conntrack map GC sweeps that expire stale
+# entries. Reduces LRU eviction pressure under sustained traffic. 0 = disabled.
 conntrack_gc_interval_seconds = 300
+
+# Maximum number of ICMP echo requests queued in the token bucket before
+# rate limiting kicks in (burst allowance).
 icmp_burst_packets = 100
+
+# Sustained ICMP echo request rate allowed per second (packets/s).
+# Requests beyond this rate are dropped after the burst bucket empties.
 icmp_rate_pps = 100
+
+# Sliding-window duration (seconds) for the global UDP byte-rate limiter.
+# A shorter window reacts faster; a longer window smooths out bursts.
 udp_global_window_seconds = 1
+
+# Global UDP byte-rate cap across all whitelisted ports (megabits/s). 0 = disabled.
+# Blocks volumetric floods from many low-rate sources that bypass per-IP limits.
+# Example: 1000 caps total ingress UDP at ~1 Gbps (~125 MB/s).
+udp_global_byte_rate_mbps = 997
+
+# Sliding-window duration (seconds) for per-IP and per-prefix rate limiters
+# (SYN rate, UDP packet rate, aggregate byte rate).
 rate_window_seconds = 1
-# Half-open (SYN-only) conntrack TTL. Entries with no ACK seen after this
-# duration are expired faster than tcp_timeout_seconds, freeing slots under
-# SYN flood. Increase if serving clients over high-latency links (>100ms RTT).
+
+# Half-open (SYN-only) conntrack TTL (seconds). Entries that never receive
+# an ACK are expired faster than tcp_timeout_seconds to free map slots under
+# SYN flood. Increase if clients have high-latency links (> 100 ms RTT).
 syn_timeout_seconds = 20
 
-[nftables]
-# nftables table family and name used in fallback mode.
-# Only relevant when the nftables backend is active instead of XDP.
+
+# nftables fallback
+# Used only when the nftables backend is active instead of XDP.
 # Requires daemon restart to take effect.
+
+[nftables]
+# nftables table address family: inet (IPv4+IPv6), ip (IPv4 only), ip6 (IPv6 only).
 family = "inet"
+
+# nftables table name. The daemon creates and manages this table exclusively.
 table = "auto_xdp"

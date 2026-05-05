@@ -36,6 +36,7 @@ class DesiredState:
     drop_events_enabled: bool = True
     rate_limit_source_prefix_v4: int = 32
     rate_limit_source_prefix_v6: int = 128
+    udp_global_byte_rate: int = 0
     xdp_runtime_config: tuple[int, int, int, int, int, int, int, int] = (
         300_000_000_000,
         60_000_000_000,
@@ -67,6 +68,7 @@ class AppliedState:
     drop_events_enabled: bool | None = None
     rate_limit_source_prefix_v4: int = 32
     rate_limit_source_prefix_v6: int = 128
+    udp_global_byte_rate: int | None = None
     xdp_runtime_config: tuple[int, int, int, int, int, int, int, int] | None = None
 
 
@@ -96,6 +98,7 @@ class ReconcilePlan:
     acl_rules_to_remove: set[tuple[str, str]] = field(default_factory=set)
     bogon_filter_update: bool | None = None
     drop_events_update: bool | None = None
+    udp_global_byte_rate_update: int | None = None
 
     def is_noop(self) -> bool:
         return not any((
@@ -123,6 +126,7 @@ class ReconcilePlan:
             self.acl_rules_to_remove,
             self.bogon_filter_update is not None,
             self.drop_events_update is not None,
+            self.udp_global_byte_rate_update is not None,
         ))
 
 
@@ -190,4 +194,6 @@ def compute_reconcile_plan(desired: DesiredState, applied: AppliedState) -> Reco
         plan.bogon_filter_update = desired.bogon_filter_enabled
     if applied.drop_events_enabled is None or applied.drop_events_enabled != desired.drop_events_enabled:
         plan.drop_events_update = desired.drop_events_enabled
+    if applied.udp_global_byte_rate is None or applied.udp_global_byte_rate != desired.udp_global_byte_rate:
+        plan.udp_global_byte_rate_update = desired.udp_global_byte_rate
     return plan

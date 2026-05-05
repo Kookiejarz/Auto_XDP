@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from auto_xdp import config as cfg
+from auto_xdp.admin.detect import detect_backend as _detect_backend
 from auto_xdp.bpf.syscall import (
     BPF_MAP_DELETE_ELEM,
     BPF_MAP_GET_NEXT_KEY,
@@ -23,6 +24,7 @@ from auto_xdp.bpf.syscall import (
     bpf,
     obj_get,
 )
+from auto_xdp.discovery import _build_systemd_socket_map
 
 try:
     import tomllib  # Python 3.11+
@@ -111,10 +113,15 @@ udp = []
 sctp = []
 
 [trusted_ips]
-# Source IPs/CIDRs that bypass all firewall checks (rate limits, whitelist).
+# Source IPs/CIDRs with elevated handling.
+# XDP TCP: trusted sources may pass pure SYN packets even when the port was not
+# auto-discovered, and they bypass SYN rate limits.
+# XDP UDP: trusted sources do NOT open closed UDP ports; the destination UDP
+# port must already be whitelisted. Once whitelisted, trusted sources bypass
+# UDP rate limits and port handlers.
+# nftables fallback: trusted sources are accepted before port checks.
 # Format:  "CIDR" = "label"
 # "10.0.0.0/8" = "internal network"
-# Trusted sources are allowed before whitelist and rate-limit checks.
 
 # SYN rate limits (new connections per second per source IP).
 # Lookup order: syn_by_proc (process name) → syn_by_service (IANA name).
@@ -206,14 +213,18 @@ openvpn = 200
 # Service-name fallback for aggregate UDP byte-rate caps.
 
 # Per-CIDR port ACL rules.
-# These bypass rate limiting and take priority over the port whitelist.
-# Ports do NOT need to be in the whitelist — ACL is a zero-trust path.
+# XDP TCP ACL entries explicitly allow matching source CIDRs to reach listed
+# TCP ports even when those ports were not auto-discovered, and bypass TCP SYN
+# rate limits.
+# XDP UDP ACL entries do not open closed UDP ports; the destination UDP port
+# must already be whitelisted. Once whitelisted, matching ACL entries bypass
+# UDP rate limits and port handlers.
 # Use ACL when a service should be reachable only from specific source ranges.
 
 # [[acl]]
 # proto = "tcp"
 # cidr  = "10.0.0.0/8"
-# ports = [5432, 6379]
+# ports = [5432, 6379]  # destination ports covered by this ACL
 
 
 # Protocol slot handlers (bpf_tail_call dispatch for non-TCP/UDP/ICMP traffic).
@@ -1451,69 +1462,6 @@ def _autodetect_iface() -> str:
     raise RuntimeError("Could not detect interface. Use --iface IFACE.")
 
 
-def _detect_backend(
-    bpf_pin_dir: str,
-    run_state_dir: str,
-    iface: str,
-    nft_family: str,
-    nft_table: str,
-) -> str:
-    """Returns 'xdp' or 'nftables', raises RuntimeError if neither found."""
-    pkt_counters = Path(bpf_pin_dir) / "pkt_counters"
-
-    def _iface_has_xdp(iface_name: str) -> bool:
-        if not iface_name:
-            return False
-        try:
-            out = subprocess.check_output(
-                ["ip", "-d", "link", "show", "dev", iface_name],
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-            return bool(re.search(r"xdp|xdpgeneric|xdpoffload", out))
-        except (subprocess.CalledProcessError, OSError):
-            return False
-
-    def _nft_table_exists() -> bool:
-        if not shutil.which("nft"):
-            return False
-        result = subprocess.run(
-            ["nft", "list", "table", nft_family, nft_table],
-            capture_output=True,
-        )
-        return result.returncode == 0
-
-    def _check_xdp() -> bool:
-        return pkt_counters.exists() or _iface_has_xdp(iface)
-
-    def _check_xdp_last_resort() -> bool:
-        return pkt_counters.exists()
-
-    # Read hint from run-state file
-    candidate = ""
-    backend_file = Path(run_state_dir) / "backend"
-    if backend_file.is_file():
-        try:
-            candidate = backend_file.read_text().strip()
-        except OSError:
-            candidate = ""
-
-    if candidate == "xdp" and _check_xdp():
-        return "xdp"
-    if candidate == "nftables" and _nft_table_exists():
-        return "nftables"
-
-    # Fall back to auto-detect
-    if _check_xdp():
-        return "xdp"
-    if _nft_table_exists():
-        return "nftables"
-    if _check_xdp_last_resort():
-        return "xdp"
-
-    raise RuntimeError("No active Auto XDP backend detected.")
-
-
 def _read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
     """Returns (tcp_ports, udp_ports) from BPF whitelist maps."""
     tcp_map = str(Path(bpf_pin_dir) / "tcp_whitelist")
@@ -1530,6 +1478,11 @@ def _read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
             try:
                 return int(v, 0)
             except ValueError:
+                return 0
+        if isinstance(v, list):
+            try:
+                return int.from_bytes(bytes(_as_int(b) & 0xFF for b in v[:4]), "little")
+            except (TypeError, ValueError):
                 return 0
         return 0
 
@@ -1553,9 +1506,17 @@ def _read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
             return []
         ports: list[int] = []
         for row in rows:
-            if _as_int(row.get("value", 0)) <= 0:
+            fmt = row.get("formatted")
+            if isinstance(fmt, dict):
+                val = fmt.get("value", 0)
+                port = fmt.get("key", 0)
+            else:
+                val = _as_int(row.get("value", 0))
+                port = _key_to_port(row.get("key", 0))
+            if not isinstance(val, int) or val <= 0:
                 continue
-            port = _key_to_port(row.get("key", 0))
+            if not isinstance(port, int):
+                port = _key_to_port(row.get("key", 0))
             if 0 < port <= 65535:
                 ports.append(port)
         return sorted(set(ports))
@@ -1590,9 +1551,22 @@ def _read_nft_ports(nft_family: str, nft_table: str) -> tuple[list[int], list[in
     return _read_set("tcp_ports"), _read_set("udp_ports")
 
 
+def _display_proc_name(
+    proc_name: str,
+    port: int,
+    systemd_socket_map: dict[int, str] | None,
+) -> tuple[str, dict[int, str] | None]:
+    if proc_name != "systemd":
+        return proc_name, systemd_socket_map
+    if systemd_socket_map is None:
+        systemd_socket_map = _build_systemd_socket_map()
+    return systemd_socket_map.get(port, proc_name), systemd_socket_map
+
+
 def _lookup_port_procs(proto: str, ports: list[int]) -> dict[int, set[str]]:
     """Returns {port: set_of_process_names} by scanning /proc/net/{tcp,udp}."""
     proc_by_port: dict[int, set[str]] = {p: set() for p in ports}
+    systemd_socket_map: dict[int, str] | None = None
 
     def _parse_proc_net(path: str, state_filter: str, check_no_remote: bool = False) -> dict[int, int]:
         result: dict[int, int] = {}
@@ -1657,7 +1631,8 @@ def _lookup_port_procs(proto: str, ports: list[int]) -> dict[int, set[str]]:
 
     for port, inode in port_to_inode.items():
         if port in proc_by_port and inode in inode_map:
-            proc_by_port[port].add(inode_map[inode])
+            proc_name, systemd_socket_map = _display_proc_name(inode_map[inode], port, systemd_socket_map)
+            proc_by_port[port].add(proc_name)
 
     return proc_by_port
 
@@ -1747,19 +1722,21 @@ def _cmd_ports(args: argparse.Namespace) -> int:
     run_state_dir: str = args.run_state_dir
     nft_family: str = args.nft_family
     nft_table: str = args.nft_table
-    iface: str = args.iface or ""
+    ifaces: list[str] = (args.iface or "").split() or []
 
     # Auto-detect interface if not provided
-    if not iface:
+    if not ifaces:
         try:
-            iface = _autodetect_iface()
+            ifaces = [_autodetect_iface()]
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
 
+    iface = ifaces[0]
+
     # Detect backend
     try:
-        backend = _detect_backend(bpf_pin_dir, run_state_dir, iface, nft_family, nft_table)
+        backend = _detect_backend(Path(bpf_pin_dir), Path(run_state_dir), ifaces, nft_family, nft_table)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1771,8 +1748,8 @@ def _cmd_ports(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    syn_rate_map = str(Path(bpf_pin_dir) / "syn_rate_ports")
-    udp_rate_map = str(Path(bpf_pin_dir) / "udp_rate_ports")
+    syn_rate_map = str(Path(bpf_pin_dir) / "tcp_port_policies")
+    udp_rate_map = str(Path(bpf_pin_dir) / "udp_port_policies")
 
     def _render_current(tcp: list[int], udp: list[int]) -> None:
         tcp_procs = _lookup_port_procs("tcp", tcp)
@@ -1801,7 +1778,7 @@ def _cmd_ports(args: argparse.Namespace) -> int:
         while True:
             _time.sleep(args.interval)
             try:
-                new_backend = _detect_backend(bpf_pin_dir, run_state_dir, iface, nft_family, nft_table)
+                new_backend = _detect_backend(Path(bpf_pin_dir), Path(run_state_dir), ifaces, nft_family, nft_table)
                 new_tcp, new_udp = _collect_ports(new_backend, bpf_pin_dir, nft_family, nft_table)
             except RuntimeError:
                 continue
@@ -2433,16 +2410,18 @@ def _render_stats(
 def _cmd_stats(args: argparse.Namespace) -> int:
     import time as _time
 
-    iface = args.iface or ""
-    if not iface:
+    ifaces: list[str] = (args.iface or "").split() or []
+    if not ifaces:
         try:
-            iface = _autodetect_iface()
+            ifaces = [_autodetect_iface()]
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
 
+    iface = ifaces[0]
+
     try:
-        backend = _detect_backend(args.bpf_pin_dir, args.run_state_dir, iface, args.nft_family, args.nft_table)
+        backend = _detect_backend(Path(args.bpf_pin_dir), Path(args.run_state_dir), ifaces, args.nft_family, args.nft_table)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1

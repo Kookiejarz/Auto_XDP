@@ -140,5 +140,6 @@ def resolve_desired_state(observed: ObservedState) -> DesiredState:
         drop_events_enabled=cfg.DROP_EVENTS_ENABLED,
         rate_limit_source_prefix_v4=cfg.RATE_LIMIT_SOURCE_PREFIX_V4,
         rate_limit_source_prefix_v6=cfg.RATE_LIMIT_SOURCE_PREFIX_V6,
+        udp_global_byte_rate=cfg.XDP_UDP_GLOBAL_BYTE_RATE,
         xdp_runtime_config=_xdp_runtime_config(),
     )

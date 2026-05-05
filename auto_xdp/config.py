@@ -61,6 +61,7 @@ XDP_ICMP_RATE_PPS = 100.0
 XDP_UDP_GLOBAL_WINDOW_SECONDS = 1.0
 XDP_RATE_WINDOW_SECONDS = 1.0
 XDP_SYN_TIMEOUT_SECONDS = 30.0
+XDP_UDP_GLOBAL_BYTE_RATE = 0
 
 NFT_FAMILY = _NFT_FAMILY
 NFT_TABLE = _NFT_TABLE
@@ -288,7 +289,7 @@ def apply_toml_config(cfg: dict) -> None:
     global XDP_CONNTRACK_REFRESH_SECONDS, XDP_CONNTRACK_GC_INTERVAL_SECONDS
     global XDP_ICMP_BURST_PACKETS, XDP_ICMP_RATE_PPS
     global XDP_UDP_GLOBAL_WINDOW_SECONDS, XDP_RATE_WINDOW_SECONDS
-    global XDP_SYN_TIMEOUT_SECONDS
+    global XDP_SYN_TIMEOUT_SECONDS, XDP_UDP_GLOBAL_BYTE_RATE
     global NFT_FAMILY, NFT_TABLE
 
     TCP_PERMANENT.clear()
@@ -438,3 +439,9 @@ def apply_toml_config(cfg: dict) -> None:
         "xdp.runtime.syn_timeout_seconds",
         30.0,
     )
+    _udp_global_byte_rate_mbps = _coerce_nonnegative_float(
+        xdp_runtime.get("udp_global_byte_rate_mbps", 0.0),
+        "xdp.runtime.udp_global_byte_rate_mbps",
+        0.0,
+    )
+    XDP_UDP_GLOBAL_BYTE_RATE = int(_udp_global_byte_rate_mbps * 1_000_000 / 8)

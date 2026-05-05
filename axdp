@@ -173,6 +173,14 @@ autodetect_iface() {
     }
 }
 
+_any_iface_has_xdp() {
+    local _iface
+    for _iface in ${IFACES:-${IFACE:-}}; do
+        ip -d link show dev "$_iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload' && return 0
+    done
+    return 1
+}
+
 detect_backend() {
     local candidate=""
 
@@ -182,7 +190,7 @@ detect_backend() {
 
     case "$candidate" in
         xdp)
-            if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]] || ip -d link show dev "$IFACE" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
+            if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]] || _any_iface_has_xdp; then
                 BACKEND="xdp"
                 return 0
             fi
@@ -195,7 +203,7 @@ detect_backend() {
             ;;
     esac
 
-    if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]] && ip -d link show dev "$IFACE" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
+    if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]] && _any_iface_has_xdp; then
         BACKEND="xdp"
         return 0
     fi
@@ -362,436 +370,20 @@ run_conntrack() {
 
 
 
-
-
-read_xdp_ports() {
-    local tcp_map="${BPF_PIN_DIR}/tcp_whitelist"
-    local udp_map="${BPF_PIN_DIR}/udp_whitelist"
-    [[ -e "$tcp_map" && -e "$udp_map" ]] || {
-        echo "XDP whitelist maps not found under ${BPF_PIN_DIR}" >&2
-        exit 1
-    }
-
-    bpftool -j map dump pinned "$tcp_map" | python3 -c '
-import json
-import sys
-
-def to_int(v):
-    if isinstance(v, int):
-        return v
-    if isinstance(v, str):
-        try:
-            return int(v, 0)
-        except ValueError:
-            return 0
-    return 0
-
-def norm(v):
-    if isinstance(v, (int, str)):
-        return to_int(v)
-    if isinstance(v, list):
-        return sum(norm(i) for i in v)
-    if isinstance(v, dict):
-        if "value" in v:
-            return norm(v["value"])
-        if "values" in v:
-            return norm(v["values"])
-        return sum(norm(i) for i in v.values())
-    return 0
-
-def key_to_port(key):
-    if isinstance(key, list):
-        if len(key) >= 2:
-            b0 = to_int(key[0]) & 0xFF
-            b1 = to_int(key[1]) & 0xFF
-            b2 = to_int(key[2]) & 0xFF if len(key) > 2 else 0
-            b3 = to_int(key[3]) & 0xFF if len(key) > 3 else 0
-            return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-        return 0
-    if isinstance(key, (int, str)):
-        return to_int(key)
-    if isinstance(key, dict):
-        return norm(key)
-    return 0
-
-try:
-    rows = json.load(sys.stdin)
-    ports = []
-    for row in rows:
-        if norm(row.get("value", row.get("values", 0))) <= 0:
-            continue
-        port = key_to_port(row.get("key"))
-        if 0 < port <= 65535:
-            ports.append(port)
-    print(",".join(str(p) for p in sorted(set(ports))))
-except KeyboardInterrupt:
-    sys.exit(130)
-'
-    bpftool -j map dump pinned "$udp_map" | python3 -c '
-import json
-import sys
-
-def to_int(v):
-    if isinstance(v, int):
-        return v
-    if isinstance(v, str):
-        try:
-            return int(v, 0)
-        except ValueError:
-            return 0
-    return 0
-
-def norm(v):
-    if isinstance(v, (int, str)):
-        return to_int(v)
-    if isinstance(v, list):
-        return sum(norm(i) for i in v)
-    if isinstance(v, dict):
-        if "value" in v:
-            return norm(v["value"])
-        if "values" in v:
-            return norm(v["values"])
-        return sum(norm(i) for i in v.values())
-    return 0
-
-def key_to_port(key):
-    if isinstance(key, list):
-        if len(key) >= 2:
-            b0 = to_int(key[0]) & 0xFF
-            b1 = to_int(key[1]) & 0xFF
-            b2 = to_int(key[2]) & 0xFF if len(key) > 2 else 0
-            b3 = to_int(key[3]) & 0xFF if len(key) > 3 else 0
-            return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-        return 0
-    if isinstance(key, (int, str)):
-        return to_int(key)
-    if isinstance(key, dict):
-        return norm(key)
-    return 0
-
-try:
-    rows = json.load(sys.stdin)
-    ports = []
-    for row in rows:
-        if norm(row.get("value", row.get("values", 0))) <= 0:
-            continue
-        port = key_to_port(row.get("key"))
-        if 0 < port <= 65535:
-            ports.append(port)
-    print(",".join(str(p) for p in sorted(set(ports))))
-except KeyboardInterrupt:
-    sys.exit(130)
-'
-}
-
-read_nft_ports() {
-    command -v nft >/dev/null 2>&1 || {
-        echo "nft command not found" >&2
-        exit 1
-    }
-
-    nft -j list set "$NFT_FAMILY" "$NFT_TABLE" tcp_ports 2>/dev/null | python3 -c '
-import json
-import sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    print("")
-    sys.exit(0)
-ports = set()
-for item in data.get("nftables", []):
-    e = item.get("element")
-    if not e:
-        continue
-    elems = e.get("elem", [])
-    for v in elems:
-        if isinstance(v, int) and 0 < v <= 65535:
-            ports.add(v)
-print(",".join(str(p) for p in sorted(ports)))
-'
-
-    nft -j list set "$NFT_FAMILY" "$NFT_TABLE" udp_ports 2>/dev/null | python3 -c '
-import json
-import sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    print("")
-    sys.exit(0)
-ports = set()
-for item in data.get("nftables", []):
-    e = item.get("element")
-    if not e:
-        continue
-    elems = e.get("elem", [])
-    for v in elems:
-        if isinstance(v, int) and 0 < v <= 65535:
-            ports.add(v)
-print(",".join(str(p) for p in sorted(ports)))
-'
-}
-
-parse_ports_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            watch|--watch)
-                PORTS_WATCH=1
-                shift
-                ;;
-            --interval)
-                [[ $# -ge 2 ]] || {
-                    echo "Missing value for --interval" >&2
-                    exit 1
-                }
-                PORTS_INTERVAL="$2"
-                shift 2
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            *)
-                echo "Unknown ports option: $1" >&2
-                exit 1
-                ;;
-        esac
-    done
-}
-
-render_port_lines() {
-    local proto="$1"
-    local csv="$2"
-
-    if [[ -z "$csv" ]]; then
-        echo "  (none)"
-        return 0
-    fi
-
-    python3 - "$proto" "$csv" "${BPF_PIN_DIR}/syn_rate_ports" "${BPF_PIN_DIR}/udp_rate_ports" <<'PY'
-import socket
-import sys
-import os
-
-proto = sys.argv[1]
-csv = sys.argv[2]
-syn_rate_map_path = sys.argv[3] if len(sys.argv) > 3 else ""
-udp_rate_map_path = sys.argv[4] if len(sys.argv) > 4 else ""
-try:
-    ports = [int(p) for p in csv.split(",") if p]
-    proc_by_port = {p: set() for p in ports}
-
-    def _parse_proc_net(path, state_filter, check_no_remote=False):
-        result = {}
-        try:
-            with open(path) as f:
-                next(f)
-                for line in f:
-                    parts = line.split()
-                    if len(parts) < 10:
-                        continue
-                    local, remote, st, inode_str = parts[1], parts[2], parts[3], parts[9]
-                    if st != state_filter:
-                        continue
-                    if check_no_remote and not remote.endswith(':0000'):
-                        continue
-                    port = int(local.split(':')[1], 16)
-                    if port > 0:
-                        result[port] = int(inode_str)
-        except Exception:
-            pass
-        return result
-
-    if proto == "tcp":
-        port_to_inode = {}
-        port_to_inode.update(_parse_proc_net('/proc/net/tcp', '0A'))
-        port_to_inode.update(_parse_proc_net('/proc/net/tcp6', '0A'))
-    else:
-        port_to_inode = {}
-        port_to_inode.update(_parse_proc_net('/proc/net/udp', '07', check_no_remote=True))
-        port_to_inode.update(_parse_proc_net('/proc/net/udp6', '07', check_no_remote=True))
-
-    wanted_inodes = {inode for port, inode in port_to_inode.items() if port in proc_by_port}
-    inode_map = {}
-    if wanted_inodes:
-        try:
-            for entry in os.scandir('/proc'):
-                if not entry.name.isdigit():
-                    continue
-                pid = entry.name
-                try:
-                    for fd_entry in os.scandir(f'/proc/{pid}/fd'):
-                        try:
-                            link = os.readlink(fd_entry.path)
-                            if link.startswith('socket:['):
-                                inode = int(link[8:-1])
-                                if inode in wanted_inodes:
-                                    with open(f'/proc/{pid}/comm') as cf:
-                                        inode_map[inode] = cf.read().strip()
-                                    wanted_inodes.discard(inode)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                if not wanted_inodes:
-                    break
-        except Exception:
-            pass
-
-    for port, inode in port_to_inode.items():
-        if port in proc_by_port and inode in inode_map:
-            proc_by_port[port].add(inode_map[inode])
-
-    import subprocess
-    import json as _json
-
-    def _b(v):
-        if isinstance(v, int):
-            return v & 0xFF
-        if isinstance(v, str):
-            try:
-                return int(v, 0) & 0xFF
-            except ValueError:
-                return 0
-        return 0
-
-    def _read_rate_map(path):
-        rates = {}
-        if not (path and os.path.exists(path)):
-            return rates
-        try:
-            out = subprocess.check_output(
-                ["bpftool", "-j", "map", "dump", "pinned", path],
-                stderr=subprocess.DEVNULL,
-            )
-            for row in _json.loads(out):
-                key = row.get("key", [])
-                val = row.get("value", [])
-                if isinstance(key, list) and len(key) >= 4:
-                    port = _b(key[0]) | (_b(key[1]) << 8) | (_b(key[2]) << 16) | (_b(key[3]) << 24)
-                    if isinstance(val, list) and len(val) >= 4:
-                        rate = _b(val[0]) | (_b(val[1]) << 8) | (_b(val[2]) << 16) | (_b(val[3]) << 24)
-                        if rate > 0:
-                            rates[port] = rate
-        except Exception:
-            pass
-        return rates
-
-    rate_map_path = syn_rate_map_path if proto == "tcp" else udp_rate_map_path
-    port_rates = _read_rate_map(rate_map_path)
-
-    for p in sorted(set(ports)):
-        try:
-            svc = socket.getservbyport(p, proto)
-        except Exception:
-            svc = "-"
-        procs = ",".join(sorted(proc_by_port.get(p, set()))) or "-"
-        rate = port_rates.get(p)
-        rate_str = f"{rate}/s" if rate else "-"
-        print(f"  {p:5d}  {svc:<14}  {procs:<14}  {rate_str}")
-except KeyboardInterrupt:
-    sys.exit(130)
-PY
-}
-
-collect_port_targets() {
-    case "$BACKEND" in
-        xdp)
-            readarray -t _ports < <(read_xdp_ports)
-            ;;
-        nftables)
-            readarray -t _ports < <(read_nft_ports)
-            ;;
-        *)
-            echo "No active backend detected." >&2
-            exit 1
-            ;;
-    esac
-
-    PORTS_TCP="${_ports[0]:-}"
-    PORTS_UDP="${_ports[1]:-}"
-}
-
-csv_to_sorted_lines() {
-    local csv="$1"
-    if [[ -z "$csv" ]]; then
-        return 0
-    fi
-    printf '%s\n' "${csv//,/ }" | tr ' ' '\n' | sed '/^$/d' | sort -n
-}
-
-diff_csv() {
-    local old_csv="$1"
-    local new_csv="$2"
-    local mode="$3" # added|removed
-    case "$mode" in
-        added)
-            comm -13 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | tr '\n' ' ' | sed 's/ $//'
-            ;;
-        removed)
-            comm -23 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | tr '\n' ' ' | sed 's/ $//'
-            ;;
-    esac
-}
-
 run_ports() {
-    local tcp_ports="" udp_ports=""
-    local prev_tcp="" prev_udp=""
-    local added_tcp removed_tcp added_udp removed_udp
-    local now_ts
-
-    parse_ports_args "$@"
-    load_config
-    autodetect_iface
-    detect_backend
-    collect_port_targets
-    tcp_ports="$PORTS_TCP"
-    udp_ports="$PORTS_UDP"
-
-    printf 'Backend   : %s\n' "$BACKEND"
-    printf 'Interface : %s\n' "$IFACE"
-    printf 'TCP allow :\n'
-    render_port_lines tcp "$tcp_ports"
-    printf 'UDP allow :\n'
-    render_port_lines udp "$udp_ports"
-
-    if [[ $PORTS_WATCH -eq 0 ]]; then
-        return 0
-    fi
-
-    prev_tcp="$tcp_ports"
-    prev_udp="$udp_ports"
-    while true; do
-        sleep "$PORTS_INTERVAL"
-        detect_backend
-        collect_port_targets
-        tcp_ports="$PORTS_TCP"
-        udp_ports="$PORTS_UDP"
-
-        if [[ "$tcp_ports" == "$prev_tcp" && "$udp_ports" == "$prev_udp" ]]; then
-            continue
-        fi
-
-        now_ts=$(date '+%Y-%m-%d %H:%M:%S')
-        added_tcp=$(diff_csv "$prev_tcp" "$tcp_ports" added)
-        removed_tcp=$(diff_csv "$prev_tcp" "$tcp_ports" removed)
-        added_udp=$(diff_csv "$prev_udp" "$udp_ports" added)
-        removed_udp=$(diff_csv "$prev_udp" "$udp_ports" removed)
-
-        echo ""
-        printf '[%s] Port whitelist updated\n' "$now_ts"
-        [[ -n "$added_tcp" ]] && printf '  TCP + %s\n' "$added_tcp"
-        [[ -n "$removed_tcp" ]] && printf '  TCP - %s\n' "$removed_tcp"
-        [[ -n "$added_udp" ]] && printf '  UDP + %s\n' "$added_udp"
-        [[ -n "$removed_udp" ]] && printf '  UDP - %s\n' "$removed_udp"
-        echo ""
-        printf 'TCP allow :\n'
-        render_port_lines tcp "$tcp_ports"
-        printf 'UDP allow :\n'
-        render_port_lines udp "$udp_ports"
-
-        prev_tcp="$tcp_ports"
-        prev_udp="$udp_ports"
+    local args=()
+    for arg in "$@"; do
+        [[ "$arg" == "watch" ]] && arg="--watch"
+        args+=("$arg")
     done
+    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.admin_cli \
+        --config "$TOML_CONFIG" \
+        --bpf-pin-dir "$BPF_PIN_DIR" \
+        --install-dir "$INSTALL_DIR" \
+        --run-state-dir "$RUN_STATE_DIR" \
+        --nft-family "$NFT_FAMILY" \
+        --nft-table "$NFT_TABLE" \
+        ports "${args[@]}"
 }
 
 run_stats() {
@@ -802,7 +394,7 @@ run_stats() {
         --run-state-dir "$RUN_STATE_DIR" \
         --nft-family "$NFT_FAMILY" \
         --nft-table "$NFT_TABLE" \
-        --iface "${IFACE:-}" \
+        --iface "${IFACES:-${IFACE:-}}" \
         stats "$@"
 }
 
