@@ -165,7 +165,7 @@ The difference is operational:
 - `libbpf` or `libbpf-dev` / `libbpf-devel` — BPF headers, depending on distro 
 - `bpftool` — manage BPF maps 
 - `iproute2` or `iproute` — provides both `ip` and `tc` for XDP attach and UDP egress tracking
-- `python3` — sync daemon runtime 
+- `python3` **3.10 or newer** — sync daemon runtime; Python 3.11+ uses the stdlib `tomllib`, and the installer adds `tomli` automatically for Python 3.10
 - `nftables` — compatibility fallback backend 
 
 ---
