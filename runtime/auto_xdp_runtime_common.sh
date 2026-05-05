@@ -182,7 +182,7 @@ auto_tune_interface_parallelism() {
 }
 
 ensure_bpffs() {
-    if ! mount | grep -q 'type bpf'; then
+    if ! mountpoint -q /sys/fs/bpf; then
         _auto_xdp_info "Mounting bpffs on /sys/fs/bpf..."
         mount -t bpf bpf /sys/fs/bpf || {
             _auto_xdp_warn "bpffs mount failed."
@@ -201,12 +201,34 @@ cleanup_tc_egress_filter() {
     done
 }
 
+_map_value_size_ok() {
+    local _path="$1" _want="$2" _got=""
+    _got=$(bpftool map show pinned "$_path" 2>/dev/null \
+               | sed -n 's/.*\bvalue \([0-9]*\)B.*/\1/p')
+    # If bpftool can't query the map (unavailable or old format), skip the guard.
+    [[ -z "$_got" || "$_got" == "$_want" ]]
+}
+
 xdp_maps_ready() {
     local map_name=""
     while IFS= read -r map_name; do
         [[ -n "$map_name" ]] || continue
         [[ -e "${BPF_PIN_DIR}/${map_name}" ]] || return 1
     done < <(xdp_required_map_names)
+
+    # Value-size guard: catches pinned maps from an older build before the
+    # caller skips reload.  Sizes are derived from the C structs in bpf/include/:
+    #   xdp_runtime_cfg  8 × __u64                              = 64 B
+    #   udp_global_state bpf_spin_lock(4) + __u32(4) + 4×__u64 = 40 B
+    # Update these numbers whenever the corresponding struct gains or loses fields.
+    _map_value_size_ok "${BPF_PIN_DIR}/xdp_runtime_cfg" 64 || {
+        _auto_xdp_warn "xdp_runtime_cfg value_size mismatch; forcing XDP reload"
+        return 1
+    }
+    _map_value_size_ok "${BPF_PIN_DIR}/udp_global_rl" 40 || {
+        _auto_xdp_warn "udp_global_rl value_size mismatch; forcing XDP reload"
+        return 1
+    }
 }
 
 _auto_xdp_required_maps_file() {

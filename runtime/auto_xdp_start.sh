@@ -1,17 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-CONFIG_FILE="/etc/auto_xdp/auto_xdp.env"
-RUN_STATE_DIR="/run/auto_xdp"
-RUNTIME_COMMON_SCRIPT="/usr/local/lib/auto_xdp/auto_xdp_runtime_common.sh"
-
-[[ -f "$CONFIG_FILE" ]] || {
-    echo "[auto_xdp] missing config: $CONFIG_FILE" >&2
-    exit 1
-}
-
-# shellcheck disable=SC1091
-source "$CONFIG_FILE"
+CONFIG_FILE="${CONFIG_FILE:-/etc/auto_xdp/auto_xdp.env}"
+RUN_STATE_DIR="${RUN_STATE_DIR:-/run/auto_xdp}"
+RUNTIME_COMMON_SCRIPT="${RUNTIME_COMMON_SCRIPT:-/usr/local/lib/auto_xdp/auto_xdp_runtime_common.sh}"
 
 append_pythonpath_once() {
     local path="$1"
@@ -53,16 +45,6 @@ discover_python_lib_dir() {
     fi
 }
 
-PYTHON_LIB_DIR="$(discover_python_lib_dir)"
-export PYTHON_LIB_DIR
-append_pythonpath_once "${PYTHON_LIB_DIR}"
-export PYTHONPATH="${PYTHONPATH:-}"
-
-[[ -f "$RUNTIME_COMMON_SCRIPT" ]] || {
-    echo "[auto_xdp] missing runtime library: $RUNTIME_COMMON_SCRIPT" >&2
-    exit 1
-}
-
 auto_xdp_shared_info() {
     echo "[auto_xdp] $*" >&2
 }
@@ -71,15 +53,33 @@ auto_xdp_shared_warn() {
     echo "[auto_xdp] warning: $*" >&2
 }
 
-# shellcheck disable=SC1091
-source "$RUNTIME_COMMON_SCRIPT"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    [[ -f "$CONFIG_FILE" ]] || {
+        echo "[auto_xdp] missing config: $CONFIG_FILE" >&2
+        exit 1
+    }
+    # shellcheck disable=SC1091
+    source "$CONFIG_FILE"
 
-# Normalize _IFACES array — supports both new IFACES= and legacy IFACE= configs.
-IFS=' ' read -ra _IFACES <<< "${IFACES:-${IFACE:-}}"
-[[ ${#_IFACES[@]} -gt 0 ]] || {
-    echo "[auto_xdp] no interfaces configured (IFACES or IFACE missing from config)" >&2
-    exit 1
-}
+    PYTHON_LIB_DIR="$(discover_python_lib_dir)"
+    export PYTHON_LIB_DIR
+    append_pythonpath_once "${PYTHON_LIB_DIR}"
+    export PYTHONPATH="${PYTHONPATH:-}"
+
+    [[ -f "$RUNTIME_COMMON_SCRIPT" ]] || {
+        echo "[auto_xdp] missing runtime library: $RUNTIME_COMMON_SCRIPT" >&2
+        exit 1
+    }
+    # shellcheck disable=SC1091
+    source "$RUNTIME_COMMON_SCRIPT"
+
+    # Normalize _IFACES array — supports both new IFACES= and legacy IFACE= configs.
+    IFS=' ' read -ra _IFACES <<< "${IFACES:-${IFACE:-}}"
+    [[ ${#_IFACES[@]} -gt 0 ]] || {
+        echo "[auto_xdp] no interfaces configured (IFACES or IFACE missing from config)" >&2
+        exit 1
+    }
+fi
 
 resolve_preferred_backend() {
     local preferred="${PREFERRED_BACKEND:-auto}"
@@ -155,19 +155,26 @@ ensure_xdp_loaded() {
     # If the prog is already pinned and maps are intact, just re-attach any
     # interface that has lost its XDP program (e.g. after a link bounce).
     if [[ -f "$BPF_PIN_DIR/prog" ]] && xdp_maps_ready; then
-        local _iface _any_missing=0
+        local _iface _any_missing=0 _xdp_mode="native"
         for _iface in "${_IFACES[@]}"; do
             if ! ip link show "$_iface" 2>/dev/null | grep -q "xdp"; then
                 _any_missing=1
-                ip link set dev "$_iface" xdp pinned "$BPF_PIN_DIR/prog" 2>/dev/null \
-                || ip link set dev "$_iface" xdp generic pinned "$BPF_PIN_DIR/prog" 2>/dev/null \
-                || echo "[auto_xdp] warning: could not re-attach XDP to $_iface" >&2
+                if ip link set dev "$_iface" xdp pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
+                    echo "[auto_xdp] re-attached XDP (native) on $_iface" >&2
+                elif ip link set dev "$_iface" xdp generic pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
+                    echo "[auto_xdp] re-attached XDP (generic) on $_iface" >&2
+                    _xdp_mode="generic"
+                else
+                    echo "[auto_xdp] warning: could not re-attach XDP to $_iface" >&2
+                fi
+            elif ip -d link show dev "$_iface" 2>/dev/null | grep -q "xdpgeneric"; then
+                _xdp_mode="generic"
             fi
         done
         load_port_handlers || true
         auto_tune_interface_parallelism || true
         [[ $_any_missing -eq 1 ]] && echo "[auto_xdp] re-attached XDP to missing interfaces" >&2
-        echo "existing" > "${RUN_STATE_DIR}/xdp_mode"
+        echo "$_xdp_mode" > "${RUN_STATE_DIR}/xdp_mode"
         return 0
     fi
 
@@ -249,11 +256,13 @@ select_backend() {
     echo "nftables" > "${RUN_STATE_DIR}/backend"
 }
 
-if [[ "${1:-}" == "--sync-once" ]]; then
-    shift
-    select_backend
-    run_sync_script once "$@"
-fi
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if [[ "${1:-}" == "--sync-once" ]]; then
+        shift
+        select_backend
+        run_sync_script once "$@"
+    fi
 
-select_backend
-run_sync_script watch
+    select_backend
+    run_sync_script watch
+fi

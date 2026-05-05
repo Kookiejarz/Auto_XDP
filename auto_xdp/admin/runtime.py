@@ -7,6 +7,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from auto_xdp.admin.detect import detect_backend as _detect_backend_impl
+
 
 @dataclass
 class RuntimeContext:
@@ -86,23 +88,11 @@ def _iface_xdp_state(iface: str) -> str:
     return "off"
 
 
-def _iface_has_xdp_attachment(iface: str) -> bool:
-    state = _iface_xdp_state(iface)
-    return state in {"generic", "native"}
-
-
 def _iface_tc_egress_state(iface: str) -> str:
     if not _command_exists("tc"):
         return "unavailable"
     result = _run_text(["tc", "filter", "show", "dev", iface, "egress", "pref", "49152"])
     return "attached" if result.returncode == 0 and result.stdout.strip() else "off"
-
-
-def _nft_table_exists(family: str, table: str) -> bool:
-    if not _command_exists("nft"):
-        return False
-    result = _run_text(["nft", "list", "table", family, table])
-    return result.returncode == 0
 
 
 def _count_conntrack_entries(map_path: Path) -> int:
@@ -130,26 +120,10 @@ def _configured_ifaces(env: dict[str, str]) -> list[str]:
     return []
 
 
-def detect_backend(ctx: RuntimeContext, iface: str) -> str:
-    candidate = ""
-    backend_path = ctx.run_state_dir / "backend"
-    if backend_path.exists():
-        candidate = backend_path.read_text().strip()
-
-    pkt_counters = ctx.bpf_pin_dir / "pkt_counters"
-    nft_exists = _nft_table_exists(ctx.nft_family, ctx.nft_table)
-
-    if candidate == "xdp" and (pkt_counters.exists() or _iface_has_xdp_attachment(iface)):
-        return "xdp"
-    if candidate == "nftables" and nft_exists:
-        return "nftables"
-    if pkt_counters.exists() and _iface_has_xdp_attachment(iface):
-        return "xdp"
-    if nft_exists:
-        return "nftables"
-    if pkt_counters.exists():
-        return "xdp"
-    raise RuntimeError("No active Auto XDP backend detected.")
+def detect_backend(ctx: RuntimeContext, interfaces: list[str]) -> str:
+    return _detect_backend_impl(
+        ctx.bpf_pin_dir, ctx.run_state_dir, interfaces, ctx.nft_family, ctx.nft_table
+    )
 
 
 def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
@@ -161,7 +135,8 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
     if not interfaces:
         interfaces = [iface]
 
-    backend = detect_backend(ctx, iface)
+    check_ifaces = [ctx.interface] if ctx.interface else interfaces
+    backend = detect_backend(ctx, check_ifaces)
     xdp_mode_path = ctx.run_state_dir / "xdp_mode"
     xdp_mode = xdp_mode_path.read_text().strip() if xdp_mode_path.exists() else "-"
 
