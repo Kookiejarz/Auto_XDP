@@ -278,7 +278,7 @@ dry_run_report() {
     echo "init_system=$INIT_SYSTEM"
     echo "interfaces=${detected_ifaces:-undetected}"
     echo "missing_commands=$(for cmd in clang bpftool python3 curl ip tc nft; do command -v "$cmd" >/dev/null 2>&1 || printf '%s ' "$cmd"; done | sed 's/[[:space:]]*$//')"
-    echo "planned_packages=$(package_list_for_manager; optional_package_list_for_manager; printf ' python3-psutil')"
+    echo "planned_packages=$(package_list_for_manager; optional_package_list_for_manager; printf ' python3-psutil python3-tomli-if-python310')"
     echo "planned_actions=check-dependencies,compile-xdp,deploy-backend,install-runtime,initial-sync,install-service"
     echo "note=dry-run performs no installs, no downloads, and no system changes"
 }
