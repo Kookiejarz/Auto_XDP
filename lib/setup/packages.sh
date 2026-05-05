@@ -148,6 +148,48 @@ ensure_psutil() {
     esac
 }
 
+ensure_python_runtime() {
+    python3 - <<'PY' || die "Auto XDP requires Python 3.10 or newer."
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+ensure_tomli_for_python310() {
+    if python3 - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+    then
+        return 0
+    fi
+
+    if python3 -c "import tomli" 2>/dev/null; then
+        return 0
+    fi
+
+    case "$PKG_MANAGER" in
+        apt-get)
+            apt-get install -y -qq python3-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            ;;
+        dnf|yum)
+            "$PKG_MANAGER" install -y python3-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            ;;
+        zypper)
+            zypper --non-interactive install -y python3-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            ;;
+        pacman)
+            pacman -S --noconfirm --needed python-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            ;;
+        apk)
+            apk add --no-cache py3-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            ;;
+        *)
+            python3 -m pip install --quiet --break-system-packages tomli
+            ;;
+    esac
+}
+
 check_required_tools_step() {
     local missing=()
     local cmd
@@ -166,9 +208,11 @@ check_required_tools_step() {
     fi
 
     command -v python3 &>/dev/null || die "python3 not found after installation."
+    ensure_python_runtime
     command -v curl &>/dev/null || die "curl not found after installation."
     command -v ip &>/dev/null || die "ip command not found after installation."
     ensure_psutil
+    ensure_tomli_for_python310
     PYTHON3_BIN=$(command -v python3)
     step_ok
 }

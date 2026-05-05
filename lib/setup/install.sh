@@ -224,7 +224,10 @@ for e in json.load(sys.stdin).get('tree', []):
         fetch_local_or_remote "$rel" "$rel" "$target" || return 1
     done
 
-    cp "${INSTALL_DIR}/xdp_required_maps.txt" "${pkg_root}/xdp_required_maps.txt" || return 1
+    fetch_local_or_remote \
+        "auto_xdp/xdp_required_maps.txt" \
+        "auto_xdp/xdp_required_maps.txt" \
+        "${pkg_root}/xdp_required_maps.txt" || return 1
 }
 
 install_runner_script() {
@@ -412,7 +415,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${RUNNER_SCRIPT}
-Restart=always
+Restart=on-failure
 RestartSec=5
 User=root
 
