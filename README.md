@@ -62,31 +62,58 @@ The difference is operational:
 ## How It Works
 
 ```
-Incoming Packet
-      │
-      ▼
-┌─────────────┐
-│  NIC Driver │  ← XDP hooks here (before kernel stack)
-└──────┬──────┘
-       │
-       ▼
-┌──────────────────────────────┐
-│       xdp_port_whitelist     │
-│                              │
-│  ETH → IPv4/IPv6 → TCP/UDP   │
-│                              │
-│  IPv4 TCP SYN? → whitelist + │
-│                  conntrack   │
-│  IPv4 TCP ACK? → conntrack   │
-│  IPv4 UDP?     → ct/port/IP  │
-│  ICMP/ICMPv6? → rate-limit   │
-│  ARP/NDP?   → PASS           │
-│                              │
-│  Not in whitelist → DROP     │
-└──────────────────────────────┘
-       │
-       ▼
-  XDP_PASS / XDP_DROP
+							Incoming Packet
+      								│
+      								▼
+							 ┌─────────────┐
+							 │  NIC Driver │  ← XDP hooks here (before kernel stack)
+						 	 └──────┬──────┘
+       								│
+       								▼
+┌──────────────────────────────────────────────┐
+│                 xdp_firewall                 │
+│                                              │
+│  VLAN strip → nesting > limit ────────→ DROP │
+│       │                                      │
+│       ├─ ARP / non-IP ─────────────→ PASS    │
+│       │                                      │
+│       └─ IPv4 / IPv6                         │
+│            ├─ Fragment ──────────────→ DROP  │
+│            ├─ Bogon src (if enabled) → DROP  │
+│            │                                 │
+│            ├─ TCP                            │
+│            │   ├─ Malformed flags/doff → DROP│
+│            │   ├─ Trusted src / ACL ──→ PASS │
+│            │   ├─ Conntrack hit ──────→ PASS │
+│            │   ├─ SYN + whitelist ────→ PASS │
+│            │   ├─ SYN rate exceeded ──→ DROP │
+│            │   └────────────────────→ DROP   │
+│            │                                 │
+│            ├─ UDP                            │
+│            │   ├─ Malformed ──────────→ DROP │
+│            │   ├─ Conntrack hit ──────→ PASS │
+│            │   ├─ Whitelist miss ─────→ DROP │
+│            │   ├─ Trusted src / ACL ──→ PASS │
+│            │   ├─ Per-src rate ───────→ DROP │
+│            │   ├─ Global rate ────────→ DROP │
+│            │   └────────────────────→ PASS   │
+│            │   └────────────────────→ DROP   │
+│            │                                 │
+│            ├─ ICMP / ICMPv6                  │
+│            │   ├─ Error types ────────→ PASS │
+│            │   ├─ Echo (rate-limited) → PASS │
+│            │   └─ Echo (rate exceeded)→ DROP │
+│            │                                 │
+│            ├─ Proto-41 (6in4/SIT)            │
+│            │   ├─ sit4_endpoints hit ─→ PASS │
+│            │   └────────────────────→ DROP   │
+│            │                                 │
+│            └─ Other (GRE / ESP / SCTP / …)   │
+│                └─ slot handler ───→ PASS/DROP│
+└──────────────────────────────────────────────┘
+       							│
+       							▼
+ 					 XDP_PASS / XDP_DROP							
 ```
 
 ---
@@ -106,11 +133,14 @@ Incoming Packet
 - **Wire-speed filtering** via XDP (bypasses kernel network stack)
 - **~40–65 ns per-packet latency** measured on real hardware (see [Benchmarks](#-real-world-performance-benchmark))
 - **Auto-sync whitelist**: daemon watches listening sockets and updates the active backend in real time
-- **IPv4 + IPv6 TCP conntrack hardening**: pure SYN creates temporary state; unsolicited ACK packets are dropped
+- **IPv4 + IPv6 TCP conntrack hardening**: pure SYN creates temporary state with a short configurable SYN timeout; unsolicited ACK packets are dropped
 - **Kernel-side outbound state tracking**: a `tc` egress program records host-initiated IPv4/IPv6 TCP SYN packets and UDP reply tuples so return traffic can be matched at XDP without reopening the old bypasses
-- **IPv4 + IPv6 UDP hardening**: inbound server ports use `udp_whitelist`, reply traffic can be matched by `udp_conntrack`, and explicitly trusted IPv4/IPv6 sources or CIDR ranges can be allowed via `trusted_ipv4`/`trusted_ipv6`
+- **IPv4 + IPv6 UDP hardening**: inbound server ports use `udp_whitelist`, reply traffic can be matched by separate `udp_ct4`/`udp_ct6` maps, and trusted IPv4/IPv6 sources can bypass UDP rate limits only after the destination port is open
 - **IPv6 support**, including extension header traversal on both XDP and tc egress, plus explicit non-initial fragment drops
-- **Periodic conntrack sync (seeding established flows)**: the daemon now periodically seeds existing IPv4/IPv6 TCP sessions into `tcp_conntrack`, which helps preserve active sessions after re-attaching XDP or manual map clears.
+- **6in4 (SIT) tunnel endpoint filtering**: a `sit4_endpoints` map allows only configured outer IPv4 sources for proto-41 encapsulated traffic; unconfigured tunnel packets are dropped
+- **Per-CIDR port ACL rules**: `axdp acl add tcp CIDR PORT...` can explicitly allow TCP ports for selected source CIDRs independently of auto-discovery; UDP ACL rules apply after the UDP destination port is already whitelisted
+- **Under-attack mode**: `axdp under-attack on` suspends process-event-driven sync so the whitelist stays static; only explicit `axdp sync` calls or the 30-second safety timer can change allowed ports
+- **Periodic conntrack sync (seeding established flows)**: the daemon periodically seeds existing IPv4/IPv6 TCP sessions into `tcp_ct4`/`tcp_ct6`, which helps preserve active sessions after re-attaching XDP or manual map clears
 - **Reload-safe XDP attach**: the installer also pre-seeds existing sessions before initial attach.
 - **Pinned BPF maps** that survive reloads and can be updated at runtime 
 - **ICMP token-bucket rate limiter**: XDP-level protection against ICMP/ICMPv6 ping floods; 100 pps burst cap with per-second token refill, while ARP and IPv6 NDP control traffic (RS/RA/NS/NA) are always passed
@@ -204,14 +234,15 @@ sudo bash setup_xdp.sh --check-update --force
 3. Installs missing dependencies via the detected package manager 
 4. Uses local `xdp_firewall.c` / `tc_flow_track.c` / `xdp_port_sync.py` / `axdp` by default from a local checkout; when run from `stdin`, it prefers the matching GitHub copies
 5. Compiles the XDP and tc BPF objects when the host has the required toolchain
-6. Pre-seeds current IPv4/IPv6 established TCP sessions into `tcp_conntrack` before attaching XDP
-7. Loads and attaches a `tc clsact egress` program that records outbound TCP SYN and UDP reply tuples
-8. Tries to attach XDP in native mode, then generic mode
-9. Falls back to `nftables` automatically if XDP cannot be attached
-10. Installs the runtime launcher at `/usr/local/bin/auto_xdp_start.sh`
-11. Installs the sync daemon at `/usr/local/bin/xdp_port_sync.py`
-12. Runs an initial port sync using the selected backend
-13. Registers and starts `xdp-port-sync` on `systemd` or `OpenRC` when available
+6. Installs `xdp_required_maps.txt` before attaching XDP so the map readiness check uses the current version
+7. Pre-seeds current IPv4/IPv6 established TCP sessions into `tcp_ct4`/`tcp_ct6` before attaching XDP
+8. Loads and attaches a `tc clsact egress` program that records outbound TCP SYN and UDP reply tuples
+9. Tries to attach XDP in native mode, then generic mode
+10. Falls back to `nftables` automatically if XDP cannot be attached
+11. Installs the runtime launcher at `/usr/local/bin/auto_xdp_start.sh`
+12. Installs the sync daemon at `/usr/local/bin/xdp_port_sync.py`
+13. Runs an initial port sync using the selected backend
+14. Registers and starts `xdp-port-sync` on `systemd` or `OpenRC` when available
 
 ---
 
@@ -223,17 +254,24 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 |:-:|:-:|:--:|:-:|:-:|
 | `tcp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
 | `udp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
-| `tcp_conntrack` | LRU_HASH | 262144 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
-| `udp_conntrack` | LRU_HASH | 262144 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
+| `tcp_ct4` | LRU_HASH | 262144 | `struct flow_key_v4 { sport, dport, saddr, daddr }` | `__u64` ktime_ns |
+| `tcp_ct6` | LRU_HASH | 262144 | `struct flow_key_v6 { sport, dport, saddr[16], daddr[16] }` | `__u64` ktime_ns |
+| `udp_ct4` | LRU_HASH | 262144 | `struct flow_key_v4` | `__u64` ktime_ns |
+| `udp_ct6` | LRU_HASH | 262144 | `struct flow_key_v6` | `__u64` ktime_ns |
 | `trusted_ipv4` | LPM_TRIE | 256 | `struct trusted_v4_key { prefixlen, addr }` (IPv4 CIDR) | `__u32` (1 = trusted) |
 | `trusted_ipv6` | LPM_TRIE | 256 | `struct trusted_v6_key { prefixlen, addr[16] }` (IPv6 CIDR) | `__u32` (1 = trusted) |
 | `pkt_counters` | PERCPU_ARRAY | 22 | `__u32` counter index | `__u64` packet count |
+| `byte_counters` | PERCPU_ARRAY | 4 | `__u32` index (0=total_bytes, 1=drop_bytes, 2=total_pkts, 3=drop_pkts) | `__u64` |
 | `icmp_tb` | ARRAY | 1 | `__u32` (0) | `struct icmp_token_bucket { last_ns, tokens }` |
-| `syn_rate_ports` | HASH | 1024 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
-| `syn_rate_map` | LRU_HASH | 65536 | `struct syn_rate_key { dest_port, saddr[4] }` | `struct syn_rate_val { window_start_ns, count }` |
-| `udp_rate_ports` | HASH | 1024 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
-| `udp_rate_map` | LRU_HASH | 65536 | `struct syn_rate_key { dest_port, saddr[4] }` | `struct syn_rate_val { window_start_ns, count }` |
-| `udp_global_rl` | PERCPU_ARRAY | 1 | `__u32` (0) | `struct udp_global_tb { rate_max, window_start_ns, prev_bytes, curr_bytes }` |
+| `tcp_port_policies` | HASH | 1024 | `__u32` dest port | per-port SYN rate config |
+| `udp_port_policies` | HASH | 1024 | `__u32` dest port | per-port UDP rate config |
+| `udp_global_rl` | ARRAY | 1 | `__u32` (0) | `struct udp_global_state { lock, byte_rate_max, window_start_ns, prev_bytes, curr_bytes }` |
+| `sit4_endpoints` | HASH | 256 | `__u32` outer IPv4 src addr | `__u32` (1 = allowed) |
+| `slot_ctx_map` | ARRAY | 16 | `__u32` slot index | slot handler context |
+| `slot_def_action` | ARRAY | 16 | `__u32` slot index | default action when no handler matches |
+| `proto_handlers` | ARRAY | 256 | `__u32` IP proto number | handler slot index |
+| `tcp_port_handlers` | HASH | 1024 | `__u32` dest port | handler slot index |
+| `udp_port_handlers` | HASH | 1024 | `__u32` dest port | handler slot index |
 
 ### Manually Add / Remove a Port
 
@@ -273,10 +311,10 @@ The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/auto_xdp_
 3. **Safety Fallback**: Performs a full sync every **30 seconds** to ensure consistency.
 4. **Backend Sync**: Updates either pinned BPF maps or `nftables` sets, depending on what the host supports.
 5. **UDP Discovery Rule**: Because UDP has no `LISTEN` state, the daemon syncs unconnected bound UDP sockets (no remote peer) into `udp_whitelist`, which is a practical approximation of server-style UDP ports.
-6. **Trusted Source IPs/CIDRs**: Optional IPv4/IPv6 addresses or CIDR ranges can be synced into the XDP-side `trusted_ipv4`/`trusted_ipv6` LPM trie maps for reply-style UDP traffic such as DNS or NTP.
+6. **Trusted Source IPs/CIDRs**: Optional IPv4/IPv6 addresses or CIDR ranges can be synced into the XDP-side `trusted_ipv4`/`trusted_ipv6` LPM trie maps. In XDP mode, trusted TCP sources can pass pure SYN packets without the auto-discovered TCP whitelist; trusted UDP sources still require the destination UDP port to be whitelisted first.
 7. **Backend Guard Rails**: In `auto` mode, the daemon only selects XDP when the required pinned maps are present; otherwise it falls back to `nftables` instead of crashing.
 
-Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`, and the XDP ingress path checks those maps before falling back to `tcp_whitelist`, `udp_whitelist`, or `trusted_ipv4`/`trusted_ipv6`.
+Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`. The XDP ingress path checks those maps before falling back to the TCP/UDP admission rules.
 
 ### Permanent Ports
 
@@ -328,6 +366,7 @@ Runtime data-path tunables live in `/etc/auto_xdp/config.toml` and are synced in
 [xdp.runtime]
 tcp_timeout_seconds = 300
 udp_timeout_seconds = 60
+syn_timeout_seconds = 30    # incomplete SYN entries are evicted after this
 conntrack_refresh_seconds = 30
 icmp_burst_packets = 100
 icmp_rate_pps = 100
@@ -376,10 +415,44 @@ sudo axdp stats --watch --rates --interval 2
 # Run one manual sync
 sudo axdp sync
 
-# Inspect currently allowed TCP/UDP ports (with per-IP SYN rate stats)
+# Inspect currently allowed TCP/UDP ports
 sudo axdp ports
 sudo axdp ports --tcp
 sudo axdp ports --udp
+
+# Show active backend and XDP attachment state
+sudo axdp backend
+
+# Show TCP/UDP conntrack entry visibility
+sudo axdp conntrack
+sudo axdp conntrack tcp
+sudo axdp conntrack udp
+
+# Under-attack mode: suspend process-event-driven sync (whitelist becomes static)
+sudo axdp under-attack
+sudo axdp under-attack on
+sudo axdp under-attack off
+
+# Trusted source IPs/CIDRs
+sudo axdp trust list
+sudo axdp trust add 10.0.0.0/8 office-net
+sudo axdp trust del 10.0.0.0/8
+
+# Per-CIDR port ACL rules
+sudo axdp acl list
+sudo axdp acl add tcp 203.23.2.0/24 443 8443
+sudo axdp acl del tcp 203.23.2.0/24
+
+# Permanent ports (never auto-removed)
+sudo axdp permanent list
+sudo axdp permanent add tcp 2222 alt-ssh
+sudo axdp permanent del tcp 2222
+
+# Protocol slot handlers (GRE, ESP, SCTP, custom)
+sudo axdp slot list
+sudo axdp slot load gre
+sudo axdp slot load 47 /etc/auto_xdp/handlers/custom_gre.o
+sudo axdp slot unload 47
 
 # View or change daemon log level
 sudo axdp log-level
@@ -451,6 +524,16 @@ sudo axdp ports
 sudo axdp ports --tcp
 sudo axdp ports --udp
 
+# Active backend and XDP attachment
+sudo axdp backend
+
+# Conntrack visibility
+sudo axdp conntrack
+
+# Under-attack mode (freeze whitelist)
+sudo axdp under-attack on
+sudo axdp under-attack off
+
 # Change daemon log verbosity and restart the service
 sudo axdp log-level
 sudo axdp log-level debug
@@ -503,7 +586,8 @@ In `--force` mode, the installer skips confirmation prompts and:
 
 ### TCP
 - **IPv4 + IPv6 stateful path**:
-  - If packet is a **pure SYN** and source matches `trusted_ipv4`/`trusted_ipv6` → insert flow key into `tcp_conntrack` and **PASS** (whitelist and SYN rate limit bypassed)
+  - If packet is a **pure SYN** and source matches `trusted_ipv4`/`trusted_ipv6` → insert flow key into `tcp_conntrack` and **PASS** (auto-discovery whitelist and SYN rate limit bypassed)
+  - If packet is a **pure SYN** and source/port matches a TCP ACL rule → insert flow key into `tcp_conntrack` and **PASS** (auto-discovery whitelist and SYN rate limit bypassed)
   - If packet is a **pure SYN** and destination port is in `tcp_whitelist` → insert flow key into `tcp_conntrack` and **PASS**
   - If **ACK** is set and the flow key exists in `tcp_conntrack` → **PASS**
   - If **ACK** is set and no conntrack entry exists → count `CNT_TCP_CT_MISS` and **DROP**
@@ -539,16 +623,18 @@ Running the structural check first ensures that only RFC 793-conforming packets 
 ### UDP
 - **IPv4 stateful path**:
   - If the inbound flow key exists in `udp_conntrack` → **PASS**
-  - If source IPv4 address/prefix matches `trusted_ipv4` → **PASS** (whitelist and rate limits bypassed)
-  - If destination port is in `udp_whitelist` → **PASS**
+  - If destination port is not in `udp_whitelist` → **DROP**
+  - If source IPv4 address/prefix matches `trusted_ipv4` or a UDP ACL rule → **PASS** (rate limits and port handler bypassed; whitelist already matched)
+  - If destination port is in `udp_whitelist` and rate limits pass → **PASS**
   - Otherwise → **DROP**
 - **IPv6 stateful path**:
   - If the inbound flow key exists in `udp_conntrack` → **PASS**
-  - If source IPv6 address/prefix matches `trusted_ipv6` → **PASS** (whitelist and rate limits bypassed)
-  - If destination port is in `udp_whitelist` → **PASS**
+  - If destination port is not in `udp_whitelist` → **DROP**
+  - If source IPv6 address/prefix matches `trusted_ipv6` or a UDP ACL rule → **PASS** (rate limits and port handler bypassed; whitelist already matched)
+  - If destination port is in `udp_whitelist` and rate limits pass → **PASS**
   - Otherwise → **DROP**
-- **Trusted source priority**: trusted sources bypass port whitelist and all rate limits (per-source, per-port, global). Fragment drops and malformed-packet checks still apply.
-- **Userspace assist**: trusted IPv4/IPv6 source addresses and CIDR ranges are synced into `trusted_ipv4`/`trusted_ipv6` LPM trie maps by the daemon; the `nftables` fallback maintains equivalent `trusted_v4`/`trusted_v6` sets.
+- **Trusted source priority**: in XDP mode, trusted TCP sources are an emergency/admin bypass for pure SYN admission and skip the auto-discovered TCP whitelist and SYN limits. For UDP, trusted sources do not open closed ports; they only bypass UDP rate limits and port handlers after the destination port is already whitelisted. Fragment drops and malformed-packet checks still apply.
+- **Userspace assist**: trusted IPv4/IPv6 source addresses and CIDR ranges are synced into `trusted_ipv4`/`trusted_ipv6` LPM trie maps by the daemon. The `nftables` fallback maintains equivalent `trusted_v4`/`trusted_v6` sets and accepts trusted sources before port checks.
 
 ### IPv6 Extension Headers
 
@@ -675,4 +761,4 @@ For bugs or questions, please [open an issue](https://github.com/Kookiejarz/Auto
 
 ## 📄 License
 
-[MIT](./LICENSE) © 2026 Yunheng Liu
+[MPL 2.0](./LICENSE) © 2026 Yunheng Liu

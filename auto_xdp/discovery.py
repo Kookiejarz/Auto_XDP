@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 _IS_LINUX = sys.platform == "linux"
 
-# ── psutil (non-Linux fallback) ───────────────────────────────────────────────
+# psutil (non-Linux fallback)
 
 try:
     import psutil
