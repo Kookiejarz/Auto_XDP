@@ -22,6 +22,7 @@ BPF_MAP_GET_NEXT_KEY = 4
 BPF_OBJ_GET = 7
 BPF_OBJ_GET_INFO_BY_FD = 15
 BPF_MAP_LOOKUP_BATCH = 24
+BPF_F_LOCK = 4
 
 
 def bpf(cmd: int, attr: ctypes.Array) -> int:

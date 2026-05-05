@@ -54,6 +54,7 @@ struct udp_global_state {
     __u64 window_start_ns;      // offset 8  — ktime_ns of current bucket; 0 = uninit
     __u64 prev_bytes;           // offset 16 — byte count in previous 1-s bucket
     __u64 curr_bytes;           // offset 24 — byte count in current 1-s bucket
+    __u64 blocked_until_ns;     // offset 32 — ktime_ns until which all traffic is blocked; 0 = not blocked
 };
 
 // Per-CPU local byte accumulator for the two-level UDP global rate limiter.
@@ -61,6 +62,7 @@ struct udp_global_state {
 // udp_global_state only when the batch threshold is reached.
 struct udp_percpu_local {
     __u64 local_bytes;
+    __u64 blocked_until_ns;     // per-CPU copy of the block verdict for the fast-drop path
 };
 
 // Per-port SYN rate limit config, populated at runtime by xdp_port_sync.
@@ -144,3 +146,19 @@ struct acl_val {
     __u32 count;
     __u16 ports[ACL_MAX_PORTS];
 };
+
+static __always_inline void fill_ct_key_v4_map(struct ct_key_v4 *out, const struct flow_key *key)
+{
+    out->sport = key->sport;
+    out->dport = key->dport;
+    out->saddr = (__be32)key->saddr[0];
+    out->daddr = (__be32)key->daddr[0];
+}
+
+static __always_inline void fill_ct_key_v6_map(struct ct_key_v6 *out, const struct flow_key *key)
+{
+    out->sport = key->sport;
+    out->dport = key->dport;
+    __builtin_memcpy(out->saddr, key->saddr, sizeof(out->saddr));
+    __builtin_memcpy(out->daddr, key->daddr, sizeof(out->daddr));
+}

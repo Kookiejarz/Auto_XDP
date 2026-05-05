@@ -11,6 +11,7 @@ from auto_xdp.bpf.maps import (
     BpfAclMaps,
     BpfArrayMap,
     BpfConntrackMaps,
+    BpfGlobalRlMap,
     BpfPortPolicyMap,
     BpfPortPolicyViewMap,
     BpfRuntimeConfigMap,
@@ -98,6 +99,7 @@ class XdpBackend(PortBackend):
         self.udp_agg_rate_map: BpfSynRatePortsMap | None = None
         self.acl_maps: BpfAclMaps | None = None
         self.runtime_config_map: BpfRuntimeConfigMap | None = None
+        self.global_rl_map: BpfGlobalRlMap | None = None
         self.bogon_cfg_map: BpfArrayMap | None = None
         self.observability_cfg_map: BpfArrayMap | None = None
         self.sctp_map: BpfArrayMap | None = None
@@ -129,6 +131,11 @@ class XdpBackend(PortBackend):
             log.debug("xdp_runtime_cfg map opened; runtime tuning active.")
         except OSError as exc:
             log.debug("xdp_runtime_cfg map unavailable (%s); runtime tuning inactive.", exc)
+        try:
+            self.global_rl_map = BpfGlobalRlMap(cfg.UDP_GLOBAL_RL_MAP_PATH)
+            log.debug("udp_global_rl map opened; global UDP rate limit control active.")
+        except OSError as exc:
+            log.debug("udp_global_rl map unavailable (%s); global UDP rate limit inactive.", exc)
         try:
             self.bogon_cfg_map = BpfArrayMap(cfg.BOGON_CFG_MAP_PATH)
         except OSError as exc:
@@ -174,6 +181,8 @@ class XdpBackend(PortBackend):
             self.acl_maps.close()
         if self.runtime_config_map is not None:
             self.runtime_config_map.close()
+        if self.global_rl_map is not None:
+            self.global_rl_map.close()
         if self.bogon_cfg_map is not None:
             self.bogon_cfg_map.close()
         if self.observability_cfg_map is not None:
@@ -198,6 +207,7 @@ class XdpBackend(PortBackend):
             acl_rules=self.acl_maps.active_entries() if self.acl_maps is not None else {},
             bogon_filter_enabled=bool(self.bogon_cfg_map.get(0)) if self.bogon_cfg_map is not None else None,
             drop_events_enabled=bool(self.observability_cfg_map.get(0)) if self.observability_cfg_map is not None else None,
+            udp_global_byte_rate=self.global_rl_map.get() if self.global_rl_map is not None else None,
             xdp_runtime_config=self.runtime_config_map.get() if self.runtime_config_map is not None else None,
         )
 
@@ -409,6 +419,13 @@ class XdpBackend(PortBackend):
             self.bogon_cfg_map.set(0, 1 if plan.bogon_filter_update else 0, dry_run)
         if self.observability_cfg_map is not None and plan.drop_events_update is not None:
             self.observability_cfg_map.set(0, 1 if plan.drop_events_update else 0, dry_run)
+        if self.global_rl_map is not None and plan.udp_global_byte_rate_update is not None:
+            rate = plan.udp_global_byte_rate_update
+            if self.global_rl_map.set(rate, dry_run):
+                if rate:
+                    log.info("UDP global rate limit set to %d bytes/s", rate)
+                else:
+                    log.info("UDP global rate limit disabled")
 
         if self.sit4_map is not None:
             desired_sit4 = set(cfg.SIT4_ENDPOINTS)

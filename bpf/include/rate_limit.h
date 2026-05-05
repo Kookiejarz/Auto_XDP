@@ -103,48 +103,29 @@ static __always_inline void fill_tcp_src_conn_key_v6(
     skey->dest_port = dest_port;
 }
 
-static __always_inline void rl_fill_ct_key_v4_map(struct ct_key_v4 *out, const struct flow_key *key)
-{
-    out->sport = key->sport;
-    out->dport = key->dport;
-    out->saddr = (__be32)key->saddr[0];
-    out->daddr = (__be32)key->daddr[0];
-}
 
-static __always_inline void rl_fill_ct_key_v6_map(struct ct_key_v6 *out, const struct flow_key *key)
-{
-    out->sport = key->sport;
-    out->dport = key->dport;
-    __builtin_memcpy(out->saddr, key->saddr, sizeof(out->saddr));
-    __builtin_memcpy(out->daddr, key->daddr, sizeof(out->daddr));
-}
-
-static __always_inline __u64 *rl_tcp_conntrack_lookup(
-    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6)
-{
-    if (ipv4)
-        return bpf_map_lookup_elem(&tcp_ct4, key_v4);
-    return bpf_map_lookup_elem(&tcp_ct6, key_v6);
-}
-
-static __always_inline void rl_tcp_conntrack_delete(
-    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6)
-{
-    if (ipv4)
-        bpf_map_delete_elem(&tcp_ct4, key_v4);
-    else
-        bpf_map_delete_elem(&tcp_ct6, key_v6);
-}
-
-static __always_inline void rl_tcp_conntrack_update(
-    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6,
-    __u64 now, __u64 flags)
-{
-    if (ipv4)
-        bpf_map_update_elem(&tcp_ct4, key_v4, &now, flags);
-    else
-        bpf_map_update_elem(&tcp_ct6, key_v6, &now, flags);
-}
+/* Sliding-window limiter: reset on expiry, drop if unit_field + increment > max. */
+#define WINDOW_RATE_CHECK(map, rkey, val_type, unit_field, now, window_ns, increment, max) \
+    do {                                                                                    \
+        val_type *_rv = bpf_map_lookup_elem(&(map), &(rkey));                             \
+        if (!_rv) {                                                                         \
+            val_type _new;                                                                  \
+            __builtin_memset(&_new, 0, sizeof(_new));                                      \
+            _new.window_start_ns = (now);                                                   \
+            _new.unit_field = (increment);                                                  \
+            bpf_map_update_elem(&(map), &(rkey), &_new, BPF_ANY);                         \
+            return XDP_PASS;                                                                \
+        }                                                                                   \
+        if ((now) - _rv->window_start_ns >= (window_ns)) {                                 \
+            _rv->window_start_ns = (now);                                                   \
+            _rv->unit_field = (increment);                                                  \
+            return XDP_PASS;                                                                \
+        }                                                                                   \
+        if ((__u64)_rv->unit_field + (__u64)(increment) > (__u64)(max))                    \
+            return XDP_DROP;                                                                \
+        _rv->unit_field += (increment);                                                     \
+        return XDP_PASS;                                                                    \
+    } while (0)
 
 static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
                                           __u32 rate_max,
@@ -153,61 +134,17 @@ static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
     if (rate_max == 0)
         return XDP_PASS;
 
+    __u64 window_ns = runtime_rate_window_ns();
+
     if (key->family == CT_FAMILY_IPV4) {
         struct syn_rate_key_v4 rkey;
-        struct syn_rate_val *rv;
-
         fill_source_rate_key_v4(&rkey, key, prefix_v4);
-        rv = bpf_map_lookup_elem(&syn4, &rkey);
-        if (!rv) {
-            struct syn_rate_val new_rv;
-            __builtin_memset(&new_rv, 0, sizeof(new_rv));
-            new_rv.window_start_ns = now;
-            new_rv.count = 1;
-            bpf_map_update_elem(&syn4, &rkey, &new_rv, BPF_ANY);
-            return XDP_PASS;
-        }
-
-        if (now - rv->window_start_ns >= runtime_rate_window_ns()) {
-            rv->window_start_ns = now;
-            rv->count = 1;
-            return XDP_PASS;
-        }
-
-        if (rv->count >= rate_max)
-            return XDP_DROP;
-
-        rv->count++;
-        return XDP_PASS;
+        WINDOW_RATE_CHECK(syn4, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
     }
 
-    {
-        struct syn_rate_key_v6 rkey;
-        struct syn_rate_val *rv;
-
-        fill_source_rate_key_v6(&rkey, key, prefix_v6);
-        rv = bpf_map_lookup_elem(&syn6, &rkey);
-        if (!rv) {
-            struct syn_rate_val new_rv;
-            __builtin_memset(&new_rv, 0, sizeof(new_rv));
-            new_rv.window_start_ns = now;
-            new_rv.count = 1;
-            bpf_map_update_elem(&syn6, &rkey, &new_rv, BPF_ANY);
-            return XDP_PASS;
-        }
-
-        if (now - rv->window_start_ns >= runtime_rate_window_ns()) {
-            rv->window_start_ns = now;
-            rv->count = 1;
-            return XDP_PASS;
-        }
-
-        if (rv->count >= rate_max)
-            return XDP_DROP;
-
-        rv->count++;
-        return XDP_PASS;
-    }
+    struct syn_rate_key_v6 rkey;
+    fill_source_rate_key_v6(&rkey, key, prefix_v6);
+    WINDOW_RATE_CHECK(syn6, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
 }
 
 static __always_inline int syn_agg_rate_check(struct flow_key *key, __u64 now,
@@ -217,190 +154,60 @@ static __always_inline int syn_agg_rate_check(struct flow_key *key, __u64 now,
     if (rate_max == 0)
         return XDP_PASS;
 
+    __u64 window_ns = runtime_rate_window_ns();
+
     if (key->family == CT_FAMILY_IPV4) {
         struct prefix_rate_key_v4 rkey;
-        struct prefix_rate_val *rv;
-
         fill_prefix_rate_key_v4(&rkey, key, dest_port, prefix_v4);
-        rv = bpf_map_lookup_elem(&synag4, &rkey);
-        if (!rv) {
-            struct prefix_rate_val new_rv;
-            __builtin_memset(&new_rv, 0, sizeof(new_rv));
-            new_rv.window_start_ns = now;
-            new_rv.units = 1;
-            bpf_map_update_elem(&synag4, &rkey, &new_rv, BPF_ANY);
-            return XDP_PASS;
-        }
-
-        if (now - rv->window_start_ns >= runtime_rate_window_ns()) {
-            rv->window_start_ns = now;
-            rv->units = 1;
-            return XDP_PASS;
-        }
-
-        if (rv->units >= rate_max)
-            return XDP_DROP;
-
-        rv->units++;
-        return XDP_PASS;
+        WINDOW_RATE_CHECK(synag4, rkey, struct prefix_rate_val, units, now, window_ns, 1ULL, rate_max);
     }
 
-    {
-        struct prefix_rate_key_v6 rkey;
-        struct prefix_rate_val *rv;
-
-        fill_prefix_rate_key_v6(&rkey, key, dest_port, prefix_v6);
-        rv = bpf_map_lookup_elem(&synag6, &rkey);
-        if (!rv) {
-            struct prefix_rate_val new_rv;
-            __builtin_memset(&new_rv, 0, sizeof(new_rv));
-            new_rv.window_start_ns = now;
-            new_rv.units = 1;
-            bpf_map_update_elem(&synag6, &rkey, &new_rv, BPF_ANY);
-            return XDP_PASS;
-        }
-
-        if (now - rv->window_start_ns >= runtime_rate_window_ns()) {
-            rv->window_start_ns = now;
-            rv->units = 1;
-            return XDP_PASS;
-        }
-
-        if (rv->units >= rate_max)
-            return XDP_DROP;
-
-        rv->units++;
-        return XDP_PASS;
-    }
+    struct prefix_rate_key_v6 rkey;
+    fill_prefix_rate_key_v6(&rkey, key, dest_port, prefix_v6);
+    WINDOW_RATE_CHECK(synag6, rkey, struct prefix_rate_val, units, now, window_ns, 1ULL, rate_max);
 }
 
 static __always_inline int udp_rate_check(struct flow_key *key, __u64 now,
                                           __u32 rate_max,
-                                          __u32 prefix_v4, __u32 prefix_v6)
+                                          __u32 prefix_v4, __u32 prefix_v6,
+                                          struct xdp_runtime_cfg *cfg)
 {
     if (rate_max == 0)
         return XDP_PASS;
 
+    __u64 window_ns = cfg_rate_window_ns(cfg);
+
     if (key->family == CT_FAMILY_IPV4) {
         struct syn_rate_key_v4 rkey;
-        struct syn_rate_val *rv;
-
         fill_source_rate_key_v4(&rkey, key, prefix_v4);
-        rv = bpf_map_lookup_elem(&udprt4, &rkey);
-        if (!rv) {
-            struct syn_rate_val new_rv;
-            __builtin_memset(&new_rv, 0, sizeof(new_rv));
-            new_rv.window_start_ns = now;
-            new_rv.count = 1;
-            bpf_map_update_elem(&udprt4, &rkey, &new_rv, BPF_ANY);
-            return XDP_PASS;
-        }
-
-        if (now - rv->window_start_ns >= runtime_rate_window_ns()) {
-            rv->window_start_ns = now;
-            rv->count = 1;
-            return XDP_PASS;
-        }
-
-        if (rv->count >= rate_max)
-            return XDP_DROP;
-
-        rv->count++;
-        return XDP_PASS;
+        WINDOW_RATE_CHECK(udprt4, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
     }
 
-    {
-        struct syn_rate_key_v6 rkey;
-        struct syn_rate_val *rv;
-
-        fill_source_rate_key_v6(&rkey, key, prefix_v6);
-        rv = bpf_map_lookup_elem(&udprt6, &rkey);
-        if (!rv) {
-            struct syn_rate_val new_rv;
-            __builtin_memset(&new_rv, 0, sizeof(new_rv));
-            new_rv.window_start_ns = now;
-            new_rv.count = 1;
-            bpf_map_update_elem(&udprt6, &rkey, &new_rv, BPF_ANY);
-            return XDP_PASS;
-        }
-
-        if (now - rv->window_start_ns >= runtime_rate_window_ns()) {
-            rv->window_start_ns = now;
-            rv->count = 1;
-            return XDP_PASS;
-        }
-
-        if (rv->count >= rate_max)
-            return XDP_DROP;
-
-        rv->count++;
-        return XDP_PASS;
-    }
+    struct syn_rate_key_v6 rkey;
+    fill_source_rate_key_v6(&rkey, key, prefix_v6);
+    WINDOW_RATE_CHECK(udprt6, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
 }
 
 static __always_inline int udp_agg_rate_check(struct flow_key *key, __u64 now,
                                               __u32 dest_port, __u64 pkt_bytes,
                                               __u32 rate_max,
-                                              __u32 prefix_v4, __u32 prefix_v6)
+                                              __u32 prefix_v4, __u32 prefix_v6,
+                                              struct xdp_runtime_cfg *cfg)
 {
     if (rate_max == 0)
         return XDP_PASS;
 
+    __u64 window_ns = cfg_rate_window_ns(cfg);
+
     if (key->family == CT_FAMILY_IPV4) {
         struct prefix_rate_key_v4 rkey;
-        struct prefix_rate_val *rv;
-
         fill_prefix_rate_key_v4(&rkey, key, dest_port, prefix_v4);
-        rv = bpf_map_lookup_elem(&udpag4, &rkey);
-        if (!rv) {
-            struct prefix_rate_val new_rv;
-            __builtin_memset(&new_rv, 0, sizeof(new_rv));
-            new_rv.window_start_ns = now;
-            new_rv.units = pkt_bytes;
-            bpf_map_update_elem(&udpag4, &rkey, &new_rv, BPF_ANY);
-            return XDP_PASS;
-        }
-
-        if (now - rv->window_start_ns >= runtime_rate_window_ns()) {
-            rv->window_start_ns = now;
-            rv->units = pkt_bytes;
-            return XDP_PASS;
-        }
-
-        if (rv->units + pkt_bytes > (__u64)rate_max)
-            return XDP_DROP;
-
-        rv->units += pkt_bytes;
-        return XDP_PASS;
+        WINDOW_RATE_CHECK(udpag4, rkey, struct prefix_rate_val, units, now, window_ns, pkt_bytes, (__u64)rate_max);
     }
 
-    {
-        struct prefix_rate_key_v6 rkey;
-        struct prefix_rate_val *rv;
-
-        fill_prefix_rate_key_v6(&rkey, key, dest_port, prefix_v6);
-        rv = bpf_map_lookup_elem(&udpag6, &rkey);
-        if (!rv) {
-            struct prefix_rate_val new_rv;
-            __builtin_memset(&new_rv, 0, sizeof(new_rv));
-            new_rv.window_start_ns = now;
-            new_rv.units = pkt_bytes;
-            bpf_map_update_elem(&udpag6, &rkey, &new_rv, BPF_ANY);
-            return XDP_PASS;
-        }
-
-        if (now - rv->window_start_ns >= runtime_rate_window_ns()) {
-            rv->window_start_ns = now;
-            rv->units = pkt_bytes;
-            return XDP_PASS;
-        }
-
-        if (rv->units + pkt_bytes > (__u64)rate_max)
-            return XDP_DROP;
-
-        rv->units += pkt_bytes;
-        return XDP_PASS;
-    }
+    struct prefix_rate_key_v6 rkey;
+    fill_prefix_rate_key_v6(&rkey, key, dest_port, prefix_v6);
+    WINDOW_RATE_CHECK(udpag6, rkey, struct prefix_rate_val, units, now, window_ns, pkt_bytes, (__u64)rate_max);
 }
 
 static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
@@ -584,7 +391,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
             count(CNT_SYN_RATE_DROP);
             count(CNT_TCP_DROP);
             emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
-                      key->sport, key->dport, (__u8)CNT_SYN_RATE_DROP);
+                      key->sport, key->dport, (__u8)CNT_SYN_RATE_DROP, now);
             return XDP_DROP;
         }
 
@@ -592,7 +399,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
             count(CNT_SYN_AGG_RATE_DROP);
             count(CNT_TCP_DROP);
             emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
-                      key->sport, key->dport, (__u8)CNT_SYN_AGG_RATE_DROP);
+                      key->sport, key->dport, (__u8)CNT_SYN_AGG_RATE_DROP, now);
             return XDP_DROP;
         }
     }
@@ -601,7 +408,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
         count(CNT_TCP_CONN_LIMIT_DROP);
         count(CNT_TCP_DROP);
         emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
-                  key->sport, key->dport, (__u8)CNT_TCP_CONN_LIMIT_DROP);
+                  key->sport, key->dport, (__u8)CNT_TCP_CONN_LIMIT_DROP, now);
         return XDP_DROP;
     }
 
@@ -609,20 +416,20 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
 }
 
 static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_port,
-                                             bool bypass_rate, bool prechecked)
+                                             bool bypass_rate, bool prechecked,
+                                             __u64 now)
 {
-    __u64 now = bpf_ktime_get_ns();
     __u64 *last_seen;
     bool ipv4 = key->family == CT_FAMILY_IPV4;
     struct ct_key_v4 key_v4;
     struct ct_key_v6 key_v6;
 
     if (ipv4)
-        rl_fill_ct_key_v4_map(&key_v4, key);
+        fill_ct_key_v4_map(&key_v4, key);
     else
-        rl_fill_ct_key_v6_map(&key_v6, key);
+        fill_ct_key_v6_map(&key_v6, key);
 
-    last_seen = rl_tcp_conntrack_lookup(ipv4, &key_v4, &key_v6);
+    last_seen = tcp_conntrack_lookup(ipv4, &key_v4, &key_v6);
     if (last_seen) {
         __u64 raw = *last_seen;
         bool is_half_open = raw & CT_SYN_PENDING;
@@ -630,12 +437,12 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
         __u64 age = now - ts;
         __u64 ct_timeout = is_half_open ? runtime_syn_timeout_ns() : runtime_tcp_timeout_ns();
         if (age > ct_timeout) {
-            rl_tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
+            tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
             tcp_src_conn_record_close(key, now, dest_port);
         } else {
             if (age > runtime_ct_refresh_ns()) {
                 __u64 new_val = is_half_open ? (now | CT_SYN_PENDING) : now;
-                rl_tcp_conntrack_update(ipv4, &key_v4, &key_v6, new_val, BPF_EXIST);
+                tcp_conntrack_update(ipv4, &key_v4, &key_v6, new_val, BPF_EXIST);
                 tcp_src_conn_record_activity(key, now, dest_port);
             }
             count(CNT_TCP_NEW_ALLOW);
@@ -646,13 +453,13 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
     if (!prechecked && precheck_new_tcp_syn(key, dest_port, bypass_rate, now) == XDP_DROP)
         return XDP_DROP;
 
-    rl_tcp_conntrack_update(ipv4, &key_v4, &key_v6, now | CT_SYN_PENDING, BPF_ANY);
+    tcp_conntrack_update(ipv4, &key_v4, &key_v6, now | CT_SYN_PENDING, BPF_ANY);
     tcp_src_conn_record_new(key, now, dest_port);
     count(CNT_TCP_NEW_ALLOW);
     return XDP_PASS;
 }
 
-// Two-level global UDP rate limiter.
+// Two-level global UDP rate limiter with blocked_until_ns fast path.
 //
 // Problem with the naive PERCPU_ARRAY approach: each CPU independently enforces
 // byte_rate_max, so the effective global limit is byte_rate_max × N_CPUs.
@@ -661,12 +468,16 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
 // (single shared state, spinlock-protected):
 //
 //   Fast path (per packet, no lock):
-//     Accumulate pkt_bytes in the current CPU's local counter.
-//     Return XDP_PASS immediately if the batch threshold is not yet reached.
+//     If local->blocked_until_ns is set and unexpired, drop immediately and
+//     clear local_bytes to prevent a burst on unblock.
+//     Otherwise accumulate pkt_bytes; pass if batch threshold not yet reached.
 //
 //   Slow path (every UDP_GLOBAL_BATCH_BYTES per CPU, one spinlock acquisition):
-//     Flush the local batch to the shared two-bucket sliding window.
-//     Return XDP_DROP if the global byte rate is exceeded.
+//     Check g->blocked_until_ns (under lock): if the global block is active,
+//     save the deadline, propagate it to local->blocked_until_ns, and drop.
+//     If the block just expired, reset the sliding-window state for a clean
+//     slate.  Otherwise run the two-bucket sliding window; if the rate is
+//     exceeded, set g->blocked_until_ns = now + window_ns and drop.
 //
 // Overshoot at any instant is bounded by N_CPUs × UDP_GLOBAL_BATCH_BYTES.
 // For 32 CPUs and a 64 KiB batch that is 2 MiB — acceptable for a DDoS limiter.
@@ -677,13 +488,27 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
 
 #define UDP_GLOBAL_BATCH_BYTES (65536ULL)
 
-static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes)
+static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes,
+                                                 struct xdp_runtime_cfg *cfg)
 {
     __u32 key = 0;
+
+    struct udp_global_state *g = bpf_map_lookup_elem(&udp_global_rl, &key);
+    if (!g || g->byte_rate_max == 0)
+        return XDP_PASS;
 
     struct udp_percpu_local *local = bpf_map_lookup_elem(&udp_percpu_acc, &key);
     if (!local)
         return XDP_PASS;
+
+    // Per-CPU fast path: check block verdict without any spinlock.
+    if (local->blocked_until_ns != 0) {
+        if (now < local->blocked_until_ns) {
+            local->local_bytes = 0;
+            return XDP_DROP;
+        }
+        local->blocked_until_ns = 0;
+    }
 
     local->local_bytes += pkt_bytes;
     if (local->local_bytes < UDP_GLOBAL_BATCH_BYTES)
@@ -692,44 +517,64 @@ static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes)
     __u64 to_flush = local->local_bytes;
     local->local_bytes = 0;
 
-    struct udp_global_state *g = bpf_map_lookup_elem(&udp_global_rl, &key);
-    if (!g || g->byte_rate_max == 0)
-        return XDP_PASS;
-
-    __u64 window_ns = runtime_udp_global_window_ns();
+    __u64 window_ns = cfg_udp_global_window_ns(cfg);
+    __u64 block_until = 0;
     int ret = XDP_PASS;
 
     bpf_spin_lock(&g->lock);
 
-    if (g->window_start_ns == 0) {
-        g->window_start_ns = now;
-        g->prev_bytes = 0;
-        g->curr_bytes = to_flush;
-    } else {
-        __u64 elapsed = now - g->window_start_ns;
+    if (g->blocked_until_ns != 0) {
+        if (now < g->blocked_until_ns) {
+            // Global block still active: save deadline for propagation after unlock.
+            block_until = g->blocked_until_ns;
+        } else {
+            // Block expired: reset sliding-window state for a clean slate.
+            g->blocked_until_ns = 0;
+            g->window_start_ns = 0;
+            g->prev_bytes = 0;
+            g->curr_bytes = 0;
+        }
+    }
 
-        if (elapsed >= 2 * window_ns) {
+    if (block_until == 0) {
+        if (g->window_start_ns == 0) {
             g->window_start_ns = now;
             g->prev_bytes = 0;
             g->curr_bytes = to_flush;
         } else {
-            if (elapsed >= window_ns) {
-                g->prev_bytes = g->curr_bytes;
-                g->curr_bytes = 0;
-                g->window_start_ns += window_ns;
-                elapsed -= window_ns;
-            }
-            __u64 weighted = g->prev_bytes * (window_ns - elapsed)
-                           + g->curr_bytes * window_ns;
-            __u64 threshold = (__u64)g->byte_rate_max * window_ns;
-            if (weighted + to_flush * window_ns > threshold) {
-                ret = XDP_DROP;
+            __u64 elapsed = now - g->window_start_ns;
+
+            if (elapsed >= 2 * window_ns) {
+                g->window_start_ns = now;
+                g->prev_bytes = 0;
+                g->curr_bytes = to_flush;
             } else {
-                g->curr_bytes += to_flush;
+                if (elapsed >= window_ns) {
+                    g->prev_bytes = g->curr_bytes;
+                    g->curr_bytes = 0;
+                    g->window_start_ns += window_ns;
+                    elapsed -= window_ns;
+                }
+                __u64 weighted = g->prev_bytes * (window_ns - elapsed)
+                               + g->curr_bytes * window_ns;
+                __u64 threshold = (__u64)g->byte_rate_max * window_ns;
+                if (weighted + to_flush * window_ns > threshold) {
+                    block_until = now + window_ns;
+                    g->blocked_until_ns = block_until;
+                    ret = XDP_DROP;
+                } else {
+                    g->curr_bytes += to_flush;
+                }
             }
         }
     }
 
     bpf_spin_unlock(&g->lock);
+
+    if (block_until != 0) {
+        local->blocked_until_ns = block_until;
+        ret = XDP_DROP;
+    }
+
     return ret;
 }

@@ -30,8 +30,9 @@ static __always_inline int check_tcp_ipv4(
         count(CNT_TCP_DROP);
         __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
         __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
+        __u64 _now = bpf_ktime_get_ns();
         emit_drop(IPPROTO_TCP, CT_FAMILY_IPV4, s, d,
-                  tcp->source, tcp->dest, malform);
+                  tcp->source, tcp->dest, malform, _now);
         return XDP_DROP;
     }
 
@@ -39,18 +40,15 @@ static __always_inline int check_tcp_ipv4(
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
     fill_flow_key_v4(&key, ip->saddr, ip->daddr, tcp->source, tcp->dest);
 
-    // Trusted source: bypass whitelist + SYN rate limit for new connections.
     // Malformed-packet check already ran above; fragments dropped before we arrive.
-    if ((tcp_flags & 0x02) && !(tcp_flags & 0x10) && is_trusted_v4(ip->saddr)) {
-        return allow_new_tcp_syn(&key, dest_port, true, false);
-    }
+    if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
+        if (is_trusted_v4(ip->saddr))
+            return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
 
-    if ((tcp_flags & 0x02) && !(tcp_flags & 0x10)) {
         struct trusted_v4_key tk = { .prefixlen = 32, .addr = ip->saddr };
         struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v4, &tk);
-        if (av && acl_port_match(av, dest_port)) {
-            return allow_new_tcp_syn(&key, dest_port, true, false);
-        }
+        if (av && acl_port_match(av, dest_port))
+            return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
     }
 
     return check_tcp_conntrack(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
@@ -74,8 +72,9 @@ static __always_inline int check_tcp_ipv6(
         __u32 s[4], d[4];
         __builtin_memcpy(s, &ipv6->saddr, 16);
         __builtin_memcpy(d, &ipv6->daddr, 16);
+        __u64 _now = bpf_ktime_get_ns();
         emit_drop(IPPROTO_TCP, CT_FAMILY_IPV6, s, d,
-                  tcp->source, tcp->dest, malform);
+                  tcp->source, tcp->dest, malform, _now);
         return XDP_DROP;
     }
 
@@ -83,18 +82,17 @@ static __always_inline int check_tcp_ipv6(
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
     fill_flow_key_v6(&key, &ipv6->saddr, &ipv6->daddr, tcp->source, tcp->dest);
 
-    if ((tcp_flags & 0x02) && !(tcp_flags & 0x10) && is_trusted_v6(&ipv6->saddr)) {
-        return allow_new_tcp_syn(&key, dest_port, true, false);
-    }
+    // Malformed-packet check already ran above; fragments dropped before we arrive.
+    if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
+        if (is_trusted_v6(&ipv6->saddr))
+            return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
 
-    if ((tcp_flags & 0x02) && !(tcp_flags & 0x10)) {
         struct trusted_v6_key tk;
         tk.prefixlen = 128;
         __builtin_memcpy(tk.addr, &ipv6->saddr, 16);
         struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v6, &tk);
-        if (av && acl_port_match(av, dest_port)) {
-            return allow_new_tcp_syn(&key, dest_port, true, false);
-        }
+        if (av && acl_port_match(av, dest_port))
+            return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
     }
 
     return check_tcp_conntrack(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
@@ -107,7 +105,9 @@ static __always_inline int check_udp_ipv4(
 {
     struct udphdr *udp = trans_data;
     struct flow_key key;
+    struct ct_key_v4 ct_key;
     __u64 now = bpf_ktime_get_ns();
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
     __u64 *last_seen;
 
     if ((void *)(udp + 1) > data_end)
@@ -120,7 +120,7 @@ static __always_inline int check_udp_ipv4(
         __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
         __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
         emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, s, d,
-                  udp->source, udp->dest, malform);
+                  udp->source, udp->dest, malform, now);
         return XDP_DROP;
     }
 
@@ -128,31 +128,52 @@ static __always_inline int check_udp_ipv4(
     __u64 pkt_bytes = (__u64)bpf_ntohs(ip->tot_len);
     struct udp_port_policy_cfg *policy;
 
-    // UDP replies are stateful now: tc egress records outbound packets as the
-    // reverse tuple, and XDP ingress looks up the current inbound tuple here.
+    // tc egress records outbound UDP packets as the reverse tuple; XDP looks up
+    // the inbound tuple here to pass replies without a whitelist check.
     fill_flow_key_v4(&key, ip->saddr, ip->daddr, udp->source, udp->dest);
-    {
-        struct ct_key_v4 map_key;
-        fill_ct_key_v4_map(&map_key, &key);
-        last_seen = bpf_map_lookup_elem(&udp_ct4, &map_key);
-        if (last_seen) {
-            __u64 age = now - *last_seen;
-            if (age > runtime_udp_timeout_ns()) {
-                bpf_map_delete_elem(&udp_ct4, &map_key);
-            } else {
-                if (age > runtime_ct_refresh_ns())
-                    bpf_map_update_elem(&udp_ct4, &map_key, &now, BPF_EXIST);
-                count(CNT_UDP_PASS);
-                return XDP_PASS;
-            }
-        }
+    fill_ct_key_v4_map(&ct_key, &key);
 
-        {
-            __u64 *valid_until = bpf_map_lookup_elem(&udp_hv4, &map_key);
-            if (valid_until && now < *valid_until) {
-                count(CNT_UDP_PASS);
-                return XDP_PASS;
+    last_seen = bpf_map_lookup_elem(&udp_ct4, &ct_key);
+    if (last_seen) {
+        __u64 age = now - *last_seen;
+        if (age <= cfg_udp_timeout_ns(cfg)) {
+            if (age > cfg_ct_refresh_ns(cfg))
+                bpf_map_update_elem(&udp_ct4, &ct_key, &now, BPF_EXIST);
+            count(CNT_UDP_PASS);
+            return XDP_PASS;
+        }
+        bpf_map_delete_elem(&udp_ct4, &ct_key);
+    }
+
+    __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
+    if (!allow || !*allow) {
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_UDP_DROP, now);
+        return XDP_DROP;
+    }
+
+    {
+        __u32 rl_key = 0;
+        struct udp_percpu_local *local_pre = bpf_map_lookup_elem(&udp_percpu_acc, &rl_key);
+        if (local_pre && local_pre->blocked_until_ns != 0) {
+            if (now < local_pre->blocked_until_ns) {
+                local_pre->local_bytes = 0;
+                count(CNT_UDP_GLOBAL_RATE_DROP);
+                count(CNT_UDP_DROP);
+                emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                          key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+                return XDP_DROP;
             }
+            local_pre->blocked_until_ns = 0;
+        }
+    }
+
+    {
+        __u64 *valid_until = bpf_map_lookup_elem(&udp_hv4, &ct_key);
+        if (valid_until && now < *valid_until) {
+            count(CNT_UDP_PASS);
+            return XDP_PASS;
         }
     }
 
@@ -170,55 +191,48 @@ static __always_inline int check_udp_ipv4(
         }
     }
 
-    __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
-    if (allow && *allow) {
-        policy = bpf_map_lookup_elem(&udp_port_policies, &dest_port);
-        if (is_handler_blocked(&key)) {
-            count(CNT_HANDLER_BLOCK_DROP);
-            count(CNT_UDP_DROP);
-            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
-                      key.sport, key.dport, (__u8)CNT_HANDLER_BLOCK_DROP);
-            return XDP_DROP;
-        }
-        if (udp_rate_check(
-                &key, now,
-                policy ? policy->rate_max : 0,
-                policy ? policy->source_prefix_v4 : 32,
-                policy ? policy->source_prefix_v6 : 128) == XDP_DROP) {
-            count(CNT_UDP_RATE_DROP);
-            count(CNT_UDP_DROP);
-            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
-                      key.sport, key.dport, (__u8)CNT_UDP_RATE_DROP);
-            return XDP_DROP;
-        }
-        if (udp_agg_rate_check(
-                &key, now, dest_port, pkt_bytes,
-                policy ? policy->agg_rate_max : 0,
-                policy ? policy->source_prefix_v4 : 32,
-                policy ? policy->source_prefix_v6 : 128) == XDP_DROP) {
-            count(CNT_UDP_AGG_RATE_DROP);
-            count(CNT_UDP_DROP);
-            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
-                      key.sport, key.dport, (__u8)CNT_UDP_AGG_RATE_DROP);
-            return XDP_DROP;
-        }
-        if (udp_global_rate_check(now, pkt_bytes) == XDP_DROP) {
-            count(CNT_UDP_GLOBAL_RATE_DROP);
-            count(CNT_UDP_DROP);
-            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
-                      key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP);
-            return XDP_DROP;
-        }
-        // Only after rate gates pass do we dispatch into an optional handler.
-        try_udp_port_dispatch(ctx, &key, l3_off, inner_off, dest_port);
-        count(CNT_UDP_PASS);
-        return XDP_PASS;
+    if (is_handler_blocked(&key)) {
+        count(CNT_HANDLER_BLOCK_DROP);
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_HANDLER_BLOCK_DROP, now);
+        return XDP_DROP;
     }
-
-    count(CNT_UDP_DROP);
-    emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
-              key.sport, key.dport, (__u8)CNT_UDP_DROP);
-    return XDP_DROP;
+    policy = bpf_map_lookup_elem(&udp_port_policies, &dest_port);
+    if (udp_rate_check(
+            &key, now,
+            policy ? policy->rate_max : 0,
+            policy ? policy->source_prefix_v4 : 32,
+            policy ? policy->source_prefix_v6 : 128,
+            cfg) == XDP_DROP) {
+        count(CNT_UDP_RATE_DROP);
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_UDP_RATE_DROP, now);
+        return XDP_DROP;
+    }
+    if (udp_agg_rate_check(
+            &key, now, dest_port, pkt_bytes,
+            policy ? policy->agg_rate_max : 0,
+            policy ? policy->source_prefix_v4 : 32,
+            policy ? policy->source_prefix_v6 : 128,
+            cfg) == XDP_DROP) {
+        count(CNT_UDP_AGG_RATE_DROP);
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_UDP_AGG_RATE_DROP, now);
+        return XDP_DROP;
+    }
+    if (udp_global_rate_check(now, pkt_bytes, cfg) == XDP_DROP) {
+        count(CNT_UDP_GLOBAL_RATE_DROP);
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+        return XDP_DROP;
+    }
+    try_udp_port_dispatch(ctx, &key, l3_off, inner_off, dest_port);
+    count(CNT_UDP_PASS);
+    return XDP_PASS;
 }
 
 static __always_inline int check_udp_ipv6(
@@ -228,7 +242,9 @@ static __always_inline int check_udp_ipv6(
 {
     struct udphdr *udp = trans_data;
     struct flow_key key;
+    struct ct_key_v6 ct_key;
     __u64 now = bpf_ktime_get_ns();
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
     __u64 *last_seen;
     struct udp_port_policy_cfg *policy;
 
@@ -243,37 +259,57 @@ static __always_inline int check_udp_ipv6(
         __builtin_memcpy(s, &ipv6->saddr, 16);
         __builtin_memcpy(d, &ipv6->daddr, 16);
         emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, s, d,
-                  udp->source, udp->dest, malform);
+                  udp->source, udp->dest, malform, now);
         return XDP_DROP;
     }
 
     __u32 dest_port = (__u32)bpf_ntohs(udp->dest);
     __u64 pkt_bytes = (__u64)sizeof(*ipv6) + (__u64)bpf_ntohs(ipv6->payload_len);
 
-    // IPv6 UDP replies are matched by the same shared conntrack map shape.
     fill_flow_key_v6(&key, &ipv6->saddr, &ipv6->daddr, udp->source, udp->dest);
-    {
-        struct ct_key_v6 map_key;
-        fill_ct_key_v6_map(&map_key, &key);
-        last_seen = bpf_map_lookup_elem(&udp_ct6, &map_key);
-        if (last_seen) {
-            __u64 age = now - *last_seen;
-            if (age > runtime_udp_timeout_ns()) {
-                bpf_map_delete_elem(&udp_ct6, &map_key);
-            } else {
-                if (age > runtime_ct_refresh_ns())
-                    bpf_map_update_elem(&udp_ct6, &map_key, &now, BPF_EXIST);
-                count(CNT_UDP_PASS);
-                return XDP_PASS;
-            }
-        }
+    fill_ct_key_v6_map(&ct_key, &key);
 
-        {
-            __u64 *valid_until = bpf_map_lookup_elem(&udp_hv6, &map_key);
-            if (valid_until && now < *valid_until) {
-                count(CNT_UDP_PASS);
-                return XDP_PASS;
+    last_seen = bpf_map_lookup_elem(&udp_ct6, &ct_key);
+    if (last_seen) {
+        __u64 age = now - *last_seen;
+        if (age <= cfg_udp_timeout_ns(cfg)) {
+            if (age > cfg_ct_refresh_ns(cfg))
+                bpf_map_update_elem(&udp_ct6, &ct_key, &now, BPF_EXIST);
+            count(CNT_UDP_PASS);
+            return XDP_PASS;
+        }
+        bpf_map_delete_elem(&udp_ct6, &ct_key);
+    }
+
+    __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
+    if (!allow || !*allow) {
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_UDP_DROP, now);
+        return XDP_DROP;
+    }
+
+    {
+        __u32 rl_key = 0;
+        struct udp_percpu_local *local_pre = bpf_map_lookup_elem(&udp_percpu_acc, &rl_key);
+        if (local_pre && local_pre->blocked_until_ns != 0) {
+            if (now < local_pre->blocked_until_ns) {
+                local_pre->local_bytes = 0;
+                count(CNT_UDP_GLOBAL_RATE_DROP);
+                count(CNT_UDP_DROP);
+                emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
+                          key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+                return XDP_DROP;
             }
+            local_pre->blocked_until_ns = 0;
+        }
+    }
+
+    {
+        __u64 *valid_until = bpf_map_lookup_elem(&udp_hv6, &ct_key);
+        if (valid_until && now < *valid_until) {
+            count(CNT_UDP_PASS);
+            return XDP_PASS;
         }
     }
 
@@ -293,55 +329,48 @@ static __always_inline int check_udp_ipv6(
         }
     }
 
-    __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
-    if (allow && *allow) {
-        policy = bpf_map_lookup_elem(&udp_port_policies, &dest_port);
-        if (is_handler_blocked(&key)) {
-            count(CNT_HANDLER_BLOCK_DROP);
-            count(CNT_UDP_DROP);
-            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
-                      key.sport, key.dport, (__u8)CNT_HANDLER_BLOCK_DROP);
-            return XDP_DROP;
-        }
-        if (udp_rate_check(
-                &key, now,
-                policy ? policy->rate_max : 0,
-                policy ? policy->source_prefix_v4 : 32,
-                policy ? policy->source_prefix_v6 : 128) == XDP_DROP) {
-            count(CNT_UDP_RATE_DROP);
-            count(CNT_UDP_DROP);
-            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
-                      key.sport, key.dport, (__u8)CNT_UDP_RATE_DROP);
-            return XDP_DROP;
-        }
-        if (udp_agg_rate_check(
-                &key, now, dest_port, pkt_bytes,
-                policy ? policy->agg_rate_max : 0,
-                policy ? policy->source_prefix_v4 : 32,
-                policy ? policy->source_prefix_v6 : 128) == XDP_DROP) {
-            count(CNT_UDP_AGG_RATE_DROP);
-            count(CNT_UDP_DROP);
-            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
-                      key.sport, key.dport, (__u8)CNT_UDP_AGG_RATE_DROP);
-            return XDP_DROP;
-        }
-        if (udp_global_rate_check(now, pkt_bytes) == XDP_DROP) {
-            count(CNT_UDP_GLOBAL_RATE_DROP);
-            count(CNT_UDP_DROP);
-            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
-                      key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP);
-            return XDP_DROP;
-        }
-        // Only after rate gates pass do we dispatch into an optional handler.
-        try_udp_port_dispatch(ctx, &key, l3_off, inner_off, dest_port);
-        count(CNT_UDP_PASS);
-        return XDP_PASS;
+    if (is_handler_blocked(&key)) {
+        count(CNT_HANDLER_BLOCK_DROP);
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_HANDLER_BLOCK_DROP, now);
+        return XDP_DROP;
     }
-
-    count(CNT_UDP_DROP);
-    emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
-              key.sport, key.dport, (__u8)CNT_UDP_DROP);
-    return XDP_DROP;
+    policy = bpf_map_lookup_elem(&udp_port_policies, &dest_port);
+    if (udp_rate_check(
+            &key, now,
+            policy ? policy->rate_max : 0,
+            policy ? policy->source_prefix_v4 : 32,
+            policy ? policy->source_prefix_v6 : 128,
+            cfg) == XDP_DROP) {
+        count(CNT_UDP_RATE_DROP);
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_UDP_RATE_DROP, now);
+        return XDP_DROP;
+    }
+    if (udp_agg_rate_check(
+            &key, now, dest_port, pkt_bytes,
+            policy ? policy->agg_rate_max : 0,
+            policy ? policy->source_prefix_v4 : 32,
+            policy ? policy->source_prefix_v6 : 128,
+            cfg) == XDP_DROP) {
+        count(CNT_UDP_AGG_RATE_DROP);
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_UDP_AGG_RATE_DROP, now);
+        return XDP_DROP;
+    }
+    if (udp_global_rate_check(now, pkt_bytes, cfg) == XDP_DROP) {
+        count(CNT_UDP_GLOBAL_RATE_DROP);
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+        return XDP_DROP;
+    }
+    try_udp_port_dispatch(ctx, &key, l3_off, inner_off, dest_port);
+    count(CNT_UDP_PASS);
+    return XDP_PASS;
 }
 
 // ICMP token-bucket rate limiter: returns XDP_PASS or XDP_DROP.
@@ -391,11 +420,10 @@ static __always_inline int icmp_rate_limit(void)
     return ret;
 }
 
-// Main XDP program
-
 static __always_inline int _xdp_fw(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     void *data     = (void *)(long)ctx->data;
+    __u64 now      = bpf_ktime_get_ns();
 
     // --- 1. Parse Ethernet layer ---
     struct ethhdr *eth = data;
@@ -417,7 +445,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         eth_proto == bpf_htons(ETH_P_8021AD)) {
         count(CNT_VLAN_DROP);
         { __u32 z[4]; __builtin_memset(z, 0, 16);
-          emit_drop(0, 0, z, z, 0, 0, (__u8)CNT_VLAN_DROP); }
+          emit_drop(0, 0, z, z, 0, 0, (__u8)CNT_VLAN_DROP, now); }
         return XDP_DROP;
     }
 
@@ -437,7 +465,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             count(CNT_FRAG_DROP);
             { __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
               __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
-              emit_drop(ip->protocol, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_FRAG_DROP); }
+              emit_drop(ip->protocol, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_FRAG_DROP, now); }
             return XDP_DROP;
         }
 
@@ -447,7 +475,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             count(CNT_BOGON_DROP);
             { __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
               __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
-              emit_drop(ip->protocol, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_BOGON_DROP); }
+              emit_drop(ip->protocol, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_BOGON_DROP, now); }
             return XDP_DROP;
         }
 
@@ -481,7 +509,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
                 count(CNT_ICMP_DROP);
                 { __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
                   __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
-                  emit_drop(IPPROTO_ICMP, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_ICMP_DROP); }
+                  emit_drop(IPPROTO_ICMP, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_ICMP_DROP, now); }
                 return XDP_DROP;
             }
             count(CNT_IPV4_OTHER);
@@ -501,7 +529,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             count(CNT_SLOT_DROP);
             { __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
               __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
-              emit_drop(IPPROTO_IPV6, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_SLOT_DROP); }
+              emit_drop(IPPROTO_IPV6, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_SLOT_DROP, now); }
             return XDP_DROP;
         }
         default: {
@@ -528,7 +556,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             { __u32 s[4], d[4];
               __builtin_memcpy(s, &ipv6->saddr, 16);
               __builtin_memcpy(d, &ipv6->daddr, 16);
-              emit_drop(0, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_FRAG_DROP); }
+              emit_drop(0, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_FRAG_DROP, now); }
             return XDP_DROP;
         }
         if (nexthdr == IPPROTO_NONE)
@@ -539,7 +567,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             { __u32 s[4], d[4];
               __builtin_memcpy(s, &ipv6->saddr, 16);
               __builtin_memcpy(d, &ipv6->daddr, 16);
-              emit_drop(nexthdr, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_BOGON_DROP); }
+              emit_drop(nexthdr, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_BOGON_DROP, now); }
             return XDP_DROP;
         }
 
@@ -567,7 +595,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
                 { __u32 s[4], d[4];
                   __builtin_memcpy(s, &ipv6->saddr, 16);
                   __builtin_memcpy(d, &ipv6->daddr, 16);
-                  emit_drop(IPPROTO_ICMPV6, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_ICMP_DROP); }
+                  emit_drop(IPPROTO_ICMPV6, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_ICMP_DROP, now); }
                 return XDP_DROP;
             }
             count(CNT_IPV6_OTHER);

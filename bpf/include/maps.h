@@ -345,3 +345,38 @@ struct {
     __type(key, struct ct_key_v6);
     __type(value, __u64);  // validated_until_ns
 } udp_hv6 SEC(".maps");
+
+static __always_inline __u64 *tcp_conntrack_lookup(
+    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6)
+{
+    if (ipv4)
+        return bpf_map_lookup_elem(&tcp_ct4, key_v4);
+    return bpf_map_lookup_elem(&tcp_ct6, key_v6);
+}
+
+static __always_inline void tcp_conntrack_delete(
+    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6)
+{
+    if (ipv4)
+        bpf_map_delete_elem(&tcp_ct4, key_v4);
+    else
+        bpf_map_delete_elem(&tcp_ct6, key_v6);
+}
+
+static __always_inline void tcp_conntrack_update(
+    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6,
+    __u64 val, __u64 flags)
+{
+    if (ipv4)
+        bpf_map_update_elem(&tcp_ct4, key_v4, &val, flags);
+    else
+        bpf_map_update_elem(&tcp_ct6, key_v6, &val, flags);
+}
+
+static __always_inline __u32 *tcp_pending_lookup(
+    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6)
+{
+    if (ipv4)
+        return bpf_map_lookup_elem(&tcp_pd4, key_v4);
+    return bpf_map_lookup_elem(&tcp_pd6, key_v6);
+}

@@ -12,6 +12,7 @@ import time
 
 from auto_xdp import config as cfg
 from auto_xdp.bpf.syscall import (
+    BPF_F_LOCK,
     BPF_MAP_DELETE_ELEM,
     BPF_MAP_GET_NEXT_KEY,
     BPF_MAP_LOOKUP_BATCH,
@@ -182,6 +183,47 @@ class BpfRuntimeConfigMap(BpfFdMap):
             return True
         except OSError as exc:
             log.warning("BPF runtime config update failed path=%s: %s", self.path, exc)
+            return False
+
+
+class BpfGlobalRlMap(BpfFdMap):
+    # struct udp_global_state: lock(4) + byte_rate_max(4) + window_start_ns(8) + prev_bytes(8) + curr_bytes(8) + blocked_until_ns(8)
+    _STRUCT_FMT = "=IIQQQQ"
+    _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)  # 40 bytes
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self._key = ctypes.create_string_buffer(4)
+        self._val = ctypes.create_string_buffer(self._STRUCT_SIZE)
+        self._update_attr = ctypes.create_string_buffer(128)
+        self._lookup_attr = ctypes.create_string_buffer(128)
+        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
+        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, BPF_F_LOCK)
+        struct.pack_into("=I4xQQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr, BPF_F_LOCK)
+
+    def get(self) -> int:
+        try:
+            struct.pack_into("=I", self._key, 0, 0)
+            bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+            _, byte_rate_max, _, _, _, _ = struct.unpack_from(self._STRUCT_FMT, self._val, 0)
+            return byte_rate_max
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                log.warning("BPF global rl lookup failed path=%s: %s", self.path, exc)
+            return 0
+
+    def set(self, byte_rate_max: int, dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info("[DRY] %s global_rl byte_rate_max=%d bytes/s", self.path, byte_rate_max)
+            return True
+        try:
+            struct.pack_into("=I", self._key, 0, 0)
+            struct.pack_into(self._STRUCT_FMT, self._val, 0, 0, byte_rate_max, 0, 0, 0, 0)
+            bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
+            return True
+        except OSError as exc:
+            log.warning("BPF global rl update failed path=%s: %s", self.path, exc)
             return False
 
 

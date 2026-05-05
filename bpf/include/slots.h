@@ -46,7 +46,7 @@ static __always_inline int dispatch_to_slot(
     __u32 *action = bpf_map_lookup_elem(&slot_def_action, &zero);
     if (action && *action == 1) {
         count(CNT_SLOT_DROP);
-        emit_drop(ip_proto, family, saddr, daddr, 0, 0, (__u8)CNT_SLOT_DROP);
+        emit_drop(ip_proto, family, saddr, daddr, 0, 0, (__u8)CNT_SLOT_DROP, bpf_ktime_get_ns());
         return XDP_DROP;
     }
     count(CNT_SLOT_PASS);

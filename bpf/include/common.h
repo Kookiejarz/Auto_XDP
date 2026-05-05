@@ -40,6 +40,11 @@ struct vlan_hdr {
 #define CT_FAMILY_IPV6 10
 #define NS_PER_SEC 1000000000ULL
 
+#define TCP_FLAG_FIN  0x01
+#define TCP_FLAG_SYN  0x02
+#define TCP_FLAG_RST  0x04
+#define TCP_FLAG_ACK  0x10
+
 
 // CT_SYN_PENDING and other shared conntrack flags (also included by tc_flow_track.c).
 #include "ct_flags.h"
@@ -115,6 +120,38 @@ static __always_inline __u64 runtime_udp_global_window_ns(void)
 static __always_inline __u64 runtime_rate_window_ns(void)
 {
     struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && cfg->rate_window_ns ? cfg->rate_window_ns : NS_PER_SEC;
+}
+
+// cfg_*_ns(): pre-fetched cfg pointer variants — callers that already hold a
+// runtime_cfg() pointer use these to avoid redundant map lookups in hot paths.
+static __always_inline __u64 cfg_tcp_timeout_ns(struct xdp_runtime_cfg *cfg)
+{
+    return cfg && cfg->tcp_timeout_ns ? cfg->tcp_timeout_ns : 300ULL * NS_PER_SEC;
+}
+
+static __always_inline __u64 cfg_syn_timeout_ns(struct xdp_runtime_cfg *cfg)
+{
+    return cfg && cfg->syn_timeout_ns ? cfg->syn_timeout_ns : 30ULL * NS_PER_SEC;
+}
+
+static __always_inline __u64 cfg_udp_timeout_ns(struct xdp_runtime_cfg *cfg)
+{
+    return cfg && cfg->udp_timeout_ns ? cfg->udp_timeout_ns : 60ULL * NS_PER_SEC;
+}
+
+static __always_inline __u64 cfg_ct_refresh_ns(struct xdp_runtime_cfg *cfg)
+{
+    return cfg && cfg->ct_refresh_ns ? cfg->ct_refresh_ns : 30ULL * NS_PER_SEC;
+}
+
+static __always_inline __u64 cfg_udp_global_window_ns(struct xdp_runtime_cfg *cfg)
+{
+    return cfg && cfg->udp_global_window_ns ? cfg->udp_global_window_ns : NS_PER_SEC;
+}
+
+static __always_inline __u64 cfg_rate_window_ns(struct xdp_runtime_cfg *cfg)
+{
     return cfg && cfg->rate_window_ns ? cfg->rate_window_ns : NS_PER_SEC;
 }
 
@@ -219,13 +256,14 @@ static __always_inline void emit_drop(
     __u8 proto, __u8 family,
     __u32 *src_ip, __u32 *dst_ip,
     __be16 sport, __be16 dport,
-    __u8 reason)
+    __u8 reason,
+    __u64 now)
 {
     if (!drop_events_enabled())
         return;
     struct pkt_event *e = bpf_ringbuf_reserve(&pkt_ringbuf, sizeof(*e), 0);
     if (!e) return;
-    e->ts_ns    = bpf_ktime_get_ns();
+    e->ts_ns    = now;
     e->proto    = proto;
     e->family   = family;
     e->verdict  = 1;
