@@ -40,6 +40,20 @@ _UDP_RATE_BY_PROC: dict[str, int] = {}
 _UDP_RATE_BY_SERVICE: dict[str, int] = {}
 _UDP_AGG_BYTES_BY_PROC: dict[str, int] = {}
 _UDP_AGG_BYTES_BY_SERVICE: dict[str, int] = {}
+
+# Default-on TCP protection knobs — applied when no explicit per-proc/service
+# entry exists. See docs/superpowers/specs/2026-05-06-tcp-default-on-protection-design.md.
+XDP_SENSITIVE_PORT_THRESHOLD = 5
+XDP_DEFAULT_TCP_SYN_RATE_STRICT = 5
+XDP_DEFAULT_TCP_SYN_RATE = 100
+XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT = 50
+XDP_DEFAULT_TCP_SYN_AGG_RATE = 1000
+XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT = 5
+XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC = 50
+XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX_STRICT = 20
+XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX = 200
+XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT_STRICT = 200
+XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT = 5000
 RATE_LIMIT_SOURCE_PREFIX_V4 = 32
 RATE_LIMIT_SOURCE_PREFIX_V6 = 128
 
@@ -213,6 +227,8 @@ def load_toml_config(path: str = TOML_CONFIG_PATH) -> dict:
         return {}
 
 
+
+
 def _coerce_log_level(value: object, default: str = "warning") -> str:
     level = str(value).lower()
     if level not in {"debug", "info", "warning", "error"}:
@@ -291,6 +307,12 @@ def apply_toml_config(cfg: dict) -> None:
     global XDP_UDP_GLOBAL_WINDOW_SECONDS, XDP_RATE_WINDOW_SECONDS
     global XDP_SYN_TIMEOUT_SECONDS, XDP_UDP_GLOBAL_BYTE_RATE
     global NFT_FAMILY, NFT_TABLE
+    global XDP_SENSITIVE_PORT_THRESHOLD
+    global XDP_DEFAULT_TCP_SYN_RATE_STRICT, XDP_DEFAULT_TCP_SYN_RATE
+    global XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT, XDP_DEFAULT_TCP_SYN_AGG_RATE
+    global XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT, XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC
+    global XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX_STRICT, XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX
+    global XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT_STRICT, XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT
 
     TCP_PERMANENT.clear()
     UDP_PERMANENT.clear()
@@ -438,6 +460,50 @@ def apply_toml_config(cfg: dict) -> None:
         xdp_runtime.get("syn_timeout_seconds", 30.0),
         "xdp.runtime.syn_timeout_seconds",
         30.0,
+    )
+    XDP_SENSITIVE_PORT_THRESHOLD = _coerce_positive_int(
+        xdp_runtime.get("sensitive_port_threshold", 5),
+        "xdp.runtime.sensitive_port_threshold", 5,
+    )
+    XDP_DEFAULT_TCP_SYN_RATE_STRICT = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_syn_rate_strict", 5),
+        "xdp.runtime.default_tcp_syn_rate_strict", 5,
+    )
+    XDP_DEFAULT_TCP_SYN_RATE = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_syn_rate", 100),
+        "xdp.runtime.default_tcp_syn_rate", 100,
+    )
+    XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_syn_agg_rate_strict", 50),
+        "xdp.runtime.default_tcp_syn_agg_rate_strict", 50,
+    )
+    XDP_DEFAULT_TCP_SYN_AGG_RATE = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_syn_agg_rate", 1000),
+        "xdp.runtime.default_tcp_syn_agg_rate", 1000,
+    )
+    XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_established_per_src_strict", 5),
+        "xdp.runtime.default_tcp_established_per_src_strict", 5,
+    )
+    XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_established_per_src", 50),
+        "xdp.runtime.default_tcp_established_per_src", 50,
+    )
+    XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX_STRICT = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_established_per_prefix_strict", 20),
+        "xdp.runtime.default_tcp_established_per_prefix_strict", 20,
+    )
+    XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_established_per_prefix", 200),
+        "xdp.runtime.default_tcp_established_per_prefix", 200,
+    )
+    XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT_STRICT = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_established_per_port_strict", 200),
+        "xdp.runtime.default_tcp_established_per_port_strict", 200,
+    )
+    XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT = _coerce_positive_int(
+        xdp_runtime.get("default_tcp_established_per_port", 5000),
+        "xdp.runtime.default_tcp_established_per_port", 5000,
     )
     _udp_global_byte_rate_mbps = _coerce_nonnegative_float(
         xdp_runtime.get("udp_global_byte_rate_mbps", 0.0),
