@@ -194,6 +194,24 @@ class FakeRuntimeConfigMap:
         self.closed = True
 
 
+class FakeGlobalRlMap:
+    def __init__(self, active=0):
+        self._active = active
+        self.ops = []
+        self.closed = False
+
+    def get(self):
+        return self._active
+
+    def set(self, byte_rate_max, dry_run=False):
+        self.ops.append((byte_rate_max, dry_run))
+        self._active = byte_rate_max
+        return True
+
+    def close(self):
+        self.closed = True
+
+
 def make_proc_event_message(what: int) -> bytes:
     payload = struct.pack("I", what)
     cn = struct.pack("IIIIHH", proc_events_mod._CN_IDX_PROC, 1, 0, 0, len(payload), 0) + payload
@@ -228,6 +246,7 @@ class XdpPortSyncTests(unittest.TestCase):
             "xdp_icmp_rate_pps": cfg.XDP_ICMP_RATE_PPS,
             "xdp_udp_global_window_seconds": cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS,
             "xdp_rate_window_seconds": cfg.XDP_RATE_WINDOW_SECONDS,
+            "xdp_udp_global_byte_rate": cfg.XDP_UDP_GLOBAL_BYTE_RATE,
         }
         try:
             cfg.apply_toml_config({
@@ -263,6 +282,7 @@ class XdpPortSyncTests(unittest.TestCase):
                         "icmp_rate_pps": 50,
                         "udp_global_window_seconds": 2,
                         "rate_window_seconds": 0.5,
+                        "udp_global_byte_rate_mbps": 997,
                     },
                 },
             })
@@ -291,6 +311,7 @@ class XdpPortSyncTests(unittest.TestCase):
             self.assertEqual(cfg.XDP_ICMP_RATE_PPS, 50)
             self.assertEqual(cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS, 2)
             self.assertEqual(cfg.XDP_RATE_WINDOW_SECONDS, 0.5)
+            self.assertEqual(cfg.XDP_UDP_GLOBAL_BYTE_RATE, 124_625_000)
             self.assertFalse(cfg.DROP_EVENTS_ENABLED)
         finally:
             cfg.LOG_LEVEL = old_values["log_level"]
@@ -321,6 +342,7 @@ class XdpPortSyncTests(unittest.TestCase):
             cfg.XDP_ICMP_RATE_PPS = old_values["xdp_icmp_rate_pps"]
             cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS = old_values["xdp_udp_global_window_seconds"]
             cfg.XDP_RATE_WINDOW_SECONDS = old_values["xdp_rate_window_seconds"]
+            cfg.XDP_UDP_GLOBAL_BYTE_RATE = old_values["xdp_udp_global_byte_rate"]
 
     def test_udp_malformed_drop_only_rejects_port_zero(self):
         source = (Path(__file__).resolve().parents[2] / "bpf" / "include" / "parse.h").read_text()
@@ -488,26 +510,30 @@ class XdpPortSyncTests(unittest.TestCase):
             return services[(port, proto)]
 
         with mock.patch.object(policy_mod, "service_name", side_effect=fake_service_name), \
-             mock.patch.object(policy_mod.cfg, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
-             mock.patch.object(policy_mod.cfg, "_SYN_RATE_BY_SERVICE", {"ssh": 2}), \
-             mock.patch.object(policy_mod.cfg, "_UDP_RATE_BY_PROC", {"named": 5000}), \
-             mock.patch.object(policy_mod.cfg, "_UDP_RATE_BY_SERVICE", {"domain": 5000}), \
-             mock.patch.object(policy_mod.cfg, "TCP_PERMANENT", {22: "ssh"}), \
-             mock.patch.object(policy_mod.cfg, "UDP_PERMANENT", {123: "ntp"}), \
-             mock.patch.object(policy_mod.cfg, "SCTP_PERMANENT", {3868: "diameter"}), \
-             mock.patch.object(policy_mod.cfg, "TRUSTED_SRC_IPS", {"203.0.113.8/32": "office"}), \
-             mock.patch.object(policy_mod.cfg, "ACL_RULES", [{"proto": "tcp", "cidr": "203.0.113.0/24", "ports": [22, 443]}]), \
-             mock.patch.object(policy_mod.cfg, "BOGON_FILTER_ENABLED", True), \
-             mock.patch.object(policy_mod.cfg, "RATE_LIMIT_SOURCE_PREFIX_V4", 24), \
-             mock.patch.object(policy_mod.cfg, "RATE_LIMIT_SOURCE_PREFIX_V6", 64), \
-             mock.patch.object(policy_mod.cfg, "XDP_TCP_TIMEOUT_SECONDS", 600.0), \
-             mock.patch.object(policy_mod.cfg, "XDP_UDP_TIMEOUT_SECONDS", 120.0), \
-             mock.patch.object(policy_mod.cfg, "XDP_CONNTRACK_REFRESH_SECONDS", 45.0), \
-             mock.patch.object(policy_mod.cfg, "XDP_ICMP_BURST_PACKETS", 200), \
-             mock.patch.object(policy_mod.cfg, "XDP_ICMP_RATE_PPS", 50.0), \
-             mock.patch.object(policy_mod.cfg, "XDP_UDP_GLOBAL_WINDOW_SECONDS", 2.0), \
-             mock.patch.object(policy_mod.cfg, "XDP_RATE_WINDOW_SECONDS", 0.5), \
-             mock.patch.object(policy_mod.cfg, "XDP_SYN_TIMEOUT_SECONDS", 10.0):
+             mock.patch.multiple(
+                 policy_mod.cfg,
+                 _SYN_RATE_BY_PROC={"sshd": 2},
+                 _SYN_RATE_BY_SERVICE={"ssh": 2},
+                 _UDP_RATE_BY_PROC={"named": 5000},
+                 _UDP_RATE_BY_SERVICE={"domain": 5000},
+                 TCP_PERMANENT={22: "ssh"},
+                 UDP_PERMANENT={123: "ntp"},
+                 SCTP_PERMANENT={3868: "diameter"},
+                 TRUSTED_SRC_IPS={"203.0.113.8/32": "office"},
+                 ACL_RULES=[{"proto": "tcp", "cidr": "203.0.113.0/24", "ports": [22, 443]}],
+                 BOGON_FILTER_ENABLED=True,
+                 RATE_LIMIT_SOURCE_PREFIX_V4=24,
+                 RATE_LIMIT_SOURCE_PREFIX_V6=64,
+                 XDP_TCP_TIMEOUT_SECONDS=600.0,
+                 XDP_UDP_TIMEOUT_SECONDS=120.0,
+                 XDP_CONNTRACK_REFRESH_SECONDS=45.0,
+                 XDP_ICMP_BURST_PACKETS=200,
+                 XDP_ICMP_RATE_PPS=50.0,
+                 XDP_UDP_GLOBAL_WINDOW_SECONDS=2.0,
+                 XDP_RATE_WINDOW_SECONDS=0.5,
+                 XDP_SYN_TIMEOUT_SECONDS=10.0,
+                 XDP_UDP_GLOBAL_BYTE_RATE=124_625_000,
+             ):
             desired = policy_mod.resolve_desired_state(observed)
 
         self.assertEqual(desired.tcp_ports, {22, 80, 2222})
@@ -520,6 +546,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertTrue(desired.bogon_filter_enabled)
         self.assertEqual(desired.rate_limit_source_prefix_v4, 24)
         self.assertEqual(desired.rate_limit_source_prefix_v6, 64)
+        self.assertEqual(desired.udp_global_byte_rate, 124_625_000)
         self.assertEqual(
             desired.xdp_runtime_config,
             (
@@ -549,6 +576,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.udp_agg_rate_map = FakeUdpPortMap()
         backend.acl_maps = None
         backend.runtime_config_map = FakeRuntimeConfigMap()
+        backend.global_rl_map = FakeGlobalRlMap()
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap({0})
         backend.sit4_map = None
@@ -576,6 +604,7 @@ class XdpPortSyncTests(unittest.TestCase):
             udp_rate_limits={53: 5000},
             udp_agg_rate_limits={53: 6000000},
             drop_events_enabled=False,
+            udp_global_byte_rate=124_625_000,
             xdp_runtime_config=runtime_cfg,
         )
         observed = state_mod.ObservedState(tcp_processes={22: "sshd"}, udp_processes={53: "named"})
@@ -601,6 +630,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(backend.udp_rate_map.set_ops, [(53, 5000, False)])
         self.assertEqual(backend.udp_agg_rate_map.set_ops, [(53, 6000000, False)])
         self.assertEqual(backend.runtime_config_map.ops, [(runtime_cfg, False)])
+        self.assertEqual(backend.global_rl_map.ops, [(124_625_000, False)])
         self.assertEqual(backend.observability_cfg_map.ops, [(0, 0, False)])
 
     def test_xdp_backend_stale_conntrack_removal_requires_repeated_misses(self):
@@ -623,6 +653,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
+        backend.global_rl_map = None
         backend._conntrack_stale_rounds = {}
 
         desired = state_mod.DesiredState()
@@ -655,6 +686,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
+        backend.global_rl_map = None
         backend._conntrack_stale_rounds = {}
         backend.conntrack_map.existing_keys = mock.Mock(return_value=set())
 
@@ -833,6 +865,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
+        backend.global_rl_map = None
         backend._conntrack_stale_rounds = {}
 
         backend.reconcile(state_mod.DesiredState(), dry_run=True, observed_state=state_mod.ObservedState())
@@ -945,6 +978,9 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap()
         backend.sit4_map = None
+        backend.global_rl_map = FakeGlobalRlMap()
+        backend._abuseipdb_syncer = None
+        backend._risk_maps = None
 
         backend.close()
 
@@ -956,6 +992,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertTrue(backend.udp_conntrack_map.closed)
         self.assertTrue(backend.runtime_config_map.closed)
         self.assertTrue(backend.observability_cfg_map.closed)
+        self.assertTrue(backend.global_rl_map.closed)
 
     def test_nftables_backend_ensure_ruleset_keeps_existing_complete_ruleset(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)

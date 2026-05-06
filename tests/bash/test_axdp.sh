@@ -248,6 +248,182 @@ test_detect_backend_reports_missing_state() (
     assert_contains "$output" "No active Auto XDP backend detected."
 )
 
+_setup_reattach_test_env() {
+    local tmpdir="$1"
+    BPF_PIN_DIR="$tmpdir/bpf"
+    RUN_STATE_DIR="$tmpdir/run"
+    XDP_OBJ_PATH="$tmpdir/xdp.o"
+    mkdir -p "$BPF_PIN_DIR" "$RUN_STATE_DIR" "$tmpdir/bin"
+
+    # satisfy ensure_xdp_loaded preconditions
+    touch "$BPF_PIN_DIR/prog" "$XDP_OBJ_PATH"
+    for _m in tcp_whitelist udp_whitelist pkt_counters syn_rate tcp_ct4 tcp_ct6 udp_ct4 udp_ct6; do
+        touch "$BPF_PIN_DIR/$_m"
+    done
+
+    # bpftool must exist in PATH for ensure_xdp_loaded to proceed
+    printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/bpftool"
+    chmod +x "$tmpdir/bin/bpftool"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+
+    # stubs for functions from auto_xdp_runtime_common.sh (not loaded in tests)
+    ensure_bpffs() { return 0; }
+    cleanup_tc_egress_filter() { return 0; }
+    xdp_maps_ready() { return 0; }
+    load_port_handlers() { return 0; }
+    auto_tune_interface_parallelism() { return 0; }
+}
+
+test_ensure_xdp_reattach_records_generic_mode_on_fallback() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+
+    # eth0 has no xdp (needs re-attach); native fails, generic succeeds
+    # eth1 already has native xdp
+    cat >"$tmpdir/bin/ip" <<'EOF_IP'
+#!/bin/sh
+args="$*"
+if echo "$args" | grep -q "show.*eth0\b\|show dev eth0"; then
+    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether\n"
+elif echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
+    printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
+elif echo "$args" | grep -q "set.*eth0.*xdp generic"; then
+    exit 0
+elif echo "$args" | grep -q "set.*eth0.*xdp "; then
+    exit 1
+fi
+exit 0
+EOF_IP
+    chmod +x "$tmpdir/bin/ip"
+
+    _IFACES=(eth0 eth1)
+    ensure_xdp_loaded || return 1
+    assert_eq "$(cat "$RUN_STATE_DIR/xdp_mode")" "generic"
+)
+
+test_ensure_xdp_reattach_records_native_mode_when_all_native() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+
+    # eth0 has no xdp; re-attach succeeds native. eth1 already has native xdp.
+    cat >"$tmpdir/bin/ip" <<'EOF_IP'
+#!/bin/sh
+args="$*"
+if echo "$args" | grep -q "show.*eth0\b\|show dev eth0"; then
+    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether\n"
+elif echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
+    printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
+elif echo "$args" | grep -q "set.*eth0.*xdp "; then
+    exit 0
+fi
+exit 0
+EOF_IP
+    chmod +x "$tmpdir/bin/ip"
+
+    _IFACES=(eth0 eth1)
+    ensure_xdp_loaded || return 1
+    assert_eq "$(cat "$RUN_STATE_DIR/xdp_mode")" "native"
+)
+
+test_ensure_xdp_reattach_records_generic_when_existing_iface_is_generic() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+
+    # Both interfaces already have xdp attached; eth1 is generic only
+    cat >"$tmpdir/bin/ip" <<'EOF_IP'
+#!/bin/sh
+args="$*"
+if echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
+    printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdpgeneric\n"
+else
+    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
+fi
+exit 0
+EOF_IP
+    chmod +x "$tmpdir/bin/ip"
+
+    _IFACES=(eth0 eth1)
+    ensure_xdp_loaded || return 1
+    assert_eq "$(cat "$RUN_STATE_DIR/xdp_mode")" "generic"
+)
+
+test_detect_backend_multi_iface_second_only() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    RUN_STATE_DIR="$tmpdir/run"
+    BPF_PIN_DIR="$tmpdir/bpf"
+    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
+    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
+    touch "$BPF_PIN_DIR/pkt_counters"
+
+    # stub ip: eth0 has no xdp, eth1 has xdp (native)
+    cat >"$tmpdir/bin/ip" <<'EOF_IP'
+#!/bin/sh
+if echo "$@" | grep -q eth1; then
+    echo "    link/ether xdp"
+else
+    echo "    link/ether"
+fi
+exit 0
+EOF_IP
+    chmod +x "$tmpdir/bin/ip"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+    IFACES="eth0 eth1"
+    IFACE="eth0"
+    BACKEND=""
+    detect_backend || return 1
+    assert_eq "$BACKEND" "xdp"
+)
+
+test_detect_backend_multi_iface_mixed_modes() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    RUN_STATE_DIR="$tmpdir/run"
+    BPF_PIN_DIR="$tmpdir/bpf"
+    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
+    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
+    touch "$BPF_PIN_DIR/pkt_counters"
+
+    # stub ip: eth0 has native xdp, eth1 has generic xdp (no native support)
+    cat >"$tmpdir/bin/ip" <<'EOF_IP'
+#!/bin/sh
+if echo "$@" | grep -q eth1; then
+    echo "    link/ether xdpgeneric"
+else
+    echo "    link/ether xdp"
+fi
+exit 0
+EOF_IP
+    chmod +x "$tmpdir/bin/ip"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+    IFACES="eth0 eth1"
+    IFACE="eth0"
+    BACKEND=""
+    detect_backend || return 1
+    assert_eq "$BACKEND" "xdp"
+)
+
 test_run_backend_reports_runtime_state_and_conntrack_counts() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -524,6 +700,11 @@ run_test "axdp permanent supports SCTP ports" test_run_permanent_supports_sctp_p
 run_test "axdp detects active xdp backend from runtime state" test_detect_backend_prefers_xdp_runtime_state
 run_test "axdp detects nftables fallback backend" test_detect_backend_falls_back_to_nftables
 run_test "axdp reports when no backend is active" test_detect_backend_reports_missing_state
+run_test "axdp detects xdp backend when only second iface has xdp attached" test_detect_backend_multi_iface_second_only
+run_test "axdp detects xdp backend with mixed native and generic ifaces" test_detect_backend_multi_iface_mixed_modes
+run_test "auto_xdp_start records generic xdp_mode when re-attach falls back to generic" test_ensure_xdp_reattach_records_generic_mode_on_fallback
+run_test "auto_xdp_start records native xdp_mode when re-attach succeeds natively" test_ensure_xdp_reattach_records_native_mode_when_all_native
+run_test "auto_xdp_start records generic xdp_mode when existing iface already in generic mode" test_ensure_xdp_reattach_records_generic_when_existing_iface_is_generic
 run_test "axdp backend reports runtime attach state and conntrack counts" test_run_backend_reports_runtime_state_and_conntrack_counts
 run_test "axdp backend json reports runtime attach state and conntrack counts" test_run_backend_json_reports_runtime_state_and_conntrack_counts
 run_test "axdp conntrack summarizes destination ports" test_run_conntrack_summarizes_destination_ports
