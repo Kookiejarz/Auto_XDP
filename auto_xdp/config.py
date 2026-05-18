@@ -36,6 +36,10 @@ _SYN_AGG_RATE_BY_PROC: dict[str, int] = {}
 _SYN_AGG_RATE_BY_SERVICE: dict[str, int] = {}
 _TCP_CONN_BY_PROC: dict[str, int] = {}
 _TCP_CONN_BY_SERVICE: dict[str, int] = {}
+_TCP_CONN_PREFIX_BY_PROC: dict[str, int] = {}
+_TCP_CONN_PREFIX_BY_SERVICE: dict[str, int] = {}
+_TCP_CONN_PORT_BY_PROC: dict[str, int] = {}
+_TCP_CONN_PORT_BY_SERVICE: dict[str, int] = {}
 _UDP_RATE_BY_PROC: dict[str, int] = {}
 _UDP_RATE_BY_SERVICE: dict[str, int] = {}
 _UDP_AGG_BYTES_BY_PROC: dict[str, int] = {}
@@ -126,6 +130,9 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "udp_hv6",
     "slot_ctx_map",
     "slot_def_action",
+    "tsc_pfx4",
+    "tsc_pfx6",
+    "tsc_port",
 )
 
 
@@ -163,6 +170,10 @@ def load_required_xdp_map_names() -> tuple[str, ...]:
 
 REQUIRED_XDP_MAP_NAMES = load_required_xdp_map_names()
 
+TSC_PFX4_MAP_PATH = ""
+TSC_PFX6_MAP_PATH = ""
+TSC_PORT_MAP_PATH = ""
+
 
 def _set_bpf_pin_dir(pin_dir: str) -> None:
     """Update BPF_PIN_DIR and every derived map-path global in one place."""
@@ -177,6 +188,7 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     global TCP_ACL_MAP_PATH4, TCP_ACL_MAP_PATH6
     global UDP_ACL_MAP_PATH4, UDP_ACL_MAP_PATH6
     global SIT4_ENDPOINTS_MAP_PATH
+    global TSC_PFX4_MAP_PATH, TSC_PFX6_MAP_PATH, TSC_PORT_MAP_PATH
     global REQUIRED_XDP_MAP_PATHS
     BPF_PIN_DIR = pin_dir
     TCP_MAP_PATH = f"{pin_dir}/tcp_whitelist"
@@ -199,6 +211,9 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     UDP_ACL_MAP_PATH4 = f"{pin_dir}/udp_acl_v4"
     UDP_ACL_MAP_PATH6 = f"{pin_dir}/udp_acl_v6"
     SIT4_ENDPOINTS_MAP_PATH = f"{pin_dir}/sit4_endpoints"
+    TSC_PFX4_MAP_PATH = f"{pin_dir}/tsc_pfx4"
+    TSC_PFX6_MAP_PATH = f"{pin_dir}/tsc_pfx6"
+    TSC_PORT_MAP_PATH = f"{pin_dir}/tsc_port"
     REQUIRED_XDP_MAP_PATHS = tuple(f"{pin_dir}/{n}" for n in REQUIRED_XDP_MAP_NAMES)
 
 
@@ -327,6 +342,10 @@ def apply_toml_config(cfg: dict) -> None:
     _SYN_AGG_RATE_BY_SERVICE.clear()
     _TCP_CONN_BY_PROC.clear()
     _TCP_CONN_BY_SERVICE.clear()
+    _TCP_CONN_PREFIX_BY_PROC.clear()
+    _TCP_CONN_PREFIX_BY_SERVICE.clear()
+    _TCP_CONN_PORT_BY_PROC.clear()
+    _TCP_CONN_PORT_BY_SERVICE.clear()
     _UDP_RATE_BY_PROC.clear()
     _UDP_RATE_BY_SERVICE.clear()
     _UDP_AGG_BYTES_BY_PROC.clear()
@@ -379,6 +398,10 @@ def apply_toml_config(cfg: dict) -> None:
     _SYN_AGG_RATE_BY_SERVICE.update({k: int(v) for k, v in rl.get("syn_agg_by_service", {}).items()})
     _TCP_CONN_BY_PROC.update({k: int(v) for k, v in rl.get("tcp_conn_by_proc", {}).items()})
     _TCP_CONN_BY_SERVICE.update({k: int(v) for k, v in rl.get("tcp_conn_by_service", {}).items()})
+    _TCP_CONN_PREFIX_BY_PROC.update({k: int(v) for k, v in rl.get("tcp_conn_prefix_by_proc", {}).items()})
+    _TCP_CONN_PREFIX_BY_SERVICE.update({k: int(v) for k, v in rl.get("tcp_conn_prefix_by_service", {}).items()})
+    _TCP_CONN_PORT_BY_PROC.update({k: int(v) for k, v in rl.get("tcp_conn_port_by_proc", {}).items()})
+    _TCP_CONN_PORT_BY_SERVICE.update({k: int(v) for k, v in rl.get("tcp_conn_port_by_service", {}).items()})
     _UDP_RATE_BY_PROC.update({k: int(v) for k, v in rl.get("udp_by_proc", {}).items()})
     _UDP_RATE_BY_SERVICE.update({k: int(v) for k, v in rl.get("udp_by_service", {}).items()})
     _UDP_AGG_BYTES_BY_PROC.update({k: int(v) for k, v in rl.get("udp_agg_bytes_by_proc", {}).items()})

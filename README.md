@@ -759,6 +759,37 @@ For bugs or questions, please [open an issue](https://github.com/Kookiejarz/Auto
  </picture>
 </a>
 
+## Behavior change — default-on TCP protection
+
+Previously, TCP SYN-rate / SYN-aggregate-rate / per-source ESTABLISHED-cap
+controls only applied to ports listed in `[rate_limits.syn_by_proc]` /
+`[rate_limits.syn_by_service]` (and the parallel `tcp_conn_by_*` tables);
+all other ports ran unprotected.
+
+Now every auto-discovered TCP port receives baseline protection from five layers:
+
+| Layer | Key | Normal default | Strict default (sensitive procs) |
+|---|---|---|---|
+| L1 SYN rate (per-source) | (src/prefix, port) | 100 SYN/s | 5 SYN/s |
+| L2 SYN aggregate rate (per-prefix) | (prefix, port) | 1000 SYN/s | 50 SYN/s |
+| L3 Per-source ESTABLISHED cap | (src/32, port) | 50 | 5 |
+| L4 Per-prefix ESTABLISHED cap | (prefix, port) | 200 | 20 |
+| L5 Per-port total ESTABLISHED cap | (port) | 5000 | 200 |
+
+"Sensitive" = process or service is in `[rate_limits.syn_by_proc]` /
+`syn_by_service` with rate ≤ `sensitive_port_threshold` (default 5).
+This covers SSH, databases, RDP, telnet.
+
+The shipped `[rate_limits].source_cidr_v4` defaults to `/24` so per-prefix
+counters (L2 and L4) cover /24-scale aggregation out of the box.
+
+**Operators wanting to disable protection for a specific port** can pin any
+knob to `0` via the matching `[rate_limits].*_by_proc` / `*_by_service` table
+entry. See `docs/superpowers/specs/2026-05-06-tcp-default-on-protection-design.md`
+for the full design rationale.
+
+---
+
 ## 📄 License
 
 [MPL 2.0](./LICENSE) © 2026 Yunheng Liu

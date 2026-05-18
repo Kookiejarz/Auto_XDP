@@ -357,12 +357,14 @@ class XdpPortSyncTests(unittest.TestCase):
 
     def test_port_rate_limit_prefers_process_name_then_service_name(self):
         import auto_xdp.policy as policy
+        # Use a rate above the sensitive threshold (5) so the service entry is
+        # returned as-is rather than triggering the strict default tier.
         with mock.patch.object(policy, "service_name", side_effect=lambda port, proto: "ssh" if port == 22 else "http"), \
              mock.patch.object(policy.cfg, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
-             mock.patch.object(policy.cfg, "_SYN_RATE_BY_SERVICE", {"ssh": 2}):
-            self.assertEqual(policy._port_rate_limit(2222, "sshd"), 2)
-            self.assertEqual(policy._port_rate_limit(22), 2)
-            self.assertEqual(policy._port_rate_limit(80), 0)
+             mock.patch.object(policy.cfg, "_SYN_RATE_BY_SERVICE", {"ssh": 10}):
+            self.assertEqual(policy._port_rate_limit(2222, "sshd"), 2)  # explicit proc
+            self.assertEqual(policy._port_rate_limit(22), 10)            # explicit service (above threshold)
+            self.assertEqual(policy._port_rate_limit(80), cfg.XDP_DEFAULT_TCP_SYN_RATE)  # normal default
 
     def test_policy_uses_rebound_config_dicts_not_import_time_aliases(self):
         import auto_xdp.policy as policy
@@ -370,10 +372,12 @@ class XdpPortSyncTests(unittest.TestCase):
         old_service = policy.cfg._SYN_RATE_BY_SERVICE
         try:
             policy.cfg._SYN_RATE_BY_PROC = {"sshd": 3}
-            policy.cfg._SYN_RATE_BY_SERVICE = {"ssh": 4}
+            # Use rate above sensitive threshold (5) to test that the rebound
+            # service dict is read (not import-time alias).
+            policy.cfg._SYN_RATE_BY_SERVICE = {"ssh": 10}
             with mock.patch.object(policy, "service_name", return_value="ssh"):
                 self.assertEqual(policy._port_rate_limit(2222, "sshd"), 3)
-                self.assertEqual(policy._port_rate_limit(22), 4)
+                self.assertEqual(policy._port_rate_limit(22), 10)
         finally:
             policy.cfg._SYN_RATE_BY_PROC = old_proc
             policy.cfg._SYN_RATE_BY_SERVICE = old_service
@@ -540,8 +544,16 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(desired.udp_ports, {53, 123})
         self.assertEqual(desired.sctp_ports, {2905, 3868})
         self.assertEqual(desired.trusted_cidrs, {"203.0.113.8/32"})
-        self.assertEqual(desired.tcp_syn_rate_limits, {22: 2, 2222: 2})
-        self.assertEqual(desired.udp_rate_limits, {53: 5000})
+        # Port 2222: explicit proc (sshd=2). Port 22: ssh=2 ≤ threshold → strict
+        # default tier. Port 80: no match → normal default tier.
+        self.assertEqual(desired.tcp_syn_rate_limits.get(2222), 2)
+        self.assertEqual(desired.tcp_syn_rate_limits.get(22), cfg.XDP_DEFAULT_TCP_SYN_RATE_STRICT)
+        self.assertEqual(desired.tcp_syn_rate_limits.get(80), cfg.XDP_DEFAULT_TCP_SYN_RATE)
+        # UDP resolvers still return 0 for unconfigured ports; the filter
+        # removal means those 0-valued entries now appear in desired_state
+        # (harmless — BPF treats 0 as disabled, same as no entry).
+        self.assertEqual(desired.udp_rate_limits.get(53), 5000)
+        self.assertIn(123, desired.udp_rate_limits)  # present, value 0 (no config)
         self.assertEqual(desired.acl_rules, {("tcp", "203.0.113.0/24"): frozenset({22, 443})})
         self.assertTrue(desired.bogon_filter_enabled)
         self.assertEqual(desired.rate_limit_source_prefix_v4, 24)
@@ -572,6 +584,8 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.syn_rate_map = FakeSynRateMap({22: 1})
         backend.syn_agg_rate_map = FakeSynRateMap()
         backend.tcp_conn_limit_map = FakeSynRateMap()
+        backend.tcp_conn_prefix_limit_map = None
+        backend.tcp_conn_port_limit_map = None
         backend.udp_rate_map = FakeUdpPortMap()
         backend.udp_agg_rate_map = FakeUdpPortMap()
         backend.acl_maps = None
@@ -644,6 +658,8 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.syn_rate_map = None
         backend.syn_agg_rate_map = None
         backend.tcp_conn_limit_map = None
+        backend.tcp_conn_prefix_limit_map = None
+        backend.tcp_conn_port_limit_map = None
         backend.udp_rate_map = None
         backend.udp_agg_rate_map = None
         backend.acl_maps = None
@@ -677,6 +693,8 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.syn_rate_map = None
         backend.syn_agg_rate_map = None
         backend.tcp_conn_limit_map = None
+        backend.tcp_conn_prefix_limit_map = None
+        backend.tcp_conn_port_limit_map = None
         backend.udp_rate_map = None
         backend.udp_agg_rate_map = None
         backend.acl_maps = None
@@ -856,6 +874,8 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.syn_rate_map = None
         backend.syn_agg_rate_map = None
         backend.tcp_conn_limit_map = None
+        backend.tcp_conn_prefix_limit_map = None
+        backend.tcp_conn_port_limit_map = None
         backend.udp_rate_map = None
         backend.udp_agg_rate_map = None
         backend.acl_maps = None
@@ -889,16 +909,22 @@ class XdpPortSyncTests(unittest.TestCase):
             self.assertEqual(policy._udp_port_rate_limit(123), 500)
             self.assertEqual(policy._udp_port_rate_limit(12345), 0)
 
-    def test_syn_aggregate_and_tcp_conn_limits_derive_from_syn_rate(self):
+    def test_syn_aggregate_and_tcp_conn_limits_use_default_tiers(self):
+        # Replaces old "derive via 8× / 16× multiplier" test.
+        # ssh=2 ≤ sensitive_threshold (5) → strict default tier for all caps.
+        # port 80: no match → normal default tier.
         import auto_xdp.policy as policy
         with mock.patch.object(policy, "service_name", side_effect=lambda port, proto: "ssh" if port == 22 else "http"), \
              mock.patch.object(policy.cfg, "_SYN_RATE_BY_SERVICE", {"ssh": 2}), \
              mock.patch.object(policy.cfg, "_SYN_AGG_RATE_BY_SERVICE", {}), \
-             mock.patch.object(policy.cfg, "_TCP_CONN_BY_SERVICE", {}):
-            self.assertEqual(policy._syn_aggregate_rate_limit(22), 16)
-            self.assertEqual(policy._tcp_conn_limit(22), 32)
-            self.assertEqual(policy._syn_aggregate_rate_limit(80), 0)
-            self.assertEqual(policy._tcp_conn_limit(80), 0)
+             mock.patch.object(policy.cfg, "_TCP_CONN_BY_SERVICE", {}), \
+             mock.patch.object(policy.cfg, "_SYN_RATE_BY_PROC", {}), \
+             mock.patch.object(policy.cfg, "_SYN_AGG_RATE_BY_PROC", {}), \
+             mock.patch.object(policy.cfg, "_TCP_CONN_BY_PROC", {}):
+            self.assertEqual(policy._syn_aggregate_rate_limit(22), cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT)
+            self.assertEqual(policy._tcp_conn_limit(22), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT)
+            self.assertEqual(policy._syn_aggregate_rate_limit(80), cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE)
+            self.assertEqual(policy._tcp_conn_limit(80), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC)
 
     def test_udp_aggregate_byte_limit_uses_explicit_or_derived_values(self):
         import auto_xdp.policy as policy
@@ -971,6 +997,8 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.syn_rate_map = FakeSynRateMap()
         backend.syn_agg_rate_map = FakeSynRateMap()
         backend.tcp_conn_limit_map = FakeSynRateMap()
+        backend.tcp_conn_prefix_limit_map = None
+        backend.tcp_conn_port_limit_map = None
         backend.udp_rate_map = FakeUdpPortMap()
         backend.udp_agg_rate_map = FakeUdpPortMap()
         backend.acl_maps = None
@@ -993,6 +1021,37 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertTrue(backend.runtime_config_map.closed)
         self.assertTrue(backend.observability_cfg_map.closed)
         self.assertTrue(backend.global_rl_map.closed)
+
+
+class TcpDefaultOnSmokeTests(unittest.TestCase):
+    """End-to-end: default-on protection reaches the plan layer on all 5 layers."""
+
+    def test_unconfigured_port_produces_plan_entries_for_all_five_layers(self):
+        observed = state_mod.ObservedState(
+            tcp={8080},
+            tcp_processes={8080: "myapp"},
+        )
+        desired = policy_mod.resolve_desired_state(observed)
+
+        # L1 SYN rate — Bug 1 fix
+        self.assertEqual(desired.tcp_syn_rate_limits.get(8080), cfg.XDP_DEFAULT_TCP_SYN_RATE)
+        # L2 SYN agg rate — Bug 1 fix
+        self.assertEqual(desired.tcp_syn_agg_rate_limits.get(8080), cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE)
+        # L3 per-src ESTABLISHED — Bug 1 fix
+        self.assertEqual(desired.tcp_conn_limits.get(8080), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC)
+        # L4 per-prefix ESTABLISHED — Bug 2
+        self.assertEqual(desired.tcp_conn_prefix_limits.get(8080), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX)
+        # L5 per-port ESTABLISHED — Bug 2
+        self.assertEqual(desired.tcp_conn_port_limits.get(8080), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT)
+
+        # All 5 layers must propagate into a fresh reconcile plan.
+        applied = state_mod.AppliedState()
+        plan = state_mod.compute_reconcile_plan(desired, applied)
+        self.assertIn(8080, plan.tcp_syn_rate_limits_to_upsert)
+        self.assertIn(8080, plan.tcp_syn_agg_rate_limits_to_upsert)
+        self.assertIn(8080, plan.tcp_conn_limits_to_upsert)
+        self.assertIn(8080, plan.tcp_conn_prefix_limits_to_upsert)
+        self.assertIn(8080, plan.tcp_conn_port_limits_to_upsert)
 
     def test_nftables_backend_ensure_ruleset_keeps_existing_complete_ruleset(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)

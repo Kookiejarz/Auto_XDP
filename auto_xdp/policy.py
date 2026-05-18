@@ -27,6 +27,44 @@ def _xdp_runtime_config() -> tuple[int, int, int, int, int, int, int, int]:
     )
 
 
+def _explicit_lookup(
+    port: int,
+    proc: str,
+    proc_limits: dict[str, int],
+    service_limits: dict[str, int],
+) -> int | None:
+    """Return explicit operator value for the port, or None if no entry matches.
+
+    Critically distinguishes "explicit 0 (pin off)" from "missing entry"
+    (which lets callers apply default-tier values).
+    """
+    if proc and proc in proc_limits:
+        return proc_limits[proc]
+    svc = service_name(port, "tcp")
+    if svc and svc in service_limits:
+        return service_limits[svc]
+    return None
+
+
+def _is_sensitive(port: int, proc: str) -> bool:
+    """A port is sensitive iff the owning proc/service has rate <= threshold.
+
+    Rate 0 (pin off) is exempt, not sensitive — it does not promote
+    the port to the strict tier.
+    """
+    threshold = cfg.XDP_SENSITIVE_PORT_THRESHOLD
+    if proc:
+        rate = cfg._SYN_RATE_BY_PROC.get(proc)
+        if rate is not None and 0 < rate <= threshold:
+            return True
+    svc = service_name(port, "tcp")
+    if svc:
+        rate = cfg._SYN_RATE_BY_SERVICE.get(svc)
+        if rate is not None and 0 < rate <= threshold:
+            return True
+    return False
+
+
 def _resolve_service_limit(
     port: int,
     proto: str,
@@ -45,34 +83,64 @@ def _resolve_service_limit(
 
 
 def _port_rate_limit(port: int, proc: str = "") -> int:
-    """Return the SYN rate limit for a TCP port, or 0 to skip rate limiting.
-
-    Resolution order:
-      1. Process name (_SYN_RATE_BY_PROC) — catches services on non-standard ports.
-      2. IANA service name (_SYN_RATE_BY_SERVICE) — fallback for unknown processes.
-      3. Anything else → 0 (no rate limit).
-    """
-    return _resolve_service_limit(port, "tcp", proc, cfg._SYN_RATE_BY_PROC, cfg._SYN_RATE_BY_SERVICE)
+    # Proc-table is authoritative explicit override (inc. explicit 0 = pin off).
+    if proc and proc in cfg._SYN_RATE_BY_PROC:
+        return cfg._SYN_RATE_BY_PROC[proc]
+    # Service-table entry ≤ threshold acts as a sensitivity marker; the resolver
+    # applies the strict default rather than the raw service value.
+    if _is_sensitive(port, proc):
+        return cfg.XDP_DEFAULT_TCP_SYN_RATE_STRICT
+    # Explicit service-table value above the sensitive threshold.
+    explicit = _explicit_lookup(
+        port, proc, cfg._SYN_RATE_BY_PROC, cfg._SYN_RATE_BY_SERVICE,
+    )
+    if explicit is not None:
+        return explicit
+    return cfg.XDP_DEFAULT_TCP_SYN_RATE
 
 
 def _syn_aggregate_rate_limit(port: int, proc: str = "") -> int:
-    limit = _resolve_service_limit(
-        port, "tcp", proc, cfg._SYN_AGG_RATE_BY_PROC, cfg._SYN_AGG_RATE_BY_SERVICE
+    explicit = _explicit_lookup(
+        port, proc, cfg._SYN_AGG_RATE_BY_PROC, cfg._SYN_AGG_RATE_BY_SERVICE,
     )
-    if limit > 0:
-        return limit
-    base = _port_rate_limit(port, proc)
-    return base * 8 if base > 0 else 0
+    if explicit is not None:
+        return explicit
+    if _is_sensitive(port, proc):
+        return cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT
+    return cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE
 
 
 def _tcp_conn_limit(port: int, proc: str = "") -> int:
-    limit = _resolve_service_limit(
-        port, "tcp", proc, cfg._TCP_CONN_BY_PROC, cfg._TCP_CONN_BY_SERVICE
+    explicit = _explicit_lookup(
+        port, proc, cfg._TCP_CONN_BY_PROC, cfg._TCP_CONN_BY_SERVICE,
     )
-    if limit > 0:
-        return limit
-    base = _port_rate_limit(port, proc)
-    return max(16, base * 16) if base > 0 else 0
+    if explicit is not None:
+        return explicit
+    if _is_sensitive(port, proc):
+        return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT
+    return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC
+
+
+def _tcp_conn_prefix_limit(port: int, proc: str = "") -> int:
+    explicit = _explicit_lookup(
+        port, proc, cfg._TCP_CONN_PREFIX_BY_PROC, cfg._TCP_CONN_PREFIX_BY_SERVICE,
+    )
+    if explicit is not None:
+        return explicit
+    if _is_sensitive(port, proc):
+        return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX_STRICT
+    return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX
+
+
+def _tcp_conn_port_limit(port: int, proc: str = "") -> int:
+    explicit = _explicit_lookup(
+        port, proc, cfg._TCP_CONN_PORT_BY_PROC, cfg._TCP_CONN_PORT_BY_SERVICE,
+    )
+    if explicit is not None:
+        return explicit
+    if _is_sensitive(port, proc):
+        return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT_STRICT
+    return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT
 
 
 def _udp_port_rate_limit(port: int, proc: str = "") -> int:
@@ -95,12 +163,12 @@ def _resolve_port_limits(
     process_names: dict[int, str],
     resolver,
 ) -> dict[int, int]:
-    desired: dict[int, int] = {}
-    for port in ports:
-        limit = resolver(port, process_names.get(port, ""))
-        if limit > 0:
-            desired[port] = limit
-    return desired
+    """Return resolver(port, proc) for every port — including 0 (pin off).
+
+    Pre-default-on, this filtered out 0 to keep the desired-state map small.
+    Now every auto-discovered port produces an entry so default-tier values
+    propagate to the BPF policy map."""
+    return {port: resolver(port, process_names.get(port, "")) for port in ports}
 
 
 def _desired_acl_rules() -> dict[tuple[str, str], frozenset[int]]:
@@ -131,6 +199,12 @@ def resolve_desired_state(observed: ObservedState) -> DesiredState:
             tcp_ports, observed.tcp_processes, _syn_aggregate_rate_limit
         ),
         tcp_conn_limits=_resolve_port_limits(tcp_ports, observed.tcp_processes, _tcp_conn_limit),
+        tcp_conn_prefix_limits=_resolve_port_limits(
+            tcp_ports, observed.tcp_processes, _tcp_conn_prefix_limit
+        ),
+        tcp_conn_port_limits=_resolve_port_limits(
+            tcp_ports, observed.tcp_processes, _tcp_conn_port_limit
+        ),
         udp_rate_limits=_resolve_port_limits(udp_ports, observed.udp_processes, _udp_port_rate_limit),
         udp_agg_rate_limits=_resolve_port_limits(
             udp_ports, observed.udp_processes, _udp_aggregate_byte_limit

@@ -56,20 +56,24 @@ static __always_inline int check_tcp_conntrack(
         }
         {
             __u64 raw = *last_seen;
+            bool was_established = !(raw & CT_SYN_PENDING);
             __u64 ts = raw & ~CT_SYN_PENDING;
             __u64 ct_to = (raw & CT_SYN_PENDING) ? cfg_syn_timeout_ns(cfg) : cfg_tcp_timeout_ns(cfg);
             if (now - ts > ct_to) {
                 tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
-                tcp_src_conn_record_close(key, now, dest_port);
+                if (was_established)
+                    tcp_src_conn_record_close(key, now, dest_port);
                 count(CNT_TCP_CT_MISS);
                 count(CNT_TCP_DROP);
                 emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
                           key->sport, key->dport, (__u8)CNT_TCP_CT_MISS, now);
                 return XDP_DROP;
             }
+            /* Valid RST: delete entry and decrement only if ESTABLISHED. */
+            tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
+            if (was_established)
+                tcp_src_conn_record_close(key, now, dest_port);
         }
-        tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
-        tcp_src_conn_record_close(key, now, dest_port);
         count(CNT_TCP_ESTABLISHED);
         return XDP_PASS;
     }
@@ -92,7 +96,8 @@ static __always_inline int check_tcp_conntrack(
             __u64 ct_timeout = is_half_open ? cfg_syn_timeout_ns(cfg) : cfg_tcp_timeout_ns(cfg);
             if (age > ct_timeout) {
                 tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
-                tcp_src_conn_record_close(key, now, dest_port);
+                if (!is_half_open)
+                    tcp_src_conn_record_close(key, now, dest_port);
                 count(CNT_TCP_CT_MISS);
                 count(CNT_TCP_DROP);
                 emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
@@ -102,14 +107,18 @@ static __always_inline int check_tcp_conntrack(
 
             if (tcp_flags & TCP_FLAG_FIN) {
                 tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
-                tcp_src_conn_record_close(key, now, dest_port);
+                if (!is_half_open)
+                    tcp_src_conn_record_close(key, now, dest_port);
                 count(CNT_TCP_ESTABLISHED);
                 return XDP_PASS;
             }
 
-            if (is_half_open || age > ct_refresh) {
-                // Half-open: promote to established immediately on first ACK.
-                // Established: refresh timestamp after ct_refresh interval.
+            if (is_half_open) {
+                /* Promotion: half-open -> ESTABLISHED. Increment counters. */
+                tcp_conntrack_update(ipv4, &key_v4, &key_v6, now, BPF_EXIST);
+                tcp_src_conn_record_established(key, now, dest_port);
+            } else if (age > ct_refresh) {
+                /* Heartbeat refresh on existing ESTABLISHED: no count change. */
                 tcp_conntrack_update(ipv4, &key_v4, &key_v6, now, BPF_EXIST);
                 tcp_src_conn_record_activity(key, now, dest_port);
             }
@@ -140,8 +149,10 @@ static __always_inline int check_tcp_conntrack(
             fill_ct_key_v6_map(&key_v6, key);
         last_seen = tcp_conntrack_lookup(ipv4, &key_v4, &key_v6);
         if (last_seen) {
+            bool fin_was_established = !(*last_seen & CT_SYN_PENDING);
             tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
-            tcp_src_conn_record_close(key, now, dest_port);
+            if (fin_was_established)
+                tcp_src_conn_record_close(key, now, dest_port);
             count(CNT_TCP_ESTABLISHED);
             return XDP_PASS;
         }

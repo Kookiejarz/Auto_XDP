@@ -778,13 +778,13 @@ class BpfSynRatePortsMap(BpfFdMap):
 
 
 class BpfPortPolicyMap(BpfFdMap):
-    _STRUCT_FMT = "=IIIIII"
+    _STRUCT_FMT = "=IIIIIIII"
     _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
 
     def __init__(self, path: str) -> None:
         super().__init__(path)
         self._max_entries: int = map_max_entries(self.fd)
-        self._cache: dict[int, tuple[int, int, int, int, int, int]] = {}
+        self._cache: dict[int, tuple[int, int, int, int, int, int, int, int]] = {}
         self._key = ctypes.create_string_buffer(4)
         self._val = ctypes.create_string_buffer(self._STRUCT_SIZE)
         self._update_attr = ctypes.create_string_buffer(128)
@@ -819,10 +819,10 @@ class BpfPortPolicyMap(BpfFdMap):
             port = struct.unpack_from("=I", keys_buf, i * 4)[0]
             self._cache[port] = struct.unpack_from(self._STRUCT_FMT, vals_buf, i * self._STRUCT_SIZE)
 
-    def active_structs(self) -> dict[int, tuple[int, int, int, int, int, int]]:
+    def active_structs(self) -> dict[int, tuple[int, int, int, int, int, int, int, int]]:
         return dict(self._cache)
 
-    def set_fields(self, port: int, fields: tuple[int, int, int, int, int, int], dry_run: bool = False) -> bool:
+    def set_fields(self, port: int, fields: tuple[int, int, int, int, int, int, int, int], dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s port %d fields=%s", self.path, port, fields)
             return True
@@ -881,7 +881,7 @@ class BpfPortPolicyViewMap:
     def set(self, port: int, rate_max: int, dry_run: bool = False) -> bool:
         current = self._backing.active_structs().get(
             port,
-            (0, 0, 0, cfg.RATE_LIMIT_SOURCE_PREFIX_V4, cfg.RATE_LIMIT_SOURCE_PREFIX_V6, 0),
+            (0, 0, 0, cfg.RATE_LIMIT_SOURCE_PREFIX_V4, cfg.RATE_LIMIT_SOURCE_PREFIX_V6, 0, 0, 0),
         )
         updated = list(current)
         updated[self._field_index] = rate_max
