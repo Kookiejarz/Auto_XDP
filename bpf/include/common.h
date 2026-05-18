@@ -198,11 +198,13 @@ enum xdp_counter_idx {
     CNT_UDP_MALFORM_PORT0    = 25, // UDP src or dst port is 0
     CNT_UDP_MALFORM_LEN      = 26, // UDP length field < 8 or exceeds packet boundary
     CNT_BOGON_DROP           = 27, // packet dropped: spoofed/reserved source address
-    CNT_TCP_CONN_LIMIT_DROP  = 28, // TCP SYN dropped by per-source concurrent connection limit
-    CNT_SYN_AGG_RATE_DROP    = 29, // TCP SYN dropped by per-prefix aggregate rate limiter
-    CNT_UDP_AGG_RATE_DROP    = 30, // UDP dropped by per-prefix byte-rate limiter
-    CNT_HANDLER_BLOCK_DROP   = 31, // dropped: src IP in handler_blocked map
-    CNT_MAX                  = 32,
+    CNT_TCP_CONN_LIMIT_DROP        = 28, // TCP SYN dropped by per-source concurrent connection limit
+    CNT_SYN_AGG_RATE_DROP          = 29, // TCP SYN dropped by per-prefix aggregate rate limiter
+    CNT_UDP_AGG_RATE_DROP          = 30, // UDP dropped by per-prefix byte-rate limiter
+    CNT_HANDLER_BLOCK_DROP         = 31, // dropped: src IP in handler_blocked map
+    CNT_TCP_CONN_PREFIX_LIMIT_DROP = 32, // TCP SYN dropped by per-prefix concurrent connection limit
+    CNT_TCP_CONN_PORT_LIMIT_DROP   = 33, // TCP SYN dropped by per-port total concurrent connection limit
+    CNT_MAX                        = 34,
 };
 
 struct {

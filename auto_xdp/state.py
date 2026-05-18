@@ -29,6 +29,8 @@ class DesiredState:
     tcp_syn_rate_limits: dict[int, int] = field(default_factory=dict)
     tcp_syn_agg_rate_limits: dict[int, int] = field(default_factory=dict)
     tcp_conn_limits: dict[int, int] = field(default_factory=dict)
+    tcp_conn_prefix_limits: dict[int, int] = field(default_factory=dict)
+    tcp_conn_port_limits: dict[int, int] = field(default_factory=dict)
     udp_rate_limits: dict[int, int] = field(default_factory=dict)
     udp_agg_rate_limits: dict[int, int] = field(default_factory=dict)
     acl_rules: dict[tuple[str, str], frozenset[int]] = field(default_factory=dict)
@@ -61,6 +63,8 @@ class AppliedState:
     tcp_syn_rate_limits: dict[int, int] = field(default_factory=dict)
     tcp_syn_agg_rate_limits: dict[int, int] = field(default_factory=dict)
     tcp_conn_limits: dict[int, int] = field(default_factory=dict)
+    tcp_conn_prefix_limits: dict[int, int] = field(default_factory=dict)
+    tcp_conn_port_limits: dict[int, int] = field(default_factory=dict)
     udp_rate_limits: dict[int, int] = field(default_factory=dict)
     udp_agg_rate_limits: dict[int, int] = field(default_factory=dict)
     acl_rules: dict[tuple[str, str], frozenset[int]] = field(default_factory=dict)
@@ -90,6 +94,10 @@ class ReconcilePlan:
     tcp_syn_agg_rate_limits_to_remove: set[int] = field(default_factory=set)
     tcp_conn_limits_to_upsert: dict[int, int] = field(default_factory=dict)
     tcp_conn_limits_to_remove: set[int] = field(default_factory=set)
+    tcp_conn_prefix_limits_to_upsert: dict[int, int] = field(default_factory=dict)
+    tcp_conn_prefix_limits_to_remove: set[int] = field(default_factory=set)
+    tcp_conn_port_limits_to_upsert: dict[int, int] = field(default_factory=dict)
+    tcp_conn_port_limits_to_remove: set[int] = field(default_factory=set)
     udp_rate_limits_to_upsert: dict[int, int] = field(default_factory=dict)
     udp_rate_limits_to_remove: set[int] = field(default_factory=set)
     udp_agg_rate_limits_to_upsert: dict[int, int] = field(default_factory=dict)
@@ -118,6 +126,10 @@ class ReconcilePlan:
             self.tcp_syn_agg_rate_limits_to_remove,
             self.tcp_conn_limits_to_upsert,
             self.tcp_conn_limits_to_remove,
+            self.tcp_conn_prefix_limits_to_upsert,
+            self.tcp_conn_prefix_limits_to_remove,
+            self.tcp_conn_port_limits_to_upsert,
+            self.tcp_conn_port_limits_to_remove,
             self.udp_rate_limits_to_upsert,
             self.udp_rate_limits_to_remove,
             self.udp_agg_rate_limits_to_upsert,
@@ -174,6 +186,18 @@ def compute_reconcile_plan(desired: DesiredState, applied: AppliedState) -> Reco
         ),
         tcp_conn_limits_to_remove=_dict_removals(
             desired.tcp_conn_limits, applied.tcp_conn_limits
+        ),
+        tcp_conn_prefix_limits_to_upsert=_dict_upserts(
+            desired.tcp_conn_prefix_limits, applied.tcp_conn_prefix_limits
+        ),
+        tcp_conn_prefix_limits_to_remove=_dict_removals(
+            desired.tcp_conn_prefix_limits, applied.tcp_conn_prefix_limits
+        ),
+        tcp_conn_port_limits_to_upsert=_dict_upserts(
+            desired.tcp_conn_port_limits, applied.tcp_conn_port_limits
+        ),
+        tcp_conn_port_limits_to_remove=_dict_removals(
+            desired.tcp_conn_port_limits, applied.tcp_conn_port_limits
         ),
         udp_rate_limits_to_upsert=_dict_upserts(
             desired.udp_rate_limits, applied.udp_rate_limits

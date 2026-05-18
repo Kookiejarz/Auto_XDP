@@ -62,7 +62,15 @@ sctp = []   # e.g. [5060]
 # TCP rate limits
 # New SYN packets allowed per second per source IP.
 # Lookup order: syn_by_proc (process name) → syn_by_service (IANA service name).
-# Ports absent from both tables are not SYN-rate-limited.
+# Ports absent from both tables use the default tier (see [xdp.runtime] below).
+
+[rate_limits]
+# Aggregation prefix used by syn_agg_rate, per-prefix ESTABLISHED cap, and other
+# per-prefix counters. Default /24 for IPv4 so distributed floods from one /24
+# share a single counter; per-IP /32 counter still applies independently.
+# IPv6 default /64 covers a typical end-site.
+source_cidr_v4 = 24
+source_cidr_v6 = 64
 
 [rate_limits.syn_by_proc]
 # Key: process name as reported by /proc. Value: max new SYNs/s per source IP.
@@ -117,6 +125,21 @@ telnet          = 2
 
 [rate_limits.tcp_conn_by_service]
 # Fallback concurrent connection cap keyed by IANA service name.
+
+[rate_limits.tcp_conn_prefix_by_proc]
+# Per-prefix ESTABLISHED cap override per process. Format:
+# proc_name = max_established_per_prefix
+# Empty → uses default_tcp_established_per_prefix(_strict) from [xdp.runtime].
+
+[rate_limits.tcp_conn_prefix_by_service]
+# Same, keyed by IANA service name.
+
+[rate_limits.tcp_conn_port_by_proc]
+# Per-port total ESTABLISHED cap override per process. Format:
+# proc_name = max_established_per_port
+
+[rate_limits.tcp_conn_port_by_service]
+# Same, keyed by IANA service name.
 
 
 # UDP rate limits
@@ -248,6 +271,33 @@ rate_window_seconds = 1
 # an ACK are expired faster than tcp_timeout_seconds to free map slots under
 # SYN flood. Increase if clients have high-latency links (> 100 ms RTT).
 syn_timeout_seconds = 20
+
+# --- Default-on TCP protection ---
+# Sensitivity threshold: a port is "sensitive" when its owning process or
+# service has an explicit syn-rate ≤ this value in [rate_limits.syn_by_proc]
+# / [rate_limits.syn_by_service]. Sensitive ports get the strict default tier;
+# everything else gets the normal tier.
+sensitive_port_threshold = 5
+
+# Per-source SYN rate (SYN/s). L1 — narrowest layer.
+default_tcp_syn_rate_strict = 5      # SSH, DBs, RDP — already in syn_by_*
+default_tcp_syn_rate        = 100    # HTTP/HTTPS/games/RPC/anything else
+
+# Per-prefix aggregate SYN rate (SYN/s). L2 — caps distributed floods.
+default_tcp_syn_agg_rate_strict = 50
+default_tcp_syn_agg_rate        = 1000
+
+# Per-source ESTABLISHED concurrent connections (sessions). L3.
+default_tcp_established_per_src_strict = 5
+default_tcp_established_per_src        = 50
+
+# Per-prefix ESTABLISHED concurrent connections (sessions). L4.
+default_tcp_established_per_prefix_strict = 20
+default_tcp_established_per_prefix        = 200
+
+# Per-port total ESTABLISHED concurrent connections (sessions). L5.
+default_tcp_established_per_port_strict = 200
+default_tcp_established_per_port        = 5000
 
 
 # nftables fallback

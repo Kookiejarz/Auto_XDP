@@ -74,12 +74,14 @@ struct syn_rate_port_cfg {
 };
 
 struct tcp_port_policy_cfg {
-    __u32 syn_rate_max;
-    __u32 syn_agg_rate_max;
-    __u32 conn_limit_max;
-    __u32 source_prefix_v4;
-    __u32 source_prefix_v6;
-    __u32 _pad;
+    __u32 syn_rate_max;             /* view idx 0 */
+    __u32 syn_agg_rate_max;         /* view idx 1 */
+    __u32 conn_limit_max;           /* view idx 2 — true ESTABLISHED count after Task 8 */
+    __u32 source_prefix_v4;         /* view idx 3 */
+    __u32 source_prefix_v6;         /* view idx 4 */
+    __u32 conn_prefix_limit_max;    /* view idx 5 (NEW) */
+    __u32 conn_port_limit_max;      /* view idx 6 (NEW) */
+    __u32 _pad;                     /* view idx 7 */
 };
 
 struct udp_port_policy_cfg {
@@ -132,6 +134,18 @@ struct tcp_src_conn_key_v6 {
 };
 
 struct tcp_src_conn_val {
+    __u64 last_seen_ns;
+    __u32 count;
+    __u32 _pad;
+};
+
+struct tcp_pfx_conn_val {
+    __u64 last_seen_ns;
+    __u32 count;
+    __u32 _pad;
+};
+
+struct tcp_port_conn_val {
     __u64 last_seen_ns;
     __u32 count;
     __u32 _pad;

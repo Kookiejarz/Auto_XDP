@@ -95,6 +95,8 @@ class XdpBackend(PortBackend):
         self.syn_rate_map: BpfSynRatePortsMap | None = None
         self.syn_agg_rate_map: BpfSynRatePortsMap | None = None
         self.tcp_conn_limit_map: BpfSynRatePortsMap | None = None
+        self.tcp_conn_prefix_limit_map: BpfSynRatePortsMap | None = None
+        self.tcp_conn_port_limit_map: BpfSynRatePortsMap | None = None
         self.udp_rate_map: BpfSynRatePortsMap | None = None
         self.udp_agg_rate_map: BpfSynRatePortsMap | None = None
         self.acl_maps: BpfAclMaps | None = None
@@ -108,6 +110,8 @@ class XdpBackend(PortBackend):
             self.syn_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 0, cfg.TCP_PORT_POLICY_MAP_PATH)
             self.syn_agg_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 1, cfg.TCP_PORT_POLICY_MAP_PATH)
             self.tcp_conn_limit_map = BpfPortPolicyViewMap(self._tcp_policy_map, 2, cfg.TCP_PORT_POLICY_MAP_PATH)
+            self.tcp_conn_prefix_limit_map = BpfPortPolicyViewMap(self._tcp_policy_map, 5, cfg.TCP_PORT_POLICY_MAP_PATH)
+            self.tcp_conn_port_limit_map = BpfPortPolicyViewMap(self._tcp_policy_map, 6, cfg.TCP_PORT_POLICY_MAP_PATH)
             log.debug("tcp_port_policies map opened; TCP per-port policy active.")
         except OSError as exc:
             log.debug("tcp_port_policies map unavailable (%s); TCP per-port policy inactive.", exc)
@@ -202,6 +206,8 @@ class XdpBackend(PortBackend):
             tcp_syn_rate_limits=self.syn_rate_map.active() if self.syn_rate_map is not None else {},
             tcp_syn_agg_rate_limits=self.syn_agg_rate_map.active() if self.syn_agg_rate_map is not None else {},
             tcp_conn_limits=self.tcp_conn_limit_map.active() if self.tcp_conn_limit_map is not None else {},
+            tcp_conn_prefix_limits=self.tcp_conn_prefix_limit_map.active() if self.tcp_conn_prefix_limit_map is not None else {},
+            tcp_conn_port_limits=self.tcp_conn_port_limit_map.active() if self.tcp_conn_port_limit_map is not None else {},
             udp_rate_limits=self.udp_rate_map.active() if self.udp_rate_map is not None else {},
             udp_agg_rate_limits=self.udp_agg_rate_map.active() if self.udp_agg_rate_map is not None else {},
             acl_rules=self.acl_maps.active_entries() if self.acl_maps is not None else {},
@@ -365,6 +371,24 @@ class XdpBackend(PortBackend):
                 "tcp_conn_limit",
             )
 
+        if self.tcp_conn_prefix_limit_map is not None:
+            self._apply_rate_map_delta(
+                self.tcp_conn_prefix_limit_map,
+                plan.tcp_conn_prefix_limits_to_upsert,
+                plan.tcp_conn_prefix_limits_to_remove,
+                dry_run,
+                "tcp_conn_prefix_limit",
+            )
+
+        if self.tcp_conn_port_limit_map is not None:
+            self._apply_rate_map_delta(
+                self.tcp_conn_port_limit_map,
+                plan.tcp_conn_port_limits_to_upsert,
+                plan.tcp_conn_port_limits_to_remove,
+                dry_run,
+                "tcp_conn_port_limit",
+            )
+
         if self.udp_rate_map is not None:
             self._apply_rate_map_delta(
                 self.udp_rate_map,
@@ -389,6 +413,8 @@ class XdpBackend(PortBackend):
                 set(desired_state.tcp_syn_rate_limits)
                 | set(desired_state.tcp_syn_agg_rate_limits)
                 | set(desired_state.tcp_conn_limits)
+                | set(desired_state.tcp_conn_prefix_limits)
+                | set(desired_state.tcp_conn_port_limits)
             )
             self._tcp_policy_map.ensure_prefixes(
                 tcp_policy_ports,
@@ -480,6 +506,10 @@ class XdpBackend(PortBackend):
                     log.info("SYN aggregate port %d rate_max=%d/s", port, rate_max)
                 elif kind == "tcp_conn_limit":
                     log.info("TCP conn limit port %d conn_max=%d", port, rate_max)
+                elif kind == "tcp_conn_prefix_limit":
+                    log.info("TCP conn prefix limit port %d conn_max=%d", port, rate_max)
+                elif kind == "tcp_conn_port_limit":
+                    log.info("TCP conn port limit port %d conn_max=%d", port, rate_max)
                 elif kind == "udp":
                     svc = port_procs.get(port) or service_name(port, "udp") or "unknown"
                     log.info("UDP rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
@@ -494,6 +524,10 @@ class XdpBackend(PortBackend):
                     log.info("SYN aggregate port %d removed", port)
                 elif kind == "tcp_conn_limit":
                     log.info("TCP conn limit port %d removed", port)
+                elif kind == "tcp_conn_prefix_limit":
+                    log.info("TCP conn prefix limit port %d removed", port)
+                elif kind == "tcp_conn_port_limit":
+                    log.info("TCP conn port limit port %d removed", port)
                 elif kind == "udp":
                     log.info("UDP rate port %d removed (port no longer whitelisted)", port)
                 elif kind == "udp_agg":

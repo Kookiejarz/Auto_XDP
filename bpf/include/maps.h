@@ -227,6 +227,29 @@ struct {
     __type(value, struct tcp_src_conn_val);
 } tsc6 SEC(".maps");
 
+/* Per-prefix × port concurrent ESTABLISHED count (Bug 2 fix L4). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
+    __type(key, struct prefix_rate_key_v4);
+    __type(value, struct tcp_pfx_conn_val);
+} tsc_pfx4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
+    __type(key, struct prefix_rate_key_v6);
+    __type(value, struct tcp_pfx_conn_val);
+} tsc_pfx6 SEC(".maps");
+
+/* Per-port total concurrent ESTABLISHED count (Bug 2 fix L5). */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, struct tcp_port_conn_val);
+} tsc_port SEC(".maps");
+
 // Per-CIDR port ACL: source CIDR → list of allowed destination ports.
 // ACL entries bypass rate limiting and take priority over the port whitelist.
 // TCP and UDP are configured independently via separate maps.

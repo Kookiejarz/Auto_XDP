@@ -30,3 +30,6 @@ udp_hv6
 slot_ctx_map
 slot_def_action
 sit4_endpoints
+tsc_pfx4
+tsc_pfx6
+tsc_port
