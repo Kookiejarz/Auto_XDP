@@ -62,14 +62,14 @@ The difference is operational:
 ## How It Works
 
 ```
-							Incoming Packet
-      								│
-      								▼
-							 ┌─────────────┐
-							 │  NIC Driver │  ← XDP hooks here (before kernel stack)
-						 	 └──────┬──────┘
-       								│
-       								▼
+Incoming Packet
+      │
+    	▼
+┌─────────────┐
+│  NIC Driver │  ← XDP hooks here (before kernel stack)
+└──────┬──────┘
+       │
+       ▼
 ┌──────────────────────────────────────────────┐
 │                 xdp_firewall                 │
 │                                              │
@@ -111,9 +111,9 @@ The difference is operational:
 │            └─ Other (GRE / ESP / SCTP / …)   │
 │                └─ slot handler ───→ PASS/DROP│
 └──────────────────────────────────────────────┘
-       							│
-       							▼
- 					 XDP_PASS / XDP_DROP							
+  	│
+  	▼
+ XDP_PASS / XDP_DROP							
 ```
 
 ---
@@ -123,8 +123,11 @@ The difference is operational:
 1. **`xdp_firewall.c`** — eBPF/XDP kernel program that filters packets at wire speed
 2. **`tc_flow_track.c`** — eBPF `tc` egress helper that records outbound IPv4/IPv6 TCP SYN packets and UDP reply tuples
 3. **`xdp_port_sync.py`** — userspace daemon that syncs TCP/UDP listening ports and trusted IPv4 source IPs
-4. **`axdp`** — operator CLI for statistics, sync, service control, and daemon log level
-5. **`setup_xdp.sh`** — installer that compiles the BPF objects, installs the runtime launcher, and sets up boot-time auto-sync
+4. **`pkt_relay.py`** — userspace daemon that drains the `pkt_ringbuf` BPF ring buffer and broadcasts packet events (DROP/ALLOW) over a Unix socket; runs as the `auto-xdp-relay` service
+5. **`auto_xdp/tui.py`** — htop-like live TUI client (`axdp tui`) that subscribes to the relay socket and displays packet events, port deltas, and per-counter rates
+6. **`auto_xdp/abuseipdb.py`** — threat-intel syncer that fetches `borestad/blocklist-abuseipdb` IPv4 lists and writes them to the `abuseipdb_v4` LPM trie
+7. **`axdp`** — operator CLI for statistics, sync, service control, and daemon log level
+8. **`setup_xdp.sh`** — installer that compiles the BPF objects, installs the runtime launcher, and sets up boot-time auto-sync
 
 ---
 
@@ -150,6 +153,9 @@ The difference is operational:
 - **Configurable daemon verbosity**: `axdp log-level debug|info|warning|error` updates the installed service config and restarts it
 - **Native + generic XDP**: tries native first, then generic
 - **nftables fallback**: if both XDP attach modes fail, keeps automatic port whitelisting with a dynamic `nftables` ruleset
+- **AbuseIPDB threat-intel blocklist** *(opt-in)*: drops source IPs listed in the `borestad/blocklist-abuseipdb` IPv4 feeds before any conntrack/whitelist evaluation; populated by an in-daemon syncer (no API key required); fail-open when the map is empty so a fetch failure cannot lock you out
+- **Per-packet event ring buffer + relay**: kernel emits both DROP and ALLOW events to the `pkt_ringbuf` BPF ring buffer; the `auto-xdp-relay` service broadcasts them over a Unix socket with configurable retention so late-attaching clients can replay recent history
+- **Live TUI**: `axdp tui` subscribes to the relay socket and renders packet events, current port whitelist, and counter rates side-by-side
 
 ---
 
@@ -241,8 +247,9 @@ sudo bash setup_xdp.sh --check-update --force
 10. Falls back to `nftables` automatically if XDP cannot be attached
 11. Installs the runtime launcher at `/usr/local/bin/auto_xdp_start.sh`
 12. Installs the sync daemon at `/usr/local/bin/xdp_port_sync.py`
-13. Runs an initial port sync using the selected backend
-14. Registers and starts `xdp-port-sync` on `systemd` or `OpenRC` when available
+13. Installs the packet event relay at `/usr/local/bin/pkt_relay.py`
+14. Runs an initial port sync using the selected backend
+15. Registers and starts `xdp-port-sync` and `auto-xdp-relay` on `systemd` or `OpenRC` when available
 
 ---
 
@@ -260,7 +267,7 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 | `udp_ct6` | LRU_HASH | 262144 | `struct flow_key_v6` | `__u64` ktime_ns |
 | `trusted_ipv4` | LPM_TRIE | 256 | `struct trusted_v4_key { prefixlen, addr }` (IPv4 CIDR) | `__u32` (1 = trusted) |
 | `trusted_ipv6` | LPM_TRIE | 256 | `struct trusted_v6_key { prefixlen, addr[16] }` (IPv6 CIDR) | `__u32` (1 = trusted) |
-| `pkt_counters` | PERCPU_ARRAY | 22 | `__u32` counter index | `__u64` packet count |
+| `pkt_counters` | PERCPU_ARRAY | 35 | `__u32` counter index | `__u64` packet count |
 | `byte_counters` | PERCPU_ARRAY | 4 | `__u32` index (0=total_bytes, 1=drop_bytes, 2=total_pkts, 3=drop_pkts) | `__u64` |
 | `icmp_tb` | ARRAY | 1 | `__u32` (0) | `struct icmp_token_bucket { last_ns, tokens }` |
 | `tcp_port_policies` | HASH | 1024 | `__u32` dest port | per-port SYN rate config |
@@ -268,10 +275,10 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 | `udp_global_rl` | ARRAY | 1 | `__u32` (0) | `struct udp_global_state { lock, byte_rate_max, window_start_ns, prev_bytes, curr_bytes }` |
 | `sit4_endpoints` | HASH | 256 | `__u32` outer IPv4 src addr | `__u32` (1 = allowed) |
 | `slot_ctx_map` | ARRAY | 16 | `__u32` slot index | slot handler context |
-| `slot_def_action` | ARRAY | 16 | `__u32` slot index | default action when no handler matches |
 | `proto_handlers` | ARRAY | 256 | `__u32` IP proto number | handler slot index |
 | `tcp_port_handlers` | HASH | 1024 | `__u32` dest port | handler slot index |
 | `udp_port_handlers` | HASH | 1024 | `__u32` dest port | handler slot index |
+| `abuseipdb_v4` | LPM_TRIE | 262144 | `struct trusted_v4_key { prefixlen, addr }` | `__u32` (1 = blocked) |
 
 ### Manually Add / Remove a Port
 
@@ -412,6 +419,11 @@ sudo axdp stats --rates
 # Combine both
 sudo axdp stats --watch --rates --interval 2
 
+# Live TUI (htop-like view: events, ports, counters)
+sudo axdp tui
+sudo axdp tui --interval 1
+sudo axdp tui --socket /var/run/auto_xdp/pkt_events.sock
+
 # Run one manual sync
 sudo axdp sync
 
@@ -495,6 +507,19 @@ Counter labels in `axdp` are intentionally human-readable:
 20. `TCP_BAD_DOFF` — TCP invalid data offset (`doff < 5`, `doff > 15`, or truncated header)
 21. `TCP_PORT0` — TCP src or dst port is 0
 22. `VLAN_DROP` — VLAN nesting depth exceeds limit (possible bypass attempt)
+23. `SLOT_CALL` — packets dispatched to a protocol slot handler via tail call
+24. `SLOT_PASS` — slot miss with `default_action = pass` (no handler matched)
+25. `SLOT_DROP` — slot miss with `default_action = drop` (no handler matched)
+26. `UDP_PORT0` — UDP src or dst port is 0
+27. `UDP_BAD_LEN` — UDP length field < 8 or exceeds packet boundary
+28. `BOGON_DROP` — packet dropped: source address in spoofed/reserved (bogon) range
+29. `TCP_CONN_LIMIT_DROP` — TCP SYN dropped by per-source concurrent connection limit
+30. `SYN_AGG_RATE_DROP` — TCP SYN dropped by per-prefix aggregate rate limiter
+31. `UDP_AGG_RATE_DROP` — UDP dropped by per-prefix byte-rate limiter
+32. `HANDLER_BLOCK_DROP` — dropped: source IP in `handler_blocked` map
+33. `TCP_CONN_PREFIX_LIMIT_DROP` — TCP SYN dropped by per-prefix concurrent connection limit
+34. `TCP_CONN_PORT_LIMIT_DROP` — TCP SYN dropped by per-port total concurrent connection limit
+35. `ABUSEIPDB_DROP` — dropped: source IP in AbuseIPDB blocklist (when `[abuseipdb] enabled = true`)
 
 ## Post-Install Quick Commands
 
@@ -515,6 +540,9 @@ sudo axdp stats --rates
 
 # Live delta rates
 sudo axdp stats --watch --rates --interval 2
+
+# Live TUI (events + ports + counters in one view)
+sudo axdp tui
 
 # Run one manual sync
 sudo axdp sync
@@ -579,6 +607,70 @@ In `--force` mode, the installer skips confirmation prompts and:
 
 1. Pulls the GitHub copy automatically when `--check-update` finds a hash mismatch
 2. Unloads any existing XDP program automatically before reinstalling
+
+---
+
+## Packet Event Stream (Live TUI + Relay)
+
+The XDP program emits per-packet events to a BPF ring buffer (`pkt_ringbuf`) with both **DROP** and **ALLOW** verdicts (`emit_drop` and `emit_allow` in `bpf/include/common.h`). A separate userspace daemon, `pkt_relay.py`, drains the ring buffer and broadcasts events over a Unix socket so multiple clients (TUI, ad-hoc tooling, log shippers) can subscribe without contending for the kernel ring.
+
+```bash
+# Live TUI client (subscribes, renders events + port whitelist + counters)
+sudo axdp tui
+
+# Tail the relay socket directly with socat for ad-hoc inspection
+sudo socat - UNIX-CONNECT:/var/run/auto_xdp/pkt_events.sock
+```
+
+Tunable knobs in `config.toml`:
+
+```toml
+[ringbuf]
+# Unix socket used by pkt_relay.py and axdp tui.
+socket_path = "/var/run/auto_xdp/pkt_events.sock"
+
+# Relay-side history retention for clients that connect later.
+retention_seconds = 300
+max_events = 100000
+max_history_send = 5000
+
+# TUI-side event scrollback kept in the local client process.
+tui_max_events = 500
+```
+
+The relay runs as a separate systemd/OpenRC service, `auto-xdp-relay`, installed alongside `xdp-port-sync`. Event emission is gated by the `drop_event_flags` array map (bit 0); when clear, the BPF program skips ring-buffer writes entirely so an unattended relay doesn't fill the buffer.
+
+---
+
+## Threat-Intel Blocklist (AbuseIPDB)
+
+Optional in-daemon syncer that fetches the [borestad/blocklist-abuseipdb](https://github.com/borestad/blocklist-abuseipdb) IPv4 feeds and writes them into the `abuseipdb_v4` LPM trie. Source IPs that match the trie are dropped at XDP **before** any conntrack or whitelist evaluation (counter `ABUSEIPDB_DROP`, idx 34). No API key required — the lists are public.
+
+IPv4 only: upstream does not publish IPv6 lists (SLAAC privacy churn makes long-window v6 blocklists nearly useless).
+
+Enable in `config.toml`:
+
+```toml
+[abuseipdb]
+# Threat-intel blocklist: drops source IPs listed in borestad/blocklist-abuseipdb.
+# trusted_ips still bypass AbuseIPDB (trusted wins).
+# enabled = false  →  maps stay empty, no traffic blocked (fail-open).
+enabled = true
+
+# Confidence-100 windows: 1d, 3d, 7d, 14d, 30d, 60d, 90d, 120d.
+# Shorter window = fewer stale entries.
+sources = ["s1003d"]
+
+# Refresh interval in seconds. Minimum 60s. Recommended: 3600 (1 hour).
+refresh_seconds = 3600
+```
+
+Operational notes:
+
+- **Fail-open** by design — if the GitHub fetch fails or the daemon hasn't yet run a refresh, the trie stays empty and traffic is unaffected. The kernel-side `xdp_runtime_cfg.cfg_flags` field gates the LPM lookup so a disabled or empty map costs only one cheap ARRAY read per packet.
+- **`trusted_ips` always wins**: a CIDR added via `axdp trust add` bypasses the AbuseIPDB check.
+- Dropped traffic is observable as `ABUSEIPDB_DROP` in `axdp stats` and as `verdict=DROP, reason=ABUSEIPDB_DROP` in `axdp tui` / the relay event stream.
+- Server needs HTTPS egress to `raw.githubusercontent.com` for fetches.
 
 ---
 
@@ -770,7 +862,7 @@ Now every auto-discovered TCP port receives baseline protection from five layers
 
 | Layer | Key | Normal default | Strict default (sensitive procs) |
 |---|---|---|---|
-| L1 SYN rate (per-source) | (src/prefix, port) | 100 SYN/s | 5 SYN/s |
+| L1 SYN rate (per-source) | (src/prefix) | 100 SYN/s | 5 SYN/s |
 | L2 SYN aggregate rate (per-prefix) | (prefix, port) | 1000 SYN/s | 50 SYN/s |
 | L3 Per-source ESTABLISHED cap | (src/32, port) | 50 | 5 |
 | L4 Per-prefix ESTABLISHED cap | (prefix, port) | 200 | 20 |
@@ -783,10 +875,12 @@ This covers SSH, databases, RDP, telnet.
 The shipped `[rate_limits].source_cidr_v4` defaults to `/24` so per-prefix
 counters (L2 and L4) cover /24-scale aggregation out of the box.
 
-**Operators wanting to disable protection for a specific port** can pin any
-knob to `0` via the matching `[rate_limits].*_by_proc` / `*_by_service` table
-entry. See `docs/superpowers/specs/2026-05-06-tcp-default-on-protection-design.md`
-for the full design rationale.
+**Operators wanting to disable protection for a matching process or service**
+can pin any knob to `0` via the matching `[rate_limits].*_by_proc` /
+`*_by_service` table entry. See `docs/tcp-rate-limits.md` for operator-facing
+configuration details and
+`docs/superpowers/specs/2026-05-06-tcp-default-on-protection-design.md` for the
+full design rationale.
 
 ---
 

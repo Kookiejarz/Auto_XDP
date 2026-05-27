@@ -344,20 +344,22 @@ udp_port_policies
 udp_global_rl
 xdp_runtime_cfg
 udp_percpu_acc
-bogon_cfg
-observability_cfg
-proto_handlers
-tcp_port_handlers
-udp_port_handlers
+	proto_handlers
+	tcp_port_handlers
+	udp_port_handlers
 tcp_pd4
 tcp_pd6
 hblk4
 hblk6
 udp_hv4
-udp_hv6
-slot_ctx_map
-slot_def_action
-EOF
+	udp_hv6
+	slot_ctx_map
+	sit4_endpoints
+	tsc_pfx4
+	tsc_pfx6
+	tsc_port
+	abuseipdb_v4
+	EOF
 }
 
 seed_existing_tcp_conntrack() {
@@ -471,12 +473,12 @@ load_sock_state_tracker() {
             event sock/inet_sock_set_state \
             prog pinned "$prog_pin" \
             pinned "$link_pin" >/dev/null 2>&1; then
-        _auto_xdp_warn "Failed to attach sock_state tracepoint (bpftool too old?); cleaning up."
-        rm -f "$prog_pin" "${BPF_PIN_DIR}/sock_state_rb"
-        return 1
+        _auto_xdp_warn "bpftool link create unavailable; tracepoint will be attached by pkt_relay via perf_event_open."
+        # Keep prog + map pins so pkt_relay can attach the tracepoint itself.
+        return 0
     fi
 
-    _auto_xdp_info "sock_state tracker attached (tracepoint inet_sock_set_state)."
+    _auto_xdp_info "sock_state tracker loaded (tracepoint will be attached by pkt_relay)."
     return 0
 }
 
@@ -513,12 +515,7 @@ except (OSError, ValueError):
         default_action="${default_action:-pass}"
         enabled_json="${enabled_json:-[]}"
     fi
-    local action_val=0
-    [[ "$default_action" == "drop" ]] && action_val=1
-    bpftool map update pinned "${BPF_PIN_DIR}/slot_def_action" \
-        key 0 0 0 0 value "$action_val" 0 0 0 2>/dev/null \
-        && _auto_xdp_info "Slot default_action: ${default_action}" \
-        || _auto_xdp_warn "Failed to set slot default_action"
+    _auto_xdp_info "Slot default_action: ${default_action} (managed by xdp_runtime_cfg)"
 
     [[ "$enabled_json" == "[]" ]] && return 0
     [[ -d "$handlers_dir" ]] || {

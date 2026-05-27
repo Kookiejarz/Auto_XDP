@@ -30,7 +30,10 @@ from auto_xdp.bpf.maps import BpfGlobalRlMap, BpfPortPolicyMap
 
 DEFAULT_SOCKET = "/var/run/auto_xdp/pkt_events.sock"
 DEFAULT_TUI_MAX_EVENTS = 500
+MAP_INFO_INTERVAL = 10.0
+MAP_COUNT_INTERVAL = 10.0
 HIGH_CHURN_MAP_COUNT_INTERVAL = 30.0
+TUI_IDLE_REDRAW_INTERVAL = 1.0
 
 _HIGH_CHURN_MAPS = {
     "tcp_ct4",
@@ -95,9 +98,22 @@ class TuiSnapshot:
 
 
 @dataclass
+class TrafficRow:
+    ip: str
+    proto: str
+    port: str
+    packets: int
+    bytes_: int | None
+    verdict: str
+    last_seen: float
+
+
+@dataclass
 class MapUsageCache:
     counts: dict[str, int] = field(default_factory=dict)
     refreshed_at: dict[str, float] = field(default_factory=dict)
+    map_info: dict[str, dict[str, Any]] = field(default_factory=dict)
+    map_info_refreshed_at: float = 0.0
 
 
 class RelayClient:
@@ -274,7 +290,9 @@ def _collect_map_usage(
     under_attack: bool = False,
     cache: MapUsageCache | None = None,
     now: float | None = None,
+    count_interval: float = MAP_COUNT_INTERVAL,
     high_churn_interval: float = HIGH_CHURN_MAP_COUNT_INTERVAL,
+    map_info_interval: float = MAP_INFO_INTERVAL,
     sample_counts: bool = True,
 ) -> list[MapUsage]:
     pin_dir = Path(bpf_pin_dir)
@@ -288,9 +306,28 @@ def _collect_map_usage(
     except Exception:
         tcp_ports, udp_ports = [], []
 
-    all_info = _all_map_info()
-    bpftool_ok = bool(shutil.which("bpftool"))
+    if cache.map_info and now - cache.map_info_refreshed_at < map_info_interval:
+        all_info = cache.map_info
+    else:
+        all_info = _all_map_info()
+        if all_info:
+            cache.map_info = all_info
+            cache.map_info_refreshed_at = now
+    bpftool_ok = bool(shutil.which("bpftool")) or bool(all_info)
     rows: list[MapUsage] = []
+
+    def _sample_count(path: Path, interval: float) -> tuple[int | None, str]:
+        last = cache.refreshed_at.get(path.name, 0.0)
+        if path.name in cache.counts and now - last < interval:
+            return cache.counts[path.name], "cached"
+        count = _dump_count(path)
+        if count is None:
+            cached = cache.counts.get(path.name)
+            return cached, "cached" if cached is not None else "live"
+        cache.counts[path.name] = count
+        cache.refreshed_at[path.name] = now
+        return count, "sampled"
+
     for path in sorted(p for p in pin_dir.iterdir() if p.is_file()):
         info = all_info.get(path.name, {})
         if not bpftool_ok and not info:
@@ -319,20 +356,13 @@ def _collect_map_usage(
                 current = cache.counts[path.name]
                 note = "cached"
             else:
-                current = _dump_count(path)
-                if current is None:
-                    current = cache.counts.get(path.name)
-                    note = "cached" if current is not None else "live"
-                else:
-                    cache.counts[path.name] = current
-                    cache.refreshed_at[path.name] = now
-                    note = "sampled"
+                current, note = _sample_count(path, high_churn_interval)
         elif kind in {"array", "percpu_array"}:
-            current = _dump_count(path)
+            current, note = _sample_count(path, count_interval)
         elif kind in {"ringbuf", "prog_array"}:
             current = None
         else:
-            current = _dump_count(path)
+            current, note = _sample_count(path, count_interval)
         pct = (current / maximum * 100.0) if current is not None and maximum else None
         map_id_val = info.get("id")
         map_id = int(map_id_val) if isinstance(map_id_val, int) else None
@@ -615,8 +645,16 @@ class SnapshotWorker:
             except Exception as exc:
                 with self._lock:
                     self._error = str(exc)
+            
             elapsed = time.monotonic() - started
-            self._wakeup.wait(max(0.05, self._interval - elapsed))
+            min_interval = 0.5
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+                elapsed = time.monotonic() - started
+            
+            remaining = self._interval - elapsed
+            if remaining > 0:
+                self._wakeup.wait(remaining)
             self._wakeup.clear()
 
 
@@ -645,6 +683,13 @@ def _make_win_set(stdscr: Any) -> _WinSet | None:
         summary=stdscr.derwin(summary_h, right_w, 1, left_w),
         ports=stdscr.derwin(h - summary_h - 1, right_w, 1 + summary_h, left_w),
     )
+
+
+def _make_full_win(stdscr: Any) -> Any | None:
+    h, w = stdscr.getmaxyx()
+    if h < 20 or w < 80:
+        return None
+    return stdscr.derwin(h - 1, w, 1, 0)
 
 
 def _clip(text: str, width: int) -> str:
@@ -762,6 +807,84 @@ def _draw_events(win: Any, relay: RelayClient, snap: TuiSnapshot, top: int, focu
     _add(win, win.getmaxyx()[0] - 1, 2, footer, curses.A_DIM)
 
 
+def _event_bytes(ev: dict[str, Any]) -> int | None:
+    for key in ("bytes", "size", "len", "pkt_len", "packet_len"):
+        try:
+            value = int(ev.get(key, 0))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _collect_top_traffic(events: list[dict[str, Any]], limit: int = 10) -> list[TrafficRow]:
+    totals: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for ev in events:
+        if ev.get("type") == "port_change":
+            continue
+        ip = str(ev.get("src") or "-")
+        proto = str(ev.get("proto") or "-")
+        port = str(ev.get("dport") or "-")
+        key = (ip, proto, port)
+        row = totals.setdefault(
+            key,
+            {
+                "packets": 0,
+                "bytes": 0,
+                "has_bytes": False,
+                "verdict": str(ev.get("verdict") or "-"),
+                "last_seen": 0.0,
+            },
+        )
+        row["packets"] += 1
+        byte_count = _event_bytes(ev)
+        if byte_count is not None:
+            row["bytes"] += byte_count
+            row["has_bytes"] = True
+        last_seen = float(ev.get("seen_at") or 0.0)
+        if last_seen >= row["last_seen"]:
+            row["last_seen"] = last_seen
+            row["verdict"] = str(ev.get("verdict") or "-")
+
+    rows = [
+        TrafficRow(
+            ip=ip,
+            proto=proto,
+            port=port,
+            packets=int(data["packets"]),
+            bytes_=int(data["bytes"]) if data["has_bytes"] else None,
+            verdict=str(data["verdict"]),
+            last_seen=float(data["last_seen"]),
+        )
+        for (ip, proto, port), data in totals.items()
+    ]
+    return sorted(
+        rows,
+        key=lambda row: (-(row.bytes_ or 0), -row.packets, row.ip, row.proto, row.port),
+    )[:limit]
+
+
+def _draw_top_traffic(win: Any, relay: RelayClient) -> None:
+    _box(win, "top traffic by source ip / protocol / port")
+    _add(win, 1, 1, f"{'#':>2} {'source ip':<39} {'proto':<8} {'port':>5} {'packets':>10} {'bytes':>10} {'last':<8} verdict")
+    rows = _collect_top_traffic(relay.events, limit=10)
+    visible = max(0, win.getmaxyx()[0] - 3)
+    for idx, row in enumerate(rows[:visible], start=2):
+        tstr = "-"
+        if row.last_seen > 0:
+            tstr = _dt.datetime.fromtimestamp(row.last_seen).strftime("%H:%M:%S")
+        bytes_text = "-" if row.bytes_ is None else _human_bytes(row.bytes_)
+        attr = curses.color_pair(2) if row.verdict == "ALLOW" else curses.color_pair(3)
+        line = (
+            f"{idx - 1:>2} {row.ip:<39.39} {row.proto:<8.8} {row.port:>5.5} "
+            f"{row.packets:>10} {bytes_text:>10} {tstr:<8} {row.verdict}"
+        )
+        _add(win, idx, 1, line, attr)
+    footer = f"{len(relay.events)} retained events  v:overview  q:quit  {relay.status}"
+    _add(win, win.getmaxyx()[0] - 1, 2, footer, curses.A_DIM)
+
+
 def _port_key(row: tuple[str, int, str, str, str]) -> tuple[str, int]:
     return row[0], row[1]
 
@@ -824,15 +947,30 @@ def _draw(
     port_marks: dict[tuple[str, int], tuple[str, float, tuple[str, int, str, str, str]]],
     wins: _WinSet | None,
     port_filter: str,
+    page: str = "overview",
 ) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
+    if page == "traffic":
+        traffic_win = _make_full_win(stdscr)
+        if traffic_win is None:
+            _add(stdscr, 0, 0, "terminal too small; need at least 80x20")
+            stdscr.refresh()
+            return
+        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        title = f"Auto XDP TUI  top traffic  backend={snap.backend} iface={snap.iface} mode={snap.attach_mode}  {now}  v:overview q:quit"
+        _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
+        if last_error:
+            _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(3) | curses.A_BOLD)
+        _draw_top_traffic(traffic_win, relay)
+        stdscr.refresh()
+        return
     if wins is None:
         _add(stdscr, 0, 0, "terminal too small; need at least 80x20")
         stdscr.refresh()
         return
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"Auto XDP TUI  backend={snap.backend} iface={snap.iface} mode={snap.attach_mode} map={snap.map_id} ports={port_filter}  {now}  tab:focus t/u:ports q:quit"
+    title = f"Auto XDP TUI  backend={snap.backend} iface={snap.iface} mode={snap.attach_mode} map={snap.map_id} ports={port_filter}  {now}  v:traffic tab:focus t/u:ports q:quit"
     _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
     if last_error:
         _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(3) | curses.A_BOLD)
@@ -856,7 +994,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     curses.init_pair(8, curses.COLOR_CYAN, -1)
     curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_CYAN)
     stdscr.nodelay(True)
-    stdscr.timeout(50)
+    stdscr.timeout(200)
 
     relay = RelayClient(args.socket, max_events=int(args.tui_max_events))
     worker = SnapshotWorker(args)
@@ -868,39 +1006,53 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     previous_port_rows: dict[tuple[str, int], tuple[str, int, str, str, str]] | None = None
     port_marks: dict[tuple[str, int], tuple[str, float, tuple[str, int, str, str, str]]] = {}
     port_filter = "all"
+    page = "overview"
     wins: _WinSet | None = None
+    last_draw_at = 0.0
+    last_draw_state: tuple[Any, ...] | None = None
 
-    def _refresh_wins() -> None:
+    def _refresh_wins() -> bool:
         nonlocal wins
         h, w = stdscr.getmaxyx()
         if wins is not None and wins.h == h and wins.w == w:
-            return
+            return False
         stdscr.clear()
         wins = _make_win_set(stdscr)
+        return True
 
     _refresh_wins()
 
     try:
         while True:
+            ui_dirty = False
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
                 return 0
             if ch == curses.KEY_RESIZE:
-                _refresh_wins()
+                ui_dirty = _refresh_wins() or ui_dirty
             elif ch in (ord("t"), ord("T")):
                 port_filter = "all" if port_filter == "TCP" else "TCP"
+                ui_dirty = True
             elif ch in (ord("u"), ord("U")):
                 port_filter = "all" if port_filter == "UDP" else "UDP"
+                ui_dirty = True
+            elif ch in (ord("v"), ord("V")):
+                page = "traffic" if page == "overview" else "overview"
+                ui_dirty = True
             snap, last_error = worker.get()
             now = time.monotonic()
+            before_marks = set(port_marks)
             port_marks = {
                 key: mark
                 for key, mark in port_marks.items()
                 if mark[1] > now
             }
+            if set(port_marks) != before_marks:
+                ui_dirty = True
             if relay.ports_dirty:
                 relay.ports_dirty = False
                 worker.wakeup()
+                ui_dirty = True
             if snap.collected_at > last_ports_snapshot_at:
                 current_port_rows = {_port_key(row): row for row in snap.ports}
                 if previous_port_rows is not None:
@@ -913,6 +1065,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                         port_marks[key] = ("removed", expires_at, previous_port_rows[key])
                 previous_port_rows = current_port_rows
                 last_ports_snapshot_at = snap.collected_at
+                ui_dirty = True
             if wins is not None:
                 map_visible = max(1, wins.maps.getmaxyx()[0] - 3)
                 event_visible = max(1, wins.events.getmaxyx()[0] - 3)
@@ -923,35 +1076,65 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             event_top = _clamp_event_top(relay, event_visible, event_top)
             if ch == 9:
                 focus = "events" if focus == "maps" else "maps"
+                ui_dirty = True
             if ch == curses.KEY_UP:
                 if focus == "events":
                     event_top = max(relay.events_offset, event_top - 1)
                 else:
                     map_scroll = max(0, map_scroll - 1)
+                ui_dirty = True
             elif ch == curses.KEY_DOWN:
                 if focus == "events":
                     event_top = min(_event_bottom_top(relay, event_visible), event_top + 1)
                 else:
                     map_scroll = min(map_scroll_max, map_scroll + 1)
+                ui_dirty = True
             elif ch == curses.KEY_PPAGE:
                 if focus == "events":
                     event_top = max(relay.events_offset, event_top - event_visible)
                 else:
                     map_scroll = max(0, map_scroll - map_visible)
+                ui_dirty = True
             elif ch == curses.KEY_NPAGE:
                 if focus == "events":
                     event_top = min(_event_bottom_top(relay, event_visible), event_top + event_visible)
                 else:
                     map_scroll = min(map_scroll_max, map_scroll + map_visible)
+                ui_dirty = True
             follow_events = event_top >= _event_bottom_top(relay, event_visible)
+            relay_state_before = (relay.events_offset, relay.events_end, relay.status)
             relay.poll()
-            _refresh_wins()
+            if (relay.events_offset, relay.events_end, relay.status) != relay_state_before:
+                ui_dirty = True
+            if relay.ports_dirty:
+                relay.ports_dirty = False
+                worker.wakeup()
+                ui_dirty = True
+            ui_dirty = _refresh_wins() or ui_dirty
             map_scroll = min(map_scroll, max(0, len(snap.maps) - map_visible))
             if follow_events:
                 event_top = _event_bottom_top(relay, event_visible)
             else:
                 event_top = _clamp_event_top(relay, event_visible, event_top)
-            _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter)
+            draw_state = (
+                snap.collected_at,
+                last_error,
+                relay.events_offset,
+                relay.events_end,
+                relay.status,
+                map_scroll,
+                event_top,
+                focus,
+                port_filter,
+                page,
+                wins.h if wins is not None else 0,
+                wins.w if wins is not None else 0,
+            )
+            now = time.monotonic()
+            if ui_dirty or draw_state != last_draw_state or now - last_draw_at >= TUI_IDLE_REDRAW_INTERVAL:
+                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page)
+                last_draw_at = now
+                last_draw_state = draw_state
     finally:
         worker.stop()
         relay.close()

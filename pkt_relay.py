@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import ctypes
+import ctypes.util
 import json
 import logging
 import mmap
 import os
+import platform
 import queue
 import select
 import signal
@@ -31,9 +34,12 @@ from auto_xdp.sock_state import SockStateReader, SOCK_STATE_EVENT_SIZE
 
 # paths & defaults
 
-TOML_CONFIG_PATH   = "/etc/auto_xdp/config.toml"
-RINGBUF_PIN_PATH   = "/sys/fs/bpf/xdp_fw/pkt_ringbuf"
-SOCK_STATE_RB_PIN_PATH   = "/sys/fs/bpf/xdp_fw/sock_state_rb"
+TOML_CONFIG_PATH        = "/etc/auto_xdp/config.toml"
+RINGBUF_PIN_PATH        = "/sys/fs/bpf/xdp_fw/pkt_ringbuf"
+SOCK_STATE_RB_PIN_PATH  = "/sys/fs/bpf/xdp_fw/sock_state_rb"
+SOCK_STATE_PROG_PIN_PATH = "/sys/fs/bpf/xdp_fw/sock_state_prog"
+SOCK_STATE_LINK_PIN_PATH = "/sys/fs/bpf/xdp_fw/sock_state_link"
+SOCK_STATE_TRACEPOINT   = "sock/inet_sock_set_state"
 SOCK_STATE_RB_MAX_ENTRIES = 1 << 16   # 64 KiB — must match C definition
 SOCKET_PATH        = "/var/run/auto_xdp/pkt_events.sock"
 PID_FILE           = "/var/run/auto_xdp/pkt_relay.pid"
@@ -97,6 +103,80 @@ _PKT_EVENT_SIZE = 48   # sizeof(struct pkt_event)
 _AF_INET        = 2
 _AF_INET6       = 10
 
+# perf_event_open-based tracepoint attachment (fallback when bpftool link create
+# is unavailable). Attachment lifetime is tied to the returned fds.
+
+_PERF_EVENT_OPEN_NR: dict[str, int] = {
+    "x86_64": 298, "aarch64": 241, "armv7l": 364, "i386": 336,
+}
+_PERF_TYPE_TRACEPOINT   = 1
+_PERF_FLAG_FD_CLOEXEC   = 1 << 3
+_PERF_EVENT_IOC_ENABLE  = 0x2400
+_PERF_EVENT_IOC_SET_BPF = 0x40042408
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+
+
+def _tp_id(tracepoint: str) -> int | None:
+    for base in ("/sys/kernel/tracing/events", "/sys/kernel/debug/tracing/events"):
+        try:
+            with open(f"{base}/{tracepoint}/id") as f:
+                return int(f.read().strip())
+        except OSError:
+            continue
+    return None
+
+
+def attach_tracepoint(prog_pin: str, tracepoint: str) -> list[int]:
+    """Attach pinned BPF prog to tracepoint on all CPUs via perf_event_open.
+
+    Returns open perf fds — caller must keep them open for the attachment to
+    remain active.
+    """
+    nr = _PERF_EVENT_OPEN_NR.get(platform.machine())
+    if nr is None:
+        return []
+
+    tp_id = _tp_id(tracepoint)
+    if tp_id is None:
+        return []
+
+    try:
+        prog_fd = obj_get(prog_pin)
+    except OSError:
+        return []
+
+    # perf_event_attr: 128-byte struct; only type/size/config matter here.
+    attr = bytearray(128)
+    struct.pack_into("<IIQ", attr, 0, _PERF_TYPE_TRACEPOINT, 128, tp_id)
+    attr_c = (ctypes.c_char * 128).from_buffer(attr)
+
+    import fcntl
+    n_cpus = os.cpu_count() or 1
+    perf_fds: list[int] = []
+    for cpu in range(n_cpus):
+        ret = _libc.syscall(
+            ctypes.c_long(nr),
+            ctypes.byref(attr_c),
+            ctypes.c_int(-1),
+            ctypes.c_int(cpu),
+            ctypes.c_int(-1),
+            ctypes.c_long(_PERF_FLAG_FD_CLOEXEC),
+        )
+        if ret < 0:
+            continue
+        pfd = int(ret)
+        try:
+            fcntl.ioctl(pfd, _PERF_EVENT_IOC_SET_BPF, struct.pack("I", prog_fd))
+            fcntl.ioctl(pfd, _PERF_EVENT_IOC_ENABLE, 0)
+            perf_fds.append(pfd)
+        except OSError:
+            os.close(pfd)
+
+    os.close(prog_fd)
+    return perf_fds
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -114,6 +194,8 @@ def decode_event(raw: bytes) -> dict | None:
         return None
     ts_ns, src_raw, dst_raw, src_port, dst_port, proto, family, verdict, reason = \
         _DECODE_STRUCT.unpack_from(raw, 0)
+    src_port = socket.ntohs(src_port)
+    dst_port = socket.ntohs(dst_port)
 
     if family == _AF_INET:
         src_ip = socket.inet_ntoa(src_raw[0:4])
@@ -298,9 +380,14 @@ class RelayServer:
     # main loop
 
     def _reader_loop(self) -> None:
-        # BPF_RB_NO_WAKEUP suppresses epoll notifications, so the fd is never
-        # readable via select. Poll directly with a short sleep instead.
+        watch_fds = [self._rb.fileno()]
+        if self._ss is not None:
+            watch_fds.append(self._ss.fileno())
         while self._running:
+            try:
+                select.select(watch_fds, [], [], 0.5)
+            except (ValueError, OSError):
+                break
             for raw in self._rb.drain():
                 ev = decode_event(raw)
                 if ev:
@@ -315,7 +402,6 @@ class RelayServer:
                         self._queue.put_nowait(ev)
                     except queue.Full:
                         pass
-            time.sleep(0.005)
 
     def run(self) -> None:
         self._open_server()
@@ -333,7 +419,7 @@ class RelayServer:
             while self._running:
                 rfds: list[int] = [srv_fd, *self._clients.keys()]
                 try:
-                    readable, _, _ = select.select(rfds, [], [], 0.01)
+                    readable, _, _ = select.select(rfds, [], [], 0.05)
                 except (InterruptedError, ValueError):
                     readable = []
 
@@ -459,6 +545,20 @@ def main() -> None:
             )
             time.sleep(max(args.retry_interval, 0.1))
 
+    # If sock_state_rb is pinned but no bpftool link was created, attach the
+    # tracepoint ourselves so the ring buffer actually receives events.
+    _perf_fds: list[int] = []
+    if (
+        not os.path.exists(SOCK_STATE_LINK_PIN_PATH)
+        and os.path.exists(args.sock_state_rb)
+        and os.path.exists(SOCK_STATE_PROG_PIN_PATH)
+    ):
+        _perf_fds = attach_tracepoint(SOCK_STATE_PROG_PIN_PATH, SOCK_STATE_TRACEPOINT)
+        if _perf_fds:
+            log.info("sock_state tracepoint attached via perf_event_open (%d CPUs).", len(_perf_fds))
+        else:
+            log.info("perf_event_open attachment failed; port_change events disabled.")
+
     ss_reader: SockStateReader | None = None
     try:
         ss_rb = RingBufReader(args.sock_state_rb, SOCK_STATE_RB_MAX_ENTRIES)
@@ -491,6 +591,11 @@ def main() -> None:
         relay.run()
     finally:
         rb.close()
+        for _pfd in _perf_fds:
+            try:
+                os.close(_pfd)
+            except OSError:
+                pass
         _remove_pid(args.pid_file)
 
 

@@ -20,8 +20,10 @@ from auto_xdp.admin.detect import detect_backend as _detect_backend
 from auto_xdp.bpf.syscall import (
     BPF_MAP_DELETE_ELEM,
     BPF_MAP_GET_NEXT_KEY,
+    BPF_MAP_LOOKUP_BATCH,
     BPF_MAP_LOOKUP_ELEM,
     bpf,
+    map_max_entries,
     obj_get,
 )
 from auto_xdp.discovery import _build_systemd_socket_map
@@ -94,6 +96,19 @@ debounce_seconds = 0.4
 # xdp  = require XDP mode when possible.
 # nftables = force nftables fallback mode.
 preferred_backend = "auto"
+
+[ringbuf]
+# Unix socket used by pkt_relay.py and axdp tui.
+socket_path = "/var/run/auto_xdp/pkt_events.sock"
+
+# Relay-side history retention. The relay keeps recent events for clients
+# that connect after drops/new connections already happened.
+retention_seconds = 300
+max_events = 100000
+max_history_send = 5000
+
+# TUI-side event scrollback kept in the local client process.
+tui_max_events = 500
 
 [discovery]
 # Exclude loopback-only listeners from exposure discovery.
@@ -1108,6 +1123,19 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
 
     slot_pin_dir.mkdir(parents=True, exist_ok=True)
     pin_path = slot_pin_dir / f"proto_{proto}"
+
+    # If this proto is already loaded, unload it cleanly first:
+    # 1. remove the proto_handlers map entry (drops the map's ref to the old prog)
+    # 2. unlink the pin (drops the pin's ref) → old prog refcount hits 0 → freed
+    if pin_path.exists():
+        subprocess.run(
+            ["bpftool", "map", "delete", "pinned", str(proto_handlers),
+             "key", str(proto), "0", "0", "0"],
+            capture_output=True,
+            text=True,
+        )
+        pin_path.unlink()
+
     load_cmd = [
         "bpftool",
         "prog",
@@ -1463,65 +1491,68 @@ def _autodetect_iface() -> str:
 
 
 def _read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
-    """Returns (tcp_ports, udp_ports) from BPF whitelist maps."""
-    tcp_map = str(Path(bpf_pin_dir) / "tcp_whitelist")
-    udp_map = str(Path(bpf_pin_dir) / "udp_whitelist")
+    """Returns (tcp_ports, udp_ports) from BPF whitelist maps via direct BPF syscalls."""
+    tcp_path = str(Path(bpf_pin_dir) / "tcp_whitelist")
+    udp_path = str(Path(bpf_pin_dir) / "udp_whitelist")
 
-    for p in (tcp_map, udp_map):
+    for p in (tcp_path, udp_path):
         if not Path(p).exists():
             raise RuntimeError(f"XDP whitelist maps not found under {bpf_pin_dir}")
 
-    def _as_int(v: Any) -> int:
-        if isinstance(v, int):
-            return v
-        if isinstance(v, str):
-            try:
-                return int(v, 0)
-            except ValueError:
-                return 0
-        if isinstance(v, list):
-            try:
-                return int.from_bytes(bytes(_as_int(b) & 0xFF for b in v[:4]), "little")
-            except (TypeError, ValueError):
-                return 0
-        return 0
-
-    def _key_to_port(key: Any) -> int:
-        if isinstance(key, int):
-            return key
-        if isinstance(key, list):
-            return int.from_bytes(
-                bytes(_as_int(b) & 0xFF for b in key[:4]), "little"
-            )
-        return _as_int(key)
-
-    def _dump_map(path: str) -> list[int]:
+    def _read_array_ports(path: str) -> list[int]:
         try:
-            out = subprocess.check_output(
-                ["bpftool", "-j", "map", "dump", "pinned", path],
-                stderr=subprocess.DEVNULL,
+            fd = obj_get(path)
+        except OSError as exc:
+            raise RuntimeError(f"Cannot open BPF map {path}: {exc}") from exc
+        try:
+            n = map_max_entries(fd)
+            keys_buf = ctypes.create_string_buffer(4 * n)
+            vals_buf = ctypes.create_string_buffer(4 * n)
+            out_batch = ctypes.create_string_buffer(4)
+            attr = ctypes.create_string_buffer(56)
+            struct.pack_into(
+                "=QQQQIIQQ", attr, 0,
+                0,
+                ctypes.cast(out_batch, ctypes.c_void_p).value or 0,
+                ctypes.cast(keys_buf, ctypes.c_void_p).value or 0,
+                ctypes.cast(vals_buf, ctypes.c_void_p).value or 0,
+                n, fd, 0, 0,
             )
-            rows = json.loads(out)
-        except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
-            return []
-        ports: list[int] = []
-        for row in rows:
-            fmt = row.get("formatted")
-            if isinstance(fmt, dict):
-                val = fmt.get("value", 0)
-                port = fmt.get("key", 0)
-            else:
-                val = _as_int(row.get("value", 0))
-                port = _key_to_port(row.get("key", 0))
-            if not isinstance(val, int) or val <= 0:
-                continue
-            if not isinstance(port, int):
-                port = _key_to_port(row.get("key", 0))
-            if 0 < port <= 65535:
-                ports.append(port)
-        return sorted(set(ports))
+            try:
+                bpf(BPF_MAP_LOOKUP_BATCH, attr)
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    # Sequential fallback for kernels without batch support
+                    k = ctypes.create_string_buffer(4)
+                    v = ctypes.create_string_buffer(4)
+                    la = ctypes.create_string_buffer(128)
+                    struct.pack_into(
+                        "=I4xQQ", la, 0, fd,
+                        ctypes.cast(k, ctypes.c_void_p).value or 0,
+                        ctypes.cast(v, ctypes.c_void_p).value or 0,
+                    )
+                    ports: list[int] = []
+                    for port in range(1, min(n, 65536)):
+                        try:
+                            struct.pack_into("=I", k, 0, port)
+                            bpf(BPF_MAP_LOOKUP_ELEM, la)
+                            if struct.unpack_from("=I", v, 0)[0]:
+                                ports.append(port)
+                        except OSError:
+                            continue
+                    return ports
+                # ENOENT means end-of-map; count in attr is updated.
+            fetched = struct.unpack_from("=I", attr, 32)[0]
+            return sorted({
+                struct.unpack_from("=I", keys_buf, i * 4)[0]
+                for i in range(fetched)
+                if struct.unpack_from("=I", vals_buf, i * 4)[0]
+                and 0 < struct.unpack_from("=I", keys_buf, i * 4)[0] <= 65535
+            })
+        finally:
+            os.close(fd)
 
-    return _dump_map(tcp_map), _dump_map(udp_map)
+    return _read_array_ports(tcp_path), _read_array_ports(udp_path)
 
 
 def _read_nft_ports(nft_family: str, nft_table: str) -> tuple[list[int], list[int]]:
@@ -1901,9 +1932,12 @@ _XDP_COUNTER_NAMES = [
     "SYN_AGG_RATE_DROP",
     "UDP_AGG_RATE_DROP",
     "HANDLER_BLOCK_DROP",
+    "TCP_CONN_PREFIX_LIMIT_DROP",
+    "TCP_CONN_PORT_LIMIT_DROP",
+    "ABUSEIPDB_DROP",
 ]
 
-_XDP_DROP_INDEXES = {2, 4, 7, 10, 21, 24, 27}
+_XDP_DROP_INDEXES = {2, 4, 7, 10, 11, 12, 13, 21, 24, 27, 28, 29, 30, 31, 32, 33, 34}
 
 
 def _human_bytes(value: int) -> str:
@@ -2096,7 +2130,7 @@ def _read_xdp_rows(bpf_pin_dir: str) -> list[tuple[str, int, int]]:
         rows.append((_XDP_COUNTER_NAMES[idx], packets, -1))
 
     for idx in sorted(key_packets.keys()):
-        if idx >= 32:
+        if idx >= len(_XDP_COUNTER_NAMES):
             rows.append((f"COUNTER_{idx}", key_packets[idx], -1))
 
     total_bytes, drop_bytes, total_pkts, drop_pkts = _read_byte_counters(bpf_pin_dir)
@@ -2505,6 +2539,16 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_tui(args: argparse.Namespace) -> int:
+    from auto_xdp.tui import run_tui
+
+    try:
+        return run_tui(args)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin_cli")
     parser.add_argument("--config", required=True)
@@ -2630,6 +2674,13 @@ def build_parser() -> argparse.ArgumentParser:
     stats_cmd.add_argument("--render", choices=["append", "screen"], default="append")
     stats_cmd.add_argument("--interface", dest="iface")
     stats_cmd.set_defaults(func=_cmd_stats)
+
+    tui_cmd = subparsers.add_parser("tui")
+    tui_cmd.add_argument("--interval", type=float, default=2.0)
+    tui_cmd.add_argument("--socket")
+    tui_cmd.add_argument("--max-events", dest="tui_max_events", type=int)
+    tui_cmd.add_argument("--interface", dest="iface")
+    tui_cmd.set_defaults(func=_cmd_tui)
 
     return parser
 

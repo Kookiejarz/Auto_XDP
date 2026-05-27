@@ -12,6 +12,7 @@ NFT_TABLE="auto_xdp"
 NFT_CHAIN="input"
 RUNNER_SCRIPT="/usr/local/bin/auto_xdp_start.sh"
 SERVICE_NAME="xdp-port-sync"
+RELAY_SERVICE_NAME="auto-xdp-relay"
 SYSTEMD_RUN_DIR="${SYSTEMD_RUN_DIR:-/run/systemd/system}"
 RAW_URL="https://raw.githubusercontent.com/Kookiejarz/auto_xdp/main"
 
@@ -26,6 +27,7 @@ Usage: axdp [command] [options]
 
 Commands:
   stats [args...]        Show Auto XDP statistics
+  tui [args...]          Open htop-like live TUI
   watch [args...]        Shorthand for: stats --watch
   ports [args...]        Show currently allowed TCP/UDP ports
   backend                Show active backend and runtime attachment state
@@ -61,6 +63,11 @@ Stats options:
   --interval SEC       Refresh / delta interval in seconds (default: 1)
   --interface IFACE    Override interface autodetection
 
+TUI options:
+  --interval SEC       Refresh maps/ports/stats interval (default: 2)
+  --socket PATH        pkt_relay Unix socket path
+  --interface IFACE    Override interface autodetection
+
 Ports options:
   --watch              Refresh continuously and detect changes
   --interval SEC       Refresh interval in seconds (default: 2)
@@ -80,11 +87,20 @@ run_service_cmd() {
     local action="$1"
 
     if command -v systemctl >/dev/null 2>&1 && [[ -d "$SYSTEMD_RUN_DIR" ]]; then
-        exec systemctl "$action" "$SERVICE_NAME"
+        systemctl "$action" "$SERVICE_NAME"
+        if systemctl list-unit-files "${RELAY_SERVICE_NAME}.service" >/dev/null 2>&1; then
+            systemctl "$action" "$RELAY_SERVICE_NAME" || true
+        else
+            echo "Relay service not installed yet. Re-run setup_xdp.sh --force to install ${RELAY_SERVICE_NAME}." >&2
+        fi
+        return 0
     fi
 
     if command -v rc-service >/dev/null 2>&1; then
-        exec rc-service "$SERVICE_NAME" "$action"
+        rc-service "$SERVICE_NAME" "$action"
+        rc-service "$RELAY_SERVICE_NAME" "$action" 2>/dev/null || \
+            echo "Relay service not installed yet. Re-run setup_xdp.sh --force to install ${RELAY_SERVICE_NAME}." >&2
+        return 0
     fi
 
     echo "No supported init system detected for service control." >&2
@@ -111,8 +127,18 @@ load_config() {
     fi
 }
 
+# Drop CWD from sys.path before delegating to a module so an `auto_xdp/`
+# directory in the caller's working directory cannot shadow the installed package.
+PY_BOOTSTRAP='import sys, runpy; sys.path[:] = [p for p in sys.path if p]; runpy.run_module(sys.argv.pop(1), run_name="__main__", alter_sys=True)'
+
+run_py_module() {
+    local module="$1"
+    shift
+    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -c "$PY_BOOTSTRAP" "$module" "$@"
+}
+
 run_admin_config() {
-    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin_cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
@@ -120,7 +146,7 @@ run_admin_config() {
 }
 
 run_admin_runtime() {
-    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.admin.main \
+    run_py_module auto_xdp.admin.main \
         --env-config "$CONFIG_FILE" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --run-state-dir "$RUN_STATE_DIR" \
@@ -376,7 +402,7 @@ run_ports() {
         [[ "$arg" == "watch" ]] && arg="--watch"
         args+=("$arg")
     done
-    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin_cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
@@ -387,7 +413,7 @@ run_ports() {
 }
 
 run_stats() {
-    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin_cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
@@ -396,6 +422,18 @@ run_stats() {
         --nft-table "$NFT_TABLE" \
         --iface "${IFACES:-${IFACE:-}}" \
         stats "$@"
+}
+
+run_tui() {
+    run_py_module auto_xdp.admin_cli \
+        --config "$TOML_CONFIG" \
+        --bpf-pin-dir "$BPF_PIN_DIR" \
+        --install-dir "$INSTALL_DIR" \
+        --run-state-dir "$RUN_STATE_DIR" \
+        --nft-family "$NFT_FAMILY" \
+        --nft-table "$NFT_TABLE" \
+        --iface "${IFACES:-${IFACE:-}}" \
+        tui "$@"
 }
 
 run_check_update() {
@@ -562,6 +600,10 @@ main() {
         stats)
             shift || true
             run_stats "$@"
+            ;;
+        tui)
+            shift || true
+            run_tui "$@"
             ;;
         watch)
             shift || true

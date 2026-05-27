@@ -171,6 +171,7 @@ ensure_xdp_loaded() {
                 _xdp_mode="generic"
             fi
         done
+        [[ -f "$BPF_PIN_DIR/sock_state_link" ]] || load_sock_state_tracker || true
         load_port_handlers || true
         auto_tune_interface_parallelism || true
         [[ $_any_missing -eq 1 ]] && echo "[auto_xdp] re-attached XDP to missing interfaces" >&2
@@ -208,6 +209,7 @@ ensure_xdp_loaded() {
     }
     seed_existing_tcp_conntrack
     load_tc_egress_program || true
+    load_sock_state_tracker || true
     load_slot_handlers || true
     load_port_handlers || true
 
