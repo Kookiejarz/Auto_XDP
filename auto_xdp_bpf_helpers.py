@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import ipaddress
 import json
 import os
 import platform
@@ -97,9 +98,23 @@ def pack_ct_key_v4(conn) -> bytes:
 
 
 def pack_ct_key_v6(conn) -> bytes:
+    mapped_remote = _ipv4_mapped_packed(conn.raddr.ip)
+    mapped_local = _ipv4_mapped_packed(conn.laddr.ip)
+    if mapped_remote is not None and mapped_local is not None:
+        return struct.pack("!HH4s4s", conn.raddr.port, conn.laddr.port, mapped_remote, mapped_local)
     remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
     local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
     return struct.pack("!HH16s16s", conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
+
+
+def _ipv4_mapped_packed(ip_str: str) -> bytes | None:
+    try:
+        addr = ipaddress.IPv6Address(ip_str.split("%", 1)[0])
+    except ValueError:
+        return None
+    if addr.ipv4_mapped is None:
+        return None
+    return addr.ipv4_mapped.packed
 
 
 def pack_ct_key(conn) -> bytes:
@@ -162,13 +177,12 @@ def cmd_seed_tcp_conntrack(map_path_v4: str, map_path_v6: str) -> int:
     stamp = time.monotonic_ns()
     for conn in iter_established_tcp():
         try:
-            if conn.family == socket.AF_INET and map_v4 is not None:
-                packed = pack_ct_key_v4(conn)
+            packed = pack_ct_key(conn)
+            if len(packed) == 12 and map_v4 is not None:
                 ctypes.memmove(key_v4, packed, len(packed))
                 struct.pack_into("=Q", value_v4, 0, stamp)
                 bpf(BPF_MAP_UPDATE_ELEM, attr_v4)
-            elif conn.family == socket.AF_INET6 and map_v6 is not None:
-                packed = pack_ct_key_v6(conn)
+            elif len(packed) == 36 and map_v6 is not None:
                 ctypes.memmove(key_v6, packed, len(packed))
                 struct.pack_into("=Q", value_v6, 0, stamp)
                 bpf(BPF_MAP_UPDATE_ELEM, attr_v6)

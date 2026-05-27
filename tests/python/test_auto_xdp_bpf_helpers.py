@@ -52,6 +52,24 @@ class AutoXdpBpfHelpersTests(unittest.TestCase):
         )
         self.assertEqual(packed, expected)
 
+    def test_pack_ct_key_ipv4_mapped_ipv6_uses_v4_map_layout(self):
+        conn = types.SimpleNamespace(
+            family=socket.AF_INET6,
+            laddr=make_addr("::ffff:203.0.113.10", 443),
+            raddr=make_addr("::ffff:198.51.100.20", 50000),
+        )
+
+        packed = helpers.pack_ct_key(conn)
+        expected = struct.pack(
+            "!HH4s4s",
+            50000,
+            443,
+            socket.inet_aton("198.51.100.20"),
+            socket.inet_aton("203.0.113.10"),
+        )
+        self.assertEqual(packed, expected)
+        self.assertEqual(len(packed), 12)
+
     def test_iter_established_tcp_filters_connections(self):
         fake_psutil = types.SimpleNamespace(CONN_ESTABLISHED="ESTABLISHED")
         fake_psutil.net_connections = lambda kind: [
@@ -180,6 +198,31 @@ class AutoXdpBpfHelpersTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue().strip(), "2")
         self.assertEqual(bpf_call.call_count, 2)
         close_call.assert_has_calls([mock.call(123), mock.call(124)])
+
+    def test_cmd_seed_tcp_conntrack_seeds_ipv4_mapped_ipv6_into_v4_map(self):
+        connections = [
+            types.SimpleNamespace(
+                family=socket.AF_INET6,
+                laddr=make_addr("::ffff:203.0.113.10", 443),
+                raddr=make_addr("::ffff:198.51.100.20", 50000),
+            ),
+        ]
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), \
+             mock.patch.object(helpers, "psutil", object()), \
+             mock.patch.object(helpers.os.path, "exists", side_effect=lambda path: path.endswith("tcp_ct4")), \
+             mock.patch.object(helpers, "obj_get", return_value=123), \
+             mock.patch.object(helpers, "iter_established_tcp", return_value=connections), \
+             mock.patch.object(helpers, "bpf") as bpf_call, \
+             mock.patch.object(helpers.os, "close") as close_call, \
+             mock.patch.object(helpers.time, "monotonic_ns", return_value=99):
+            rc = helpers.cmd_seed_tcp_conntrack("/pins/tcp_ct4", "/pins/tcp_ct6")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout.getvalue().strip(), "1")
+        bpf_call.assert_called_once()
+        close_call.assert_called_once_with(123)
 
     def test_main_dispatches_seed_subcommand(self):
         with mock.patch.object(sys, "argv", [

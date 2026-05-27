@@ -158,16 +158,36 @@ def _pack_conntrack_key_raw(family: int, sport_h: int, dport_h: int, src: bytes,
     """Pack XDP conntrack lookup key from SOCK_DIAG fields."""
     if family == socket.AF_INET:
         return struct.pack("!HH4s4s", dport_h, sport_h, dst[:4], src[:4])
+    if family == socket.AF_INET6 and _is_ipv4_mapped_v6(src) and _is_ipv4_mapped_v6(dst):
+        return struct.pack("!HH4s4s", dport_h, sport_h, dst[12:16], src[12:16])
     return struct.pack("!HH16s16s", dport_h, sport_h, dst, src)
 
 
 # shared helpers (used by both paths)
+
+def _is_ipv4_mapped_v6(raw: bytes) -> bool:
+    return len(raw) >= 16 and raw[:10] == b"\x00" * 10 and raw[10:12] == b"\xff\xff"
+
+
+def _ipv4_mapped_packed(ip_str: str) -> bytes | None:
+    try:
+        addr = ipaddress.IPv6Address(ip_str.split("%", 1)[0])
+    except ValueError:
+        return None
+    if addr.ipv4_mapped is None:
+        return None
+    return addr.ipv4_mapped.packed
+
 
 def _pack_tcp_conntrack_key(conn) -> bytes:
     if conn.family == socket.AF_INET:
         remote_ip = socket.inet_aton(conn.raddr.ip)
         local_ip = socket.inet_aton(conn.laddr.ip)
         return struct.pack("!HH4s4s", conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
+    mapped_remote = _ipv4_mapped_packed(conn.raddr.ip)
+    mapped_local = _ipv4_mapped_packed(conn.laddr.ip)
+    if mapped_remote is not None and mapped_local is not None:
+        return struct.pack("!HH4s4s", conn.raddr.port, conn.laddr.port, mapped_remote, mapped_local)
     remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
     local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
     return struct.pack("!HH16s16s", conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
