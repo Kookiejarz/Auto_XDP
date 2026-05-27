@@ -18,7 +18,7 @@ cleanup_existing_xdp() {
 
     if [[ $any_xdp -eq 1 ]]; then
         local iface_list="${xdp_ifaces[*]}"
-        warn "Existing XDP program detected on: $iface_list"
+        info "Existing XDP program detected on: $iface_list — will replace"
         if confirm_yes_no "Unload the existing XDP program from all interfaces and continue? [y/N] " "abort"; then
             :
         else
@@ -53,7 +53,7 @@ cleanup_existing_xdp() {
     fi
 
     if [[ -d "$BPF_PIN_DIR" ]]; then
-        warn "Removing old BPF pin directory $BPF_PIN_DIR..."
+        info "Removing stale BPF pin directory $BPF_PIN_DIR"
         rm -rf "$BPF_PIN_DIR"
     fi
     mkdir -p "$BPF_PIN_DIR"
@@ -61,7 +61,8 @@ cleanup_existing_xdp() {
 
 deploy_xdp_backend() {
     if [[ ! -f "$XDP_OBJ_INSTALLED" ]]; then
-        warn "Compiled XDP object not found; skipping XDP backend."
+        XDP_FALLBACK_REASON="compiled XDP object not found"
+        warn "XDP unavailable: compiled object not found; continuing with nftables backend."
         return 1
     fi
 
@@ -70,19 +71,22 @@ deploy_xdp_backend() {
 
     if ! bpftool prog load "$XDP_OBJ_INSTALLED" "$BPF_PIN_DIR/prog" type xdp \
             pinmaps "$BPF_PIN_DIR"; then
-        warn "bpftool prog load failed; falling back from XDP."
+        XDP_FALLBACK_REASON="bpftool failed to load the XDP program"
+        warn "XDP unavailable: bpftool program load failed; continuing with nftables backend."
         rm -rf "$BPF_PIN_DIR"
         return 1
     fi
 
     if ! xdp_maps_ready; then
-        warn "Pinned XDP maps are incomplete after pinning; falling back from XDP."
+        XDP_FALLBACK_REASON="pinned XDP maps are incomplete"
+        warn "XDP unavailable: pinned maps are incomplete; continuing with nftables backend."
         rm -rf "$BPF_PIN_DIR"
         return 1
     fi
 
     seed_existing_tcp_conntrack
     load_tc_egress_program || true
+    load_sock_state_tracker || true
 
     local iface attached=0 _native_err _generic_err
     ACTIVE_XDP_MODE="native"
@@ -95,8 +99,8 @@ deploy_xdp_backend() {
             attached=$((attached + 1))
         else
             warn "Failed to attach XDP to $iface (skipping this interface)"
-            [[ -n "$_native_err" ]] && warn "  ↳ native:  $_native_err"
-            [[ -n "$_generic_err" ]] && warn "  ↳ generic: $_generic_err"
+            [[ -n "$_native_err" ]] && warn "  native : $_native_err"
+            [[ -n "$_generic_err" ]] && warn "  generic: $_generic_err"
         fi
     done
 
@@ -106,7 +110,8 @@ deploy_xdp_backend() {
         return 0
     fi
 
-    warn "XDP could not be attached to any interface — using nftables fallback."
+    XDP_FALLBACK_REASON="XDP attach failed on all target interfaces"
+    warn "XDP unavailable: attach failed on all target interfaces; continuing with nftables backend."
     cleanup_tc_egress_filter
     for iface in "${IFACES[@]}"; do
         ip link set dev "$iface" xdp off 2>/dev/null || true
@@ -119,6 +124,7 @@ deploy_backend_step() {
     step_begin "Loading backend on ${IFACES[*]}"
     if deploy_xdp_backend; then
         cleanup_existing_nftables
+        XDP_FALLBACK_REASON=""
         step_ok "XDP $ACTIVE_XDP_MODE mode"
     else
         ACTIVE_BACKEND="nftables"

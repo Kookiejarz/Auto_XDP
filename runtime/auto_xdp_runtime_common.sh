@@ -142,11 +142,66 @@ _auto_xdp_iface_irqs() {
     ' "$AUTO_XDP_PROC_INTERRUPTS" 2>/dev/null | sort -n -u
 }
 
+# Return CPUs on the NUMA node local to the given NIC, one per line.
+# Falls back to empty output (caller should then use all online CPUs).
+_auto_xdp_iface_numa_cpus() {
+    local iface="$1"
+    local numa_node_path="${AUTO_XDP_SYS_CLASS_NET_DIR}/${iface}/device/numa_node"
+
+    [[ -r "$numa_node_path" ]] || return 1
+    local node
+    node=$(<"$numa_node_path")
+    # -1 means the platform doesn't expose NUMA topology
+    [[ "$node" =~ ^[0-9]+$ ]] || return 1
+
+    local cpulist_path="/sys/devices/system/node/node${node}/cpulist"
+    [[ -r "$cpulist_path" ]] || return 1
+    _auto_xdp_expand_cpu_ranges "$(<"$cpulist_path")"
+}
+
+_auto_xdp_check_irqbalance() {
+    local running=0
+    if systemctl is-active --quiet irqbalance 2>/dev/null; then
+        running=1
+    elif pgrep -x irqbalance >/dev/null 2>&1; then
+        running=1
+    fi
+    (( running )) || return 0
+
+    _auto_xdp_warn "irqbalance is running and will override IRQ affinity settings."
+
+    if _auto_xdp_truthy "${FORCE:-0}"; then
+        _auto_xdp_info "Stopping irqbalance (--force)."
+        systemctl stop irqbalance 2>/dev/null \
+            || service irqbalance stop 2>/dev/null \
+            || _auto_xdp_warn "Could not stop irqbalance; IRQ affinity may be overridden at next rebalance."
+        return 0
+    fi
+
+    # Only prompt if we're in a setup context where confirm_yes_no is available.
+    if declare -F confirm_yes_no >/dev/null 2>&1; then
+        if confirm_yes_no "Stop irqbalance now to preserve IRQ affinity settings? [y/N] "; then
+            systemctl stop irqbalance 2>/dev/null \
+                || service irqbalance stop 2>/dev/null \
+                || _auto_xdp_warn "Could not stop irqbalance."
+        else
+            _auto_xdp_warn "irqbalance left running; IRQ affinity settings may be overridden. Re-run with --force to stop automatically."
+        fi
+    else
+        _auto_xdp_warn "Run 'systemctl stop irqbalance' to allow IRQ affinity pinning to take effect."
+    fi
+}
+
 _auto_xdp_balance_iface_irqs() {
     local iface="$1" irq idx cpu affinity_path
-    local -a cpus=() irqs=()
+    local -a cpus=() irqs=() all_cpus=()
 
-    mapfile -t cpus < <(_auto_xdp_online_cpus)
+    # Prefer CPUs on the NIC's NUMA node; fall back to all online CPUs.
+    mapfile -t cpus < <(_auto_xdp_iface_numa_cpus "$iface" 2>/dev/null)
+    local numa_local=${#cpus[@]}
+    if (( numa_local == 0 )); then
+        mapfile -t cpus < <(_auto_xdp_online_cpus)
+    fi
     (( ${#cpus[@]} > 0 )) || return 0
 
     mapfile -t irqs < <(_auto_xdp_iface_irqs "$iface")
@@ -160,7 +215,12 @@ _auto_xdp_balance_iface_irqs() {
         printf '%s\n' "$cpu" > "$affinity_path" 2>/dev/null || true
     done
 
-    _auto_xdp_info "Balanced ${#irqs[@]} IRQ(s) for $iface across ${#cpus[@]} CPU(s)."
+    if (( numa_local > 0 )); then
+        mapfile -t all_cpus < <(_auto_xdp_online_cpus)
+        _auto_xdp_info "Balanced ${#irqs[@]} IRQ(s) for $iface across ${#cpus[@]} NUMA-local CPU(s) (node $(< "${AUTO_XDP_SYS_CLASS_NET_DIR}/${iface}/device/numa_node"), ${#all_cpus[@]} total online)."
+    else
+        _auto_xdp_info "Balanced ${#irqs[@]} IRQ(s) for $iface across ${#cpus[@]} CPU(s) (no NUMA topology available)."
+    fi
 }
 
 auto_tune_interface_parallelism() {
@@ -174,6 +234,8 @@ auto_tune_interface_parallelism() {
 
     mapfile -t cpus < <(_auto_xdp_online_cpus)
     (( ${#cpus[@]} > 0 )) || return 0
+
+    _auto_xdp_check_irqbalance
 
     for iface in "${ifaces_ref[@]}"; do
         _auto_xdp_tune_combined_channels "$iface" "${#cpus[@]}"
@@ -199,6 +261,9 @@ cleanup_tc_egress_filter() {
     for iface in "${ifaces_ref[@]}"; do
         tc filter del dev "$iface" egress pref "${TC_FILTER_PREF:-49152}" 2>/dev/null || true
     done
+    rm -f "${BPF_PIN_DIR}/sock_state_link" \
+          "${BPF_PIN_DIR}/sock_state_prog" \
+          "${BPF_PIN_DIR}/sock_state_rb" 2>/dev/null || true
 }
 
 _map_value_size_ok() {
@@ -218,10 +283,10 @@ xdp_maps_ready() {
 
     # Value-size guard: catches pinned maps from an older build before the
     # caller skips reload.  Sizes are derived from the C structs in bpf/include/:
-    #   xdp_runtime_cfg  8 × __u64                              = 64 B
-    #   udp_global_state bpf_spin_lock(4) + __u32(4) + 4×__u64 = 40 B
+    #   xdp_runtime_cfg  8 × __u64 + 2 × __u32 (cfg_flags + _pad) = 72 B
+    #   udp_global_state bpf_spin_lock(4) + __u32(4) + 4×__u64     = 40 B
     # Update these numbers whenever the corresponding struct gains or loses fields.
-    _map_value_size_ok "${BPF_PIN_DIR}/xdp_runtime_cfg" 64 || {
+    _map_value_size_ok "${BPF_PIN_DIR}/xdp_runtime_cfg" 72 || {
         _auto_xdp_warn "xdp_runtime_cfg value_size mismatch; forcing XDP reload"
         return 1
     }
@@ -373,6 +438,46 @@ load_tc_egress_program() {
     done
 
     [[ $attached -gt 0 ]] && return 0 || return 1
+}
+
+load_sock_state_tracker() {
+    local obj_path=""
+    local prog_pin="${BPF_PIN_DIR}/sock_state_prog"
+    local link_pin="${BPF_PIN_DIR}/sock_state_link"
+
+    obj_path=$(_auto_xdp_first_value SOCK_STATE_OBJ_PATH SOCK_STATE_OBJ_INSTALLED) || obj_path=""
+
+    rm -f "$link_pin" "$prog_pin"
+    rm -f "${BPF_PIN_DIR}/sock_state_rb"
+
+    if [[ ! -f "$obj_path" ]]; then
+        _auto_xdp_warn "sock_state_track.o not found; falling back to proc_connector sync only."
+        return 1
+    fi
+
+    if ! command -v bpftool &>/dev/null; then
+        _auto_xdp_warn "bpftool not found; sock_state tracker unavailable."
+        return 1
+    fi
+
+    if ! bpftool prog load "$obj_path" "$prog_pin" \
+            type tracepoint \
+            pinmaps "${BPF_PIN_DIR}/" >/dev/null 2>&1; then
+        _auto_xdp_warn "Failed to load sock_state tracker (kernel may be too old for this BPF feature)."
+        return 1
+    fi
+
+    if ! bpftool link create type tracepoint \
+            event sock/inet_sock_set_state \
+            prog pinned "$prog_pin" \
+            pinned "$link_pin" >/dev/null 2>&1; then
+        _auto_xdp_warn "Failed to attach sock_state tracepoint (bpftool too old?); cleaning up."
+        rm -f "$prog_pin" "${BPF_PIN_DIR}/sock_state_rb"
+        return 1
+    fi
+
+    _auto_xdp_info "sock_state tracker attached (tracepoint inet_sock_set_state)."
+    return 0
 }
 
 load_slot_handlers() {

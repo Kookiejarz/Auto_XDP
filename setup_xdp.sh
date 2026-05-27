@@ -14,24 +14,27 @@ _STEP_NEWLINED=0
 _PENDING_NL=0
 # Prefix used to indent sub-lines inside a step (aligns with label text).
 _STEP_INDENT="             "
+OK_MARK="${GREEN}✓${NC}"
+WARN_MARK="${YELLOW}!${NC}"
+FAIL_MARK="${RED}✗${NC}"
 
 info()  {
     if [[ $IN_STEP -eq 1 ]]; then
         if [[ $_STEP_NEWLINED -eq 0 ]]; then printf "\n"; _STEP_NEWLINED=1; fi
         if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; fi
-        printf "${_STEP_INDENT}${CYAN}↳ [INFO]${NC}  %s" "$*"
+        printf "${_STEP_INDENT}${CYAN}[INFO]${NC}  %s" "$*"
         _PENDING_NL=1
     else
         if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; _PENDING_NL=0; fi
         echo -e "${CYAN}[INFO]${NC}  $*"
     fi
 }
-ok()    { if [[ $IN_STEP -eq 0 ]]; then echo -e "${GREEN}[ OK ]${NC}  $*"; fi; }
+ok()    { if [[ $IN_STEP -eq 0 ]]; then echo -e "${GREEN}[OK]${NC}    $*"; fi; }
 warn()  {
     if [[ $IN_STEP -eq 1 ]]; then
         if [[ $_STEP_NEWLINED -eq 0 ]]; then printf "\n"; _STEP_NEWLINED=1; fi
         if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; _PENDING_NL=0; fi
-        printf "${_STEP_INDENT}${YELLOW}↳ [WARN]${NC}  %s\n" "$*"
+        printf "${_STEP_INDENT}${YELLOW}[WARN]${NC}  %s\n" "$*"
     else
         if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; _PENDING_NL=0; fi
         echo -e "${YELLOW}[WARN]${NC}  $*"
@@ -40,14 +43,32 @@ warn()  {
 die()   {
     if [[ $IN_STEP -eq 1 ]]; then
         if [[ $_STEP_NEWLINED -eq 0 ]]; then
-            printf " ${RED}✗${NC}\n"
+            printf " ${FAIL_MARK}\n"
         else
             if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; fi
-            printf "${_STEP_INDENT}${RED}✗${NC}\n"
+            printf "${_STEP_INDENT}${FAIL_MARK}\n"
         fi
         IN_STEP=0; _STEP_NEWLINED=0; _PENDING_NL=0
     fi
     echo -e "${RED}[ERR ]${NC}  $*" >&2
+    exit 1
+}
+
+die_with_next() {
+    local message="$1"
+    local next_step="$2"
+
+    if [[ $IN_STEP -eq 1 ]]; then
+        if [[ $_STEP_NEWLINED -eq 0 ]]; then
+            printf " ${FAIL_MARK}\n"
+        else
+            if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; fi
+            printf "${_STEP_INDENT}${FAIL_MARK}\n"
+        fi
+        IN_STEP=0; _STEP_NEWLINED=0; _PENDING_NL=0
+    fi
+    echo -e "${RED}[ERR ]${NC}  $message" >&2
+    echo "       Next: $next_step" >&2
     exit 1
 }
 
@@ -73,6 +94,9 @@ RUNNER_SRC="runtime/auto_xdp_start.sh"
 RUNTIME_COMMON_SRC="runtime/auto_xdp_runtime_common.sh"
 XDP_OBJ_INSTALLED="${INSTALL_DIR}/xdp_firewall.o"
 TC_OBJ_INSTALLED="${INSTALL_DIR}/tc_flow_track.o"
+SOCK_STATE_SRC="bpf/sock_state_track.c"
+SOCK_STATE_OBJ="sock_state_track.o"
+SOCK_STATE_OBJ_INSTALLED="${INSTALL_DIR}/sock_state_track.o"
 BPF_RUNTIME_COMMON_INSTALLED="${INSTALL_DIR}/auto_xdp_runtime_common.sh"
 BPF_HELPER_SRC="auto_xdp_bpf_helpers.py"
 BPF_HELPER_INSTALLED="${INSTALL_DIR}/auto_xdp_bpf_helpers.py"
@@ -81,6 +105,7 @@ BUILD_STAGING_DIR=""
 
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 SERVICE_NAME="xdp-port-sync"
+RELAY_SERVICE_NAME="auto-xdp-relay"
 RAW_URL="https://raw.githubusercontent.com/Kookiejarz/auto_xdp/main"
 TC_FILTER_PREF=49152
 PREFER_REMOTE_SOURCES=0
@@ -108,6 +133,7 @@ SYSTEMD_AVAILABLE=0
 OPENRC_AVAILABLE=0
 ACTIVE_BACKEND="nftables"
 ACTIVE_XDP_MODE="none"
+XDP_FALLBACK_REASON=""
 PYTHON3_BIN=""
 CHECK_UPDATES=0
 FORCE=0
@@ -118,11 +144,22 @@ DISTRO_NAME="unknown"
 DISTRO_LIKE=""
 DISTRO_FAMILY="unknown"
 
+_SETUP_TMPFILES=()
+_cleanup_setup_tmpfiles() {
+    local f
+    for f in "${_SETUP_TMPFILES[@]:-}"; do
+        [[ -f "$f" ]] && rm -f "$f"
+    done
+    return 0
+}
+trap '_cleanup_setup_tmpfiles' EXIT
+
 source_setup_lib() {
     local relative_path="$1"
     local source_path="$relative_path"
     if [[ $PREFER_REMOTE_SOURCES -eq 1 || ! -r "$source_path" ]]; then
         source_path=$(mktemp)
+        _SETUP_TMPFILES+=("$source_path")
         curl -fsSL "${RAW_URL}/${relative_path}" -o "$source_path" \
             || die "Failed to load ${relative_path}"
     fi
@@ -150,6 +187,7 @@ load_runtime_common_lib() {
     local lib_path="$RUNTIME_COMMON_SRC"
     if [[ $PREFER_REMOTE_SOURCES -eq 1 || ! -r "$lib_path" ]]; then
         lib_path=$(mktemp)
+        _SETUP_TMPFILES+=("$lib_path")
         if ! fetch_local_or_remote "$RUNTIME_COMMON_SRC" "$RUNTIME_COMMON_SRC" "$lib_path"; then
             die "Failed to load ${RUNTIME_COMMON_SRC}"
         fi
@@ -185,6 +223,7 @@ main() {
     check_root_privileges
     resolve_target_interfaces_step
     detect_environment_step
+    print_setup_plan
     check_required_tools_step
     bootstrap_bpf_helper_step
     confirm_existing_install_step

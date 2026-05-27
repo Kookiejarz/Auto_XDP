@@ -23,7 +23,7 @@ bootstrap_bpf_helper_step() {
     fi
 
     if ! command -v bpftool &>/dev/null || ! command -v clang &>/dev/null; then
-        echo -e "  ${YELLOW}[WARN]${NC}  bpftool or clang still missing — XDP backend may be unavailable."
+        warn "bpftool or clang still missing — XDP backend may be unavailable"
     fi
 }
 
@@ -289,12 +289,44 @@ compile_xdp_program() {
     return 0
 }
 
+compile_sock_state_program() {
+    if ! command -v clang &>/dev/null; then
+        warn "clang missing; sock_state tracker will be skipped."
+        return 1
+    fi
+
+    if ! stage_build_source "$SOCK_STATE_SRC" "$SOCK_STATE_SRC" "$SOCK_STATE_SRC"; then
+        warn "Unable to fetch ${SOCK_STATE_SRC}; sock_state tracker will be skipped."
+        return 1
+    fi
+
+    if ! resolve_bpf_build_env || [[ -z "$ASM_INC" ]]; then
+        return 1
+    fi
+
+    if ! compile_bpf_object \
+            "${BUILD_STAGING_DIR}/${SOCK_STATE_SRC}" \
+            "$SOCK_STATE_OBJ" \
+            "$BUILD_STAGING_DIR"; then
+        warn "Failed to compile ${SOCK_STATE_SRC}; sock_state tracker will be skipped."
+        return 1
+    fi
+
+    mkdir -p "$INSTALL_DIR"
+    cp "$SOCK_STATE_OBJ" "$SOCK_STATE_OBJ_INSTALLED"
+    return 0
+}
+
 compile_bpf_objects_step() {
-    step_begin "Compiling XDP and tc BPF objects" COMPILE
-    if compile_xdp_program; then
+    step_begin "Compiling XDP, tc, and sock_state BPF objects" COMPILE
+    local ok=1
+    compile_xdp_program || ok=0
+    compile_sock_state_program || true
+    if [[ $ok -eq 1 ]]; then
         step_ok
     else
-        step_warn "compile failed — nftables fallback will be used"
+        XDP_FALLBACK_REASON="BPF object compilation failed"
+        step_warn "XDP unavailable, continuing with nftables backend"
     fi
 }
 
@@ -327,7 +359,7 @@ cleanup_build_artifacts_step() {
     local _cleaned=()
 
     step_begin "Cleaning up build artifacts"
-    for _f in "$XDP_OBJ" "$TC_OBJ"; do
+    for _f in "$XDP_OBJ" "$TC_OBJ" "$SOCK_STATE_OBJ"; do
         if [[ -f "$_f" ]]; then
             rm -f "$_f" && _cleaned+=("$_f")
         fi

@@ -17,6 +17,7 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 TOML_CONFIG_PATH = "/etc/auto_xdp/config.toml"
+RINGBUF_SOCKET_PATH = "/var/run/auto_xdp/pkt_events.sock"
 
 BACKEND_AUTO = "auto"
 BACKEND_XDP = "xdp"
@@ -96,6 +97,13 @@ TRUSTED_SRC_IPS: dict[str, str] = {}
 ACL_RULES: list[dict] = []
 SIT4_ENDPOINTS: list[str] = []
 
+ABUSEIPDB_ENABLED = False
+ABUSEIPDB_BASE_URL = "https://raw.githubusercontent.com/borestad/blocklist-abuseipdb/refs/heads/main"
+ABUSEIPDB_SOURCES: list[str] = ["s1003d"]
+ABUSEIPDB_REFRESH_SECONDS = 3600.0
+ABUSEIPDB_RISK_MAP_PATH4 = ""
+ABUSEIPDB_CFG_MAP_PATH = ""
+
 ACL_MAX_PORTS = 64
 ACL_VAL_SIZE = 4 + ACL_MAX_PORTS * 2
 
@@ -117,8 +125,6 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "udp_global_rl",
     "xdp_runtime_cfg",
     "udp_percpu_acc",
-    "bogon_cfg",
-    "observability_cfg",
     "proto_handlers",
     "tcp_port_handlers",
     "udp_port_handlers",
@@ -129,10 +135,11 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "udp_hv4",
     "udp_hv6",
     "slot_ctx_map",
-    "slot_def_action",
+    "sit4_endpoints",
     "tsc_pfx4",
     "tsc_pfx6",
     "tsc_port",
+    "abuseipdb_v4",
 )
 
 
@@ -190,6 +197,7 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     global SIT4_ENDPOINTS_MAP_PATH
     global TSC_PFX4_MAP_PATH, TSC_PFX6_MAP_PATH, TSC_PORT_MAP_PATH
     global REQUIRED_XDP_MAP_PATHS
+    global ABUSEIPDB_RISK_MAP_PATH4, ABUSEIPDB_CFG_MAP_PATH
     BPF_PIN_DIR = pin_dir
     TCP_MAP_PATH = f"{pin_dir}/tcp_whitelist"
     UDP_MAP_PATH = f"{pin_dir}/udp_whitelist"
@@ -204,8 +212,6 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     UDP_PORT_POLICY_MAP_PATH = f"{pin_dir}/udp_port_policies"
     UDP_GLOBAL_RL_MAP_PATH = f"{pin_dir}/udp_global_rl"
     XDP_RUNTIME_CFG_MAP_PATH = f"{pin_dir}/xdp_runtime_cfg"
-    BOGON_CFG_MAP_PATH = f"{pin_dir}/bogon_cfg"
-    OBSERVABILITY_CFG_MAP_PATH = f"{pin_dir}/observability_cfg"
     TCP_ACL_MAP_PATH4 = f"{pin_dir}/tcp_acl_v4"
     TCP_ACL_MAP_PATH6 = f"{pin_dir}/tcp_acl_v6"
     UDP_ACL_MAP_PATH4 = f"{pin_dir}/udp_acl_v4"
@@ -214,6 +220,8 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     TSC_PFX4_MAP_PATH = f"{pin_dir}/tsc_pfx4"
     TSC_PFX6_MAP_PATH = f"{pin_dir}/tsc_pfx6"
     TSC_PORT_MAP_PATH = f"{pin_dir}/tsc_port"
+    ABUSEIPDB_RISK_MAP_PATH4 = f"{pin_dir}/abuseipdb_v4"
+    ABUSEIPDB_CFG_MAP_PATH = f"{pin_dir}/abuseipdb_cfg"
     REQUIRED_XDP_MAP_PATHS = tuple(f"{pin_dir}/{n}" for n in REQUIRED_XDP_MAP_NAMES)
 
 
@@ -534,3 +542,18 @@ def apply_toml_config(cfg: dict) -> None:
         0.0,
     )
     XDP_UDP_GLOBAL_BYTE_RATE = int(_udp_global_byte_rate_mbps * 1_000_000 / 8)
+
+    global ABUSEIPDB_ENABLED, ABUSEIPDB_BASE_URL, ABUSEIPDB_SOURCES, ABUSEIPDB_REFRESH_SECONDS
+    _ab = cfg.get("abuseipdb", {})
+    ABUSEIPDB_ENABLED = bool(_ab.get("enabled", False))
+    ABUSEIPDB_BASE_URL = str(_ab.get(
+        "base_url",
+        "https://raw.githubusercontent.com/borestad/blocklist-abuseipdb/refs/heads/main",
+    ))
+    _raw_sources = _ab.get("sources", ["s1003d"])
+    ABUSEIPDB_SOURCES = [str(s) for s in _raw_sources] if isinstance(_raw_sources, list) else ["s1003d"]
+    ABUSEIPDB_REFRESH_SECONDS = _coerce_positive_float(
+        _ab.get("refresh_seconds", 3600.0),
+        "abuseipdb.refresh_seconds",
+        3600.0,
+    )

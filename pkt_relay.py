@@ -12,38 +12,36 @@ from __future__ import annotations
 
 import argparse
 import collections
-import ctypes
-import ctypes.util
 import json
 import logging
 import mmap
 import os
-import platform
+import queue
 import select
 import signal
 import socket
 import struct
 import sys
+import threading
 import time
 
-try:
-    import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib  # type: ignore[no-redef]
-    except ImportError:
-        tomllib = None  # type: ignore[assignment]
+from auto_xdp.bpf.syscall import obj_get
+from auto_xdp.config import load_toml_config
+from auto_xdp.sock_state import SockStateReader, SOCK_STATE_EVENT_SIZE
 
 # paths & defaults
 
 TOML_CONFIG_PATH   = "/etc/auto_xdp/config.toml"
 RINGBUF_PIN_PATH   = "/sys/fs/bpf/xdp_fw/pkt_ringbuf"
+SOCK_STATE_RB_PIN_PATH   = "/sys/fs/bpf/xdp_fw/sock_state_rb"
+SOCK_STATE_RB_MAX_ENTRIES = 1 << 16   # 64 KiB — must match C definition
 SOCKET_PATH        = "/var/run/auto_xdp/pkt_events.sock"
 PID_FILE           = "/var/run/auto_xdp/pkt_relay.pid"
 RINGBUF_MAX_ENTRIES = 1 << 22   # 4 MiB — must match C definition
 RETENTION_SECONDS  = 300
 MAX_EVENTS         = 100_000
 MAX_HISTORY_SEND   = 5_000      # cap history batch sent on client connect
+EVENT_QUEUE_MAX    = 20_000     # reader→broadcaster queue depth before dropping
 
 PAGE_SIZE = mmap.PAGESIZE
 
@@ -65,6 +63,7 @@ _PROTO_NAMES: dict[int, str] = {
 
 # xdp_counter_idx values that appear as the reason field
 _REASON_NAMES: dict[int, str] = {
+    0:  "TCP_NEW_ALLOW",
     2:  "TCP_DROP",
     4:  "UDP_DROP",
     7:  "FRAG_DROP",
@@ -85,42 +84,18 @@ _REASON_NAMES: dict[int, str] = {
     25: "UDP_MALFORM_PORT0",
     26: "UDP_MALFORM_LEN",
     27: "BOGON_DROP",
+    28: "TCP_CONN_LIMIT_DROP",
+    29: "SYN_AGG_RATE_DROP",
+    30: "UDP_AGG_RATE_DROP",
+    31: "HANDLER_BLOCK_DROP",
+    32: "TCP_CONN_PREFIX_LIMIT_DROP",
+    33: "TCP_CONN_PORT_LIMIT_DROP",
+    34: "ABUSEIPDB_DROP",
 }
 
 _PKT_EVENT_SIZE = 48   # sizeof(struct pkt_event)
 _AF_INET        = 2
 _AF_INET6       = 10
-
-# BPF syscall helpers (mirrors xdp_port_sync.py)
-
-_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-_NR_BPF: int = {
-    "x86_64":  321,
-    "aarch64": 280,
-    "armv7l":  386,
-    "armv6l":  386,
-}.get(platform.machine(), 321)
-
-_BPF_OBJ_GET = 7
-
-
-def _bpf(cmd: int, attr: ctypes.Array) -> int:
-    ret = _libc.syscall(_NR_BPF, ctypes.c_int(cmd), attr, ctypes.c_uint(len(attr)))
-    if ret < 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
-    return ret
-
-
-def _obj_get(path: str) -> int:
-    """Open a pinned BPF object and return its fd."""
-    path_b = ctypes.create_string_buffer(path.encode() + b"\x00")
-    attr = ctypes.create_string_buffer(128)
-    struct.pack_into("=Q", attr, 0, ctypes.cast(path_b, ctypes.c_void_p).value or 0)
-    return _bpf(_BPF_OBJ_GET, attr)
-
-
-# ── logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -130,37 +105,15 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# config
-
-def _load_toml(path: str) -> dict:
-    if tomllib is None:
-        return {}
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except FileNotFoundError:
-        return {}
-    except OSError as exc:
-        log.warning("Failed to load %s: %s", path, exc)
-        return {}
-
-
-def _ringbuf_cfg(toml: dict) -> dict:
-    return toml.get("ringbuf", {})
-
-
 # event decoder
 
+_DECODE_STRUCT = struct.Struct("<Q16s16sHHBBBB")
+
 def decode_event(raw: bytes) -> dict | None:
-    """Decode a 48-byte pkt_event struct into a JSON-serialisable dict."""
     if len(raw) < _PKT_EVENT_SIZE:
         return None
-    ts_ns = struct.unpack_from("<Q", raw, 0)[0]
-    src_raw = raw[8:24]
-    dst_raw = raw[24:40]
-    src_port = struct.unpack_from(">H", raw, 40)[0]
-    dst_port = struct.unpack_from(">H", raw, 42)[0]
-    proto, family, _verdict, reason = struct.unpack_from("BBBB", raw, 44)
+    ts_ns, src_raw, dst_raw, src_port, dst_port, proto, family, verdict, reason = \
+        _DECODE_STRUCT.unpack_from(raw, 0)
 
     if family == _AF_INET:
         src_ip = socket.inet_ntoa(src_raw[0:4])
@@ -183,6 +136,8 @@ def decode_event(raw: bytes) -> dict | None:
         "dport":     dst_port,
         "proto":     _PROTO_NAMES.get(proto, str(proto)),
         "family":    ip_ver,
+        "verdict":   "ALLOW" if verdict == 2 else "DROP",
+        "verdict_id": verdict,
         "reason":    _REASON_NAMES.get(reason, str(reason)),
         "reason_id": reason,
     }
@@ -196,7 +151,7 @@ class RingBufReader:
     def __init__(self, pin_path: str, max_entries: int = RINGBUF_MAX_ENTRIES) -> None:
         self._max = max_entries
         self._mask = max_entries - 1
-        self._fd = _obj_get(pin_path)
+        self._fd = obj_get(pin_path)
 
         # Consumer page: read+write — we store the consumer position here.
         self._consumer = mmap.mmap(
@@ -220,9 +175,7 @@ class RingBufReader:
     def _set_cpos(self, pos: int) -> None:
         struct.pack_into("<Q", self._consumer, 0, pos)
 
-    def drain(self) -> list[bytes]:
-        """Return raw payloads for all available non-discarded records."""
-        records: list[bytes] = []
+    def drain(self):
         cpos = self._cpos()
         ppos = self._ppos()
 
@@ -231,16 +184,14 @@ class RingBufReader:
             (hdr,) = struct.unpack_from("<I", self._data, off)
 
             if hdr & _BUSY_BIT:
-                break   # producer still writing this record
+                break
 
             data_len = hdr & ~(_BUSY_BIT | _DISCARD_BIT)
             if not (hdr & _DISCARD_BIT) and data_len == _PKT_EVENT_SIZE:
-                records.append(bytes(self._data[off + _HDR_SZ: off + _HDR_SZ + data_len]))
+                yield bytes(self._data[off + _HDR_SZ: off + _HDR_SZ + data_len])
 
             cpos += _HDR_SZ + ((data_len + 7) & ~7)
             self._set_cpos(cpos)
-
-        return records
 
     def fileno(self) -> int:
         return self._fd
@@ -265,8 +216,10 @@ class RelayServer:
         retention_seconds: float = RETENTION_SECONDS,
         max_events: int = MAX_EVENTS,
         max_history_send: int = MAX_HISTORY_SEND,
+        sock_state_reader: SockStateReader | None = None,
     ) -> None:
         self._rb = ringbuf
+        self._ss = sock_state_reader
         self._sock_path = sock_path
         self._retention_ns = int(retention_seconds * 1e9)
         self._history: collections.deque[dict] = collections.deque(maxlen=max_events)
@@ -274,6 +227,7 @@ class RelayServer:
         self._clients: dict[int, socket.socket] = {}   # fd → socket
         self._server: socket.socket | None = None
         self._running = False
+        self._queue: queue.Queue[dict] = queue.Queue(maxsize=EVENT_QUEUE_MAX)
 
     # internal helpers
 
@@ -328,15 +282,40 @@ class RelayServer:
             log.debug("client disconnected fd=%d total=%d", fd, len(self._clients))
 
     def _broadcast(self, event: dict) -> None:
-        msg = {"type": "event", **event}
+        if not self._clients:
+            return
+        msg = event if "type" in event else {"type": "event", **event}
+        line = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         dead: list[int] = []
         for fd, conn in list(self._clients.items()):
-            if not self._send_line(conn, msg):
+            try:
+                conn.sendall(line)
+            except OSError:
                 dead.append(fd)
         for fd in dead:
             self._drop_client(fd)
 
     # main loop
+
+    def _reader_loop(self) -> None:
+        # BPF_RB_NO_WAKEUP suppresses epoll notifications, so the fd is never
+        # readable via select. Poll directly with a short sleep instead.
+        while self._running:
+            for raw in self._rb.drain():
+                ev = decode_event(raw)
+                if ev:
+                    ev["seen_at"] = time.time()
+                    try:
+                        self._queue.put_nowait(ev)
+                    except queue.Full:
+                        pass
+            if self._ss is not None:
+                for ev in self._ss.drain():
+                    try:
+                        self._queue.put_nowait(ev)
+                    except queue.Full:
+                        pass
+            time.sleep(0.005)
 
     def run(self) -> None:
         self._open_server()
@@ -344,39 +323,47 @@ class RelayServer:
         self._running = True
         log.info("pkt_relay running  retention=%.0fs", self._retention_ns / 1e9)
 
+        reader = threading.Thread(target=self._reader_loop, name="rb-reader", daemon=True)
+        reader.start()
+
+        srv_fd = self._server.fileno()
+        last_trim = time.monotonic()
+
         try:
             while self._running:
-                rfds: list[int] = [
-                    self._rb.fileno(),
-                    self._server.fileno(),
-                    *self._clients.keys(),
-                ]
+                rfds: list[int] = [srv_fd, *self._clients.keys()]
                 try:
-                    readable, _, _ = select.select(rfds, [], [], 1.0)
+                    readable, _, _ = select.select(rfds, [], [], 0.01)
                 except (InterruptedError, ValueError):
-                    continue
-
-                srv_fd = self._server.fileno()
-                rb_fd  = self._rb.fileno()
+                    readable = []
 
                 for rfd in readable:
                     if rfd == srv_fd:
                         self._accept_client()
-                    elif rfd == rb_fd:
-                        for raw in self._rb.drain():
-                            ev = decode_event(raw)
-                            if ev:
-                                self._history.append(ev)
-                                self._broadcast(ev)
-                    elif rfd in self._clients:
-                        conn = self._clients[rfd]
-                        try:
-                            data = conn.recv(256)
-                        except OSError:
-                            data = b""
-                        if not data:
-                            self._drop_client(rfd)
+                    else:
+                        conn = self._clients.get(rfd)
+                        if conn:
+                            try:
+                                data = conn.recv(256)
+                            except OSError:
+                                data = b""
+                            if not data:
+                                self._drop_client(rfd)
+
+                while True:
+                    try:
+                        ev = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    self._history.append(ev)
+                    self._broadcast(ev)
+
+                now = time.monotonic()
+                if now - last_trim >= 1.0:
+                    self._trim_history()
+                    last_trim = now
         finally:
+            reader.join(timeout=2.0)
             self._cleanup()
 
     def stop(self) -> None:
@@ -433,30 +420,62 @@ def main() -> None:
     ap.add_argument("--max-events", default=None, type=int, metavar="N",
                     help="in-memory event cap (overrides config)")
     ap.add_argument("--pid-file",  default=PID_FILE, metavar="PATH")
+    ap.add_argument("--wait-for-ringbuf", action="store_true",
+                    help="wait and retry until the pinned ring buffer map is available")
+    ap.add_argument("--retry-interval", default=2.0, type=float, metavar="SECS",
+                    help="retry interval for --wait-for-ringbuf (default: %(default)s)")
+    ap.add_argument(
+        "--sock-state-rb",
+        default=SOCK_STATE_RB_PIN_PATH,
+        metavar="PATH",
+        help="pinned sock_state_rb map path (default: %(default)s)",
+    )
     ap.add_argument("--debug",     action="store_true")
     args = ap.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    toml = _load_toml(args.config)
-    cfg  = _ringbuf_cfg(toml)
+    toml = load_toml_config(args.config)
+    cfg  = toml.get("ringbuf", {})
 
     sock_path  = args.socket    or cfg.get("socket_path",       SOCKET_PATH)
     retention  = args.retention or cfg.get("retention_seconds", RETENTION_SECONDS)
     max_events = args.max_events or cfg.get("max_events",       MAX_EVENTS)
 
+    while True:
+        try:
+            rb = RingBufReader(args.pin_path)
+            break
+        except OSError as exc:
+            if not args.wait_for_ringbuf:
+                log.error("Cannot open ring buffer %s: %s", args.pin_path, exc)
+                sys.exit(1)
+            log.warning(
+                "Cannot open ring buffer %s: %s; retrying in %.1fs",
+                args.pin_path,
+                exc,
+                args.retry_interval,
+            )
+            time.sleep(max(args.retry_interval, 0.1))
+
+    ss_reader: SockStateReader | None = None
     try:
-        rb = RingBufReader(args.pin_path)
-    except OSError as exc:
-        log.error("Cannot open ring buffer %s: %s", args.pin_path, exc)
-        sys.exit(1)
+        ss_rb = RingBufReader(args.sock_state_rb, SOCK_STATE_RB_MAX_ENTRIES)
+        ss_reader = SockStateReader(ss_rb)
+        log.info("sock_state_rb opened; port_change events enabled.")
+    except (OSError, FileNotFoundError):
+        log.info("sock_state_rb not found; port_change events disabled.")
+
+    max_history_send = cfg.get("max_history_send", MAX_HISTORY_SEND)
 
     relay = RelayServer(
         rb,
         sock_path=sock_path,
         retention_seconds=float(retention),
         max_events=int(max_events),
+        max_history_send=int(max_history_send),
+        sock_state_reader=ss_reader,
     )
 
     _write_pid(args.pid_file)
