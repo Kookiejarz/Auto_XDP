@@ -32,17 +32,14 @@ static __always_inline __u8 tcp_malformed_reason(struct tcphdr *tcp, void *data_
 
 // Returns 0 for valid packets, or a CNT_UDP_MALFORM_* reason code for drops.
 // count() and emit_drop() are the caller's responsibility.
-static __always_inline __u8 udp_malformed_reason(struct udphdr *udp, void *data_end)
+// l4_avail = (u32)(data_end - udp): caller computes this via pointer subtraction
+// (not addition) before the call so the verifier retains range tracking.
+static __always_inline __u8 udp_malformed_reason(struct udphdr *udp, __u32 l4_avail)
 {
     if (udp->source == 0 || udp->dest == 0)
         return (__u8)CNT_UDP_MALFORM_PORT0;
-    // This kernel's BPF verifier loses range tracking after both be16 (from
-    // bpf_ntohs) and ALU32 OR BPF_X (register OR), making any subsequent
-    // packet-pointer add on ulen fail verification. The callers already
-    // verified (udp + 1) <= data_end so memory safety is guaranteed; the
-    // upper-bound check is a semantic validation the firewall never needs
-    // because it never accesses bytes past the UDP header.
-    if (bpf_ntohs(udp->len) < 8)
+    __u16 ulen = bpf_ntohs(udp->len);
+    if (ulen < 8 || ulen > l4_avail)
         return (__u8)CNT_UDP_MALFORM_LEN;
     return 0;
 }

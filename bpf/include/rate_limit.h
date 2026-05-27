@@ -259,55 +259,6 @@ static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
     }
 }
 
-static __always_inline void tcp_src_conn_record_new(struct flow_key *key, __u64 now,
-                                                    __u32 dest_port)
-{
-    if (key->family == CT_FAMILY_IPV4) {
-        struct tcp_src_conn_key_v4 skey;
-        struct tcp_src_conn_val *sv;
-
-        fill_tcp_src_conn_key_v4(&skey, key, dest_port);
-        sv = bpf_map_lookup_elem(&tsc4, &skey);
-        if (!sv) {
-            struct tcp_src_conn_val new_sv;
-            __builtin_memset(&new_sv, 0, sizeof(new_sv));
-            new_sv.last_seen_ns = now;
-            new_sv.count = 1;
-            bpf_map_update_elem(&tsc4, &skey, &new_sv, BPF_ANY);
-            return;
-        }
-
-        if (now - sv->last_seen_ns > runtime_tcp_timeout_ns())
-            sv->count = 0;
-        if (sv->count < 0xFFFFFFFF)
-            sv->count++;
-        sv->last_seen_ns = now;
-        return;
-    }
-
-    {
-        struct tcp_src_conn_key_v6 skey;
-        struct tcp_src_conn_val *sv;
-
-        fill_tcp_src_conn_key_v6(&skey, key, dest_port);
-        sv = bpf_map_lookup_elem(&tsc6, &skey);
-        if (!sv) {
-            struct tcp_src_conn_val new_sv;
-            __builtin_memset(&new_sv, 0, sizeof(new_sv));
-            new_sv.last_seen_ns = now;
-            new_sv.count = 1;
-            bpf_map_update_elem(&tsc6, &skey, &new_sv, BPF_ANY);
-            return;
-        }
-
-        if (now - sv->last_seen_ns > runtime_tcp_timeout_ns())
-            sv->count = 0;
-        if (sv->count < 0xFFFFFFFF)
-            sv->count++;
-        sv->last_seen_ns = now;
-    }
-}
-
 static __always_inline void tcp_src_conn_record_established(
     struct flow_key *key, __u64 now, __u32 dest_port)
 {
@@ -664,6 +615,8 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
                 tcp_src_conn_record_activity(key, now, dest_port);
             }
             count(CNT_TCP_NEW_ALLOW);
+            emit_allow(IPPROTO_TCP, key->family, key->saddr, key->daddr,
+                       key->sport, key->dport, (__u8)CNT_TCP_NEW_ALLOW, now);
             return XDP_PASS;
         }
     }
@@ -673,6 +626,8 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
 
     tcp_conntrack_update(ipv4, &key_v4, &key_v6, now | CT_SYN_PENDING, BPF_ANY);
     count(CNT_TCP_NEW_ALLOW);
+    emit_allow(IPPROTO_TCP, key->family, key->saddr, key->daddr,
+               key->sport, key->dport, (__u8)CNT_TCP_NEW_ALLOW, now);
     return XDP_PASS;
 }
 

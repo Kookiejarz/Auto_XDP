@@ -50,3 +50,14 @@ def map_max_entries(fd: int) -> int:
     bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
     # bpf_map_info.max_entries is at offset 16 (after type, id, key_size, value_size)
     return struct.unpack_from("=I", info, 16)[0]
+
+
+def map_id(fd: int) -> int:
+    """Return the kernel-assigned map ID for an open BPF map fd."""
+    info = ctypes.create_string_buffer(128)
+    attr = ctypes.create_string_buffer(16)
+    info_ptr = ctypes.cast(info, ctypes.c_void_p).value or 0
+    struct.pack_into("=IIQ", attr, 0, fd, len(info), info_ptr)
+    bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
+    # bpf_map_info: type(u32) at 0, id(u32) at 4
+    return struct.unpack_from("=I", info, 4)[0]

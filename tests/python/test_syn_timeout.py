@@ -163,9 +163,9 @@ class GcExpiredSynFlagTests(unittest.TestCase):
 
 
 class BpfRuntimeConfigMapStructTests(unittest.TestCase):
-    def test_struct_fmt_has_8_fields(self):
+    def test_struct_fmt_has_8_timing_fields(self):
         from auto_xdp.bpf.maps import BpfRuntimeConfigMap
-        count = struct.calcsize(BpfRuntimeConfigMap._STRUCT_FMT) // 8
+        count = BpfRuntimeConfigMap._STRUCT_FMT.count('Q')
         self.assertEqual(count, 8)
 
 

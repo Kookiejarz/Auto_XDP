@@ -49,6 +49,7 @@ static __always_inline int check_tcp_ipv4(
         struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v4, &tk);
         if (av && acl_port_match(av, dest_port))
             return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
+
     }
 
     return check_tcp_conntrack(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
@@ -93,6 +94,7 @@ static __always_inline int check_tcp_ipv6(
         struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v6, &tk);
         if (av && acl_port_match(av, dest_port))
             return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
+
     }
 
     return check_tcp_conntrack(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
@@ -113,7 +115,8 @@ static __always_inline int check_udp_ipv4(
     if ((void *)(udp + 1) > data_end)
         return XDP_DROP;
 
-    __u8 malform = udp_malformed_reason(udp, data_end);
+    __u32 l4_avail = (__u32)((__u8 *)data_end - (__u8 *)udp);
+    __u8 malform = udp_malformed_reason(udp, l4_avail);
     if (malform) {
         count(malform);
         count(CNT_UDP_DROP);
@@ -153,19 +156,30 @@ static __always_inline int check_udp_ipv4(
         return XDP_DROP;
     }
 
+    if (abuseipdb_active() && is_abuseipdb_v4(ip->saddr)) {
+        count(CNT_ABUSEIPDB_DROP);
+        count(CNT_UDP_DROP);
+        emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                  key.sport, key.dport, (__u8)CNT_ABUSEIPDB_DROP, now);
+        return XDP_DROP;
+    }
+
     {
         __u32 rl_key = 0;
         struct udp_percpu_local *local_pre = bpf_map_lookup_elem(&udp_percpu_acc, &rl_key);
         if (local_pre && local_pre->blocked_until_ns != 0) {
             if (now < local_pre->blocked_until_ns) {
-                local_pre->local_bytes = 0;
-                count(CNT_UDP_GLOBAL_RATE_DROP);
-                count(CNT_UDP_DROP);
-                emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
-                          key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
-                return XDP_DROP;
+                if (!is_trusted_v4(ip->saddr)) {
+                    local_pre->local_bytes = 0;
+                    count(CNT_UDP_GLOBAL_RATE_DROP);
+                    count(CNT_UDP_DROP);
+                    emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                              key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+                    return XDP_DROP;
+                }
+            } else {
+                local_pre->blocked_until_ns = 0;
             }
-            local_pre->blocked_until_ns = 0;
         }
     }
 
@@ -251,7 +265,8 @@ static __always_inline int check_udp_ipv6(
     if ((void *)(udp + 1) > data_end)
         return XDP_DROP;
 
-    __u8 malform = udp_malformed_reason(udp, data_end);
+    __u32 l4_avail = (__u32)((__u8 *)data_end - (__u8 *)udp);
+    __u8 malform = udp_malformed_reason(udp, l4_avail);
     if (malform) {
         count(malform);
         count(CNT_UDP_DROP);
@@ -294,14 +309,17 @@ static __always_inline int check_udp_ipv6(
         struct udp_percpu_local *local_pre = bpf_map_lookup_elem(&udp_percpu_acc, &rl_key);
         if (local_pre && local_pre->blocked_until_ns != 0) {
             if (now < local_pre->blocked_until_ns) {
-                local_pre->local_bytes = 0;
-                count(CNT_UDP_GLOBAL_RATE_DROP);
-                count(CNT_UDP_DROP);
-                emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
-                          key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
-                return XDP_DROP;
+                if (!is_trusted_v6(&ipv6->saddr)) {
+                    local_pre->local_bytes = 0;
+                    count(CNT_UDP_GLOBAL_RATE_DROP);
+                    count(CNT_UDP_DROP);
+                    emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
+                              key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+                    return XDP_DROP;
+                }
+            } else {
+                local_pre->blocked_until_ns = 0;
             }
-            local_pre->blocked_until_ns = 0;
         }
     }
 

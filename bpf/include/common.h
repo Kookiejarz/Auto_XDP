@@ -49,6 +49,13 @@ struct vlan_hdr {
 // CT_SYN_PENDING and other shared conntrack flags (also included by tc_flow_track.c).
 #include "ct_flags.h"
 
+// cfg_flags bits for xdp_runtime_cfg.cfg_flags.
+// Zero means "all defaults" so old loaders remain compatible.
+#define XDP_CFG_FLAG_BOGON_DISABLED       (1U << 0)  // bogon filter off (default: on)
+#define XDP_CFG_FLAG_ABUSEIPDB_ENABLED    (1U << 1)  // AbuseIPDB active (default: off)
+#define XDP_CFG_FLAG_DROP_EVENTS_DISABLED (1U << 2)  // ring-buf events off (default: on)
+#define XDP_CFG_FLAG_SLOT_DROP            (1U << 3)  // unknown proto → drop (default: pass)
+
 // Runtime tunables. Userspace writes this map from config.toml; zero fields
 // fall back to defaults so old loaders remain compatible.
 struct xdp_runtime_cfg {
@@ -60,6 +67,8 @@ struct xdp_runtime_cfg {
     __u64 udp_global_window_ns;
     __u64 rate_window_ns;
     __u64 syn_timeout_ns;   // half-open (SYN-only) TTL; default 30s
+    __u32 cfg_flags;        // XDP_CFG_FLAG_* bits; replaces bogon_cfg/abuseipdb_cfg/observability_cfg/slot_def_action
+    __u32 _pad;
 };
 
 struct {
@@ -204,7 +213,8 @@ enum xdp_counter_idx {
     CNT_HANDLER_BLOCK_DROP         = 31, // dropped: src IP in handler_blocked map
     CNT_TCP_CONN_PREFIX_LIMIT_DROP = 32, // TCP SYN dropped by per-prefix concurrent connection limit
     CNT_TCP_CONN_PORT_LIMIT_DROP   = 33, // TCP SYN dropped by per-port total concurrent connection limit
-    CNT_MAX                        = 34,
+    CNT_ABUSEIPDB_DROP             = 34, // dropped: src IP in AbuseIPDB blocklist
+    CNT_MAX                        = 35,
 };
 
 struct {
@@ -238,26 +248,17 @@ struct {
     __uint(max_entries, 1 << 22); // 4 MiB
 } pkt_ringbuf SEC(".maps");
 
-// Observability runtime flags.
-// Bit 0: emit_drop() writes ringbuf events when set; skip event emission when clear.
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u32);
-} observability_cfg SEC(".maps");
-
 static __always_inline bool drop_events_enabled(void)
 {
-    __u32 key = 0;
-    __u32 *flags = bpf_map_lookup_elem(&observability_cfg, &key);
-    return !flags || (*flags & 0x1);
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return !cfg || !(cfg->cfg_flags & XDP_CFG_FLAG_DROP_EVENTS_DISABLED);
 }
 
-static __always_inline void emit_drop(
+static __always_inline void emit_packet_event(
     __u8 proto, __u8 family,
     __u32 *src_ip, __u32 *dst_ip,
     __be16 sport, __be16 dport,
+    __u8 verdict,
     __u8 reason,
     __u64 now)
 {
@@ -268,13 +269,33 @@ static __always_inline void emit_drop(
     e->ts_ns    = now;
     e->proto    = proto;
     e->family   = family;
-    e->verdict  = 1;
+    e->verdict  = verdict;
     e->reason   = reason;
     e->src_port = sport;
     e->dst_port = dport;
     __builtin_memcpy(e->src_ip, src_ip, 16);
     __builtin_memcpy(e->dst_ip, dst_ip, 16);
     bpf_ringbuf_submit(e, 0);
+}
+
+static __always_inline void emit_drop(
+    __u8 proto, __u8 family,
+    __u32 *src_ip, __u32 *dst_ip,
+    __be16 sport, __be16 dport,
+    __u8 reason,
+    __u64 now)
+{
+    emit_packet_event(proto, family, src_ip, dst_ip, sport, dport, 1, reason, now);
+}
+
+static __always_inline void emit_allow(
+    __u8 proto, __u8 family,
+    __u32 *src_ip, __u32 *dst_ip,
+    __be16 sport, __be16 dport,
+    __u8 reason,
+    __u64 now)
+{
+    emit_packet_event(proto, family, src_ip, dst_ip, sport, dport, 2, reason, now);
 }
 
 // Byte/packet counters (called exactly once per packet — no double-counting).

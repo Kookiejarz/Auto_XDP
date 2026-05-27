@@ -19,6 +19,7 @@ from auto_xdp.bpf.syscall import (
     BPF_MAP_LOOKUP_ELEM,
     BPF_MAP_UPDATE_ELEM,
     bpf,
+    map_id as _map_id,
     map_max_entries,
     obj_get,
 )
@@ -131,6 +132,9 @@ class BpfArrayMap(BpfFdMap):
     def active_ports(self) -> set[int]:
         return set(self._cache)
 
+    def map_id(self) -> int:
+        return _map_id(self.fd)
+
     def get(self, port: int) -> int:
         return 1 if port in self._cache else 0
 
@@ -147,8 +151,15 @@ class BpfArrayMap(BpfFdMap):
             return False
 
 
+XDP_CFG_FLAG_BOGON_DISABLED       = 1 << 0  # bogon filter off (default: on)
+XDP_CFG_FLAG_ABUSEIPDB_ENABLED    = 1 << 1  # AbuseIPDB active (default: off)
+XDP_CFG_FLAG_DROP_EVENTS_DISABLED = 1 << 2  # ring-buf events off (default: on)
+XDP_CFG_FLAG_SLOT_DROP            = 1 << 3  # unknown proto → drop (default: pass)
+
+
 class BpfRuntimeConfigMap(BpfFdMap):
-    _STRUCT_FMT = "=QQQQQQQQ"
+    # 8 × u64 timing fields + u32 cfg_flags + u32 _pad
+    _STRUCT_FMT = "=QQQQQQQQII"
     _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
 
     def __init__(self, path: str) -> None:
@@ -162,7 +173,7 @@ class BpfRuntimeConfigMap(BpfFdMap):
         struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
         struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
 
-    def get(self) -> tuple[int, int, int, int, int, int, int, int] | None:
+    def _lookup_raw(self) -> tuple[int, ...] | None:
         try:
             struct.pack_into("=I", self._key, 0, 0)
             bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
@@ -172,13 +183,22 @@ class BpfRuntimeConfigMap(BpfFdMap):
                 log.warning("BPF runtime config lookup failed path=%s: %s", self.path, exc)
             return None
 
-    def set(self, fields: tuple[int, int, int, int, int, int, int, int], dry_run: bool = False) -> bool:
+    def get(self) -> tuple[int, int, int, int, int, int, int, int] | None:
+        raw = self._lookup_raw()
+        return raw[:8] if raw is not None else None  # type: ignore[return-value]
+
+    def get_cfg_flags(self) -> int | None:
+        raw = self._lookup_raw()
+        return raw[8] if raw is not None else None
+
+    def set(self, fields: tuple[int, int, int, int, int, int, int, int],
+            cfg_flags: int = 0, dry_run: bool = False) -> bool:
         if dry_run:
-            log.info("[DRY] %s runtime_config=%s", self.path, fields)
+            log.info("[DRY] %s runtime_config=%s cfg_flags=0x%x", self.path, fields, cfg_flags)
             return True
         try:
             struct.pack_into("=I", self._key, 0, 0)
-            struct.pack_into(self._STRUCT_FMT, self._val, 0, *fields)
+            struct.pack_into(self._STRUCT_FMT, self._val, 0, *fields, cfg_flags, 0)
             bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
             return True
         except OSError as exc:

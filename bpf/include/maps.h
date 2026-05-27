@@ -130,15 +130,6 @@ struct {
     __type(value, struct udp_percpu_local);
 } udp_percpu_acc SEC(".maps");
 
-// Bogon filter toggle: 0 = disabled, non-zero = enabled (default on).
-// Written at runtime by xdp_port_sync from config.toml [firewall].bogon_filter.
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u32);
-} bogon_cfg SEC(".maps");
-
 // Per-port TCP policy config, populated at runtime by xdp_port_sync.
 // Key: dest port (host byte order). Value: SYN/per-prefix/conn-limit controls.
 struct {
@@ -308,16 +299,6 @@ struct {
     __type(value, __u32);
 } proto_handlers SEC(".maps");
 
-// Default action when bpf_tail_call() returns (no handler in slot).
-// 0 = XDP_PASS (default, backward-compatible), 1 = XDP_DROP (strict mode).
-// Configurable at runtime via bpftool or axdp; mirrors config.toml [slots].default_action.
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u32);
-} slot_def_action SEC(".maps");
-
 // Per-port TCP/UDP handler prog arrays (key = dest port, host byte order).
 // Userspace loads a handler .o and updates the fd at the port's index to enable
 // per-service deep inspection without modifying or reloading the main program.
@@ -368,6 +349,19 @@ struct {
     __type(key, struct ct_key_v6);
     __type(value, __u64);  // validated_until_ns
 } udp_hv6 SEC(".maps");
+
+// AbuseIPDB threat-intel blocklist (IPv4 only — upstream does not publish
+// IPv6 lists). Populated by Python syncer from borestad/blocklist-abuseipdb.
+// max_entries is a ceiling, not a preallocation: BPF_F_NO_PREALLOC means
+// memory only grows with actual inserts. Sized with headroom to fit
+// s100-90d (~267k entries) without truncation.
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 262144);
+    __type(key, struct trusted_v4_key);
+    __type(value, __u32);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} abuseipdb_v4 SEC(".maps");
 
 static __always_inline __u64 *tcp_conntrack_lookup(
     bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6)

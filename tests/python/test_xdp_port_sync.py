@@ -7,7 +7,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from auto_xdp.discovery import _discovery_exclude_networks, _bind_ip_is_exposed
+from auto_xdp.discovery import (
+    _bind_ip_is_exposed,
+    _discovery_exclude_networks,
+    _pack_conntrack_key_raw,
+    _pack_tcp_conntrack_key,
+)
 from auto_xdp.bpf.maps import render_nft_ports as _render_nft_ports
 from auto_xdp import config as cfg
 import auto_xdp.backends as backends_mod
@@ -177,17 +182,22 @@ class FakeArrayCfgMap:
 
 
 class FakeRuntimeConfigMap:
-    def __init__(self, active=None):
+    def __init__(self, active=None, cfg_flags=0):
         self._active = active
+        self._cfg_flags = cfg_flags
         self.ops = []
         self.closed = False
 
     def get(self):
         return self._active
 
-    def set(self, fields, dry_run=False):
-        self.ops.append((fields, dry_run))
+    def get_cfg_flags(self):
+        return self._cfg_flags
+
+    def set(self, fields, cfg_flags=0, dry_run=False):
+        self.ops.append((fields, cfg_flags, dry_run))
         self._active = fields
+        self._cfg_flags = cfg_flags
         return True
 
     def close(self):
@@ -352,6 +362,19 @@ class XdpPortSyncTests(unittest.TestCase):
         )
         self.assertNotIn("udp->source == udp->dest", source)
 
+    def test_udp_malformed_rejects_oversized_len_field(self):
+        source = (Path(__file__).resolve().parents[2] / "bpf" / "include" / "parse.h").read_text()
+        # Signature must accept a pre-computed integer instead of a packet pointer
+        # so the verifier does not lose range tracking on subsequent ALU ops.
+        self.assertRegex(
+            source,
+            r"udp_malformed_reason\s*\(\s*struct\s+udphdr\s*\*\s*udp\s*,\s*__u32\s+l4_avail\s*\)",
+        )
+        # Upper-bound: udp->len must not exceed available bytes from UDP header to data_end.
+        # The check may be written via a local variable (ulen) to avoid calling bpf_ntohs twice.
+        self.assertRegex(source, r"bpf_ntohs\s*\(\s*udp->len\s*\)")
+        self.assertRegex(source, r"ulen\s*>\s*l4_avail")
+
     def test_render_nft_ports_sorts_ports(self):
         self.assertEqual(_render_nft_ports({443, 22, 80}), "{ 22, 80, 443 }")
 
@@ -493,6 +516,41 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(desired_state.udp_ports, {53, 123})
         self.assertEqual(desired_state.sctp_ports, {3868})
         self.assertEqual(desired_state.trusted_cidrs, {"203.0.113.8/32"})
+
+    def test_ipv4_mapped_ipv6_established_conntrack_key_uses_v4_layout(self):
+        conn = make_conn(
+            family=socket.AF_INET6,
+            conn_type=socket.SOCK_STREAM,
+            status="ESTABLISHED",
+            laddr=make_addr("::ffff:203.0.113.10", 443),
+            raddr=make_addr("::ffff:198.51.100.20", 50000),
+        )
+
+        packed = _pack_tcp_conntrack_key(conn)
+        expected = struct.pack(
+            "!HH4s4s",
+            50000,
+            443,
+            socket.inet_aton("198.51.100.20"),
+            socket.inet_aton("203.0.113.10"),
+        )
+        self.assertEqual(packed, expected)
+        self.assertEqual(len(packed), 12)
+
+    def test_netlink_ipv4_mapped_ipv6_established_key_uses_v4_layout(self):
+        src = socket.inet_pton(socket.AF_INET6, "::ffff:198.51.100.20")
+        dst = socket.inet_pton(socket.AF_INET6, "::ffff:203.0.113.10")
+
+        packed = _pack_conntrack_key_raw(socket.AF_INET6, 443, 50000, dst, src)
+        expected = struct.pack(
+            "!HH4s4s",
+            50000,
+            443,
+            socket.inet_aton("198.51.100.20"),
+            socket.inet_aton("203.0.113.10"),
+        )
+        self.assertEqual(packed, expected)
+        self.assertEqual(len(packed), 12)
 
     def test_resolve_desired_state_merges_ports_and_policy_targets(self):
         observed = state_mod.ObservedState(
@@ -643,9 +701,10 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(backend.tcp_conn_limit_map.set_ops, [(22, 32, False)])
         self.assertEqual(backend.udp_rate_map.set_ops, [(53, 5000, False)])
         self.assertEqual(backend.udp_agg_rate_map.set_ops, [(53, 6000000, False)])
-        self.assertEqual(backend.runtime_config_map.ops, [(runtime_cfg, False)])
+        # bogon_filter_enabled=False (default) → BOGON_DISABLED(1), drop_events_enabled=False → DROP_EVENTS_DISABLED(4)
+        self.assertEqual(backend.runtime_config_map.ops, [(runtime_cfg, 5, False)])
         self.assertEqual(backend.global_rl_map.ops, [(124_625_000, False)])
-        self.assertEqual(backend.observability_cfg_map.ops, [(0, 0, False)])
+        self.assertEqual(backend.observability_cfg_map.ops, [])
 
     def test_xdp_backend_stale_conntrack_removal_requires_repeated_misses(self):
         backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)

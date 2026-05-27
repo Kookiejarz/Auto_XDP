@@ -7,6 +7,8 @@ import shutil
 
 from auto_xdp import config as cfg
 from auto_xdp.backends.base import BackendStatus, PortBackend
+from auto_xdp.abuseipdb import AbuseIPDBSyncer, BpfRiskMaps
+from auto_xdp.bpf.syscall import map_id, obj_get
 from auto_xdp.bpf.maps import (
     BpfAclMaps,
     BpfArrayMap,
@@ -18,11 +20,42 @@ from auto_xdp.bpf.maps import (
     BpfSit4EndpointsMap,
     BpfSynRatePortsMap,
     BpfTrustedMaps,
+    XDP_CFG_FLAG_ABUSEIPDB_ENABLED,
+    XDP_CFG_FLAG_BOGON_DISABLED,
+    XDP_CFG_FLAG_DROP_EVENTS_DISABLED,
+    XDP_CFG_FLAG_SLOT_DROP,
 )
 from auto_xdp.services import service_name
 from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcilePlan
 
 log = logging.getLogger(__name__)
+
+
+def _compute_cfg_flags(desired: DesiredState) -> int:
+    flags = 0
+    if not desired.bogon_filter_enabled:
+        flags |= XDP_CFG_FLAG_BOGON_DISABLED
+    if not desired.drop_events_enabled:
+        flags |= XDP_CFG_FLAG_DROP_EVENTS_DISABLED
+    if cfg.ABUSEIPDB_ENABLED:
+        flags |= XDP_CFG_FLAG_ABUSEIPDB_ENABLED
+    if cfg.SLOT_DEFAULT_ACTION == "drop":
+        flags |= XDP_CFG_FLAG_SLOT_DROP
+    return flags
+
+
+def _cfg_flag_bogon(m: BpfRuntimeConfigMap | None) -> bool | None:
+    if m is None:
+        return None
+    flags = m.get_cfg_flags()
+    return None if flags is None else not bool(flags & XDP_CFG_FLAG_BOGON_DISABLED)
+
+
+def _cfg_flag_drop_events(m: BpfRuntimeConfigMap | None) -> bool | None:
+    if m is None:
+        return None
+    flags = m.get_cfg_flags()
+    return None if flags is None else not bool(flags & XDP_CFG_FLAG_DROP_EVENTS_DISABLED)
 
 
 class XdpBackend(PortBackend):
@@ -102,8 +135,6 @@ class XdpBackend(PortBackend):
         self.acl_maps: BpfAclMaps | None = None
         self.runtime_config_map: BpfRuntimeConfigMap | None = None
         self.global_rl_map: BpfGlobalRlMap | None = None
-        self.bogon_cfg_map: BpfArrayMap | None = None
-        self.observability_cfg_map: BpfArrayMap | None = None
         self.sctp_map: BpfArrayMap | None = None
         try:
             self._tcp_policy_map = BpfPortPolicyMap(cfg.TCP_PORT_POLICY_MAP_PATH)
@@ -141,14 +172,6 @@ class XdpBackend(PortBackend):
         except OSError as exc:
             log.debug("udp_global_rl map unavailable (%s); global UDP rate limit inactive.", exc)
         try:
-            self.bogon_cfg_map = BpfArrayMap(cfg.BOGON_CFG_MAP_PATH)
-        except OSError as exc:
-            log.debug("bogon_cfg map unavailable (%s); bogon filter toggle inactive.", exc)
-        try:
-            self.observability_cfg_map = BpfArrayMap(cfg.OBSERVABILITY_CFG_MAP_PATH)
-        except OSError as exc:
-            log.debug("observability_cfg map unavailable (%s); drop-event toggle inactive.", exc)
-        try:
             self.sctp_map = BpfArrayMap(cfg.SCTP_MAP_PATH)
             log.debug("sctp_whitelist map opened; SCTP whitelist sync active.")
         except OSError as exc:
@@ -159,6 +182,36 @@ class XdpBackend(PortBackend):
             log.debug("sit4_endpoints map opened; 6in4 tunnel endpoint control active.")
         except OSError as exc:
             log.debug("sit4_endpoints map unavailable (%s); 6in4 tunnel endpoint sync inactive.", exc)
+        self._risk_maps: BpfRiskMaps | None = None
+        self._abuseipdb_syncer: AbuseIPDBSyncer | None = None
+        try:
+            self._risk_maps = BpfRiskMaps(
+                cfg.ABUSEIPDB_RISK_MAP_PATH4,
+                self.runtime_config_map,
+            )
+            if cfg.ABUSEIPDB_ENABLED:
+                self._abuseipdb_syncer = AbuseIPDBSyncer(
+                    self._risk_maps,
+                    base_url=cfg.ABUSEIPDB_BASE_URL,
+                    sources=cfg.ABUSEIPDB_SOURCES,
+                    refresh_seconds=cfg.ABUSEIPDB_REFRESH_SECONDS,
+                )
+                self._abuseipdb_syncer.start()
+            log.debug("AbuseIPDB risk maps opened.")
+        except OSError as exc:
+            log.debug("AbuseIPDB maps unavailable (%s); AbuseIPDB blocking inactive.", exc)
+
+    def is_stale(self) -> bool:
+        """Return True if the pinned tcp_whitelist map has been replaced since init."""
+        try:
+            fd = obj_get(cfg.TCP_MAP_PATH)
+            try:
+                pinned_id = map_id(fd)
+            finally:
+                os.close(fd)
+            return pinned_id != self.tcp_map.map_id()
+        except OSError:
+            return False
 
     def run_ct_gc(self) -> None:
         tcp_timeout_ns = int(cfg.XDP_TCP_TIMEOUT_SECONDS * 1e9)
@@ -187,14 +240,14 @@ class XdpBackend(PortBackend):
             self.runtime_config_map.close()
         if self.global_rl_map is not None:
             self.global_rl_map.close()
-        if self.bogon_cfg_map is not None:
-            self.bogon_cfg_map.close()
-        if self.observability_cfg_map is not None:
-            self.observability_cfg_map.close()
         if self.sctp_map is not None:
             self.sctp_map.close()
         if self.sit4_map is not None:
             self.sit4_map.close()
+        if self._abuseipdb_syncer is not None:
+            self._abuseipdb_syncer.stop()
+        if self._risk_maps is not None:
+            self._risk_maps.close()
 
     def get_applied_state(self) -> AppliedState:
         return AppliedState(
@@ -211,8 +264,8 @@ class XdpBackend(PortBackend):
             udp_rate_limits=self.udp_rate_map.active() if self.udp_rate_map is not None else {},
             udp_agg_rate_limits=self.udp_agg_rate_map.active() if self.udp_agg_rate_map is not None else {},
             acl_rules=self.acl_maps.active_entries() if self.acl_maps is not None else {},
-            bogon_filter_enabled=bool(self.bogon_cfg_map.get(0)) if self.bogon_cfg_map is not None else None,
-            drop_events_enabled=bool(self.observability_cfg_map.get(0)) if self.observability_cfg_map is not None else None,
+            bogon_filter_enabled=_cfg_flag_bogon(self.runtime_config_map),
+            drop_events_enabled=_cfg_flag_drop_events(self.runtime_config_map),
             udp_global_byte_rate=self.global_rl_map.get() if self.global_rl_map is not None else None,
             xdp_runtime_config=self.runtime_config_map.get() if self.runtime_config_map is not None else None,
         )
@@ -435,16 +488,13 @@ class XdpBackend(PortBackend):
         if self.acl_maps is not None:
             self._apply_acl_delta(plan, dry_run)
 
-        if (
-            self.runtime_config_map is not None
-            and desired_state.xdp_runtime_config != self.runtime_config_map.get()
-        ):
-            self.runtime_config_map.set(desired_state.xdp_runtime_config, dry_run)
+        if self.runtime_config_map is not None:
+            cfg_flags = _compute_cfg_flags(desired_state)
+            current = self.runtime_config_map.get()
+            current_flags = self.runtime_config_map.get_cfg_flags() or 0
+            if desired_state.xdp_runtime_config != current or cfg_flags != current_flags:
+                self.runtime_config_map.set(desired_state.xdp_runtime_config, cfg_flags, dry_run)
 
-        if self.bogon_cfg_map is not None and plan.bogon_filter_update is not None:
-            self.bogon_cfg_map.set(0, 1 if plan.bogon_filter_update else 0, dry_run)
-        if self.observability_cfg_map is not None and plan.drop_events_update is not None:
-            self.observability_cfg_map.set(0, 1 if plan.drop_events_update else 0, dry_run)
         if self.global_rl_map is not None and plan.udp_global_byte_rate_update is not None:
             rate = plan.udp_global_byte_rate_update
             if self.global_rl_map.set(rate, dry_run):

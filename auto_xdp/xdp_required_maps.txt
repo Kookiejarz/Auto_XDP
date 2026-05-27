@@ -16,8 +16,6 @@ udp_port_policies
 udp_global_rl
 xdp_runtime_cfg
 udp_percpu_acc
-bogon_cfg
-observability_cfg
 proto_handlers
 tcp_port_handlers
 udp_port_handlers
@@ -28,8 +26,8 @@ hblk6
 udp_hv4
 udp_hv6
 slot_ctx_map
-slot_def_action
 sit4_endpoints
 tsc_pfx4
 tsc_pfx6
 tsc_port
+abuseipdb_v4

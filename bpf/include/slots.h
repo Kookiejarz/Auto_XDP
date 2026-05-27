@@ -43,11 +43,13 @@ static __always_inline int dispatch_to_slot(
     bpf_tail_call(ctx, &proto_handlers, (__u32)ip_proto);
 
     // bpf_tail_call returned: slot is empty or call failed.
-    __u32 *action = bpf_map_lookup_elem(&slot_def_action, &zero);
-    if (action && *action == 1) {
-        count(CNT_SLOT_DROP);
-        emit_drop(ip_proto, family, saddr, daddr, 0, 0, (__u8)CNT_SLOT_DROP, bpf_ktime_get_ns());
-        return XDP_DROP;
+    {
+        struct xdp_runtime_cfg *cfg = runtime_cfg();
+        if (cfg && (cfg->cfg_flags & XDP_CFG_FLAG_SLOT_DROP)) {
+            count(CNT_SLOT_DROP);
+            emit_drop(ip_proto, family, saddr, daddr, 0, 0, (__u8)CNT_SLOT_DROP, bpf_ktime_get_ns());
+            return XDP_DROP;
+        }
     }
     count(CNT_SLOT_PASS);
     return XDP_PASS;

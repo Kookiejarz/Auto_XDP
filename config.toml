@@ -29,6 +29,18 @@ debounce_seconds = 0.5
 # nftables  = force nftables fallback regardless of XDP availability.
 preferred_backend = "auto"
 
+[ringbuf]
+# Unix socket used by pkt_relay.py and axdp tui.
+socket_path = "/var/run/auto_xdp/pkt_events.sock"
+
+# Relay-side history retention for clients that connect later.
+retention_seconds = 300
+max_events = 10000
+max_history_send = 5000
+
+# TUI-side event scrollback kept in the local client process.
+tui_max_events = 500
+
 [discovery]
 # When true, services bound only to 127.0.0.0/8 or ::1 are ignored;
 # they are unreachable from outside anyway.
@@ -113,33 +125,61 @@ telnet          = 2
 # Aggregate SYN rate cap across all source IPs for a given process's ports.
 # Useful to bound total SYN flood volume even when per-IP rate is low.
 # Format: process_name = max_syns_per_second  (across all sources combined)
+# Example:
+# caddy = 5000      # each Caddy TCP port: max 5000 SYN/s per source prefix
+# sshd  = 50        # each SSH port: max 50 SYN/s per source prefix
 
 [rate_limits.syn_agg_by_service]
 # Same as syn_agg_by_proc but keyed by IANA service name. Used when no
 # per-process match exists.
+# Example:
+# http  = 5000
+# https = 5000
+# ssh   = 50
 
 [rate_limits.tcp_conn_by_proc]
 # Max concurrent tracked TCP connections per source IP, per process's ports.
 # Helps prevent one client from monopolising connection table slots.
 # Format: process_name = max_concurrent_connections_per_source_ip
+# Example:
+# caddy = 200       # one source IP -> one Caddy port: max 200 established conns
+# sshd  = 5         # one source IP -> one SSH port: max 5 established conns
 
 [rate_limits.tcp_conn_by_service]
 # Fallback concurrent connection cap keyed by IANA service name.
+# Example:
+# http  = 200
+# https = 200
+# ssh   = 5
 
 [rate_limits.tcp_conn_prefix_by_proc]
 # Per-prefix ESTABLISHED cap override per process. Format:
 # proc_name = max_established_per_prefix
 # Empty → uses default_tcp_established_per_prefix(_strict) from [xdp.runtime].
+# Example:
+# caddy = 2000      # one source prefix -> one Caddy port: max 2000 conns
+# sshd  = 20        # one source prefix -> one SSH port: max 20 conns
 
 [rate_limits.tcp_conn_prefix_by_service]
 # Same, keyed by IANA service name.
+# Example:
+# http  = 2000
+# https = 2000
+# ssh   = 20
 
 [rate_limits.tcp_conn_port_by_proc]
 # Per-port total ESTABLISHED cap override per process. Format:
 # proc_name = max_established_per_port
+# Example:
+# caddy = 50000     # each Caddy TCP port total: max 50000 established conns
+# sshd  = 200       # each SSH TCP port total: max 200 established conns
 
 [rate_limits.tcp_conn_port_by_service]
 # Same, keyed by IANA service name.
+# Example:
+# http  = 50000
+# https = 50000
+# ssh   = 200
 
 
 # UDP rate limits
@@ -204,6 +244,21 @@ default_action = "drop"
 # Custom handlers: { proto = N, path = "/path/to/handler.o" }
 # Example: enabled = ["sctp", "gre"]
 enabled = []
+
+[abuseipdb]
+# Threat-intel blocklist: drops source IPs listed in borestad/blocklist-abuseipdb.
+# No API key required. trusted_ips still bypass AbuseIPDB (trusted wins).
+# enabled = false  →  maps stay empty, no traffic blocked (fail-open).
+enabled = false
+
+# Blocklist sources to fetch (confidence score 100 = max confidence).
+# Available windows: 1d, 3d, 7d, 14d, 30d, 60d, 90d, 120d.
+# Shorter windows = fewer stale entries (esp. for IPv6 SLAAC privacy churn).
+# Example: sources = ["s1003d"]  or  sources = ["s10030d"]
+sources = ["s1003d"]
+
+# Refresh interval in seconds. Minimum 60s. Recommended: 3600 (1 hour).
+refresh_seconds = 3600
 
 [port_handlers]
 # Per-port BPF tail-call handlers for deep packet inspection.

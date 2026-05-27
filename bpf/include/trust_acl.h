@@ -3,9 +3,8 @@
 
 static __always_inline bool bogon_filter_active(void)
 {
-    __u32 key = 0;
-    __u32 *v = bpf_map_lookup_elem(&bogon_cfg, &key);
-    return !v || *v != 0;  // default on if map uninitialized
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return !cfg || !(cfg->cfg_flags & XDP_CFG_FLAG_BOGON_DISABLED);
 }
 
 static __always_inline bool is_bogon_v4(__be32 addr)
@@ -64,4 +63,17 @@ static __always_inline bool acl_port_match(struct acl_val *v, __u32 port)
         if (v->ports[i] == p) return true;
     }
     return false;
+}
+
+static __always_inline bool abuseipdb_active(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && (cfg->cfg_flags & XDP_CFG_FLAG_ABUSEIPDB_ENABLED);
+}
+
+static __always_inline bool is_abuseipdb_v4(__be32 addr)
+{
+    struct trusted_v4_key k = { .prefixlen = 32, .addr = addr };
+    __u32 *v = bpf_map_lookup_elem(&abuseipdb_v4, &k);
+    return v && *v;
 }

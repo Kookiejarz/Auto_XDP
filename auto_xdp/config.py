@@ -104,6 +104,8 @@ ABUSEIPDB_REFRESH_SECONDS = 3600.0
 ABUSEIPDB_RISK_MAP_PATH4 = ""
 ABUSEIPDB_CFG_MAP_PATH = ""
 
+SLOT_DEFAULT_ACTION = "drop"
+
 ACL_MAX_PORTS = 64
 ACL_VAL_SIZE = 4 + ACL_MAX_PORTS * 2
 
@@ -542,6 +544,11 @@ def apply_toml_config(cfg: dict) -> None:
         0.0,
     )
     XDP_UDP_GLOBAL_BYTE_RATE = int(_udp_global_byte_rate_mbps * 1_000_000 / 8)
+
+    global SLOT_DEFAULT_ACTION
+    _slots = cfg.get("slots", {})
+    _slot_default = str(_slots.get("default_action", "drop")).lower()
+    SLOT_DEFAULT_ACTION = "drop" if _slot_default == "drop" else "pass"
 
     global ABUSEIPDB_ENABLED, ABUSEIPDB_BASE_URL, ABUSEIPDB_SOURCES, ABUSEIPDB_REFRESH_SECONDS
     _ab = cfg.get("abuseipdb", {})

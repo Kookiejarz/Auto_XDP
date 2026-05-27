@@ -163,6 +163,14 @@ static __always_inline int check_tcp_conntrack(
         __u32 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
         if (!allow || !*allow)
             goto drop;
+        if (abuseipdb_active() && key->family == CT_FAMILY_IPV4 &&
+            is_abuseipdb_v4((__be32)key->saddr[0])) {
+            count(CNT_ABUSEIPDB_DROP);
+            count(CNT_TCP_DROP);
+            emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
+                      key->sport, key->dport, (__u8)CNT_ABUSEIPDB_DROP, now);
+            return XDP_DROP;
+        }
         if (is_handler_blocked(key)) {
             count(CNT_HANDLER_BLOCK_DROP);
             count(CNT_TCP_DROP);
