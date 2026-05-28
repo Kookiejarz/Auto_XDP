@@ -33,14 +33,30 @@ detect_pkg_manager() {
 }
 
 detect_os_release() {
+    local _id="" _name="" _id_like=""
+    local _line _key _value
+
     if [[ -r "$OS_RELEASE_FILE" ]]; then
-        # shellcheck disable=SC1091
-        source "$OS_RELEASE_FILE"
+        while IFS= read -r _line; do
+            case "$_line" in
+                ID=*|NAME=*|ID_LIKE=*)
+                    _key="${_line%%=*}"
+                    _value="${_line#*=}"
+                    _value="${_value%\"}"
+                    _value="${_value#\"}"
+                    case "$_key" in
+                        ID) [[ -z "$_id" ]] && _id="$_value" ;;
+                        NAME) [[ -z "$_name" ]] && _name="$_value" ;;
+                        ID_LIKE) [[ -z "$_id_like" ]] && _id_like="$_value" ;;
+                    esac
+                    ;;
+            esac
+        done <"$OS_RELEASE_FILE"
     fi
 
-    DISTRO_ID="${ID:-unknown}"
-    DISTRO_NAME="${NAME:-$DISTRO_ID}"
-    DISTRO_LIKE="${ID_LIKE:-}"
+    DISTRO_ID="${_id:-unknown}"
+    DISTRO_NAME="${_name:-$DISTRO_ID}"
+    DISTRO_LIKE="${_id_like:-}"
 
     case " ${DISTRO_ID} ${DISTRO_LIKE} " in
         *" ubuntu "*|*" debian "*)

@@ -7,14 +7,17 @@ stop_existing_service() {
     case "$INIT_SYSTEM" in
         systemd)
             systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+            systemctl stop "${RELAY_SERVICE_NAME:-auto-xdp-relay}" 2>/dev/null || true
             ;;
         openrc)
             rc-service "$SERVICE_NAME" stop 2>/dev/null || true
+            rc-service "${RELAY_SERVICE_NAME:-auto-xdp-relay}" stop 2>/dev/null || true
             ;;
     esac
 
     pkill -f "auto_xdp_start.sh" 2>/dev/null || true
     pkill -f "xdp_port_sync.py" 2>/dev/null || true
+    pkill -f "pkt_relay.py" 2>/dev/null || true
 }
 
 existing_install_detected() {
@@ -40,9 +43,11 @@ existing_install_detected() {
     case "$INIT_SYSTEM" in
         systemd)
             [[ -e "/etc/systemd/system/${SERVICE_NAME}.service" ]] && return 0
+            [[ -e "/etc/systemd/system/${RELAY_SERVICE_NAME:-auto-xdp-relay}.service" ]] && return 0
             ;;
         openrc)
             [[ -e "/etc/init.d/${SERVICE_NAME}" ]] && return 0
+            [[ -e "/etc/init.d/${RELAY_SERVICE_NAME:-auto-xdp-relay}" ]] && return 0
             ;;
     esac
 
@@ -80,6 +85,7 @@ PYTHON3_BIN="${PYTHON3_BIN}"
 BPF_PIN_DIR="${BPF_PIN_DIR}"
 XDP_OBJ_PATH="${XDP_OBJ_INSTALLED}"
 TC_OBJ_PATH="${TC_OBJ_INSTALLED}"
+SOCK_STATE_OBJ_PATH="${SOCK_STATE_OBJ_INSTALLED}"
 PREFERRED_BACKEND="auto"
 AUTO_TUNE_QUEUES="1"
 BPF_HELPER_SCRIPT="${BPF_HELPER_INSTALLED}"
@@ -208,12 +214,20 @@ install_python_support_package() {
             curl -fsSL "$api_url" \
             | python3 -c "
 import json, sys
-for e in json.load(sys.stdin).get('tree', []):
+try:
+    tree = json.load(sys.stdin).get('tree', [])
+except Exception:
+    raise SystemExit(1)
+for e in tree:
     p = e['path']
     if p.startswith('auto_xdp/') and p.endswith('.py'):
         print(p)
 " | sort
         )
+        if [[ ${#files[@]} -eq 0 ]]; then
+            warn "GitHub API returned no auto_xdp Python files (rate limited or network error); aborting Python package install"
+            return 1
+        fi
     else
         mapfile -t files < <(find auto_xdp -name "*.py" -type f | sort)
     fi
@@ -288,6 +302,27 @@ install_axdp_command() {
     chmod +x "$AXDP_CMD"
 }
 
+validate_installed_python_support_package() {
+    PYTHONPATH="${PYTHON_LIB_DIR}" "${PYTHON3_BIN:-python3}" - <<'PY'
+import sys
+
+try:
+    import auto_xdp.tui  # noqa: F401
+    from auto_xdp import admin_cli
+except Exception as exc:
+    raise SystemExit(f"failed to import installed auto_xdp TUI modules: {exc}")
+
+parser = admin_cli.build_parser()
+command_action = next(
+    (action for action in parser._actions if getattr(action, "dest", None) == "command"),
+    None,
+)
+choices = set(getattr(command_action, "choices", {}) or {})
+if "tui" not in choices:
+    raise SystemExit("installed auto_xdp.admin_cli does not expose the tui command")
+PY
+}
+
 install_slot_handler_sdk() {
     local handlers_root="${INSTALL_DIR}/handlers"
     local -a handler_files=()
@@ -332,7 +367,10 @@ for e in json.load(sys.stdin).get('tree', []):
         )
     fi
 
-    [[ ${#handler_files[@]} -gt 0 ]] || die "Failed to discover handler SDK files"
+    if [[ ${#handler_files[@]} -eq 0 ]]; then
+        warn "Handler SDK files not found (GitHub API unavailable or repo empty); skipping SDK install"
+        return 1
+    fi
 
     for rel in "${handler_files[@]}"; do
         if ! fetch_local_or_remote "$rel" "$rel" "${handlers_root}/${rel#handlers/}"; then
@@ -369,6 +407,7 @@ install_runtime_files() {
     substep_run "Installing relay helper" install_relay_script
     substep_run "Installing BPF helper script" install_bpf_helper
     substep_run "Installing axdp command" install_axdp_command
+    substep_run "Validating Python support package" validate_installed_python_support_package
     substep_run "Installing slot handler SDK" install_slot_handler_sdk
     substep_run "Installing shared runtime library" _install_runtime_common_assets
     substep_run "Installing default TOML config" install_toml_config
@@ -423,9 +462,29 @@ User=root
 WantedBy=multi-user.target
 EOF_UNIT
 
+    cat > "/etc/systemd/system/${RELAY_SERVICE_NAME}.service" <<EOF_RELAY_UNIT
+[Unit]
+Description=Auto XDP packet event relay
+After=${SERVICE_NAME}.service
+Wants=${SERVICE_NAME}.service
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=${PYTHON_LIB_DIR}
+ExecStart=${RELAY_SCRIPT} --config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf
+Restart=on-failure
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF_RELAY_UNIT
+
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"
+    systemctl enable "$RELAY_SERVICE_NAME"
     systemctl restart "$SERVICE_NAME"
+    systemctl restart "$RELAY_SERVICE_NAME"
 }
 
 install_openrc_service() {
@@ -441,9 +500,26 @@ depend() {
 }
 EOF_OPENRC
 
+    cat > "/etc/init.d/${RELAY_SERVICE_NAME}" <<EOF_RELAY_OPENRC
+#!/sbin/openrc-run
+description="Auto XDP packet event relay"
+command="${RELAY_SCRIPT}"
+command_args="--config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+
+depend() {
+    need net
+    after ${SERVICE_NAME}
+}
+EOF_RELAY_OPENRC
+
     chmod +x "/etc/init.d/${SERVICE_NAME}"
+    chmod +x "/etc/init.d/${RELAY_SERVICE_NAME}"
     rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    rc-update add "$RELAY_SERVICE_NAME" default >/dev/null 2>&1 || true
     rc-service "$SERVICE_NAME" restart
+    rc-service "$RELAY_SERVICE_NAME" restart
 }
 
 run_initial_sync() {

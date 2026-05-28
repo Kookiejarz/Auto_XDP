@@ -202,15 +202,15 @@ check_required_tools_step() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         step_warn "Missing: ${missing[*]} — installing via $PKG_MANAGER"
         step_begin "Installing missing packages via $PKG_MANAGER"
-        install_packages || die "Package installation failed."
+        install_packages || die_with_next "Package installation failed." "install the missing packages manually, then rerun: sudo bash setup_xdp.sh --force ${IFACES[*]}"
         step_ok
         step_begin "Verifying installed tools"
     fi
 
-    command -v python3 &>/dev/null || die "python3 not found after installation."
+    command -v python3 &>/dev/null || die_with_next "python3 not found after installation." "install Python 3.10 or newer, then rerun: sudo bash setup_xdp.sh --force ${IFACES[*]}"
     ensure_python_runtime
-    command -v curl &>/dev/null || die "curl not found after installation."
-    command -v ip &>/dev/null || die "ip command not found after installation."
+    command -v curl &>/dev/null || die_with_next "curl not found after installation." "install curl, then rerun: sudo bash setup_xdp.sh --force ${IFACES[*]}"
+    command -v ip &>/dev/null || die_with_next "ip command not found after installation." "install iproute2/iproute, then rerun: sudo bash setup_xdp.sh --force ${IFACES[*]}"
     ensure_psutil
     ensure_tomli_for_python310
     PYTHON3_BIN=$(command -v python3)

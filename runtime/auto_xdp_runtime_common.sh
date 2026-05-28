@@ -325,7 +325,7 @@ xdp_required_map_names() {
         return 0
     fi
 
-    cat <<'EOF'
+    cat <<-'EOF'
 prog
 pkt_counters
 byte_counters

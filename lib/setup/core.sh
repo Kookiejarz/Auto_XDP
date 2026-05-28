@@ -1,8 +1,5 @@
 _step_tag() {
-    case "${1:-INFO}" in
-        COMPILE) printf "${YELLOW}[COMPILING]${NC}" ;;
-        *)       printf "${CYAN}[INFO]${NC}     " ;;
-    esac
+    printf "${CYAN}[INFO]${NC}     "
 }
 
 step_begin() {
@@ -20,11 +17,11 @@ step_ok() {
     _STEP_NEWLINED=0
     _PENDING_NL=0
     if [[ $pending -eq 1 ]]; then
-        printf " ${GREEN}✓${NC}%s\n" "${1:+  ($1)}"
+        printf " ${OK_MARK}%s\n" "${1:+  ($1)}"
     elif [[ $nl -eq 1 ]]; then
-        printf "${_STEP_INDENT}${GREEN}✓${NC}%s\n" "${1:+  ($1)}"
+        printf "${_STEP_INDENT}${OK_MARK}%s\n" "${1:+  ($1)}"
     else
-        [[ -n "${1:-}" ]] && printf "${GREEN}($1)${NC} ${GREEN}✓${NC}\n" || printf " ${GREEN}✓${NC}\n"
+        [[ -n "${1:-}" ]] && printf "${GREEN}($1)${NC} ${OK_MARK}\n" || printf " ${OK_MARK}\n"
     fi
 }
 
@@ -36,7 +33,7 @@ step_fail() {
         printf "\n"
         _PENDING_NL=0
     elif [[ $nl -eq 0 ]]; then
-        printf " ${RED}✗${NC}\n"
+        printf " ${FAIL_MARK}\n"
     fi
     printf "${_STEP_INDENT}${RED}[ERROR]${NC}  %s\n" "${1:-Failed}" >&2
 }
@@ -48,11 +45,11 @@ step_warn() {
     _STEP_NEWLINED=0
     _PENDING_NL=0
     if [[ $pending -eq 1 ]]; then
-        printf " ${YELLOW}⚠${NC}%s\n" "${1:+  ($1)}"
+        printf " ${WARN_MARK}%s\n" "${1:+  ($1)}"
     elif [[ $nl -eq 1 ]]; then
-        printf "${_STEP_INDENT}${YELLOW}⚠${NC}%s\n" "${1:+  ($1)}"
+        printf "${_STEP_INDENT}${WARN_MARK}%s\n" "${1:+  ($1)}"
     else
-        printf " ${YELLOW}⚠${NC}%s\n" "${1:+  ($1)}"
+        printf " ${WARN_MARK}%s\n" "${1:+  ($1)}"
     fi
 }
 
@@ -67,25 +64,25 @@ substep_run() {
 
     if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; _PENDING_NL=0; fi
 
-    printf "${_STEP_INDENT}${CYAN}↳ [INFO]${NC}  %-46s" "${label} …"
+    printf "${_STEP_INDENT}${CYAN}[INFO]${NC}  %-46s" "${label} …"
     _STEP_NEWLINED=0
 
     if "$@"; then
         if [[ $_PENDING_NL -eq 1 ]]; then
-            printf " ${GREEN}✓${NC}\n"
+            printf " ${OK_MARK}\n"
             _PENDING_NL=0
         else
-            printf " ${GREEN}✓${NC}\n"
+            printf " ${OK_MARK}\n"
         fi
         _STEP_NEWLINED=1
         return 0
     else
         local status=$?
         if [[ $_PENDING_NL -eq 1 ]]; then
-            printf " ${RED}✗${NC}\n"
+            printf " ${FAIL_MARK}\n"
             _PENDING_NL=0
         else
-            printf " ${RED}✗${NC}\n"
+            printf " ${FAIL_MARK}\n"
         fi
         _STEP_NEWLINED=1
         return "$status"
@@ -163,6 +160,21 @@ print_installer_banner() {
     echo -e "${BOLD}${CYAN}  ╚═══════════════════════════════════╝${NC}\n"
 }
 
+print_setup_plan() {
+    echo -e "${BOLD}Auto XDP setup plan${NC}"
+    if [[ ${#IFACES[@]} -eq 1 ]]; then
+        echo "  interface      : ${IFACES[0]}"
+    else
+        echo "  interfaces     : ${IFACES[*]}"
+    fi
+    echo "  backend        : auto (XDP preferred, nftables fallback)"
+    echo "  package manager: $PKG_MANAGER"
+    echo "  service manager: $INIT_SYSTEM"
+    echo "  install dir    : $INSTALL_DIR"
+    echo "  config dir     : $CONFIG_DIR"
+    echo ""
+}
+
 get_active_interfaces() {
     ip -o link show up 2>/dev/null \
         | awk -F': ' '{print $2}' \
@@ -174,6 +186,11 @@ get_active_interfaces() {
         | grep -v '^docker' \
         | grep -v '^veth' \
         | grep -v '^br-' \
+        | grep -v '^tun' \
+        | grep -v '^tap' \
+        | grep -v '^wg' \
+        | grep -v '^bond' \
+        | grep -v '^team' \
         || true
 }
 
@@ -216,43 +233,45 @@ print_deployment_summary() {
     █████   █████ ▒▒████████      █████    ▒▒▒███████▒      █████ █████ ██████████   █████
     ▒▒▒▒▒   ▒▒▒▒▒   ▒▒▒▒▒▒▒▒      ▒▒▒▒▒       ▒▒▒▒▒▒▒       ▒▒▒▒▒ ▒▒▒▒▒ ▒▒▒▒▒▒▒▒▒▒   ▒▒▒▒▒
 EOF
-    echo -e "${GREEN}════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  Deployment Complete!                  ${NC}"
-    echo -e "${GREEN}════════════════════════════════════════${NC}"
     echo ""
+    echo -e "${GREEN}Deployment summary${NC}"
+    echo -e "  Status         : ${OK_MARK} complete"
     if [[ ${#IFACES[@]} -eq 1 ]]; then
         echo "  Interface      : ${IFACES[0]}"
     else
         echo "  Interfaces     : ${IFACES[*]}"
     fi
-    echo "  Active backend : $ACTIVE_BACKEND"
     if [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
-        echo "  XDP mode       : $ACTIVE_XDP_MODE"
+        echo "  Backend        : XDP ($ACTIVE_XDP_MODE mode)"
         echo "  BPF maps       : $BPF_PIN_DIR/"
         echo "  TC egress obj  : $TC_OBJ_INSTALLED"
     else
+        echo "  Backend        : nftables fallback"
+        echo "  Fallback reason: ${XDP_FALLBACK_REASON:-XDP unavailable}"
         echo "  nftables table : inet auto_xdp"
     fi
     echo "  Init system    : $INIT_SYSTEM"
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        echo "  Service        : systemctl status $SERVICE_NAME"
+        echo "  Sync service   : systemd $SERVICE_NAME"
+        echo "  Relay service  : systemd ${RELAY_SERVICE_NAME:-auto-xdp-relay}"
     elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-        echo "  Service        : rc-service $SERVICE_NAME status"
+        echo "  Sync service   : openrc $SERVICE_NAME"
+        echo "  Relay service  : openrc ${RELAY_SERVICE_NAME:-auto-xdp-relay}"
     else
-        echo "  Service        : not installed"
+        echo "  Sync service   : not installed"
+        echo "  Relay service  : not installed"
     fi
+    echo "  Config         : $TOML_CONFIG"
     echo "  Launcher       : $RUNNER_SCRIPT"
     echo "  Command        : $AXDP_CMD"
     echo ""
-    echo "  Next Commands"
-    echo "  axdp           : sudo axdp"
-    echo "  axdp watch     : sudo axdp watch"
-    echo "  axdp rates     : sudo axdp stats --rates"
-    echo "  axdp live      : sudo axdp stats --watch --rates --interval 2"
-    echo "  axdp sync      : sudo axdp sync"
-    echo "  axdp ports      : sudo axdp ports"
+    echo "Next commands"
+    echo "  status         : sudo axdp status"
+    echo "  dashboard      : sudo axdp"
+    echo "  live stats     : sudo axdp stats --watch --rates --interval 2"
+    echo "  sync ports     : sudo axdp sync"
+    echo "  list ports     : sudo axdp ports"
     if [[ "$INIT_SYSTEM" == "systemd" || "$INIT_SYSTEM" == "openrc" ]]; then
-        echo "  service status : sudo axdp status"
         echo "  service restart: sudo axdp restart"
     fi
 }
