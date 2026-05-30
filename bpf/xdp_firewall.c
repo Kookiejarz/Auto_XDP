@@ -42,13 +42,14 @@ static __always_inline int check_tcp_ipv4(
 
     // Malformed-packet check already ran above; fragments dropped before we arrive.
     if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
+        __u64 now = bpf_ktime_get_ns();
         if (is_trusted_v4(ip->saddr))
-            return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
+            return allow_new_tcp_syn(&key, dest_port, true, false, now);
 
         struct trusted_v4_key tk = { .prefixlen = 32, .addr = ip->saddr };
         struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v4, &tk);
         if (av && acl_port_match(av, dest_port))
-            return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
+            return allow_new_tcp_syn(&key, dest_port, true, false, now);
 
     }
 
@@ -85,15 +86,16 @@ static __always_inline int check_tcp_ipv6(
 
     // Malformed-packet check already ran above; fragments dropped before we arrive.
     if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
+        __u64 now = bpf_ktime_get_ns();
         if (is_trusted_v6(&ipv6->saddr))
-            return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
+            return allow_new_tcp_syn(&key, dest_port, true, false, now);
 
         struct trusted_v6_key tk;
         tk.prefixlen = 128;
         __builtin_memcpy(tk.addr, &ipv6->saddr, 16);
         struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v6, &tk);
         if (av && acl_port_match(av, dest_port))
-            return allow_new_tcp_syn(&key, dest_port, true, false, bpf_ktime_get_ns());
+            return allow_new_tcp_syn(&key, dest_port, true, false, now);
 
     }
 
@@ -443,7 +445,6 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
     void *data     = (void *)(long)ctx->data;
     __u64 now      = bpf_ktime_get_ns();
 
-    // --- 1. Parse Ethernet layer ---
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
@@ -467,7 +468,6 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    // 2. IPv4
     if (eth_proto == bpf_htons(ETH_P_IP)) {
         struct iphdr *ip = l3_data;
         if ((void *)(ip + 1) > data_end)
@@ -559,7 +559,6 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         }
     }
 
-    // 3. IPv6
     if (eth_proto == bpf_htons(ETH_P_IPV6)) {
         struct ipv6hdr *ipv6 = l3_data;
         if ((void *)(ipv6 + 1) > data_end)
@@ -629,7 +628,6 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         }
     }
 
-    // 4. Pass non-IP traffic (ARP, etc.)
     count(CNT_NON_IP);
     return XDP_PASS;
 }

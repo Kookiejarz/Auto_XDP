@@ -29,12 +29,10 @@ int xdp_gre_handler(struct xdp_md *ctx)
 
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    
     struct gre_hdr *gre = data + inner_off;
 
-    if ((void *)(gre + 1) > data_end) {
+    if ((void *)(gre + 1) > data_end)
         return XDP_PASS;
-    }
 
     __u16 flags_host = bpf_ntohs(gre->flags);
 

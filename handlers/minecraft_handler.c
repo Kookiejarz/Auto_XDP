@@ -5,6 +5,7 @@
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/types.h>
+#include <stdbool.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "xdp_slot_ctx.h"
