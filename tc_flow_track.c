@@ -35,6 +35,10 @@ struct vlan_hdr {
 #define CT_FAMILY_IPV6 10
 #define VLAN_MAX_DEPTH 4
 
+#define TCP_FLAG_SYN 0x02
+#define TCP_FLAG_ACK 0x10
+#define TCP_FLAG_RST 0x04
+
 // Shared conntrack flag constants (CT_SYN_PENDING).  Also included by the XDP
 // ingress program via bpf/include/common.h — single source of truth for the
 // bit encoding used in the tcp_ct4/tcp_ct6 maps.
@@ -262,13 +266,13 @@ int tc_egress_track(struct __sk_buff *skb)
             {
                 struct ct_key_v4 map_key;
                 fill_ct_key_v4_map(&map_key, &key);
-                if ((tcp_flags & 0x02) && !(tcp_flags & 0x10)) {
+                if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
                     bpf_map_update_elem(&tcp_ct4, &map_key, &now, BPF_ANY);
                 } else {
                     __u64 *last_seen = bpf_map_lookup_elem(&tcp_ct4, &map_key);
                     if (last_seen) {
                         __u64 ts = *last_seen & ~CT_SYN_PENDING;
-                        if ((tcp_flags & 0x04) ||
+                        if ((tcp_flags & TCP_FLAG_RST) ||
                             now - ts > TCP_TIMEOUT_NS) {
                             bpf_map_delete_elem(&tcp_ct4, &map_key);
                         } else if (now - ts > CT_REFRESH_INTERVAL) {
@@ -326,7 +330,6 @@ int tc_egress_track(struct __sk_buff *skb)
     if (nexthdr == IPPROTO_NONE || nexthdr == IPV6_FRAG_DROP_SENTINEL)
         return TC_ACT_OK;
 
-    now = bpf_ktime_get_ns();
     switch (nexthdr) {
     case IPPROTO_TCP:
         tcp = trans_data;
@@ -334,18 +337,19 @@ int tc_egress_track(struct __sk_buff *skb)
             return TC_ACT_OK;
 
         tcp_flags = ((__u8 *)tcp)[13];
+        now = bpf_ktime_get_ns();
         // Record the reverse IPv6 tuple so inbound SYN-ACK/ACK packets can match.
         fill_flow_key_v6(&key, &ipv6->daddr, &ipv6->saddr, tcp->dest, tcp->source);
         {
             struct ct_key_v6 map_key;
             fill_ct_key_v6_map(&map_key, &key);
-            if ((tcp_flags & 0x02) && !(tcp_flags & 0x10)) {
+            if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
                 bpf_map_update_elem(&tcp_ct6, &map_key, &now, BPF_ANY);
             } else {
                 __u64 *last_seen = bpf_map_lookup_elem(&tcp_ct6, &map_key);
                 if (last_seen) {
                     __u64 ts = *last_seen & ~CT_SYN_PENDING;
-                    if ((tcp_flags & 0x04) ||
+                    if ((tcp_flags & TCP_FLAG_RST) ||
                         now - ts > TCP_TIMEOUT_NS) {
                         bpf_map_delete_elem(&tcp_ct6, &map_key);
                     } else if (now - ts > CT_REFRESH_INTERVAL) {
@@ -361,6 +365,7 @@ int tc_egress_track(struct __sk_buff *skb)
         if ((void *)(udp + 1) > data_end)
             return TC_ACT_OK;
 
+        now = bpf_ktime_get_ns();
         fill_flow_key_v6(&key, &ipv6->daddr, &ipv6->saddr, udp->dest, udp->source);
         {
             struct ct_key_v6 map_key;
@@ -375,6 +380,7 @@ int tc_egress_track(struct __sk_buff *skb)
         sctp = trans_data;
         if ((void *)(sctp + 1) > data_end)
             return TC_ACT_OK;
+        now = bpf_ktime_get_ns();
         fill_flow_key_v6(&key, &ipv6->daddr, &ipv6->saddr, sctp->dport, sctp->sport);
         {
             __u64 *last_seen_sctp6 = bpf_map_lookup_elem(&sctp_conntrack, &key);

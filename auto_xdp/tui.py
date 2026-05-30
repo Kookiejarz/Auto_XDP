@@ -35,6 +35,16 @@ MAP_COUNT_INTERVAL = 10.0
 HIGH_CHURN_MAP_COUNT_INTERVAL = 30.0
 TUI_IDLE_REDRAW_INTERVAL = 1.0
 
+# curses color pair indices
+_CP_GREEN = 2
+_CP_RED = 3
+_CP_YELLOW = 4
+_CP_BLACK_ON_GREEN = 5
+_CP_BLACK_ON_YELLOW = 6
+_CP_WHITE_ON_RED = 7
+_CP_CYAN = 8
+_CP_BLACK_ON_CYAN = 9
+
 _HIGH_CHURN_MAPS = {
     "tcp_ct4",
     "tcp_ct6",
@@ -127,6 +137,7 @@ class RelayClient:
         self._buf = bytearray()
         self._next_retry = 0.0
         self.ports_dirty: bool = False
+        self.reason_totals: dict[str, int] = {}
 
     @property
     def events_end(self) -> int:
@@ -218,6 +229,9 @@ class RelayClient:
         event.setdefault("seen_at", time.time())
         if event.get("type") == "port_change":
             self.ports_dirty = True
+        elif str(event.get("verdict", "")) == "DROP":
+            reason = str(event.get("reason") or "unknown")
+            self.reason_totals[reason] = self.reason_totals.get(reason, 0) + 1
         self.events.append(event)
         if len(self.events) > self.max_events:
             drop_count = len(self.events) - self.max_events
@@ -376,11 +390,20 @@ def _collect_map_usage(
     return sorted(rows, key=sort_key)
 
 
+_service_cache: dict[tuple[int, str], str] = {}
+
+
 def _safe_service(port: int, proto: str) -> str:
+    key = (port, proto)
+    cached = _service_cache.get(key)
+    if cached is not None:
+        return cached
     try:
-        return socket.getservbyport(port, proto.lower())
+        name = socket.getservbyport(port, proto.lower())
     except OSError:
-        return "-"
+        name = "-"
+    _service_cache[key] = name
+    return name
 
 
 def _read_policy(path: str) -> dict[int, tuple[int, int, int, int, int, int]]:
@@ -447,29 +470,29 @@ def _display_mode(mode: str) -> str:
 
 def _mode_attr(mode: str) -> int:
     if mode in {"xdp native", "xdp offload"}:
-        return curses.color_pair(2)
+        return curses.color_pair(_CP_GREEN)
     if mode == "xdp generic":
-        return curses.color_pair(4)
+        return curses.color_pair(_CP_YELLOW)
     if mode.startswith("nftables fallback"):
-        return curses.color_pair(3)
+        return curses.color_pair(_CP_RED)
     if mode == "auto":
-        return curses.color_pair(8)
+        return curses.color_pair(_CP_CYAN)
     if mode in {"xdp off", "missing"}:
-        return curses.color_pair(3)
+        return curses.color_pair(_CP_RED)
     return curses.A_NORMAL
 
 
 def _mode_badge_attr(mode: str) -> int:
     if mode in {"xdp native", "xdp offload"}:
-        return curses.color_pair(5) | curses.A_BOLD
+        return curses.color_pair(_CP_BLACK_ON_GREEN) | curses.A_BOLD
     if mode == "xdp generic":
-        return curses.color_pair(6) | curses.A_BOLD
+        return curses.color_pair(_CP_BLACK_ON_YELLOW) | curses.A_BOLD
     if mode.startswith("nftables fallback"):
-        return curses.color_pair(7) | curses.A_BOLD
+        return curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD
     if mode == "auto":
-        return curses.color_pair(9) | curses.A_BOLD
+        return curses.color_pair(_CP_BLACK_ON_CYAN) | curses.A_BOLD
     if mode in {"xdp off", "missing"}:
-        return curses.color_pair(7) | curses.A_BOLD
+        return curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD
     return curses.A_BOLD
 
 
@@ -735,7 +758,7 @@ def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool) -> No
         mem = "-" if row.memlock is None else _human_bytes(row.memlock)
         attr = curses.A_NORMAL
         if row.pct is not None and row.pct >= 80:
-            attr = curses.color_pair(3) | curses.A_BOLD
+            attr = curses.color_pair(_CP_RED) | curses.A_BOLD
         _add(win, idx, 1, f"{id_str:>5} {row.name:<18.18} {row.kind:<10.10} {used:>7} {maximum:>7} {pct:>5} {mem:>8}", attr)
     if len(rows) > visible:
         _add(win, win.getmaxyx()[0] - 1, 2, f"{scroll + 1}-{min(scroll + visible, len(rows))}/{len(rows)}  tab focus", curses.A_DIM)
@@ -784,20 +807,52 @@ def _event_window(relay: RelayClient, visible: int, top: int) -> tuple[int, int,
     return top, start, events
 
 
-def _draw_events(win: Any, relay: RelayClient, snap: TuiSnapshot, top: int, focused: bool) -> None:
-    _box(win, "events" + (" *" if focused else ""))
-    _add(win, 1, 1, f"{'time':<8} {'v':<5} {'protocol':<8} {'source':<36} {'dport':>5} reason")
+def _draw_event_row(win: Any, i: int, ev: dict[str, Any]) -> None:
+    ts = float(ev.get("seen_at", time.time()))
+    tstr = _dt.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+    verdict = str(ev.get("verdict", "DROP"))
+    attr = curses.color_pair(_CP_GREEN) if verdict == "ALLOW" else curses.color_pair(_CP_RED)
+    source = f"{ev.get('src', '-')}/{ev.get('sport', '-')}"
+    line = f"{tstr:<8} {verdict:<5} {str(ev.get('proto', '-')):<8.8} {source:<36.36} {str(ev.get('dport', '-')):>5} {ev.get('reason', '-')}"
+    _add(win, i, 1, line, attr)
+
+
+def _draw_events(
+    win: Any,
+    relay: RelayClient,
+    snap: TuiSnapshot,
+    top: int,
+    focused: bool,
+    dport_filter: int | None = None,
+    filter_scroll: int = 0,
+) -> None:
+    header = f"{'time':<8} {'v':<5} {'protocol':<8} {'source':<36} {'dport':>5} reason"
     visible = max(0, win.getmaxyx()[0] - 3)
-    _, start, events = _event_window(relay, visible, top)
-    follow = top >= _event_bottom_top(relay, visible)
+
+    if dport_filter is not None:
+        filtered = [ev for ev in relay.events
+                    if ev.get("type") != "port_change"
+                    and str(ev.get("dport")) == str(dport_filter)]
+        _box(win, f"events [port {dport_filter}]" + (" *" if focused else ""))
+        _add(win, 1, 1, header)
+        scroll = max(0, min(filter_scroll, max(0, len(filtered) - visible)))
+        for i, ev in enumerate(filtered[scroll:scroll + visible], start=2):
+            _draw_event_row(win, i, ev)
+        count_str = f"{scroll + 1}-{min(scroll + visible, len(filtered))}/{len(filtered)}" if filtered else "0"
+        _add(win, win.getmaxyx()[0] - 1, 2,
+             f"{count_str}  enter:clear filter  {relay.status}", curses.A_DIM)
+        return
+
+    _box(win, "events" + (" *" if focused else ""))
+    _add(win, 1, 1, header)
+    # Fix: clamp top to valid range but never advance it automatically when paused.
+    bottom_top = _event_bottom_top(relay, visible)
+    follow = top >= bottom_top
+    clamped_top = max(relay.events_offset, min(top, bottom_top))
+    start = max(0, clamped_top - relay.events_offset)
+    events = relay.events[start:start + visible] if visible else []
     for i, ev in enumerate(events, start=2):
-        ts = float(ev.get("seen_at", time.time()))
-        tstr = _dt.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-        verdict = str(ev.get("verdict", "DROP"))
-        attr = curses.color_pair(2) if verdict == "ALLOW" else curses.color_pair(3)
-        source = f"{ev.get('src', '-')}/{ev.get('sport', '-')}"
-        line = f"{tstr:<8} {verdict:<5} {str(ev.get('proto', '-')):<8.8} {source:<36.36} {str(ev.get('dport', '-')):>5} {ev.get('reason', '-')}"
-        _add(win, i, 1, line, attr)
+        _draw_event_row(win, i, ev)
     footer = relay.status
     if visible > 0 and len(relay.events) > visible:
         oldest = start + 1
@@ -865,6 +920,25 @@ def _collect_top_traffic(events: list[dict[str, Any]], limit: int = 10) -> list[
     )[:limit]
 
 
+def _draw_drop_reasons(win: Any, relay: RelayClient, scroll: int = 0) -> None:
+    rows = sorted(relay.reason_totals.items(), key=lambda x: -x[1])
+    total = sum(c for _, c in rows)
+    _box(win, f"drop reasons  {total} total")
+    h, w = win.getmaxyx()
+    bar_w = max(1, w - 48)
+    _add(win, 1, 1, f"{'reason':<28} {'count':>6}  {'%':>5}   bar")
+    visible = max(0, h - 3)
+    scroll = max(0, min(scroll, max(0, len(rows) - visible)))
+    for idx, (reason, count) in enumerate(rows[scroll:scroll + visible], start=2):
+        pct = count / total * 100.0 if total else 0.0
+        bar = "█" * max(0, int(pct / 100.0 * bar_w))
+        _add(win, idx, 1,
+             f"{reason:<28} {count:>6}  {pct:>5.1f}%  {bar}",
+             curses.color_pair(_CP_RED))
+    if len(rows) > visible:
+        _add(win, h - 1, 2, f"{scroll + 1}-{min(scroll + visible, len(rows))}/{len(rows)}  ↑↓ scroll", curses.A_DIM)
+
+
 def _draw_top_traffic(win: Any, relay: RelayClient) -> None:
     _box(win, "top traffic by source ip / protocol / port")
     _add(win, 1, 1, f"{'#':>2} {'source ip':<39} {'proto':<8} {'port':>5} {'packets':>10} {'bytes':>10} {'last':<8} verdict")
@@ -875,7 +949,7 @@ def _draw_top_traffic(win: Any, relay: RelayClient) -> None:
         if row.last_seen > 0:
             tstr = _dt.datetime.fromtimestamp(row.last_seen).strftime("%H:%M:%S")
         bytes_text = "-" if row.bytes_ is None else _human_bytes(row.bytes_)
-        attr = curses.color_pair(2) if row.verdict == "ALLOW" else curses.color_pair(3)
+        attr = curses.color_pair(_CP_GREEN) if row.verdict == "ALLOW" else curses.color_pair(_CP_RED)
         line = (
             f"{idx - 1:>2} {row.ip:<39.39} {row.proto:<8.8} {row.port:>5.5} "
             f"{row.packets:>10} {bytes_text:>10} {tstr:<8} {row.verdict}"
@@ -899,11 +973,8 @@ def _filter_port_rows(
 
 
 def _port_filter_title(proto_filter: str) -> str:
-    if proto_filter == "TCP":
-        return "ports / services / limits [TCP]"
-    if proto_filter == "UDP":
-        return "ports / services / limits [UDP]"
-    return "ports / services / limits [all]"
+    label = proto_filter if proto_filter in ("TCP", "UDP") else "all"
+    return f"ports / services / limits [{label}]"
 
 
 def _draw_ports(
@@ -911,8 +982,12 @@ def _draw_ports(
     rows: list[tuple[str, int, str, str, str]],
     port_marks: dict[tuple[str, int], tuple[str, float, tuple[str, int, str, str, str]]],
     proto_filter: str = "all",
+    cursor: int = -1,
+    event_dport_filter: int | None = None,
+    focused: bool = False,
 ) -> None:
-    _box(win, _port_filter_title(proto_filter))
+    title = _port_filter_title(proto_filter) + (" *" if focused else "")
+    _box(win, title)
     _add(win, 1, 1, f"{'p':<3} {'port':>5} {'service':<12} {'process':<16} limit")
     now = time.monotonic()
     display_rows = list(rows)
@@ -930,10 +1005,16 @@ def _draw_ports(
         attr = curses.A_NORMAL
         if mark and mark[1] > now:
             if mark[0] == "added":
-                attr = curses.color_pair(4) | curses.A_BOLD
+                attr = curses.color_pair(_CP_YELLOW) | curses.A_BOLD
             elif mark[0] == "removed":
-                attr = curses.color_pair(3) | curses.A_BOLD
+                attr = curses.color_pair(_CP_RED) | curses.A_BOLD
+        if idx - 2 == cursor:
+            attr |= curses.A_REVERSE
+        if port == event_dport_filter:
+            attr |= curses.A_BOLD
         _add(win, idx, 1, f"{proto:<3} {port:>5} {svc:<12.12} {proc:<16.16} {limit}", attr)
+    if focused:
+        _add(win, win.getmaxyx()[0] - 1, 2, "↑↓ move  enter: filter events", curses.A_DIM)
 
 
 def _draw(
@@ -948,21 +1029,32 @@ def _draw(
     wins: _WinSet | None,
     port_filter: str,
     page: str = "overview",
+    reasons_scroll: int = 0,
+    port_cursor: int = -1,
+    event_dport_filter: int | None = None,
+    event_filter_scroll: int = 0,
 ) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     if page == "traffic":
-        traffic_win = _make_full_win(stdscr)
-        if traffic_win is None:
+        full_win = _make_full_win(stdscr)
+        if full_win is None:
             _add(stdscr, 0, 0, "terminal too small; need at least 80x20")
             stdscr.refresh()
             return
+        fh, fw = full_win.getmaxyx()
+        top_h = max(8, int(fh * 0.60))
+        bot_h = fh - top_h
+        top_win = full_win.derwin(top_h, fw, 0, 0)
         now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         title = f"Auto XDP TUI  top traffic  backend={snap.backend} iface={snap.iface} mode={snap.attach_mode}  {now}  v:overview q:quit"
         _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
         if last_error:
-            _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(3) | curses.A_BOLD)
-        _draw_top_traffic(traffic_win, relay)
+            _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(_CP_RED) | curses.A_BOLD)
+        _draw_top_traffic(top_win, relay)
+        if bot_h >= 4:
+            bot_win = full_win.derwin(bot_h, fw, top_h, 0)
+            _draw_drop_reasons(bot_win, relay, reasons_scroll)
         stdscr.refresh()
         return
     if wins is None:
@@ -970,14 +1062,18 @@ def _draw(
         stdscr.refresh()
         return
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"Auto XDP TUI  backend={snap.backend} iface={snap.iface} mode={snap.attach_mode} map={snap.map_id} ports={port_filter}  {now}  v:traffic tab:focus t/u:ports q:quit"
+    title = f"Auto XDP TUI  backend={snap.backend} iface={snap.iface} mode={snap.attach_mode} map={snap.map_id} ports={port_filter}  {now}  v:traffic tab:focus t/u:filter enter:port-events q:quit"
     _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
     if last_error:
-        _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(3) | curses.A_BOLD)
+        _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(_CP_RED) | curses.A_BOLD)
     _draw_maps(wins.maps, snap.maps, map_scroll, focus == "maps")
-    _draw_events(wins.events, relay, snap, event_top, focus == "events")
+    _draw_events(wins.events, relay, snap, event_top, focus == "events",
+                 dport_filter=event_dport_filter, filter_scroll=event_filter_scroll)
     _draw_summary(wins.summary, snap)
-    _draw_ports(wins.ports, snap.ports, port_marks, port_filter)
+    _draw_ports(wins.ports, snap.ports, port_marks, port_filter,
+                cursor=port_cursor if focus == "ports" else -1,
+                event_dport_filter=event_dport_filter,
+                focused=focus == "ports")
     stdscr.refresh()
 
 
@@ -985,14 +1081,14 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(2, curses.COLOR_GREEN, -1)
-    curses.init_pair(3, curses.COLOR_RED, -1)
-    curses.init_pair(4, curses.COLOR_YELLOW, -1)
-    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_GREEN)
-    curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-    curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_RED)
-    curses.init_pair(8, curses.COLOR_CYAN, -1)
-    curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(_CP_GREEN, curses.COLOR_GREEN, -1)
+    curses.init_pair(_CP_RED, curses.COLOR_RED, -1)
+    curses.init_pair(_CP_YELLOW, curses.COLOR_YELLOW, -1)
+    curses.init_pair(_CP_BLACK_ON_GREEN, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(_CP_BLACK_ON_YELLOW, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    curses.init_pair(_CP_WHITE_ON_RED, curses.COLOR_WHITE, curses.COLOR_RED)
+    curses.init_pair(_CP_CYAN, curses.COLOR_CYAN, -1)
+    curses.init_pair(_CP_BLACK_ON_CYAN, curses.COLOR_BLACK, curses.COLOR_CYAN)
     stdscr.nodelay(True)
     stdscr.timeout(200)
 
@@ -1007,6 +1103,10 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     port_marks: dict[tuple[str, int], tuple[str, float, tuple[str, int, str, str, str]]] = {}
     port_filter = "all"
     page = "overview"
+    reasons_scroll = 0
+    port_cursor = 0
+    event_dport_filter: int | None = None
+    event_filter_scroll = 0
     wins: _WinSet | None = None
     last_draw_at = 0.0
     last_draw_state: tuple[Any, ...] | None = None
@@ -1049,10 +1149,6 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             }
             if set(port_marks) != before_marks:
                 ui_dirty = True
-            if relay.ports_dirty:
-                relay.ports_dirty = False
-                worker.wakeup()
-                ui_dirty = True
             if snap.collected_at > last_ports_snapshot_at:
                 current_port_rows = {_port_key(row): row for row in snap.ports}
                 if previous_port_rows is not None:
@@ -1075,32 +1171,85 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             map_scroll_max = max(0, len(snap.maps) - map_visible)
             event_top = _clamp_event_top(relay, event_visible, event_top)
             if ch == 9:
-                focus = "events" if focus == "maps" else "maps"
-                ui_dirty = True
-            if ch == curses.KEY_UP:
-                if focus == "events":
-                    event_top = max(relay.events_offset, event_top - 1)
+                if focus == "maps":
+                    focus = "events"
+                elif focus == "events":
+                    focus = "ports"
                 else:
-                    map_scroll = max(0, map_scroll - 1)
+                    focus = "maps"
                 ui_dirty = True
-            elif ch == curses.KEY_DOWN:
-                if focus == "events":
-                    event_top = min(_event_bottom_top(relay, event_visible), event_top + 1)
-                else:
-                    map_scroll = min(map_scroll_max, map_scroll + 1)
-                ui_dirty = True
-            elif ch == curses.KEY_PPAGE:
-                if focus == "events":
-                    event_top = max(relay.events_offset, event_top - event_visible)
-                else:
-                    map_scroll = max(0, map_scroll - map_visible)
-                ui_dirty = True
-            elif ch == curses.KEY_NPAGE:
-                if focus == "events":
-                    event_top = min(_event_bottom_top(relay, event_visible), event_top + event_visible)
-                else:
-                    map_scroll = min(map_scroll_max, map_scroll + map_visible)
-                ui_dirty = True
+            display_port_rows = _filter_port_rows(snap.ports, port_filter)
+            port_cursor = max(0, min(port_cursor, len(display_port_rows) - 1))
+            if ch in (10, 13, curses.KEY_ENTER):
+                if focus == "ports" and display_port_rows:
+                    selected_port = display_port_rows[port_cursor][1]
+                    if event_dport_filter == selected_port:
+                        event_dport_filter = None
+                    else:
+                        event_dport_filter = selected_port
+                        event_filter_scroll = 0
+                        focus = "events"
+                    ui_dirty = True
+                elif focus == "events" and event_dport_filter is not None:
+                    event_dport_filter = None
+                    ui_dirty = True
+            if page == "traffic":
+                if ch == curses.KEY_UP:
+                    reasons_scroll = max(0, reasons_scroll - 1)
+                    ui_dirty = True
+                elif ch == curses.KEY_DOWN:
+                    reasons_scroll += 1
+                    ui_dirty = True
+                elif ch == curses.KEY_PPAGE:
+                    reasons_scroll = max(0, reasons_scroll - 5)
+                    ui_dirty = True
+                elif ch == curses.KEY_NPAGE:
+                    reasons_scroll += 5
+                    ui_dirty = True
+            elif focus == "ports":
+                if ch == curses.KEY_UP:
+                    port_cursor = max(0, port_cursor - 1)
+                    ui_dirty = True
+                elif ch == curses.KEY_DOWN:
+                    port_cursor = min(len(display_port_rows) - 1, port_cursor + 1)
+                    ui_dirty = True
+            else:
+                if ch == curses.KEY_UP:
+                    if focus == "events":
+                        if event_dport_filter is not None:
+                            event_filter_scroll = max(0, event_filter_scroll - 1)
+                        else:
+                            event_top = max(relay.events_offset, event_top - 1)
+                    else:
+                        map_scroll = max(0, map_scroll - 1)
+                    ui_dirty = True
+                elif ch == curses.KEY_DOWN:
+                    if focus == "events":
+                        if event_dport_filter is not None:
+                            event_filter_scroll += 1
+                        else:
+                            event_top = min(_event_bottom_top(relay, event_visible), event_top + 1)
+                    else:
+                        map_scroll = min(map_scroll_max, map_scroll + 1)
+                    ui_dirty = True
+                elif ch == curses.KEY_PPAGE:
+                    if focus == "events":
+                        if event_dport_filter is not None:
+                            event_filter_scroll = max(0, event_filter_scroll - event_visible)
+                        else:
+                            event_top = max(relay.events_offset, event_top - event_visible)
+                    else:
+                        map_scroll = max(0, map_scroll - map_visible)
+                    ui_dirty = True
+                elif ch == curses.KEY_NPAGE:
+                    if focus == "events":
+                        if event_dport_filter is not None:
+                            event_filter_scroll += event_visible
+                        else:
+                            event_top = min(_event_bottom_top(relay, event_visible), event_top + event_visible)
+                    else:
+                        map_scroll = min(map_scroll_max, map_scroll + map_visible)
+                    ui_dirty = True
             follow_events = event_top >= _event_bottom_top(relay, event_visible)
             relay_state_before = (relay.events_offset, relay.events_end, relay.status)
             relay.poll()
@@ -1127,12 +1276,16 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 focus,
                 port_filter,
                 page,
+                reasons_scroll,
+                port_cursor,
+                event_dport_filter,
+                event_filter_scroll,
                 wins.h if wins is not None else 0,
                 wins.w if wins is not None else 0,
             )
             now = time.monotonic()
             if ui_dirty or draw_state != last_draw_state or now - last_draw_at >= TUI_IDLE_REDRAW_INTERVAL:
-                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page)
+                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll)
                 last_draw_at = now
                 last_draw_state = draw_state
     finally:
