@@ -4,6 +4,7 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
+#include <linux/in.h>
 #include <linux/types.h>
 #include <stdbool.h>
 #include <bpf/bpf_helpers.h>
