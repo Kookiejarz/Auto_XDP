@@ -125,6 +125,61 @@ test_main_dispatches_under_attack_command() (
     assert_eq "$called" "yes:on"
 )
 
+test_main_loads_configured_ifaces_for_tui() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    CONFIG_FILE="$tmpdir/auto_xdp.env"
+    cat >"$CONFIG_FILE" <<'EOF_CFG'
+IFACES="eth0 eth1"
+IFACE="eth0"
+EOF_CFG
+
+    local called=""
+    run_tui() {
+        called="$IFACES"
+    }
+
+    main tui || return 1
+    assert_eq "$called" "eth0 eth1"
+)
+
+test_main_reports_stale_admin_cli_for_tui() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir output status
+    tmpdir=$(mktemp -d)
+    PYTHON_LIB_DIR="$tmpdir/python"
+    mkdir -p "$PYTHON_LIB_DIR/auto_xdp"
+    touch "$PYTHON_LIB_DIR/auto_xdp/__init__.py"
+    cat >"$PYTHON_LIB_DIR/auto_xdp/admin_cli.py" <<'EOF_PY'
+import argparse
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin_cli")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--bpf-pin-dir", default="/sys/fs/bpf/xdp_fw")
+    parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("config")
+    return parser
+EOF_PY
+
+    output=$(main tui 2>&1)
+    status=$?
+
+    [[ $status -ne 0 ]] || {
+        printf 'expected stale admin_cli guard to fail\n'
+        return 1
+    }
+    assert_contains "$output" "Installed auto_xdp Python support package is too old for: axdp tui" || return 1
+    assert_contains "$output" "sudo axdp check-update --force"
+)
+
 test_config_updates_preserve_unrelated_sections() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -695,6 +750,8 @@ run_test "axdp sorts and diffs csv port lists" test_csv_helpers_sort_and_diff_po
 run_test "axdp reads and updates runtime log level" test_run_log_level_reads_and_updates_config
 run_test "axdp reads and updates under-attack mode" test_run_under_attack_reads_and_updates_config
 run_test "axdp dispatches under-attack command correctly" test_main_dispatches_under_attack_command
+run_test "axdp loads configured interfaces for tui" test_main_loads_configured_ifaces_for_tui
+run_test "axdp reports stale admin_cli for tui" test_main_reports_stale_admin_cli_for_tui
 run_test "axdp preserves unrelated TOML sections on config update" test_config_updates_preserve_unrelated_sections
 run_test "axdp permanent supports SCTP ports" test_run_permanent_supports_sctp_ports
 run_test "axdp detects active xdp backend from runtime state" test_detect_backend_prefers_xdp_runtime_state

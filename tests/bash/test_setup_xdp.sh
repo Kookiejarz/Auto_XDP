@@ -237,6 +237,66 @@ test_fetch_local_or_remote_uses_local_copy_without_network() (
     assert_file_contains "$dst" "local copy"
 )
 
+test_check_github_updates_lists_and_confirms_once() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir remote_root output
+    tmpdir=$(mktemp -d)
+    remote_root="$tmpdir/remote"
+    output=""
+    mkdir -p "$tmpdir/bin" "$remote_root"
+
+    cd "$tmpdir" || return 1
+    printf 'local axdp\n' >axdp
+    printf 'same config\n' >config.toml
+    printf 'remote axdp\n' >"$remote_root/axdp"
+    printf 'same config\n' >"$remote_root/config.toml"
+
+    cat >"$tmpdir/bin/curl" <<'EOF_CURL'
+#!/bin/sh
+out=""
+url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o)
+            out="$2"
+            shift 2
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            url="$1"
+            shift
+            ;;
+    esac
+done
+rel="${url#https://example.test/}"
+cp "${REMOTE_ROOT}/${rel}" "$out"
+EOF_CURL
+    chmod +x "$tmpdir/bin/curl"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+    RAW_URL="https://example.test"
+    REMOTE_ROOT="$remote_root"
+    export REMOTE_ROOT
+    CHECK_UPDATES=1
+    PREFER_REMOTE_SOURCES=0
+    FORCE=0
+    confirm_yes_no() {
+        output="${output}${1}"$'\n'
+        return 0
+    }
+
+    check_github_updates_once || return 1
+    assert_file_contains "$tmpdir/axdp" "remote axdp" || return 1
+    assert_file_contains "$tmpdir/config.toml" "same config" || return 1
+    assert_contains "$output" "Pull GitHub versions for all listed files? [y/N] " || return 1
+    assert_eq "$(printf '%s' "$output" | grep -c 'Pull GitHub versions')" "1" || return 1
+    assert_eq "$CHECK_UPDATES" "0"
+)
+
 test_write_config_enables_queue_auto_tuning() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -786,6 +846,7 @@ run_test "setup_xdp dry-run report emits CI fields" test_dry_run_report_emits_ci
 run_test "setup_xdp confirmation handles force and no-tty abort" test_confirm_yes_no_force_and_no_tty_abort_modes
 run_test "setup_xdp aborts when existing install is not confirmed" test_confirm_existing_install_step_aborts_without_confirmation
 run_test "setup_xdp prefers local files when available" test_fetch_local_or_remote_uses_local_copy_without_network
+run_test "setup_xdp check-update confirms all changed files once" test_check_github_updates_lists_and_confirms_once
 run_test "setup_xdp writes queue auto tuning into runtime config" test_write_config_enables_queue_auto_tuning
 run_test "setup_xdp sizes combined channels to available CPUs" test_auto_tune_interface_parallelism_sets_combined_channels
 run_test "setup_xdp balances interface irqs across CPUs" test_auto_tune_interface_parallelism_balances_irqs

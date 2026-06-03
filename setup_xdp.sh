@@ -221,6 +221,7 @@ main() {
 
     print_installer_banner
     check_root_privileges
+    check_github_updates_once
     resolve_target_interfaces_step
     detect_environment_step
     print_setup_plan

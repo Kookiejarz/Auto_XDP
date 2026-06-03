@@ -313,6 +313,13 @@ except Exception as exc:
     raise SystemExit(f"failed to import installed auto_xdp TUI modules: {exc}")
 
 parser = admin_cli.build_parser()
+required_options = {"--run-state-dir", "--nft-family", "--nft-table", "--iface"}
+missing_options = sorted(required_options - set(parser._option_string_actions))
+if missing_options:
+    raise SystemExit(
+        "installed auto_xdp.admin_cli is missing required wrapper options: "
+        + ", ".join(missing_options)
+    )
 command_action = next(
     (action for action in parser._actions if getattr(action, "dest", None) == "command"),
     None,

@@ -55,6 +55,87 @@ prompt_pull_github() {
     return 1
 }
 
+_check_update_candidate_files() {
+    local path
+    local fixed_files=(
+        "setup_xdp.sh"
+        "axdp"
+        "config.toml"
+        "xdp_port_sync.py"
+        "pkt_relay.py"
+        "auto_xdp_bpf_helpers.py"
+        "tc_flow_track.c"
+    )
+
+    for path in "${fixed_files[@]}"; do
+        [[ -f "$path" ]] && printf '%s\n' "$path"
+    done
+
+    for path in lib/setup/*.sh runtime/*.sh bpf/*.c bpf/include/*.h handlers/Makefile handlers/*.c handlers/*.h auto_xdp/*.py auto_xdp/admin/*.py auto_xdp/backends/*.py auto_xdp/bpf/*.py auto_xdp/xdp_required_maps.txt; do
+        [[ -f "$path" ]] && printf '%s\n' "$path"
+    done | sort -u
+}
+
+check_github_updates_once() {
+    [[ $CHECK_UPDATES -eq 1 ]] || return 0
+    [[ $PREFER_REMOTE_SOURCES -eq 0 ]] || return 0
+
+    local -a changed_files=()
+    local -a changed_tmp_files=()
+    local -a failed_files=()
+    local rel tmp_file local_hash remote_hash
+
+    info "Scanning local files for GitHub updates..."
+
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        tmp_file=$(mktemp)
+        _SETUP_TMPFILES+=("$tmp_file")
+        if ! curl -fsSL "${RAW_URL}/${rel}" -o "$tmp_file"; then
+            failed_files+=("$rel")
+            continue
+        fi
+
+        local_hash=$(sha256_of_file "$rel")
+        remote_hash=$(sha256_of_file "$tmp_file")
+        if [[ "$local_hash" != "$remote_hash" ]]; then
+            changed_files+=("$rel")
+            changed_tmp_files+=("$tmp_file")
+        fi
+    done < <(_check_update_candidate_files)
+
+    if [[ ${#failed_files[@]} -gt 0 ]]; then
+        warn "Could not check these files against GitHub:"
+        for rel in "${failed_files[@]}"; do
+            warn "  ${rel}"
+        done
+    fi
+
+    if [[ ${#changed_files[@]} -eq 0 ]]; then
+        info "All checked local files match GitHub."
+        CHECK_UPDATES=0
+        return 0
+    fi
+
+    warn "The following local files differ from GitHub:"
+    for rel in "${changed_files[@]}"; do
+        warn "  ${rel}"
+    done
+
+    if confirm_yes_no "Pull GitHub versions for all listed files? [y/N] "; then
+        local i
+        for i in "${!changed_files[@]}"; do
+            cp "${changed_tmp_files[$i]}" "${changed_files[$i]}"
+            info "Updated local ${changed_files[$i]} from GitHub."
+        done
+    else
+        warn "Keeping local files."
+    fi
+
+    CHECK_UPDATES=0
+    return 0
+}
+
 fetch_local_or_remote() {
     local local_path="$1"
     local remote_name="$2"

@@ -137,6 +137,40 @@ run_py_module() {
     PYTHONPATH="${PYTHON_LIB_DIR}" python3 -c "$PY_BOOTSTRAP" "$module" "$@"
 }
 
+require_admin_cli_runtime() {
+    local command="$1"
+
+    if PYTHONPATH="${PYTHON_LIB_DIR}" python3 -c '
+import sys
+sys.path[:] = [p for p in sys.path if p]
+
+try:
+    from auto_xdp import admin_cli
+    parser = admin_cli.build_parser()
+except Exception:
+    raise SystemExit(1)
+
+required_options = {"--run-state-dir", "--nft-family", "--nft-table", "--iface"}
+if not required_options.issubset(set(parser._option_string_actions)):
+    raise SystemExit(1)
+
+command_action = next(
+    (action for action in parser._actions if getattr(action, "dest", None) == "command"),
+    None,
+)
+choices = set(getattr(command_action, "choices", {}) or {})
+if sys.argv[1] not in choices:
+    raise SystemExit(1)
+' "$command" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    printf 'Installed auto_xdp Python support package is too old for: axdp %s\n' "$command" >&2
+    printf 'Refresh the installed package and wrapper with: sudo axdp check-update --force\n' >&2
+    printf 'Or reinstall from this checkout with: sudo bash setup_xdp.sh --force\n' >&2
+    exit 1
+}
+
 run_admin_config() {
     run_py_module auto_xdp.admin_cli \
         --config "$TOML_CONFIG" \
@@ -397,6 +431,8 @@ run_conntrack() {
 
 
 run_ports() {
+    require_admin_cli_runtime ports
+
     local args=()
     for arg in "$@"; do
         [[ "$arg" == "watch" ]] && arg="--watch"
@@ -413,6 +449,8 @@ run_ports() {
 }
 
 run_stats() {
+    require_admin_cli_runtime stats
+
     run_py_module auto_xdp.admin_cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
@@ -425,6 +463,8 @@ run_stats() {
 }
 
 run_tui() {
+    require_admin_cli_runtime tui
+
     run_py_module auto_xdp.admin_cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
@@ -595,6 +635,8 @@ run_slot() {
 
 main() {
     local cmd="${1:-stats}"
+
+    load_config
 
     case "$cmd" in
         stats)
