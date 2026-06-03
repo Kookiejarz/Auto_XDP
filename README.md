@@ -884,6 +884,19 @@ full design rationale.
 
 ---
 
+## ❤️ Special Thanks
+
+Structure Design:
+- https://github.com/gamemann/XDP-Firewall
+- https://ebpf.io/
+
+Rules & Features:
+- https://github.com/danger-dream/ebpf-firewall
+- https://github.com/R00tS3c/XDP-eBPF-Anti-DDoS-Firewall
+- https://github.com/Outfluencer/Minecraft-XDP-eBPF
+
+---
+
 ## 📄 License
 
 [MPL 2.0](./LICENSE) © 2026 Yunheng Liu
