@@ -34,6 +34,36 @@ It is built for single-host self-protection: VPSes, public cloud instances, home
 
 ---
 
+## Table of Contents
+
+- [Overview](#overview)
+- [How It Works](#how-it-works)
+- [Components](#components)
+- [Key Features](#key-features)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Install From Source](#install-from-source)
+- [What `setup_xdp.sh` Does](#what-setup_xdpsh-does-step-by-step)
+- [Automated Distro Checks](#automated-distro-checks)
+- [BPF Maps](#bpf-maps)
+- [Why ARRAY instead of HASH?](#why-array-instead-of-hash)
+- [Auto-Sync Daemon](#auto-sync-daemon)
+- [Configuration](#configuration)
+- [Statistics](#statistics)
+- [Post-Install Quick Commands](#post-install-quick-commands)
+- [Packet Event Stream](#packet-event-stream-live-tui--relay)
+- [Threat-Intel Blocklist](#threat-intel-blocklist-abuseipdb)
+- [Packet Filtering Logic](#packet-filtering-logic)
+- [Uninstall](#uninstall)
+- [Real-World Performance Benchmark](#real-world-performance-benchmark)
+- [Contributing](#contributing)
+- [Star History](#star-history)
+- [Behavior Change](#behavior-change-default-on-tcp-protection)
+- [Special Thanks](#special-thanks)
+- [License](#license)
+
+---
+
 ## Overview
 
 ### What is XDP?
@@ -192,6 +222,70 @@ Using a tag gives you a reproducible installer version instead of tracking the l
 
 When the installer is executed from `stdin` (`curl | bash`), it prefers the matching GitHub source files instead of stale local files from the current working directory.
 
+## Install From Source
+
+```bash
+git clone https://github.com/Kookiejarz/Auto_XDP.git
+cd Auto_XDP
+
+# Auto-detect interface
+sudo bash setup_xdp.sh
+
+# Or specify interface
+sudo bash setup_xdp.sh eth0
+
+# Deploy to every active non-loopback interface
+sudo bash setup_xdp.sh --all-interfaces
+
+# Or deploy to a specific set of interfaces
+sudo bash setup_xdp.sh eth0 eth1
+
+# Preview the detected OS, init system, packages, and target interfaces
+sudo bash setup_xdp.sh --dry-run
+
+# Compare local files with GitHub first, then decide interactively
+sudo bash setup_xdp.sh --check-update
+
+# Non-interactive mode for CI / automation
+sudo bash setup_xdp.sh --check-update --force
+```
+
+### Multi-Interface Installation
+
+By default, the installer uses the interface from the default route. For hosts with multiple public NICs, pass every protected interface explicitly or use `--all-interfaces`.
+
+```bash
+# Protect all active non-loopback interfaces
+sudo bash setup_xdp.sh --all-interfaces
+
+# Protect only selected interfaces
+sudo bash setup_xdp.sh eth0 ens5
+```
+
+The generated runtime config stores the interface list, and the boot-time loader re-attaches XDP and the `tc` egress tracker to those interfaces after service restart or reboot.
+
+---
+
+## What `setup_xdp.sh` Does (Step-by-Step)
+
+1. Checks for root privileges 
+2. Resolves the target interface or interface list
+3. Installs missing dependencies via the detected package manager 
+4. Uses local `xdp_firewall.c` / `tc_flow_track.c` / `xdp_port_sync.py` / `axdp` by default from a local checkout; when run from `stdin`, it prefers the matching GitHub copies
+5. Compiles the XDP and tc BPF objects when the host has the required toolchain
+6. Installs `xdp_required_maps.txt` before attaching XDP so the map readiness check uses the current version
+7. Pre-seeds current IPv4/IPv6 established TCP sessions into `tcp_ct4`/`tcp_ct6` before attaching XDP
+8. Loads and attaches a `tc clsact egress` program on each target interface to record outbound TCP SYN and UDP reply tuples
+9. Tries to attach XDP on each target interface in native mode, then generic mode
+10. Falls back to `nftables` automatically if XDP cannot be attached
+11. Installs the runtime launcher at `/usr/local/bin/auto_xdp_start.sh`
+12. Installs the sync daemon at `/usr/local/bin/xdp_port_sync.py`
+13. Installs the packet event relay at `/usr/local/bin/pkt_relay.py`
+14. Runs an initial port sync using the selected backend
+15. Registers and starts `xdp-port-sync` and `auto-xdp-relay` on `systemd` or `OpenRC` when available
+
+---
+
 ## Automated Distro Checks
 
 The repository includes a GitHub Actions matrix that installs each supported distro's native build dependencies inside that distro's own container image and compiles the BPF objects there directly.
@@ -209,47 +303,6 @@ If you only want the package-manager and init-system probe from the installer, u
 ```bash
 bash setup_xdp.sh --check-env
 ```
-
----
-
-## Install From Source
-
-```bash
-git clone https://github.com/Kookiejarz/Auto_XDP.git
-cd auto_xdp
-
-# Auto-detect interface
-sudo bash setup_xdp.sh
-
-# Or specify interface
-sudo bash setup_xdp.sh eth0
-
-# Compare local files with GitHub first, then decide interactively
-sudo bash setup_xdp.sh --check-update
-
-# Non-interactive mode for CI / automation
-sudo bash setup_xdp.sh --check-update --force
-```
-
----
-
-## What `setup_xdp.sh` Does (Step-by-Step)
-
-1. Checks for root privileges 
-2. Auto-detects default network interface
-3. Installs missing dependencies via the detected package manager 
-4. Uses local `xdp_firewall.c` / `tc_flow_track.c` / `xdp_port_sync.py` / `axdp` by default from a local checkout; when run from `stdin`, it prefers the matching GitHub copies
-5. Compiles the XDP and tc BPF objects when the host has the required toolchain
-6. Installs `xdp_required_maps.txt` before attaching XDP so the map readiness check uses the current version
-7. Pre-seeds current IPv4/IPv6 established TCP sessions into `tcp_ct4`/`tcp_ct6` before attaching XDP
-8. Loads and attaches a `tc clsact egress` program that records outbound TCP SYN and UDP reply tuples
-9. Tries to attach XDP in native mode, then generic mode
-10. Falls back to `nftables` automatically if XDP cannot be attached
-11. Installs the runtime launcher at `/usr/local/bin/auto_xdp_start.sh`
-12. Installs the sync daemon at `/usr/local/bin/xdp_port_sync.py`
-13. Installs the packet event relay at `/usr/local/bin/pkt_relay.py`
-14. Runs an initial port sync using the selected backend
-15. Registers and starts `xdp-port-sync` and `auto-xdp-relay` on `systemd` or `OpenRC` when available
 
 ---
 
@@ -288,14 +341,14 @@ bpftool map update pinned /sys/fs/bpf/xdp_fw/tcp_whitelist \
     key 0x90 0x1f 0x00 0x00 value 0x01 0x00 0x00 0x00
 
 # Remove TCP port 8080
-bpftool map delete pinned /sys/fs/bpf/xdp_fw/tcp_whitelist \
-    key 0x90 0x1f 0x00 0x00
+bpftool map update pinned /sys/fs/bpf/xdp_fw/tcp_whitelist \
+    key 0x90 0x1f 0x00 0x00 value 0x00 0x00 0x00 0x00
 
 # View current TCP whitelist
 bpftool map dump pinned /sys/fs/bpf/xdp_fw/tcp_whitelist
 ```
 
-Key encoding note: the map type is now **ARRAY** (`BPF_MAP_TYPE_ARRAY`), so the key is a 4-byte little-endian `__u32` port number (host byte order). Example: `8080` = `0x00001F90` → bytes `0x90 0x1f 0x00 0x00`
+Key encoding note: the whitelist maps are **ARRAY** maps (`BPF_MAP_TYPE_ARRAY`), so entries are not deleted. Set the value to `1` to allow a port and `0` to close it. The key is a 4-byte little-endian `__u32` port number (host byte order). Example: `8080` = `0x00001F90` → bytes `0x90 0x1f 0x00 0x00`.
 
 ---
 
@@ -323,62 +376,114 @@ The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/auto_xdp_
 
 Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`. The XDP ingress path checks those maps before falling back to the TCP/UDP admission rules.
 
-### Permanent Ports
+---
 
-Edit `xdp_port_sync.py` to always allow specific ports:
+## Configuration
 
-```python
-TCP_PERMANENT = {22: "SSH-fallback"}   # Optional: add ports you never want blocked
-UDP_PERMANENT = {50000: "custom-udp-service"}  # Use this for real high-port UDP services
-TRUSTED_SRC_IPS = {"1.1.1.1/32": "cloudflare-dns", "2606:4700:4700::1111/128": "cloudflare-dns-v6", "10.0.0.0/8": "internal-net"}
-```
-
-If a real UDP server uses a high port, add it to `UDP_PERMANENT` explicitly so it remains whitelisted even when the daemon's socket heuristics cannot distinguish it cleanly from transient client traffic.
-
-You can also add trusted IPv4/IPv6 sources and CIDR ranges at runtime:
+The installed runtime config lives at `/etc/auto_xdp/config.toml`. Use `axdp` for common changes because it edits the TOML file and reloads the daemon for you.
 
 ```bash
-# Single IPv4 host
-python3 /usr/local/bin/xdp_port_sync.py --backend auto \
-  --trusted-ip 1.1.1.1 cloudflare-dns
+# Show the current TOML config
+sudo axdp config show
 
-# IPv4 subnet — host bits are masked automatically (203.23.2.5/24 → 203.23.2.0/24)
-python3 /usr/local/bin/xdp_port_sync.py --backend auto \
-  --trusted-ip 203.23.2.0/24 office-net
+# Create the default config if it is missing
+sudo axdp config init
 
-# IPv6 single host
-python3 /usr/local/bin/xdp_port_sync.py --backend auto \
-  --trusted-ip 2606:4700:4700::1111 cloudflare-dns-v6
-
-# IPv6 prefix
-python3 /usr/local/bin/xdp_port_sync.py --backend auto \
-  --trusted-ip 2001:db8::/32 example-v6-net
-
-# Mix of IPv4, IPv4 CIDR, IPv6 host, IPv6 prefix — all in one invocation
-python3 /usr/local/bin/xdp_port_sync.py --backend auto \
-  --trusted-ip 1.1.1.1          cloudflare-dns \
-  --trusted-ip 10.0.0.0/8       internal-net \
-  --trusted-ip 2606:4700:4700::1111 cloudflare-dns-v6 \
-  --trusted-ip fd00::/8         ula-net \
-  --dry-run
+# Apply a manual edit after changing /etc/auto_xdp/config.toml
+sudo axdp restart
 ```
 
-`--trusted-ip` is synced to both backends: XDP writes to the `trusted_ipv4`/`trusted_ipv6` LPM trie maps; `nftables` writes to equivalent `trusted_v4`/`trusted_v6` sets in the `auto_xdp` table.
+### Common Policy Changes
+
+| Goal | Command | Notes |
+|---|---|---|
+| Always keep a port open | `sudo axdp permanent add tcp 2222 alt-ssh` | Supports `tcp`, `udp`, and `sctp`; useful when a port must remain allowed even if the process restarts |
+| Trust an admin/source network | `sudo axdp trust add 10.0.0.0/8 office-net` | TCP trusted sources may reach non-discovered ports; UDP trusted sources still require the destination UDP port to be open |
+| Allow selected CIDRs to selected ports | `sudo axdp acl add tcp 203.0.113.0/24 443 8443` | TCP ACLs can open specific ports for the CIDR; UDP ACLs apply only after the UDP port is already whitelisted |
+| Freeze automatic port changes during an incident | `sudo axdp under-attack on` | Suspends process-event-driven sync; use `sudo axdp under-attack off` to resume normal behavior |
+| Change daemon verbosity | `sudo axdp log-level debug` | Valid levels: `debug`, `info`, `warning`, `error` |
+
+Examples:
+
+```bash
+# Permanent ports
+sudo axdp permanent list
+sudo axdp permanent add tcp 22 ssh
+sudo axdp permanent add udp 50000 game-udp
+sudo axdp permanent del tcp 22
+
+# Trusted sources
+sudo axdp trust list
+sudo axdp trust add 203.0.113.5/32 monitoring
+sudo axdp trust add 2001:db8::/32 office-v6
+sudo axdp trust del 203.0.113.5/32
+
+# Per-CIDR ACLs
+sudo axdp acl list
+sudo axdp acl add tcp 198.51.100.0/24 5432 6379
+sudo axdp acl del tcp 198.51.100.0/24
+```
+
+### Direct TOML Editing
+
+For bulk edits, change `/etc/auto_xdp/config.toml` directly. The main sections operators usually touch are:
+
+```toml
+[daemon]
+log_level = "warning"
+preferred_backend = "auto"   # auto, xdp, or nftables
+
+[discovery]
+exclude_loopback = true
+exclude_bind_cidrs = ["10.0.0.0/8"]
+
+[permanent_ports]
+tcp = [22, 443]
+udp = [50000]
+sctp = []
+
+[trusted_ips]
+"203.0.113.5/32" = "monitoring"
+"2001:db8::/32" = "office-v6"
+
+[[acl]]
+proto = "tcp"
+cidr = "198.51.100.0/24"
+ports = [5432, 6379]
+```
+
+After a manual edit, run `sudo axdp restart` to reload the runtime services. The `axdp trust`, `axdp acl`, `axdp permanent`, `axdp log-level`, and `axdp under-attack` commands perform their own reload.
 
 ### XDP Runtime Tuning
 
-Runtime data-path tunables live in `/etc/auto_xdp/config.toml` and are synced into the `xdp_runtime_cfg` map by the daemon:
+Runtime data-path tunables live under `[xdp.runtime]` and are synced into the `xdp_runtime_cfg` map by the daemon:
 
 ```toml
 [xdp.runtime]
 tcp_timeout_seconds = 300
 udp_timeout_seconds = 60
-syn_timeout_seconds = 30    # incomplete SYN entries are evicted after this
 conntrack_refresh_seconds = 30
+conntrack_gc_interval_seconds = 300
+syn_timeout_seconds = 20
+
 icmp_burst_packets = 100
 icmp_rate_pps = 100
+
 udp_global_window_seconds = 1
+udp_global_byte_rate_mbps = 997
 rate_window_seconds = 1
+
+sensitive_port_threshold = 5
+default_tcp_syn_rate_strict = 5
+default_tcp_syn_rate = 100
+default_tcp_syn_agg_rate_strict = 50
+default_tcp_syn_agg_rate = 1000
+default_tcp_established_per_src_strict = 5
+default_tcp_established_per_src = 50
+default_tcp_established_per_prefix_strict = 20
+default_tcp_established_per_prefix = 200
+default_tcp_established_per_port_strict = 200
+default_tcp_established_per_port = 5000
 ```
 
 ### Daemon Management
@@ -386,20 +491,20 @@ rate_window_seconds = 1
 ```bash
 # systemd
 systemctl status xdp-port-sync
-journalctl -u xdp-port-sync -f
+journalctl -u xdp-port-sync -u auto-xdp-relay -f
 
 # OpenRC
 rc-service xdp-port-sync status
+rc-service auto-xdp-relay status
 
 # Manual foreground run
 /usr/local/bin/auto_xdp_start.sh
 
 # One-shot sync with automatic backend selection
-python3 /usr/local/bin/xdp_port_sync.py --backend auto
-python3 /usr/local/bin/xdp_port_sync.py --backend auto --dry-run
+sudo axdp sync
 
 # Increase foreground verbosity temporarily
-python3 /usr/local/bin/xdp_port_sync.py --backend auto --log-level debug
+sudo axdp log-level debug
 ```
 
 ## Statistics
@@ -429,8 +534,6 @@ sudo axdp sync
 
 # Inspect currently allowed TCP/UDP ports
 sudo axdp ports
-sudo axdp ports --tcp
-sudo axdp ports --udp
 
 # Show active backend and XDP attachment state
 sudo axdp backend
@@ -549,8 +652,6 @@ sudo axdp sync
 
 # Inspect currently allowed ports
 sudo axdp ports
-sudo axdp ports --tcp
-sudo axdp ports --udp
 
 # Active backend and XDP attachment
 sudo axdp backend
@@ -737,37 +838,53 @@ Traverses IPv6 extension headers up to **6 levels deep** to locate the transport
 ## Uninstall
 
 ```bash
-# Detach XDP if it is attached
-ip link set dev eth0 xdp off
+# Load installed interface list when available.
+# If the config is gone, set IFACES manually, e.g. IFACES="eth0 eth1".
+if [ -f /etc/auto_xdp/auto_xdp.env ]; then
+  . /etc/auto_xdp/auto_xdp.env
+fi
+IFACES="${IFACES:-${IFACE:-eth0}}"
 
-# Remove the TCP/UDP reply tracker
-tc filter del dev eth0 egress pref 49152 2>/dev/null || true
+# Stop runtime services first
+systemctl disable --now xdp-port-sync auto-xdp-relay 2>/dev/null || true
+rc-service xdp-port-sync stop 2>/dev/null || true
+rc-service auto-xdp-relay stop 2>/dev/null || true
+rc-update del xdp-port-sync default 2>/dev/null || true
+rc-update del auto-xdp-relay default 2>/dev/null || true
+
+# Detach XDP and remove the TCP/UDP reply tracker from each protected interface
+for iface in $IFACES; do
+  ip link set dev "$iface" xdp off 2>/dev/null || true
+  ip link set dev "$iface" xdp generic off 2>/dev/null || true
+  ip link set dev "$iface" xdp offload off 2>/dev/null || true
+  tc filter del dev "$iface" egress pref 49152 2>/dev/null || true
+  tc qdisc del dev "$iface" clsact 2>/dev/null || true
+done
 
 # Remove pinned maps and nftables fallback table
 rm -rf /sys/fs/bpf/xdp_fw
 nft delete table inet auto_xdp 2>/dev/null || true
 
-# systemd
-systemctl disable --now xdp-port-sync 2>/dev/null || true
-rm /etc/systemd/system/xdp-port-sync.service
+# Remove init service files
+rm -f /etc/systemd/system/xdp-port-sync.service
+rm -f /etc/systemd/system/auto-xdp-relay.service
 systemctl daemon-reload 2>/dev/null || true
-
-# OpenRC
-rc-service xdp-port-sync stop 2>/dev/null || true
-rc-update del xdp-port-sync default 2>/dev/null || true
-rm /etc/init.d/xdp-port-sync
+rm -f /etc/init.d/xdp-port-sync
+rm -f /etc/init.d/auto-xdp-relay
 
 # Remove installed runtime files
-rm /usr/local/bin/xdp_port_sync.py
-rm /usr/local/bin/axdp
-rm /usr/local/bin/auto_xdp_start.sh
+rm -f /usr/local/bin/xdp_port_sync.py
+rm -f /usr/local/bin/pkt_relay.py
+rm -f /usr/local/bin/axdp
+rm -f /usr/local/bin/auto_xdp_start.sh
 rm -rf /usr/local/lib/auto_xdp
 rm -rf /etc/auto_xdp
+rm -rf /run/auto_xdp /var/run/auto_xdp
 ```
 
 ---
 
-## **📊 Real-World Performance Benchmark**
+## Real-World Performance Benchmark
 
 This benchmark simulates a volumetric UDP flood attack. We used a high-performance **AMD EPYC™ 7Y43** server as the "Attacker" to stress-test a **1 vCPU AMD Ryzen 9 3900X** instance protected by Auto XDP.
 
@@ -826,7 +943,7 @@ echo "dst_mac TARGET_MAC" > $PGDEV  # Target MAC
 echo "clone_skb 100" > $PGDEV              # Speed up packet generation
 ```
 
-## 🤝 **Contributing**
+## Contributing
 
 Contributions are welcome! Please read our [Contributing Guide](./CONTRIBUTING.md) for details on our process for submitting pull requests and how to set up your development environment.
 
@@ -843,15 +960,12 @@ For bugs or questions, please [open an issue](https://github.com/Kookiejarz/Auto
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=Kookiejarz%2Fauto_xdp&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=Kookiejarz/Auto_XDP&type=date&theme=dark&legend=top-left" />
    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=Kookiejarz/Auto_XDP&type=date&legend=top-left" />
    <img alt="Star History Chart" src="https://api.star-history.com/image?repos=Kookiejarz/Auto_XDP&type=date&legend=top-left" />
  </picture>
-</a>
-
-## Behavior change — default-on TCP protection
+## Behavior Change: Default-On TCP Protection
 
 Previously, TCP SYN-rate / SYN-aggregate-rate / per-source ESTABLISHED-cap
 controls only applied to ports listed in `[rate_limits.syn_by_proc]` /
@@ -875,16 +989,9 @@ This covers SSH, databases, RDP, telnet.
 The shipped `[rate_limits].source_cidr_v4` defaults to `/24` so per-prefix
 counters (L2 and L4) cover /24-scale aggregation out of the box.
 
-**Operators wanting to disable protection for a matching process or service**
-can pin any knob to `0` via the matching `[rate_limits].*_by_proc` /
-`*_by_service` table entry. See `docs/tcp-rate-limits.md` for operator-facing
-configuration details and
-`docs/superpowers/specs/2026-05-06-tcp-default-on-protection-design.md` for the
-full design rationale.
-
 ---
 
-## ❤️ Special Thanks
+## ❤️ Special Thanks 
 
 Structure Design:
 - https://github.com/gamemann/XDP-Firewall
@@ -897,6 +1004,6 @@ Rules & Features:
 
 ---
 
-## 📄 License
+## License
 
 [MPL 2.0](./LICENSE) © 2026 Yunheng Liu
