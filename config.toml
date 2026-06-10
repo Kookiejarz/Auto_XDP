@@ -46,10 +46,16 @@ tui_max_events = 500
 # they are unreachable from outside anyway.
 exclude_loopback = true
 
+
 # Source CIDRs whose bound listeners are excluded from auto-discovery.
 # Useful for admin sockets, VPN-only services, or addresses managed elsewhere.
 # Example: exclude_bind_cidrs = ["10.0.0.0/8"]
 exclude_bind_cidrs = []
+
+# Port numbers to exclude from auto-discovery regardless of owning process.
+# Useful for ports only open to local networks.
+# Example: exclude_ports = [22, 3306]
+exclude_ports = []
 
 [permanent_ports]
 # Ports always kept open regardless of whether the owning process is running.

@@ -1883,6 +1883,75 @@ def _cmd_conntrack(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_exclude_list(args: argparse.Namespace) -> int:
+    _, data = _load_config(args.config)
+    discovery = data.get("discovery", {})
+    ports = sorted({int(p) for p in discovery.get("exclude_ports", [])})
+    cidrs = sorted(_normalize_cidr(c) for c in discovery.get("exclude_bind_cidrs", []))
+    if not ports and not cidrs:
+        print("  (none)")
+        return 0
+    for port in ports:
+        print(f"  port  {port}")
+    for cidr in cidrs:
+        print(f"  src   {cidr}")
+    return 0
+
+
+def _cmd_exclude_port_add(args: argparse.Namespace) -> int:
+    path, data = _load_config(args.config)
+    new_ports = _normalize_ports(args.ports)
+    discovery = data.setdefault("discovery", {})
+    existing = sorted({int(p) for p in discovery.get("exclude_ports", [])} | set(new_ports))
+    discovery["exclude_ports"] = existing
+    _write_toml(path, data)
+    for port in new_ports:
+        print(f"Excluded port: {port}")
+    return 0
+
+
+def _cmd_exclude_port_del(args: argparse.Namespace) -> int:
+    path, data = _load_config(args.config)
+    del_ports = set(_normalize_ports(args.ports))
+    discovery = data.setdefault("discovery", {})
+    existing = sorted({int(p) for p in discovery.get("exclude_ports", [])} - del_ports)
+    discovery["exclude_ports"] = existing
+    _write_toml(path, data)
+    for port in sorted(del_ports):
+        print(f"Un-excluded port: {port}")
+    return 0
+
+
+def _cmd_exclude_src_add(args: argparse.Namespace) -> int:
+    path, data = _load_config(args.config)
+    new_cidrs = [_normalize_cidr(c) for c in args.cidrs]
+    discovery = data.setdefault("discovery", {})
+    existing = sorted(
+        set(_normalize_cidr(c) for c in discovery.get("exclude_bind_cidrs", [])) | set(new_cidrs)
+    )
+    discovery["exclude_bind_cidrs"] = existing
+    _write_toml(path, data)
+    for cidr in new_cidrs:
+        print(f"Excluded src: {cidr}")
+    return 0
+
+
+def _cmd_exclude_src_del(args: argparse.Namespace) -> int:
+    path, data = _load_config(args.config)
+    del_cidrs = {_normalize_cidr(c) for c in args.cidrs}
+    discovery = data.setdefault("discovery", {})
+    existing = sorted(
+        _normalize_cidr(c)
+        for c in discovery.get("exclude_bind_cidrs", [])
+        if _normalize_cidr(c) not in del_cidrs
+    )
+    discovery["exclude_bind_cidrs"] = existing
+    _write_toml(path, data)
+    for cidr in sorted(del_cidrs):
+        print(f"Un-excluded src: {cidr}")
+    return 0
+
+
 def _cmd_port_handler_unload(args: argparse.Namespace) -> int:
     path = Path(args.config)
     bpf_pin_dir, _, _ = _slot_paths(args)
@@ -2656,6 +2725,27 @@ def build_parser() -> argparse.ArgumentParser:
     port_handler_unload.add_argument("port", type=int)
     port_handler_unload.add_argument("--no-config-update", action="store_true")
     port_handler_unload.set_defaults(func=_cmd_port_handler_unload)
+
+    exclude = subparsers.add_parser("exclude")
+    exclude_sub = exclude.add_subparsers(dest="subcommand", required=True)
+    exclude_list = exclude_sub.add_parser("list")
+    exclude_list.set_defaults(func=_cmd_exclude_list)
+    exclude_port = exclude_sub.add_parser("port")
+    exclude_port_sub = exclude_port.add_subparsers(dest="subsubcommand", required=True)
+    exclude_port_add = exclude_port_sub.add_parser("add")
+    exclude_port_add.add_argument("ports", nargs="+", type=int)
+    exclude_port_add.set_defaults(func=_cmd_exclude_port_add)
+    exclude_port_del = exclude_port_sub.add_parser("del")
+    exclude_port_del.add_argument("ports", nargs="+", type=int)
+    exclude_port_del.set_defaults(func=_cmd_exclude_port_del)
+    exclude_src = exclude_sub.add_parser("src")
+    exclude_src_sub = exclude_src.add_subparsers(dest="subsubcommand", required=True)
+    exclude_src_add = exclude_src_sub.add_parser("add")
+    exclude_src_add.add_argument("cidrs", nargs="+")
+    exclude_src_add.set_defaults(func=_cmd_exclude_src_add)
+    exclude_src_del = exclude_src_sub.add_parser("del")
+    exclude_src_del.add_argument("cidrs", nargs="+")
+    exclude_src_del.set_defaults(func=_cmd_exclude_src_del)
 
     conntrack_cmd = subparsers.add_parser("conntrack")
     conntrack_cmd.add_argument("target", nargs="?", choices=["tcp", "udp", "all"], default="all")

@@ -69,6 +69,7 @@ LOG_LEVEL: str = "warning"
 DEBOUNCE_SECONDS = 0.4
 DISCOVERY_EXCLUDE_LOOPBACK = True
 DISCOVERY_EXCLUDE_BIND_CIDRS: list[str] = []
+DISCOVERY_EXCLUDE_PORTS: set[int] = set()
 PREFERRED_BACKEND = BACKEND_AUTO
 XDP_CONNTRACK_STALE_RECONCILES = 2
 XDP_TCP_TIMEOUT_SECONDS = 300.0
@@ -323,7 +324,7 @@ def _coerce_prefix_len(value: object, path: str, default: int, maximum: int) -> 
 def apply_toml_config(cfg: dict) -> None:
     global BOGON_FILTER_ENABLED, ISATTACK_MODE, DROP_EVENTS_ENABLED
     global LOG_LEVEL, DEBOUNCE_SECONDS
-    global DISCOVERY_EXCLUDE_LOOPBACK, DISCOVERY_EXCLUDE_BIND_CIDRS
+    global DISCOVERY_EXCLUDE_LOOPBACK, DISCOVERY_EXCLUDE_BIND_CIDRS, DISCOVERY_EXCLUDE_PORTS
     global PREFERRED_BACKEND, XDP_CONNTRACK_STALE_RECONCILES
     global RATE_LIMIT_SOURCE_PREFIX_V4, RATE_LIMIT_SOURCE_PREFIX_V6
     global XDP_TCP_TIMEOUT_SECONDS, XDP_UDP_TIMEOUT_SECONDS
@@ -361,6 +362,7 @@ def apply_toml_config(cfg: dict) -> None:
     _UDP_AGG_BYTES_BY_PROC.clear()
     _UDP_AGG_BYTES_BY_SERVICE.clear()
     DISCOVERY_EXCLUDE_BIND_CIDRS.clear()
+    DISCOVERY_EXCLUDE_PORTS.clear()
     RATE_LIMIT_SOURCE_PREFIX_V4 = 32
     RATE_LIMIT_SOURCE_PREFIX_V6 = 128
 
@@ -434,6 +436,9 @@ def apply_toml_config(cfg: dict) -> None:
     DISCOVERY_EXCLUDE_LOOPBACK = bool(discovery.get("exclude_loopback", True))
     DISCOVERY_EXCLUDE_BIND_CIDRS.extend(
         normalize_cidr(cidr) for cidr in discovery.get("exclude_bind_cidrs", [])
+    )
+    DISCOVERY_EXCLUDE_PORTS.update(
+        int(p) for p in discovery.get("exclude_ports", [])
     )
 
     xdp = cfg.get("xdp", {})

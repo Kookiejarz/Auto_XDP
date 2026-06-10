@@ -436,6 +436,7 @@ preferred_backend = "auto"   # auto, xdp, or nftables
 [discovery]
 exclude_loopback = true
 exclude_bind_cidrs = ["10.0.0.0/8"]
+exclude_ports = [5432, 6379]
 
 [permanent_ports]
 tcp = [22, 443]

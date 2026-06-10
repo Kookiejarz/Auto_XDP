@@ -104,6 +104,8 @@ class TuiSnapshot:
     stats: list[tuple[str, int, int, str]] = field(default_factory=list)
     maps: list[MapUsage] = field(default_factory=list)
     ports: list[tuple[str, int, str, str, str]] = field(default_factory=list)
+    excluded: tuple[int, int] = (0, 0)
+    under_attack: bool = False
     status: str = ""
 
 
@@ -257,6 +259,16 @@ def _ringbuf_cfg(path: str) -> dict[str, Any]:
 def _under_attack_enabled(path: str) -> bool:
     cfg = _load_toml(path).get("under_attack", {})
     return bool(cfg.get("enabled", False)) if isinstance(cfg, dict) else False
+
+
+def _excluded_counts(path: str) -> tuple[int, int]:
+    """Return (excluded_ports, excluded_cidrs) from discovery config."""
+    discovery = _load_toml(path).get("discovery", {})
+    if not isinstance(discovery, dict):
+        return 0, 0
+    ports = len(discovery.get("exclude_ports", []) or [])
+    cidrs = len(discovery.get("exclude_bind_cidrs", []) or [])
+    return ports, cidrs
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -612,6 +624,8 @@ def _collect_snapshot(
             args.nft_table,
             include_processes=not fast,
         ),
+        excluded=_excluded_counts(args.config),
+        under_attack=_under_attack_enabled(args.config),
     )
     return snap, _rows_to_prev(rows), now
 
@@ -747,7 +761,7 @@ def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool) -> No
     total_mem = sum(r.memlock for r in rows if r.memlock is not None)
     mem_label = f"  total {_human_bytes(total_mem)}" if total_mem else ""
     _box(win, f"BPF maps{mem_label}" + (" *" if focused else ""))
-    _add(win, 1, 1, f"{'id':>5} {'map':<18} {'type':<10} {'used':>7} {'max':>7} {'%':>5} {'mem':>8}")
+    _add(win, 1, 1, f"{'id':>7} {'map':<18} {'type':<10} {'used':>7} {'max':>7} {'%':>5} {'mem':>8}")
     visible = max(0, win.getmaxyx()[0] - 3)
     scroll = max(0, min(scroll, max(0, len(rows) - visible)))
     for idx, row in enumerate(rows[scroll: scroll + visible], start=2):
@@ -759,7 +773,7 @@ def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool) -> No
         attr = curses.A_NORMAL
         if row.pct is not None and row.pct >= 80:
             attr = curses.color_pair(_CP_RED) | curses.A_BOLD
-        _add(win, idx, 1, f"{id_str:>5} {row.name:<18.18} {row.kind:<10.10} {used:>7} {maximum:>7} {pct:>5} {mem:>8}", attr)
+        _add(win, idx, 1, f"{id_str:>7} {row.name:<18.18} {row.kind:<10.10} {used:>7} {maximum:>7} {pct:>5} {mem:>8}", attr)
     if len(rows) > visible:
         _add(win, win.getmaxyx()[0] - 1, 2, f"{scroll + 1}-{min(scroll + visible, len(rows))}/{len(rows)}  tab focus", curses.A_DIM)
 
@@ -860,6 +874,10 @@ def _draw_events(
         live_tag = " [LIVE]" if follow else " [PAUSED ↑↓]"
         footer = f"{oldest}-{newest}/{len(relay.events)}{live_tag}  tab focus  {relay.status}"
     _add(win, win.getmaxyx()[0] - 1, 2, footer, curses.A_DIM)
+    if snap.under_attack:
+        note = "drop events suppressed (under-attack mode)"
+        _add(win, win.getmaxyx()[0] - 1, win.getmaxyx()[1] - len(note) - 2, note,
+             curses.color_pair(_CP_RED) | curses.A_BOLD)
 
 
 def _event_bytes(ev: dict[str, Any]) -> int | None:
@@ -985,6 +1003,7 @@ def _draw_ports(
     cursor: int = -1,
     event_dport_filter: int | None = None,
     focused: bool = False,
+    excluded: tuple[int, int] = (0, 0),
 ) -> None:
     title = _port_filter_title(proto_filter) + (" *" if focused else "")
     _box(win, title)
@@ -1013,8 +1032,17 @@ def _draw_ports(
         if port == event_dport_filter:
             attr |= curses.A_BOLD
         _add(win, idx, 1, f"{proto:<3} {port:>5} {svc:<12.12} {proc:<16.16} {limit}", attr)
+    excl_ports, excl_cidrs = excluded
+    excl_parts = []
+    if excl_ports:
+        excl_parts.append(f"{excl_ports} port{'s' if excl_ports != 1 else ''}")
+    if excl_cidrs:
+        excl_parts.append(f"{excl_cidrs} src CIDR{'s' if excl_cidrs != 1 else ''}")
+    excl_hint = f"  excluded: {', '.join(excl_parts)}  (axdp exclude list)" if excl_parts else ""
     if focused:
-        _add(win, win.getmaxyx()[0] - 1, 2, "↑↓ move  enter: filter events", curses.A_DIM)
+        _add(win, win.getmaxyx()[0] - 1, 2, f"↑↓ move  enter: filter events{excl_hint}", curses.A_DIM)
+    elif excl_hint:
+        _add(win, win.getmaxyx()[0] - 1, 2, excl_hint.strip(), curses.A_DIM)
 
 
 def _draw(
@@ -1047,14 +1075,22 @@ def _draw(
         bot_h = fh - top_h
         top_win = full_win.derwin(top_h, fw, 0, 0)
         now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        title = f"Auto XDP TUI  top traffic  backend={snap.backend} iface={snap.iface} mode={snap.attach_mode}  {now}  v:overview q:quit"
+        title = f"Auto XDP TUI  top traffic  backend={snap.backend} mode={snap.attach_mode}  {now}  v:overview q:quit"
         _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
+        if snap.under_attack:
+            badge = " UNDER ATTACK "
+            _add(stdscr, 0, max(0, w - len(badge)), badge, curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD)
         if last_error:
             _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(_CP_RED) | curses.A_BOLD)
         _draw_top_traffic(top_win, relay)
         if bot_h >= 4:
             bot_win = full_win.derwin(bot_h, fw, top_h, 0)
             _draw_drop_reasons(bot_win, relay, reasons_scroll)
+            if snap.under_attack:
+                note = " drop events suppressed (under-attack mode) "
+                bh, bw = bot_win.getmaxyx()
+                _add(bot_win, bh - 1, max(0, bw - len(note) - 2), note,
+                     curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD)
         stdscr.refresh()
         return
     if wins is None:
@@ -1062,8 +1098,12 @@ def _draw(
         stdscr.refresh()
         return
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"Auto XDP TUI  backend={snap.backend} iface={snap.iface} mode={snap.attach_mode} map={snap.map_id} ports={port_filter}  {now}  v:traffic tab:focus t/u:filter enter:port-events q:quit"
+    title = f"Auto XDP TUI  backend={snap.backend} mode={snap.attach_mode} map={snap.map_id} ports={port_filter}  {now}  v:traffic tab:focus t/u:filter enter:filter-events-by-port q:quit"
     _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
+    if snap.under_attack:
+        badge = " UNDER ATTACK "
+        badge_x = max(0, w - len(badge))
+        _add(stdscr, 0, badge_x, badge, curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD)
     if last_error:
         _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(_CP_RED) | curses.A_BOLD)
     _draw_maps(wins.maps, snap.maps, map_scroll, focus == "maps")
@@ -1073,7 +1113,8 @@ def _draw(
     _draw_ports(wins.ports, snap.ports, port_marks, port_filter,
                 cursor=port_cursor if focus == "ports" else -1,
                 event_dport_filter=event_dport_filter,
-                focused=focus == "ports")
+                focused=focus == "ports",
+                excluded=snap.excluded)
     stdscr.refresh()
 
 
@@ -1188,7 +1229,6 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                     else:
                         event_dport_filter = selected_port
                         event_filter_scroll = 0
-                        focus = "events"
                     ui_dirty = True
                 elif focus == "events" and event_dport_filter is not None:
                     event_dport_filter = None

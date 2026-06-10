@@ -55,6 +55,11 @@ Commands:
   slot load NAME         Load built-in handler: gre, esp, sctp
   slot load PROTO PATH   Load custom handler .o or compile/load .c for IP proto number
   slot unload PROTO      Remove handler from slot
+  exclude list                              List discovery exclusions
+  exclude port add PORT [PORT...]           Exclude port(s) from discovery
+  exclude port del PORT [PORT...]           Remove port exclusion(s)
+  exclude src add CIDR [CIDR...]            Exclude src IP/CIDR(s) from discovery
+  exclude src del CIDR [CIDR...]            Remove src IP/CIDR exclusion(s)
   help                   Show this help
 
 Stats options:
@@ -633,6 +638,51 @@ run_slot() {
     esac
 }
 
+run_exclude() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list)
+            run_admin_config exclude list
+            ;;
+        port|ports)
+            local action="${1:-}"
+            shift || true
+            case "$action" in
+                add|del)
+                    [[ -f "$TOML_CONFIG" ]] || run_config init
+                    run_admin_config exclude port "$action" "$@"
+                    reload_daemon
+                    ;;
+                *)
+                    echo "Usage: axdp exclude port add|del PORT [PORT...]" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        src)
+            local action="${1:-}"
+            shift || true
+            case "$action" in
+                add|del)
+                    [[ -f "$TOML_CONFIG" ]] || run_config init
+                    run_admin_config exclude src "$action" "$@"
+                    reload_daemon
+                    ;;
+                *)
+                    echo "Usage: axdp exclude src add|del CIDR [CIDR...]" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        -h|--help)
+            echo "Usage: axdp exclude list|port add|del PORT...|src add|del CIDR..."
+            ;;
+        *)
+            echo "Unknown exclude subcommand: $sub" >&2; exit 1 ;;
+    esac
+}
+
 main() {
     local cmd="${1:-stats}"
 
@@ -699,6 +749,10 @@ main() {
         slot)
             shift || true
             run_slot "$@"
+            ;;
+        exclude)
+            shift || true
+            run_exclude "$@"
             ;;
         start|stop|restart|status)
             shift || true

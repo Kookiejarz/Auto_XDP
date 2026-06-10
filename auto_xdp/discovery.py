@@ -328,6 +328,8 @@ def _get_listening_ports_netlink() -> ObservedState:
             port = sport_h
             if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets):
                 continue
+            if port in cfg.DISCOVERY_EXCLUDE_PORTS:
+                continue
             state.tcp.add(port)
             name = _resolve_systemd(_proc_name(inode), port)
             if name:
@@ -382,6 +384,8 @@ def _get_listening_ports_netlink() -> ObservedState:
         family, src = info["family"], info["src"]
         if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets):
             continue
+        if port in cfg.DISCOVERY_EXCLUDE_PORTS:
+            continue
         if info["connected_only"]:
             server_signal = (
                 info["count"] > 1               # SO_REUSEPORT proxy
@@ -410,7 +414,7 @@ def _get_listening_ports_netlink() -> ObservedState:
             for sport_h, _dp, src, _dst, _in, _rq in _nldiag_dump(
                 family, _IPPROTO_SCTP, _SS_LISTEN
             ):
-                if _bind_ip_is_exposed(_addr_str(family, src), exclude_nets):
+                if _bind_ip_is_exposed(_addr_str(family, src), exclude_nets) and sport_h not in cfg.DISCOVERY_EXCLUDE_PORTS:
                     state.sctp.add(sport_h)
     except OSError:
         pass
@@ -478,6 +482,8 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
             if conn.status == psutil.CONN_LISTEN:
                 if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets):
                     continue
+                if port in cfg.DISCOVERY_EXCLUDE_PORTS:
+                    continue
                 state.tcp.add(port)
                 name, systemd_map = _resolve_process_name(getattr(conn, "pid", None), port, pid_names, systemd_map)
                 if name:
@@ -497,6 +503,8 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
                 if not (pd.get("rx_queue", 0) > 0 or pd.get("drops", 0) > 0):
                     continue
             if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets):
+                continue
+            if port in cfg.DISCOVERY_EXCLUDE_PORTS:
                 continue
             if conn.type == socket.SOCK_DGRAM:
                 state.udp.add(port)
