@@ -209,7 +209,7 @@ Incoming Packet
 ## Quick Start
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/v26.5.30a/setup_xdp.sh | sudo bash
+curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/v26.6.10a/setup_xdp.sh | sudo bash
 ```
 
 ### Install a Specific Release
