@@ -65,4 +65,4 @@ Thanks again for contributing to Auto XDP! Every suggestion means a loooooot to 
 
 ## License
 
-By contributing, you agree that your contributions are provided under the project’s [MIT License](./LICENSE).
+By contributing, you agree that your contributions are provided under the project’s [License](./LICENSE).
