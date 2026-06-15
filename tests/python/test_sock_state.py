@@ -147,6 +147,7 @@ class TestTuiPortsDirty(unittest.TestCase):
         relay.max_events = 100
         relay.status = ""
         relay.ports_dirty = False
+        relay.reason_totals = {}
         relay.path = ""
         relay._sock = None
         relay._buf = ""

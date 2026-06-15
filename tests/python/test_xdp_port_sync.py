@@ -684,6 +684,7 @@ class XdpPortSyncTests(unittest.TestCase):
         with mock.patch.object(cfg, "TCP_PERMANENT", {22: "ssh"}), \
              mock.patch.object(cfg, "UDP_PERMANENT", {53: "dns"}), \
              mock.patch.object(cfg, "SCTP_PERMANENT", {3868: "diameter"}), \
+             mock.patch.object(cfg, "SLOT_DEFAULT_ACTION", "pass"), \
              mock.patch.object(cfg, "TRUSTED_SRC_IPS", {"198.51.100.5/32": "office"}):
             backend.reconcile(desired, dry_run=False, observed_state=observed)
 
@@ -1063,7 +1064,6 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.acl_maps = None
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend.bogon_cfg_map = None
-        backend.observability_cfg_map = FakeArrayCfgMap()
         backend.sit4_map = None
         backend.global_rl_map = FakeGlobalRlMap()
         backend._abuseipdb_syncer = None
@@ -1078,7 +1078,6 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertTrue(backend.conntrack_map.closed)
         self.assertTrue(backend.udp_conntrack_map.closed)
         self.assertTrue(backend.runtime_config_map.closed)
-        self.assertTrue(backend.observability_cfg_map.closed)
         self.assertTrue(backend.global_rl_map.closed)
 
 

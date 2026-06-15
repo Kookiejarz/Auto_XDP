@@ -1,3 +1,4 @@
+import subprocess
 import unittest
 import tempfile
 from pathlib import Path
@@ -14,10 +15,65 @@ from auto_xdp.tui import (
     _draw_ports,
     _draw_summary,
     _draw_top_traffic,
+    _dump_count,
     _event_bottom_top,
     _event_window,
     _filter_port_rows,
 )
+
+
+class DumpCountTests(unittest.TestCase):
+    def _count(self, out: bytes) -> int | None:
+        with mock.patch("auto_xdp.tui.subprocess.check_output", return_value=out):
+            return _dump_count(Path("/sys/fs/bpf/xdp_fw/some_map"))
+
+    def test_counts_plain_hash_entries(self):
+        out = (
+            b'[{"key":["0x50","0x00"],"value":["0x01"]},'
+            b'{"key":["0x35","0x00"],"value":["0x01"]},'
+            b'{"key":["0x16","0x00"],"value":["0x01"]}]'
+        )
+        self.assertEqual(self._count(out), 3)
+
+    def test_counts_percpu_entries_once_each(self):
+        # Per-CPU maps nest {"cpu":N,"value":...} objects under "values"; only
+        # the per-entry "key" wrapper must be counted.
+        out = (
+            b'[{"key":["0x01"],"values":[{"cpu":0,"value":["0x0a"]},'
+            b'{"cpu":1,"value":["0x0b"]}]},'
+            b'{"key":["0x02"],"values":[{"cpu":0,"value":["0x0c"]},'
+            b'{"cpu":1,"value":["0x0d"]}]}]'
+        )
+        self.assertEqual(self._count(out), 2)
+
+    def test_counts_btf_formatted_entries(self):
+        # BTF-formatted dumps render key/value as struct objects; struct field
+        # names ("saddr"/"count"/…) never collide with the "key" wrapper.
+        out = (
+            b'[{"key":{"saddr":1,"dport":80},"value":{"count":3}},'
+            b'{"key":{"saddr":2,"dport":443},"value":{"count":7}}]'
+        )
+        self.assertEqual(self._count(out), 2)
+
+    def test_empty_map_returns_zero(self):
+        self.assertEqual(self._count(b"[]"), 0)
+
+    def test_subprocess_failure_returns_none(self):
+        with mock.patch(
+            "auto_xdp.tui.subprocess.check_output",
+            side_effect=subprocess.CalledProcessError(1, "bpftool"),
+        ):
+            self.assertIsNone(_dump_count(Path("/sys/fs/bpf/xdp_fw/some_map")))
+
+    def test_missing_bpftool_returns_none(self):
+        with mock.patch(
+            "auto_xdp.tui.subprocess.check_output",
+            side_effect=OSError("No such file"),
+        ):
+            self.assertIsNone(_dump_count(Path("/sys/fs/bpf/xdp_fw/some_map")))
+
+    def test_garbage_output_returns_none(self):
+        self.assertIsNone(self._count(b"not json and no marker"))
 
 
 class FakeWindow:
@@ -247,6 +303,34 @@ class TuiMapUsageTests(unittest.TestCase):
         self.assertEqual(rows[0].current, 7)
         self.assertEqual(rows[0].note, "cached")
         dump_count.assert_not_called()
+
+    def test_array_map_uses_max_entries_without_dump(self):
+        # Array maps are dense: live count == max_entries, so no per-map
+        # `bpftool map dump` subprocess is needed (tsc_port is 65536 entries).
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "tsc_port").touch()
+
+            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
+                mock.patch("auto_xdp.tui._all_map_info", return_value={"tsc_port": {"name": "tsc_port", "type": "array", "max_entries": 65536}}), \
+                mock.patch("auto_xdp.tui._dump_count") as dump_count:
+                rows = _collect_map_usage(td, now=100.0)
+
+        self.assertEqual(rows[0].current, 65536)
+        self.assertEqual(rows[0].maximum, 65536)
+        self.assertEqual(rows[0].note, "array")
+        dump_count.assert_not_called()
+
+    def test_array_map_without_max_entries_falls_back_to_dump(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "weird_array").touch()
+
+            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
+                mock.patch("auto_xdp.tui._all_map_info", return_value={"weird_array": {"name": "weird_array", "type": "percpu_array"}}), \
+                mock.patch("auto_xdp.tui._dump_count", return_value=5) as dump_count:
+                rows = _collect_map_usage(td, now=100.0)
+
+        self.assertEqual(rows[0].current, 5)
+        dump_count.assert_called_once()
 
     def test_map_info_uses_cache_within_metadata_interval(self):
         with tempfile.TemporaryDirectory() as td:

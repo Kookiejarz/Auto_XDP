@@ -459,6 +459,7 @@ test_prepare_slot_handler_sources_uses_staging_dir() (
     cd "$tmpdir" || return 1
     prepare_slot_handler_sources || return 1
     assert_file_contains "$fetched" "handlers/Makefile -> $BUILD_STAGING_DIR/handlers/Makefile" || return 1
+    assert_file_contains "$fetched" "handlers/minecraft_handler.c -> $BUILD_STAGING_DIR/handlers/minecraft_handler.c" || return 1
     [[ ! -e "$tmpdir/handlers/Makefile" ]] || {
         printf 'expected handlers/Makefile to stay out of the current working directory\n'
         return 1
