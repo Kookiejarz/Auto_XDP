@@ -6,18 +6,18 @@
 stop_existing_service() {
     case "$INIT_SYSTEM" in
         systemd)
-            systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-            systemctl stop "${RELAY_SERVICE_NAME:-auto-xdp-relay}" 2>/dev/null || true
+            as_root systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+            as_root systemctl stop "${RELAY_SERVICE_NAME:-auto-xdp-relay}" 2>/dev/null || true
             ;;
         openrc)
-            rc-service "$SERVICE_NAME" stop 2>/dev/null || true
-            rc-service "${RELAY_SERVICE_NAME:-auto-xdp-relay}" stop 2>/dev/null || true
+            as_root rc-service "$SERVICE_NAME" stop 2>/dev/null || true
+            as_root rc-service "${RELAY_SERVICE_NAME:-auto-xdp-relay}" stop 2>/dev/null || true
             ;;
     esac
 
-    pkill -f "auto_xdp_start.sh" 2>/dev/null || true
-    pkill -f "xdp_port_sync.py" 2>/dev/null || true
-    pkill -f "pkt_relay.py" 2>/dev/null || true
+    as_root pkill -f "auto_xdp_start.sh" 2>/dev/null || true
+    as_root pkill -f "xdp_port_sync.py" 2>/dev/null || true
+    as_root pkill -f "pkt_relay.py" 2>/dev/null || true
 }
 
 existing_install_detected() {
@@ -76,8 +76,8 @@ stop_existing_service_step() {
 }
 
 write_config() {
-    mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_FILE" <<EOF_CFG
+    priv_mkdir "$CONFIG_DIR"
+    write_file "$CONFIG_FILE" <<EOF_CFG
 IFACES="${IFACES[*]}"
 IFACE="${IFACES[0]}"
 SYNC_SCRIPT="${SYNC_SCRIPT}"
@@ -103,9 +103,9 @@ cleanup_installed_python_support_package() {
 
     [[ -n "$pkg_root" ]] || return 0
     if [[ -d "$pkg_root" ]]; then
-        rm -rf "$pkg_root"
+        as_root rm -rf "$pkg_root"
     fi
-    mkdir -p "$pkg_root"
+    priv_mkdir "$pkg_root"
 }
 
 cleanup_installed_handler_sdk() {
@@ -118,7 +118,7 @@ cleanup_installed_handler_sdk() {
     local preserved_path=""
     local -a preserve_paths=()
 
-    mkdir -p "$handlers_root"
+    priv_mkdir "$handlers_root"
 
     if command -v "${PYTHON3_BIN:-python3}" >/dev/null 2>&1 && [[ -f "$config_path" ]]; then
         mapfile -t preserve_paths < <("${PYTHON3_BIN:-python3}" - "$config_path" "$handlers_root" <<'PY'
@@ -194,7 +194,7 @@ PY
         done
         [[ $keep_file -eq 1 ]] && continue
 
-        rm -f "$installed_file"
+        as_root rm -f "$installed_file"
     done < <(find "$handlers_root" -maxdepth 1 -type f)
 }
 
@@ -234,7 +234,7 @@ for e in tree:
 
     for rel in "${files[@]}"; do
         target="${pkg_root}/${rel#auto_xdp/}"
-        mkdir -p "$(dirname "$target")"
+        priv_mkdir "$(dirname "$target")"
         fetch_local_or_remote "$rel" "$rel" "$target" || return 1
     done
 
@@ -248,11 +248,11 @@ install_runner_script() {
     if ! fetch_local_or_remote "$RUNNER_SRC" "$RUNNER_SRC" "$RUNNER_SCRIPT"; then
         die "Failed to install ${RUNNER_SRC}"
     fi
-    chmod +x "$RUNNER_SCRIPT"
+    as_root chmod +x "$RUNNER_SCRIPT"
 }
 
 install_xdp_required_maps() {
-    mkdir -p "$INSTALL_DIR"
+    priv_mkdir "$INSTALL_DIR"
     if ! fetch_local_or_remote \
             "auto_xdp/xdp_required_maps.txt" \
             "auto_xdp/xdp_required_maps.txt" \
@@ -271,35 +271,35 @@ install_runtime_common_script() {
     if ! fetch_local_or_remote "$RUNTIME_COMMON_SRC" "$RUNTIME_COMMON_SRC" "$BPF_RUNTIME_COMMON_INSTALLED"; then
         die "Failed to install ${RUNTIME_COMMON_SRC}"
     fi
-    chmod +x "$BPF_RUNTIME_COMMON_INSTALLED"
+    as_root chmod +x "$BPF_RUNTIME_COMMON_INSTALLED"
 }
 
 install_sync_script() {
     if ! fetch_local_or_remote "xdp_port_sync.py" "xdp_port_sync.py" "$SYNC_SCRIPT"; then
         die "Failed to install xdp_port_sync.py"
     fi
-    chmod +x "$SYNC_SCRIPT"
+    as_root chmod +x "$SYNC_SCRIPT"
 }
 
 install_relay_script() {
     if ! fetch_local_or_remote "pkt_relay.py" "pkt_relay.py" "$RELAY_SCRIPT"; then
         die "Failed to install pkt_relay.py"
     fi
-    chmod +x "$RELAY_SCRIPT"
+    as_root chmod +x "$RELAY_SCRIPT"
 }
 
 install_bpf_helper() {
     if ! fetch_local_or_remote "$BPF_HELPER_SRC" "$BPF_HELPER_SRC" "$BPF_HELPER_INSTALLED"; then
         die "Failed to install ${BPF_HELPER_SRC}"
     fi
-    chmod +x "$BPF_HELPER_INSTALLED"
+    as_root chmod +x "$BPF_HELPER_INSTALLED"
 }
 
 install_axdp_command() {
     if ! fetch_local_or_remote "axdp" "axdp" "$AXDP_CMD"; then
         die "Failed to install axdp"
     fi
-    chmod +x "$AXDP_CMD"
+    as_root chmod +x "$AXDP_CMD"
 }
 
 validate_installed_python_support_package() {
@@ -342,7 +342,10 @@ install_slot_handler_sdk() {
         mapfile -t -d '' _staged < <(find "${BUILD_STAGING_DIR}/handlers" -maxdepth 1 \
             -type f \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) -print0)
         if [[ ${#_staged[@]} -gt 0 ]]; then
-            cp "${_staged[@]}" "${handlers_root}/"
+            local _sf
+            for _sf in "${_staged[@]}"; do
+                place_file "$_sf" "${handlers_root}/$(basename "$_sf")"
+            done
             return 0
         fi
     fi
@@ -388,7 +391,7 @@ for e in json.load(sys.stdin).get('tree', []):
 
 install_toml_config() {
     local toml_target="${CONFIG_DIR}/config.toml"
-    mkdir -p "$CONFIG_DIR"
+    priv_mkdir "$CONFIG_DIR"
 
     if [[ -f "$toml_target" ]]; then
         if ! confirm_yes_no "config.toml already exists at ${toml_target}. Replace with repo default? [y/N] "; then
@@ -402,7 +405,7 @@ install_toml_config() {
 }
 
 install_runtime_files() {
-    mkdir -p "$INSTALL_DIR"
+    priv_mkdir "$INSTALL_DIR"
 
     _install_runtime_common_assets() {
         install_runtime_common_script
@@ -452,7 +455,7 @@ load_configured_port_handlers_step() {
 }
 
 install_systemd_service() {
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF_UNIT
+    write_file "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF_UNIT
 [Unit]
 Description=Auto XDP Loader + Port Whitelist Auto-Sync
 After=network-online.target
@@ -469,7 +472,7 @@ User=root
 WantedBy=multi-user.target
 EOF_UNIT
 
-    cat > "/etc/systemd/system/${RELAY_SERVICE_NAME}.service" <<EOF_RELAY_UNIT
+    write_file "/etc/systemd/system/${RELAY_SERVICE_NAME}.service" <<EOF_RELAY_UNIT
 [Unit]
 Description=Auto XDP packet event relay
 After=${SERVICE_NAME}.service
@@ -487,15 +490,15 @@ User=root
 WantedBy=multi-user.target
 EOF_RELAY_UNIT
 
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
-    systemctl enable "$RELAY_SERVICE_NAME"
-    systemctl restart "$SERVICE_NAME"
-    systemctl restart "$RELAY_SERVICE_NAME"
+    as_root systemctl daemon-reload
+    as_root systemctl enable "$SERVICE_NAME"
+    as_root systemctl enable "$RELAY_SERVICE_NAME"
+    as_root systemctl restart "$SERVICE_NAME"
+    as_root systemctl restart "$RELAY_SERVICE_NAME"
 }
 
 install_openrc_service() {
-    cat > "/etc/init.d/${SERVICE_NAME}" <<EOF_OPENRC
+    write_file "/etc/init.d/${SERVICE_NAME}" <<EOF_OPENRC
 #!/sbin/openrc-run
 description="Auto XDP loader + port whitelist auto-sync"
 command="${RUNNER_SCRIPT}"
@@ -507,7 +510,7 @@ depend() {
 }
 EOF_OPENRC
 
-    cat > "/etc/init.d/${RELAY_SERVICE_NAME}" <<EOF_RELAY_OPENRC
+    write_file "/etc/init.d/${RELAY_SERVICE_NAME}" <<EOF_RELAY_OPENRC
 #!/sbin/openrc-run
 description="Auto XDP packet event relay"
 command="${RELAY_SCRIPT}"
@@ -521,17 +524,17 @@ depend() {
 }
 EOF_RELAY_OPENRC
 
-    chmod +x "/etc/init.d/${SERVICE_NAME}"
-    chmod +x "/etc/init.d/${RELAY_SERVICE_NAME}"
-    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
-    rc-update add "$RELAY_SERVICE_NAME" default >/dev/null 2>&1 || true
-    rc-service "$SERVICE_NAME" restart
-    rc-service "$RELAY_SERVICE_NAME" restart
+    as_root chmod +x "/etc/init.d/${SERVICE_NAME}"
+    as_root chmod +x "/etc/init.d/${RELAY_SERVICE_NAME}"
+    as_root rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    as_root rc-update add "$RELAY_SERVICE_NAME" default >/dev/null 2>&1 || true
+    as_root rc-service "$SERVICE_NAME" restart
+    as_root rc-service "$RELAY_SERVICE_NAME" restart
 }
 
 run_initial_sync() {
     info "Running initial sync..."
-    "$RUNNER_SCRIPT" --sync-once
+    as_root "$RUNNER_SCRIPT" --sync-once
 }
 
 run_initial_sync_step() {

@@ -1,19 +1,19 @@
 pkg_update() {
     case "$PKG_MANAGER" in
         apt-get)
-            apt-get update -qq
+            as_root apt-get update -qq
             ;;
         dnf|yum)
-            "$PKG_MANAGER" -y makecache
+            as_root "$PKG_MANAGER" -y makecache
             ;;
         zypper)
-            zypper --non-interactive refresh
+            as_root zypper --non-interactive refresh
             ;;
         pacman)
-            pacman -Sy --noconfirm
+            as_root pacman -Sy --noconfirm
             ;;
         apk)
-            apk update
+            as_root apk update
             ;;
         *)
             return 1
@@ -24,22 +24,22 @@ pkg_update() {
 pkg_install() {
     case "$PKG_MANAGER" in
         apt-get)
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+            as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
             ;;
         dnf)
-            dnf install -y "$@"
+            as_root dnf install -y "$@"
             ;;
         yum)
-            yum install -y "$@"
+            as_root yum install -y "$@"
             ;;
         zypper)
-            zypper --non-interactive install -y "$@"
+            as_root zypper --non-interactive install -y "$@"
             ;;
         pacman)
-            pacman -S --noconfirm --needed "$@"
+            as_root pacman -S --noconfirm --needed "$@"
             ;;
         apk)
-            apk add --no-cache "$@"
+            as_root apk add --no-cache "$@"
             ;;
         *)
             return 1
@@ -98,7 +98,7 @@ optional_package_list_for_manager() {
 
 install_bpftool_apt() {
     command -v bpftool &>/dev/null && return 0
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool 2>/dev/null; then
+    if as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool 2>/dev/null; then
         return 0
     fi
     pkg_install_optional "linux-tools-$(uname -r)" linux-tools-common
@@ -128,22 +128,22 @@ ensure_psutil() {
 
     case "$PKG_MANAGER" in
         apt-get)
-            apt-get install -y -qq python3-psutil 2>/dev/null || python3 -m pip install --quiet --break-system-packages psutil
+            as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-psutil 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages psutil
             ;;
         dnf|yum)
-            "$PKG_MANAGER" install -y python3-psutil 2>/dev/null || python3 -m pip install --quiet --break-system-packages psutil
+            as_root "$PKG_MANAGER" install -y python3-psutil 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages psutil
             ;;
         zypper)
-            zypper --non-interactive install -y python3-psutil 2>/dev/null || python3 -m pip install --quiet --break-system-packages psutil
+            as_root zypper --non-interactive install -y python3-psutil 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages psutil
             ;;
         pacman)
-            pacman -S --noconfirm --needed python-psutil 2>/dev/null || python3 -m pip install --quiet --break-system-packages psutil
+            as_root pacman -S --noconfirm --needed python-psutil 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages psutil
             ;;
         apk)
-            apk add --no-cache py3-psutil 2>/dev/null || python3 -m pip install --quiet --break-system-packages psutil
+            as_root apk add --no-cache py3-psutil 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages psutil
             ;;
         *)
-            python3 -m pip install --quiet --break-system-packages psutil
+            as_root python3 -m pip install --quiet --break-system-packages psutil
             ;;
     esac
 }
@@ -170,22 +170,22 @@ PY
 
     case "$PKG_MANAGER" in
         apt-get)
-            apt-get install -y -qq python3-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-tomli 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages tomli
             ;;
         dnf|yum)
-            "$PKG_MANAGER" install -y python3-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            as_root "$PKG_MANAGER" install -y python3-tomli 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages tomli
             ;;
         zypper)
-            zypper --non-interactive install -y python3-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            as_root zypper --non-interactive install -y python3-tomli 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages tomli
             ;;
         pacman)
-            pacman -S --noconfirm --needed python-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            as_root pacman -S --noconfirm --needed python-tomli 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages tomli
             ;;
         apk)
-            apk add --no-cache py3-tomli 2>/dev/null || python3 -m pip install --quiet --break-system-packages tomli
+            as_root apk add --no-cache py3-tomli 2>/dev/null || as_root python3 -m pip install --quiet --break-system-packages tomli
             ;;
         *)
-            python3 -m pip install --quiet --break-system-packages tomli
+            as_root python3 -m pip install --quiet --break-system-packages tomli
             ;;
     esac
 }
@@ -202,15 +202,15 @@ check_required_tools_step() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         step_warn "Missing: ${missing[*]} — installing via $PKG_MANAGER"
         step_begin "Installing missing packages via $PKG_MANAGER"
-        install_packages || die_with_next "Package installation failed." "install the missing packages manually, then rerun: sudo bash setup_xdp.sh --force ${IFACES[*]}"
+        install_packages || die_with_next "Package installation failed." "install the missing packages manually, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
         step_ok
         step_begin "Verifying installed tools"
     fi
 
-    command -v python3 &>/dev/null || die_with_next "python3 not found after installation." "install Python 3.10 or newer, then rerun: sudo bash setup_xdp.sh --force ${IFACES[*]}"
+    command -v python3 &>/dev/null || die_with_next "python3 not found after installation." "install Python 3.10 or newer, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
     ensure_python_runtime
-    command -v curl &>/dev/null || die_with_next "curl not found after installation." "install curl, then rerun: sudo bash setup_xdp.sh --force ${IFACES[*]}"
-    command -v ip &>/dev/null || die_with_next "ip command not found after installation." "install iproute2/iproute, then rerun: sudo bash setup_xdp.sh --force ${IFACES[*]}"
+    command -v curl &>/dev/null || die_with_next "curl not found after installation." "install curl, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
+    command -v ip &>/dev/null || die_with_next "ip command not found after installation." "install iproute2/iproute, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
     ensure_psutil
     ensure_tomli_for_python310
     PYTHON3_BIN=$(command -v python3)

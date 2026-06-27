@@ -55,6 +55,9 @@ Commands:
   slot load NAME         Load built-in handler: gre, esp, sctp
   slot load PROTO PATH   Load custom handler .o or compile/load .c for IP proto number
   slot unload PROTO      Remove handler from slot
+  port-handler list                          List loaded TCP/UDP port handlers
+  port-handler load tcp|udp PORT PATH        Load custom handler .o or compile/load .c for a port
+  port-handler unload tcp|udp PORT           Remove handler from a port
   exclude list                              List discovery exclusions
   exclude port add PORT [PORT...]           Exclude port(s) from discovery
   exclude port del PORT [PORT...]           Remove port exclusion(s)
@@ -172,7 +175,7 @@ if sys.argv[1] not in choices:
 
     printf 'Installed auto_xdp Python support package is too old for: axdp %s\n' "$command" >&2
     printf 'Refresh the installed package and wrapper with: sudo axdp check-update --force\n' >&2
-    printf 'Or reinstall from this checkout with: sudo bash setup_xdp.sh --force\n' >&2
+    printf 'Or reinstall from this checkout with: bash setup_xdp.sh --force\n' >&2
     exit 1
 }
 
@@ -638,6 +641,21 @@ run_slot() {
     esac
 }
 
+run_port_handler() {
+    local sub="${1:-list}"
+    shift || true
+
+    case "$sub" in
+        list|load|unload)
+            run_admin_config port-handler "$sub" "$@"
+            ;;
+        *)
+            echo "Usage: axdp port-handler list|load tcp|udp PORT PATH [--no-config-update]|unload tcp|udp PORT [--no-config-update]" >&2
+            exit 1
+            ;;
+    esac
+}
+
 run_exclude() {
     local sub="${1:-list}"
     shift || true
@@ -749,6 +767,10 @@ main() {
         slot)
             shift || true
             run_slot "$@"
+            ;;
+        port-handler)
+            shift || true
+            run_port_handler "$@"
             ;;
         exclude)
             shift || true

@@ -838,6 +838,193 @@ EOF_CFG
     assert_file_contains "$INSTALL_DIR/handlers/Makefile" "sdk"
 )
 
+# Write a fake sudo onto PATH that logs its invocation and then runs the wrapped
+# command, so escalation can be observed without real privileges.
+_install_fake_sudo() {
+    local bindir="$1" log="$2"
+    mkdir -p "$bindir"
+    cat >"$bindir/sudo" <<EOF_SUDO
+#!/bin/sh
+echo "sudo \$*" >> "$log"
+case "\$1" in
+    -v|-n) exit 0 ;;
+esac
+exec "\$@"
+EOF_SUDO
+    chmod +x "$bindir/sudo"
+}
+
+test_detect_privilege_mode_uses_sudo_when_not_root() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _install_fake_sudo "$tmpdir/bin" "$tmpdir/sudo.log"
+
+    PRIV_MODE="unset"
+    PATH="$tmpdir/bin:$BASE_PATH"
+    detect_privilege_mode >/dev/null 2>&1 || return 1
+    assert_eq "$PRIV_MODE" "sudo"
+)
+
+test_detect_privilege_mode_fails_without_root_or_sudo() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/bin"
+
+    # die exits the shell, so isolate detect_privilege_mode in a nested subshell.
+    ( PATH="$tmpdir/bin"; detect_privilege_mode ) >/dev/null 2>&1
+    assert_eq "$?" "1"
+)
+
+test_as_root_runs_directly_when_root() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _install_fake_sudo "$tmpdir/bin" "$tmpdir/sudo.log"
+
+    PRIV_MODE="root"
+    PATH="$tmpdir/bin:$BASE_PATH"
+    as_root touch "$tmpdir/marker" || return 1
+    [[ -f "$tmpdir/marker" ]] || { printf 'command did not run\n'; return 1; }
+    [[ ! -f "$tmpdir/sudo.log" ]] || { printf 'sudo was used in root mode\n'; return 1; }
+)
+
+test_as_root_escalates_in_sudo_mode() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _install_fake_sudo "$tmpdir/bin" "$tmpdir/sudo.log"
+
+    PRIV_MODE="sudo"
+    PATH="$tmpdir/bin:$BASE_PATH"
+    as_root touch "$tmpdir/marker" || return 1
+    [[ -f "$tmpdir/marker" ]] || { printf 'command did not run\n'; return 1; }
+    assert_file_contains "$tmpdir/sudo.log" "sudo touch"
+)
+
+test_can_write_path_detects_unwritable_destinations() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    # Writable directory -> new file is creatable without escalation.
+    _can_write_path "$tmpdir/new" || { printf 'expected writable\n'; return 1; }
+
+    # Unwritable parent -> escalation required.
+    local locked="$tmpdir/locked"
+    mkdir -p "$locked"
+    chmod 000 "$locked"
+    local rc=0
+    _can_write_path "$locked/file" || rc=$?
+    chmod 700 "$locked"
+    assert_eq "$rc" "1" "unwritable parent"
+)
+
+test_write_file_writes_content_without_escalation() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _install_fake_sudo "$tmpdir/bin" "$tmpdir/sudo.log"
+
+    PRIV_MODE="sudo"
+    PATH="$tmpdir/bin:$BASE_PATH"
+    printf 'hello\n' | write_file "$tmpdir/nested/out.txt" || return 1
+    assert_file_contains "$tmpdir/nested/out.txt" "hello" || return 1
+    [[ ! -f "$tmpdir/sudo.log" ]] || { printf 'unexpected escalation for writable dest\n'; return 1; }
+)
+
+test_priv_init_is_noop_when_root() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _install_fake_sudo "$tmpdir/bin" "$tmpdir/sudo.log"
+
+    PRIV_MODE="root"
+    PRIV_PRIMED=0
+    PATH="$tmpdir/bin:$BASE_PATH"
+    priv_init || return 1
+    [[ ! -f "$tmpdir/sudo.log" ]] || { printf 'sudo invoked while root\n'; return 1; }
+)
+
+test_priv_init_primes_sudo_once() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _install_fake_sudo "$tmpdir/bin" "$tmpdir/sudo.log"
+
+    PRIV_MODE="sudo"
+    PRIV_PRIMED=0
+    PATH="$tmpdir/bin:$BASE_PATH"
+    priv_init || return 1
+    _stop_priv_keepalive
+    assert_eq "$PRIV_PRIMED" "1" || return 1
+    assert_file_contains "$tmpdir/sudo.log" "sudo -v"
+)
+
+test_parse_args_accepts_internal_phase2_flags() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    INTERNAL_PHASE2=0
+    RESULT_FILE=""
+    IFACES=()
+    parse_args --internal-phase2 --result-file /tmp/result.env eth0 || return 1
+    assert_eq "$INTERNAL_PHASE2" "1" || return 1
+    assert_eq "$RESULT_FILE" "/tmp/result.env" || return 1
+    assert_eq "${IFACES[0]}" "eth0"
+)
+
+test_emit_backend_results_roundtrips_state() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    ACTIVE_BACKEND="nftables"
+    ACTIVE_XDP_MODE="none"
+    XDP_FALLBACK_REASON="XDP attach failed on all target interfaces"
+    _emit_backend_results "$tmpdir/result.env" || return 1
+
+    ACTIVE_BACKEND=""
+    ACTIVE_XDP_MODE=""
+    XDP_FALLBACK_REASON=""
+    # shellcheck disable=SC1090
+    source "$tmpdir/result.env"
+    assert_eq "$ACTIVE_BACKEND" "nftables" || return 1
+    assert_eq "$XDP_FALLBACK_REASON" "XDP attach failed on all target interfaces"
+)
+
+test_backend_phase_dispatch_runs_inline_when_root() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    PRIV_MODE="root"
+    run_backend_phase() { touch "$tmpdir/backend_ran"; }
+    run_backend_phase_dispatch || return 1
+    [[ -f "$tmpdir/backend_ran" ]] || { printf 'backend phase did not run inline\n'; return 1; }
+)
+
 run_test "setup_xdp detects distro families" test_detect_os_release_maps_supported_families
 run_test "setup_xdp prefers distro package-manager order" test_detect_pkg_manager_prefers_family_order
 run_test "setup_xdp reports missing package managers" test_detect_pkg_manager_fails_when_no_manager_exists
@@ -868,5 +1055,16 @@ run_test "setup_xdp restores compiled builtin slot handlers after runtime instal
 run_test "setup_xdp installs auto_xdp state module into runtime package" test_install_python_support_package_includes_state_module
 run_test "setup_xdp removes stale installed python package files" test_install_python_support_package_removes_stale_files
 run_test "setup_xdp cleans stale handler artifacts but preserves configured custom handlers" test_install_slot_handler_sdk_cleans_stale_files_and_preserves_configured_custom_handlers
+run_test "setup_xdp selects sudo mode when not root" test_detect_privilege_mode_uses_sudo_when_not_root
+run_test "setup_xdp fails when neither root nor sudo is available" test_detect_privilege_mode_fails_without_root_or_sudo
+run_test "setup_xdp as_root runs directly in root mode" test_as_root_runs_directly_when_root
+run_test "setup_xdp as_root escalates with sudo in sudo mode" test_as_root_escalates_in_sudo_mode
+run_test "setup_xdp detects unwritable destinations" test_can_write_path_detects_unwritable_destinations
+run_test "setup_xdp write_file writes to writable paths without sudo" test_write_file_writes_content_without_escalation
+run_test "setup_xdp priv_init is a no-op when root" test_priv_init_is_noop_when_root
+run_test "setup_xdp priv_init primes sudo once" test_priv_init_primes_sudo_once
+run_test "setup_xdp parses internal phase2 flags" test_parse_args_accepts_internal_phase2_flags
+run_test "setup_xdp round-trips backend results" test_emit_backend_results_roundtrips_state
+run_test "setup_xdp runs backend phase inline when root" test_backend_phase_dispatch_runs_inline_when_root
 
 finish_tests

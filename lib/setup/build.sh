@@ -180,6 +180,7 @@ prepare_slot_handler_sources() {
         "handlers/gre_handler.c"
         "handlers/esp_handler.c"
         "handlers/sctp_handler.c"
+        "handlers/minecraft_handler.c"
         "handlers/xdp_slot_ctx.h"
     )
     local _handler_file=""
@@ -251,8 +252,8 @@ compile_xdp_program() {
         return 1
     fi
 
-    mkdir -p "$INSTALL_DIR"
-    cp "$XDP_OBJ" "$XDP_OBJ_INSTALLED"
+    priv_mkdir "$INSTALL_DIR"
+    place_file "$XDP_OBJ" "$XDP_OBJ_INSTALLED"
 
     if ! stage_build_source "$TC_SRC" "$TC_SRC" "$TC_SRC"; then
         warn "Unable to fetch ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
@@ -262,7 +263,7 @@ compile_xdp_program() {
         warn "Failed to compile ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
         return 0
     fi
-    cp "$TC_OBJ" "$TC_OBJ_INSTALLED"
+    place_file "$TC_OBJ" "$TC_OBJ_INSTALLED"
 
     if [[ $_handlers_ready -eq 1 && -d "$_handlers_dir" ]] && command -v make &>/dev/null; then
         if ! bpf_header_exists "linux/bpf.h" "/usr/include" "$ASM_INC"; then
@@ -277,8 +278,12 @@ compile_xdp_program() {
                     ASM_INC="$ASM_INC" \
                     ARCH_FLAGS="-D__TARGET_ARCH_${TARGET_ARCH} ${HOST_ARCH_FLAG}" \
                     >"$handler_log" 2>&1; then
-                mkdir -p "${INSTALL_DIR}/handlers"
-                cp "${_handlers_dir}"/*.o "${INSTALL_DIR}/handlers/" 2>/dev/null || true
+                priv_mkdir "${INSTALL_DIR}/handlers"
+                local _ho
+                for _ho in "${_handlers_dir}"/*.o; do
+                    [[ -e "$_ho" ]] || continue
+                    place_file "$_ho" "${INSTALL_DIR}/handlers/$(basename "$_ho")"
+                done
             else
                 warn "Slot handler compilation failed; handlers will be unavailable"
                 warn_from_log_file "$handler_log" "handler build: "
@@ -312,8 +317,8 @@ compile_sock_state_program() {
         return 1
     fi
 
-    mkdir -p "$INSTALL_DIR"
-    cp "$SOCK_STATE_OBJ" "$SOCK_STATE_OBJ_INSTALLED"
+    priv_mkdir "$INSTALL_DIR"
+    place_file "$SOCK_STATE_OBJ" "$SOCK_STATE_OBJ_INSTALLED"
     return 0
 }
 
@@ -341,8 +346,12 @@ restore_compiled_slot_handlers() {
         return 0
     fi
 
-    mkdir -p "${INSTALL_DIR}/handlers"
-    cp "$staged_handlers"/*.o "${INSTALL_DIR}/handlers/"
+    priv_mkdir "${INSTALL_DIR}/handlers"
+    local _ho
+    for _ho in "$staged_handlers"/*.o; do
+        [[ -e "$_ho" ]] || continue
+        place_file "$_ho" "${INSTALL_DIR}/handlers/$(basename "$_ho")"
+    done
 }
 
 restore_compiled_slot_handlers_step() {

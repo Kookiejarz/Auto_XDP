@@ -89,9 +89,120 @@ substep_run() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Privilege handling
+#
+# The installer launches as an ordinary user and only escalates for the steps
+# that genuinely need it: package installs, writes under /usr/local/lib & /etc,
+# service management, and loading the BPF/XDP backend. PRIV_MODE is resolved
+# once, without prompting, by detect_privilege_mode:
+#   root  -> already EUID 0; the helpers run commands directly
+#   sudo  -> sudo is on PATH; the helpers escalate per command
+# The first password prompt is deferred to priv_init, called right before the
+# first system-mutating step, so the banner/detection/plan run as the user.
+# ---------------------------------------------------------------------------
+PRIV_MODE="root"
+PRIV_PRIMED=0
+_PRIV_KEEPALIVE_PID=""
+
+detect_privilege_mode() {
+    step_begin "Checking privileges"
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        PRIV_MODE="root"
+        step_ok "running as root"
+        return 0
+    fi
+    if command -v sudo >/dev/null 2>&1; then
+        PRIV_MODE="sudo"
+        step_ok "non-root; will escalate via sudo when needed"
+        return 0
+    fi
+    die_with_next "Some steps need root, but neither root nor sudo is available." \
+        "re-run as root (su -) or install sudo, then run: bash $0 ${IFACES[*]:-}"
+}
+
+# Run a command with root privileges (direct when already root).
+as_root() {
+    if [[ "$PRIV_MODE" == "root" ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# Prime the sudo timestamp once (single password prompt) and keep it warm for
+# the rest of the run so long steps never re-prompt. No-op when already root.
+priv_init() {
+    [[ "$PRIV_MODE" == "sudo" ]] || return 0
+    [[ $PRIV_PRIMED -eq 1 ]] && return 0
+    info "Some steps need administrative privileges; requesting sudo access..."
+    sudo -v || die "Could not obtain sudo privileges."
+    PRIV_PRIMED=1
+    ( while true; do sudo -n -v 2>/dev/null || exit 0; sleep 50; done ) &
+    _PRIV_KEEPALIVE_PID=$!
+}
+
+_stop_priv_keepalive() {
+    [[ -n "$_PRIV_KEEPALIVE_PID" ]] || return 0
+    kill "$_PRIV_KEEPALIVE_PID" 2>/dev/null || true
+    _PRIV_KEEPALIVE_PID=""
+}
+
+# True when the current user can write PATH (the nearest existing ancestor for
+# a not-yet-created path), i.e. no escalation is needed to create/replace it.
+_can_write_path() {
+    local p="$1"
+    if [[ -e "$p" ]]; then
+        [[ -w "$p" ]]
+        return
+    fi
+    local dir
+    dir="$(dirname "$p")"
+    while [[ -n "$dir" && "$dir" != "/" && ! -e "$dir" ]]; do
+        dir="$(dirname "$dir")"
+    done
+    [[ -w "$dir" ]]
+}
+
+# mkdir -p that escalates only when the target tree is not user-writable.
+priv_mkdir() {
+    local dir="$1"
+    if _can_write_path "$dir"; then
+        mkdir -p "$dir"
+    else
+        as_root mkdir -p "$dir"
+    fi
+}
+
+# Write stdin to DEST, escalating only when DEST is not user-writable.
+write_file() {
+    local dest="$1"
+    priv_mkdir "$(dirname "$dest")"
+    if _can_write_path "$dest"; then
+        cat > "$dest"
+    else
+        as_root tee "$dest" >/dev/null
+    fi
+}
+
+# Copy SRC to DEST, escalating only when DEST is not user-writable.
+place_file() {
+    local src="$1" dest="$2"
+    priv_mkdir "$(dirname "$dest")"
+    if _can_write_path "$dest"; then
+        cp "$src" "$dest"
+    else
+        as_root cp "$src" "$dest"
+    fi
+}
+
 usage() {
     cat <<'EOF'
-Usage: sudo bash setup_xdp.sh [--check-update] [--force] [--all-interfaces] [interface...]
+Usage: bash setup_xdp.sh [--check-update] [--force] [--all-interfaces] [interface...]
+
+Runs as an ordinary user and escalates with sudo only for the steps that need
+it (package installs, writes under /usr/local/lib & /etc, service management,
+and loading the XDP backend). Running the whole script with sudo still works.
 
 Options:
   --check-update     Compare local files with GitHub by SHA-256 and ask before pulling
@@ -102,9 +213,9 @@ Options:
   -h, --help         Show this help
 
 Examples:
-  sudo bash setup_xdp.sh                    # auto-detect default route interface
-  sudo bash setup_xdp.sh --all-interfaces   # deploy to all active interfaces
-  sudo bash setup_xdp.sh eth0 eth1          # deploy to specific interfaces
+  bash setup_xdp.sh                    # auto-detect default route interface
+  bash setup_xdp.sh --all-interfaces   # deploy to all active interfaces
+  bash setup_xdp.sh eth0 eth1          # deploy to specific interfaces
 EOF
 }
 
@@ -126,6 +237,15 @@ parse_args() {
             --dry-run)
                 DRY_RUN=1
                 shift
+                ;;
+            --internal-phase2)
+                # Hidden: privileged backend continuation re-exec'd via sudo.
+                INTERNAL_PHASE2=1
+                shift
+                ;;
+            --result-file)
+                RESULT_FILE="$2"
+                shift 2
                 ;;
             --all-interfaces|-a)
                 ALL_IFACES=1
@@ -215,10 +335,10 @@ resolve_target_interfaces_step() {
     step_ok "Found: ${IFACES[*]}"
 }
 
+# Backward-compatible alias; the up-front root requirement is gone. Privilege
+# is resolved by detect_privilege_mode and acquired lazily via priv_init.
 check_root_privileges() {
-    step_begin "Checking root privileges"
-    [[ $EUID -eq 0 ]] || die "Please run this script with sudo."
-    step_ok
+    detect_privilege_mode
 }
 
 print_deployment_summary() {

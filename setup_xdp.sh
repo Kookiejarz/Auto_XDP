@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # setup_xdp.sh — Auto XDP installer / loader / fallback bootstrap
-# Usage: sudo bash setup_xdp.sh [--check-update] [--force] [--check-env] [--dry-run] [interface]
+# Usage: bash setup_xdp.sh [--check-update] [--force] [--check-env] [--dry-run] [interface]
+# Runs as an ordinary user and escalates with sudo only for the steps that need
+# it; running the whole script with sudo still works.
 # Supports Debian/Ubuntu, Fedora/RHEL, openSUSE, Arch, and Alpine.
 
 set -euo pipefail
@@ -139,6 +141,8 @@ CHECK_UPDATES=0
 FORCE=0
 CHECK_ENV=0
 DRY_RUN=0
+INTERNAL_PHASE2=0
+RESULT_FILE=""
 DISTRO_ID="unknown"
 DISTRO_NAME="unknown"
 DISTRO_LIKE=""
@@ -152,7 +156,13 @@ _cleanup_setup_tmpfiles() {
     done
     return 0
 }
-trap '_cleanup_setup_tmpfiles' EXIT
+_cleanup_on_exit() {
+    _cleanup_setup_tmpfiles
+    if declare -F _stop_priv_keepalive >/dev/null 2>&1; then
+        _stop_priv_keepalive
+    fi
+}
+trap '_cleanup_on_exit' EXIT
 
 source_setup_lib() {
     local relative_path="$1"
@@ -199,8 +209,93 @@ load_runtime_common_lib() {
 load_runtime_common_lib
 source_setup_lib "lib/setup/install.sh"
 
+# The backend bring-up: load the XDP/nftables backend, register handlers, seed
+# conntrack, and install + start the system service. These steps run the shared
+# runtime library in-process, so they execute as a single privileged unit.
+run_backend_phase() {
+    deploy_backend_step
+    load_configured_slot_handlers_step
+    load_configured_port_handlers_step
+    run_initial_sync_step
+    install_runtime_service_step
+}
+
+# Persist the backend outcome so a sudo re-exec can hand it back to the
+# unprivileged parent for the deployment summary.
+_emit_backend_results() {
+    local rf="$1"
+    [[ -n "$rf" ]] || return 0
+    {
+        printf 'ACTIVE_BACKEND=%q\n' "$ACTIVE_BACKEND"
+        printf 'ACTIVE_XDP_MODE=%q\n' "$ACTIVE_XDP_MODE"
+        printf 'XDP_FALLBACK_REASON=%q\n' "$XDP_FALLBACK_REASON"
+    } > "$rf"
+}
+
+# Resolve a runnable path to this installer for the privileged re-exec. When the
+# installer is being piped from curl there is no file on disk, so materialize a
+# copy from GitHub.
+_resolve_self_path() {
+    if [[ $PREFER_REMOTE_SOURCES -eq 0 && -r "${BASH_SOURCE[0]:-}" ]]; then
+        printf '%s' "${BASH_SOURCE[0]}"
+        return 0
+    fi
+    local self
+    self=$(mktemp)
+    _SETUP_TMPFILES+=("$self")
+    curl -fsSL "${RAW_URL}/setup_xdp.sh" -o "$self" || return 1
+    printf '%s' "$self"
+}
+
+# Run run_backend_phase as a single privileged unit. Already root: in-process.
+# Non-root: re-exec just this phase under sudo (one elevated process) and import
+# the resulting backend state, so the shared runtime library never has to
+# escalate command-by-command.
+run_backend_phase_dispatch() {
+    if [[ "$PRIV_MODE" == "root" ]]; then
+        run_backend_phase
+        return 0
+    fi
+
+    local self rf
+    self=$(_resolve_self_path) || die "Could not locate the installer to escalate the backend phase."
+    rf=$(mktemp)
+    _SETUP_TMPFILES+=("$rf")
+
+    local -a force_arg=()
+    [[ $FORCE -eq 1 ]] && force_arg=(--force)
+
+    as_root bash "$self" --internal-phase2 --result-file "$rf" \
+        "${force_arg[@]}" "${IFACES[@]}" \
+        || die "Backend bring-up failed under sudo."
+
+    # shellcheck disable=SC1090
+    [[ -s "$rf" ]] && source "$rf"
+}
+
+# Privileged continuation invoked via --internal-phase2 under sudo. Almost all
+# install paths are constants set when this script is sourced; only a handful of
+# values need re-deriving before running the backend phase.
+run_internal_phase2() {
+    PRIV_MODE="root"
+    [[ ${#IFACES[@]} -gt 0 ]] || die "Internal backend phase requires target interfaces."
+    IFACE="${IFACES[0]}"
+    detect_os_release
+    detect_pkg_manager || true
+    detect_init_system
+    PYTHON3_BIN="$(command -v python3 || echo python3)"
+    BPF_HELPER_BOOTSTRAP="$BPF_HELPER_INSTALLED"
+    run_backend_phase
+    _emit_backend_results "$RESULT_FILE"
+}
+
 main() {
     parse_args "$@"
+
+    if [[ $INTERNAL_PHASE2 -eq 1 ]]; then
+        run_internal_phase2
+        exit 0
+    fi
 
     if [[ $CHECK_ENV -eq 1 ]]; then
         detect_os_release
@@ -220,24 +315,24 @@ main() {
     fi
 
     print_installer_banner
-    check_root_privileges
+    detect_privilege_mode
     check_github_updates_once
     resolve_target_interfaces_step
     detect_environment_step
     print_setup_plan
+    # First system-mutating step ahead: acquire sudo once (no-op when root).
+    priv_init
     check_required_tools_step
     bootstrap_bpf_helper_step
     confirm_existing_install_step
     stop_existing_service_step
     compile_bpf_objects_step
     install_xdp_required_maps_step
-    deploy_backend_step
     install_runtime_files_step
     restore_compiled_slot_handlers_step
-    load_configured_slot_handlers_step
-    load_configured_port_handlers_step
-    run_initial_sync_step
-    install_runtime_service_step
+    # Backend bring-up runs as a single privileged unit (root in-process, or one
+    # sudo re-exec when started as a normal user).
+    run_backend_phase_dispatch
     cleanup_build_artifacts_step
     print_deployment_summary
 }

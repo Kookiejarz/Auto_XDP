@@ -2,6 +2,21 @@ sha256_of_file() {
     python3 -c "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())" "$1"
 }
 
+# Download URL into TARGET, escalating only when TARGET is a system path. The
+# download itself runs unprivileged into a user temp, then place_file installs
+# it (with sudo if needed).
+_curl_to_target() {
+    local url="$1" target="$2" tmp
+    tmp=$(mktemp)
+    _SETUP_TMPFILES+=("$tmp")
+    if ! curl -fsSL "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    place_file "$tmp" "$target"
+    rm -f "$tmp"
+}
+
 confirm_yes_no() {
     local prompt="$1"
     local no_tty_mode="${2:-deny}"
@@ -146,8 +161,7 @@ fetch_local_or_remote() {
 
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
         info "Installer is running from stdin; fetching ${remote_name} from GitHub..."
-        mkdir -p "$(dirname "$target_path")"
-        curl -fsSL "${RAW_URL}/${remote_name}" -o "$target_path" || return 1
+        _curl_to_target "${RAW_URL}/${remote_name}" "$target_path" || return 1
         return 0
     fi
 
@@ -159,7 +173,7 @@ fetch_local_or_remote() {
                 warn "Could not fetch ${remote_name} from GitHub for comparison; keeping local copy."
                 rm -f "$tmp_file"
                 if [[ "$local_path" != "$target_path" ]]; then
-                    cp "$local_path" "$target_path"
+                    place_file "$local_path" "$target_path"
                 fi
                 return 0
             fi
@@ -171,7 +185,7 @@ fetch_local_or_remote() {
                 info "Local ${remote_name} matches GitHub."
                 rm -f "$tmp_file"
                 if [[ "$local_path" != "$target_path" ]]; then
-                    cp "$local_path" "$target_path"
+                    place_file "$local_path" "$target_path"
                 fi
                 return 0
             fi
@@ -187,7 +201,7 @@ fetch_local_or_remote() {
         fi
 
         if [[ "$local_path" != "$target_path" ]]; then
-            cp "$local_path" "$target_path"
+            place_file "$local_path" "$target_path"
         fi
         info "Using local ${remote_name}"
         return 0
@@ -209,7 +223,7 @@ fetch_local_or_remote() {
             return 0
         fi
         if prompt_pull_github "$remote_name" "$local_hash" "$remote_hash"; then
-            cp "$tmp_file" "$target_path"
+            place_file "$tmp_file" "$target_path"
             info "Updated ${remote_name}."
         else
             info "Keeping installed ${remote_name}."
@@ -219,6 +233,5 @@ fetch_local_or_remote() {
     fi
 
     info "Fetching ${remote_name} from GitHub..."
-    mkdir -p "$(dirname "$target_path")"
-    curl -fsSL "${RAW_URL}/${remote_name}" -o "$target_path"
+    _curl_to_target "${RAW_URL}/${remote_name}" "$target_path"
 }

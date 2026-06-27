@@ -193,7 +193,7 @@ Incoming Packet
 
 - Linux kernel **≥ 4.18** for the XDP backend
 - Popular Linux distro with a supported package manager: Debian/Ubuntu, Fedora/RHEL, openSUSE, Arch, or Alpine
-- Root (sudo) privileges 
+- `sudo` access — the installer runs as an ordinary user and escalates only for the steps that need it (package installs, writes under `/usr/local/lib` & `/etc`, service management, and loading the XDP backend); running the whole script as root still works
 - `nftables` support is used automatically as the compatibility fallback when XDP cannot be attached
 
 ### Dependencies (auto-installed)
@@ -215,7 +215,7 @@ curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookieja
 ### Install a Specific Release
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/<version_here>/setup_xdp.sh | sudo bash
+curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/<version_here>/setup_xdp.sh | bash
 ```
 
 Using a tag gives you a reproducible installer version instead of tracking the latest `main` branch.
@@ -224,30 +224,33 @@ When the installer is executed from `stdin` (`curl | bash`), it prefers the matc
 
 ## Install From Source
 
+Run the installer as your normal user — it asks for `sudo` once, when the first
+step that needs root begins. (Prefixing the whole command with `sudo` also works.)
+
 ```bash
 git clone https://github.com/Kookiejarz/Auto_XDP.git
 cd Auto_XDP
 
 # Auto-detect interface
-sudo bash setup_xdp.sh
+bash setup_xdp.sh
 
 # Or specify interface
-sudo bash setup_xdp.sh eth0
+bash setup_xdp.sh eth0
 
 # Deploy to every active non-loopback interface
-sudo bash setup_xdp.sh --all-interfaces
+bash setup_xdp.sh --all-interfaces
 
 # Or deploy to a specific set of interfaces
-sudo bash setup_xdp.sh eth0 eth1
+bash setup_xdp.sh eth0 eth1
 
-# Preview the detected OS, init system, packages, and target interfaces
-sudo bash setup_xdp.sh --dry-run
+# Preview the detected OS, init system, packages, and target interfaces (no root needed)
+bash setup_xdp.sh --dry-run
 
 # Compare local files with GitHub first, then decide interactively
-sudo bash setup_xdp.sh --check-update
+bash setup_xdp.sh --check-update
 
 # Non-interactive mode for CI / automation
-sudo bash setup_xdp.sh --check-update --force
+bash setup_xdp.sh --check-update --force
 ```
 
 ### Multi-Interface Installation
@@ -256,10 +259,10 @@ By default, the installer uses the interface from the default route. For hosts w
 
 ```bash
 # Protect all active non-loopback interfaces
-sudo bash setup_xdp.sh --all-interfaces
+bash setup_xdp.sh --all-interfaces
 
 # Protect only selected interfaces
-sudo bash setup_xdp.sh eth0 ens5
+bash setup_xdp.sh eth0 ens5
 ```
 
 The generated runtime config stores the interface list, and the boot-time loader re-attaches XDP and the `tc` egress tracker to those interfaces after service restart or reboot.
@@ -681,7 +684,7 @@ sudo axdp restart
 When you run the installer from a cloned repo, local source files win by default. If you want the script to compare your local copies with GitHub first, use:
 
 ```bash
-sudo bash setup_xdp.sh --check-update
+bash setup_xdp.sh --check-update
 ```
 
 In `--check-update` mode, the installer:
@@ -696,13 +699,13 @@ In `--check-update` mode, the installer:
 For CI or automated deployment, use:
 
 ```bash
-sudo bash setup_xdp.sh --force
+bash setup_xdp.sh --force
 ```
 
 Or combine it with source comparison:
 
 ```bash
-sudo bash setup_xdp.sh --check-update --force
+bash setup_xdp.sh --check-update --force
 ```
 
 In `--force` mode, the installer skips confirmation prompts and:
