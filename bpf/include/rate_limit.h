@@ -129,12 +129,13 @@ static __always_inline void fill_tcp_src_conn_key_v6(
 
 static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
                                           __u32 rate_max,
-                                          __u32 prefix_v4, __u32 prefix_v6)
+                                          __u32 prefix_v4, __u32 prefix_v6,
+                                          struct xdp_runtime_cfg *cfg)
 {
     if (rate_max == 0)
         return XDP_PASS;
 
-    __u64 window_ns = runtime_rate_window_ns();
+    __u64 window_ns = cfg_rate_window_ns(cfg);
 
     if (key->family == CT_FAMILY_IPV4) {
         struct syn_rate_key_v4 rkey;
@@ -149,12 +150,13 @@ static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
 
 static __always_inline int syn_agg_rate_check(struct flow_key *key, __u64 now,
                                               __u32 dest_port, __u32 rate_max,
-                                              __u32 prefix_v4, __u32 prefix_v6)
+                                              __u32 prefix_v4, __u32 prefix_v6,
+                                              struct xdp_runtime_cfg *cfg)
 {
     if (rate_max == 0)
         return XDP_PASS;
 
-    __u64 window_ns = runtime_rate_window_ns();
+    __u64 window_ns = cfg_rate_window_ns(cfg);
 
     if (key->family == CT_FAMILY_IPV4) {
         struct prefix_rate_key_v4 rkey;
@@ -211,7 +213,8 @@ static __always_inline int udp_agg_rate_check(struct flow_key *key, __u64 now,
 }
 
 static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
-                                                __u32 dest_port, __u32 conn_max)
+                                                __u32 dest_port, __u32 conn_max,
+                                                struct xdp_runtime_cfg *cfg)
 {
     if (conn_max == 0)
         return XDP_PASS;
@@ -225,7 +228,7 @@ static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
         if (!sv)
             return XDP_PASS;
 
-        if (now - sv->last_seen_ns > runtime_tcp_timeout_ns()) {
+        if (now - sv->last_seen_ns > cfg_tcp_timeout_ns(cfg)) {
             sv->count = 0;
             sv->last_seen_ns = now;
             return XDP_PASS;
@@ -246,7 +249,7 @@ static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
         if (!sv)
             return XDP_PASS;
 
-        if (now - sv->last_seen_ns > runtime_tcp_timeout_ns()) {
+        if (now - sv->last_seen_ns > cfg_tcp_timeout_ns(cfg)) {
             sv->count = 0;
             sv->last_seen_ns = now;
             return XDP_PASS;
@@ -260,8 +263,11 @@ static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
 }
 
 static __always_inline void tcp_src_conn_record_established(
-    struct flow_key *key, __u64 now, __u32 dest_port)
+    struct flow_key *key, __u64 now, __u32 dest_port,
+    struct xdp_runtime_cfg *cfg)
 {
+    __u64 tcp_timeout_ns = cfg_tcp_timeout_ns(cfg);
+
     /* L3 — per-source counter (tsc4/tsc6). */
     if (key->family == CT_FAMILY_IPV4) {
         struct tcp_src_conn_key_v4 skey;
@@ -275,7 +281,7 @@ static __always_inline void tcp_src_conn_record_established(
             new_sv.count = 1;
             bpf_map_update_elem(&tsc4, &skey, &new_sv, BPF_ANY);
         } else {
-            if (now - sv->last_seen_ns > runtime_tcp_timeout_ns())
+            if (now - sv->last_seen_ns > tcp_timeout_ns)
                 sv->count = 0;
             if (sv->count < 0xFFFFFFFF)
                 sv->count++;
@@ -293,7 +299,7 @@ static __always_inline void tcp_src_conn_record_established(
             new_sv.count = 1;
             bpf_map_update_elem(&tsc6, &skey, &new_sv, BPF_ANY);
         } else {
-            if (now - sv->last_seen_ns > runtime_tcp_timeout_ns())
+            if (now - sv->last_seen_ns > tcp_timeout_ns)
                 sv->count = 0;
             if (sv->count < 0xFFFFFFFF)
                 sv->count++;
@@ -320,7 +326,7 @@ static __always_inline void tcp_src_conn_record_established(
                 new_pv.count = 1;
                 bpf_map_update_elem(&tsc_pfx4, &pkey, &new_pv, BPF_ANY);
             } else {
-                if (now - pv->last_seen_ns > runtime_tcp_timeout_ns())
+                if (now - pv->last_seen_ns > tcp_timeout_ns)
                     pv->count = 0;
                 if (pv->count < 0xFFFFFFFF)
                     pv->count++;
@@ -338,7 +344,7 @@ static __always_inline void tcp_src_conn_record_established(
                 new_pv.count = 1;
                 bpf_map_update_elem(&tsc_pfx6, &pkey, &new_pv, BPF_ANY);
             } else {
-                if (now - pv->last_seen_ns > runtime_tcp_timeout_ns())
+                if (now - pv->last_seen_ns > tcp_timeout_ns)
                     pv->count = 0;
                 if (pv->count < 0xFFFFFFFF)
                     pv->count++;
@@ -352,7 +358,7 @@ static __always_inline void tcp_src_conn_record_established(
         struct tcp_port_conn_val *pv =
             bpf_map_lookup_elem(&tsc_port, &dest_port);
         if (pv) {
-            if (now - pv->last_seen_ns > runtime_tcp_timeout_ns())
+            if (now - pv->last_seen_ns > tcp_timeout_ns)
                 pv->count = 0;
             if (pv->count < 0xFFFFFFFF)
                 pv->count++;
@@ -475,7 +481,8 @@ static __always_inline void tcp_src_conn_record_close(struct flow_key *key, __u6
 
 static __always_inline int tcp_conn_prefix_limit_check(
     struct flow_key *key, __u64 now, __u32 dest_port,
-    __u32 prefix_v4, __u32 prefix_v6, __u32 conn_max)
+    __u32 prefix_v4, __u32 prefix_v6, __u32 conn_max,
+    struct xdp_runtime_cfg *cfg)
 {
     if (conn_max == 0)
         return XDP_PASS;
@@ -487,7 +494,7 @@ static __always_inline int tcp_conn_prefix_limit_check(
         pv = bpf_map_lookup_elem(&tsc_pfx4, &pkey);
         if (!pv)
             return XDP_PASS;
-        if (now - pv->last_seen_ns > runtime_tcp_timeout_ns())
+        if (now - pv->last_seen_ns > cfg_tcp_timeout_ns(cfg))
             return XDP_PASS;
         if (pv->count >= conn_max)
             return XDP_DROP;
@@ -500,7 +507,7 @@ static __always_inline int tcp_conn_prefix_limit_check(
         pv = bpf_map_lookup_elem(&tsc_pfx6, &pkey);
         if (!pv)
             return XDP_PASS;
-        if (now - pv->last_seen_ns > runtime_tcp_timeout_ns())
+        if (now - pv->last_seen_ns > cfg_tcp_timeout_ns(cfg))
             return XDP_PASS;
         if (pv->count >= conn_max)
             return XDP_DROP;
@@ -509,7 +516,8 @@ static __always_inline int tcp_conn_prefix_limit_check(
 }
 
 static __always_inline int tcp_conn_port_limit_check(
-    __u32 dest_port, __u64 now, __u32 conn_max)
+    __u32 dest_port, __u64 now, __u32 conn_max,
+    struct xdp_runtime_cfg *cfg)
 {
     if (conn_max == 0)
         return XDP_PASS;
@@ -517,7 +525,7 @@ static __always_inline int tcp_conn_port_limit_check(
         bpf_map_lookup_elem(&tsc_port, &dest_port);
     if (!pv)
         return XDP_PASS;
-    if (now - pv->last_seen_ns > runtime_tcp_timeout_ns())
+    if (now - pv->last_seen_ns > cfg_tcp_timeout_ns(cfg))
         return XDP_PASS;
     if (pv->count >= conn_max)
         return XDP_DROP;
@@ -525,7 +533,8 @@ static __always_inline int tcp_conn_port_limit_check(
 }
 
 static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest_port,
-                                                bool bypass_rate, __u64 now)
+                                                bool bypass_rate, __u64 now,
+                                                struct xdp_runtime_cfg *cfg)
 {
     struct tcp_port_policy_cfg *policy = bpf_map_lookup_elem(&tcp_port_policies, &dest_port);
     __u32 syn_rate_max = policy ? policy->syn_rate_max : 0;
@@ -537,7 +546,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
     __u32 conn_port_limit_max   = policy ? policy->conn_port_limit_max   : 0;
 
     if (!bypass_rate) {
-        if (syn_rate_check(key, now, syn_rate_max, source_prefix_v4, source_prefix_v6) == XDP_DROP) {
+        if (syn_rate_check(key, now, syn_rate_max, source_prefix_v4, source_prefix_v6, cfg) == XDP_DROP) {
             count(CNT_SYN_RATE_DROP);
             count(CNT_TCP_DROP);
             emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
@@ -545,7 +554,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
             return XDP_DROP;
         }
 
-        if (syn_agg_rate_check(key, now, dest_port, syn_agg_rate_max, source_prefix_v4, source_prefix_v6) == XDP_DROP) {
+        if (syn_agg_rate_check(key, now, dest_port, syn_agg_rate_max, source_prefix_v4, source_prefix_v6, cfg) == XDP_DROP) {
             count(CNT_SYN_AGG_RATE_DROP);
             count(CNT_TCP_DROP);
             emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
@@ -554,7 +563,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
         }
     }
 
-    if (tcp_conn_limit_check(key, now, dest_port, conn_limit_max) == XDP_DROP) {
+    if (tcp_conn_limit_check(key, now, dest_port, conn_limit_max, cfg) == XDP_DROP) {
         count(CNT_TCP_CONN_LIMIT_DROP);
         count(CNT_TCP_DROP);
         emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
@@ -564,7 +573,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
 
     if (tcp_conn_prefix_limit_check(key, now, dest_port,
                                     source_prefix_v4, source_prefix_v6,
-                                    conn_prefix_limit_max) == XDP_DROP) {
+                                    conn_prefix_limit_max, cfg) == XDP_DROP) {
         count(CNT_TCP_CONN_PREFIX_LIMIT_DROP);
         count(CNT_TCP_DROP);
         emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
@@ -572,7 +581,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
         return XDP_DROP;
     }
 
-    if (tcp_conn_port_limit_check(dest_port, now, conn_port_limit_max) == XDP_DROP) {
+    if (tcp_conn_port_limit_check(dest_port, now, conn_port_limit_max, cfg) == XDP_DROP) {
         count(CNT_TCP_CONN_PORT_LIMIT_DROP);
         count(CNT_TCP_DROP);
         emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
@@ -585,7 +594,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
 
 static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_port,
                                              bool bypass_rate, bool prechecked,
-                                             __u64 now)
+                                             __u64 now, struct xdp_runtime_cfg *cfg)
 {
     __u64 *last_seen;
     bool ipv4 = key->family == CT_FAMILY_IPV4;
@@ -603,13 +612,13 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
         bool is_half_open = raw & CT_SYN_PENDING;
         __u64 ts = raw & ~CT_SYN_PENDING;
         __u64 age = now - ts;
-        __u64 ct_timeout = is_half_open ? runtime_syn_timeout_ns() : runtime_tcp_timeout_ns();
+        __u64 ct_timeout = is_half_open ? cfg_syn_timeout_ns(cfg) : cfg_tcp_timeout_ns(cfg);
         if (age > ct_timeout) {
             tcp_conntrack_delete(ipv4, &key_v4, &key_v6);
             if (!is_half_open)
                 tcp_src_conn_record_close(key, now, dest_port);
         } else {
-            if (age > runtime_ct_refresh_ns()) {
+            if (age > cfg_ct_refresh_ns(cfg)) {
                 __u64 new_val = is_half_open ? (now | CT_SYN_PENDING) : now;
                 tcp_conntrack_update(ipv4, &key_v4, &key_v6, new_val, BPF_EXIST);
                 tcp_src_conn_record_activity(key, now, dest_port);
@@ -621,7 +630,7 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
         }
     }
 
-    if (!prechecked && precheck_new_tcp_syn(key, dest_port, bypass_rate, now) == XDP_DROP)
+    if (!prechecked && precheck_new_tcp_syn(key, dest_port, bypass_rate, now, cfg) == XDP_DROP)
         return XDP_DROP;
 
     tcp_conntrack_update(ipv4, &key_v4, &key_v6, now | CT_SYN_PENDING, BPF_ANY);

@@ -25,8 +25,17 @@ BPF_MAP_LOOKUP_BATCH = 24
 BPF_F_LOCK = 4
 
 
-def bpf(cmd: int, attr: ctypes.Array) -> int:
-    ret = _libc.syscall(NR_BPF, ctypes.c_int(cmd), attr, ctypes.c_uint(len(attr)))
+def bpf(cmd: int, attr: ctypes.Array | bytearray | memoryview) -> int:
+    if isinstance(attr, (bytearray, memoryview)):
+        attr_ptr = ctypes.addressof(ctypes.c_char.from_buffer(attr))
+    else:
+        attr_ptr = ctypes.cast(attr, ctypes.c_void_p).value or 0
+    ret = _libc.syscall(
+        NR_BPF,
+        ctypes.c_int(cmd),
+        ctypes.c_void_p(attr_ptr),
+        ctypes.c_uint(len(attr)),
+    )
     if ret < 0:
         err = ctypes.get_errno()
         raise OSError(err, os.strerror(err))

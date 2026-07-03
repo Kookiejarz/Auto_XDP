@@ -116,7 +116,7 @@ static __always_inline int check_tcp_conntrack(
             if (is_half_open) {
                 /* Promotion: half-open -> ESTABLISHED. Increment counters. */
                 tcp_conntrack_update(ipv4, &key_v4, &key_v6, now, BPF_EXIST);
-                tcp_src_conn_record_established(key, now, dest_port);
+                tcp_src_conn_record_established(key, now, dest_port, cfg);
             } else if (age > ct_refresh) {
                 /* Heartbeat refresh on existing ESTABLISHED: no count change. */
                 tcp_conntrack_update(ipv4, &key_v4, &key_v6, now, BPF_EXIST);
@@ -178,10 +178,10 @@ static __always_inline int check_tcp_conntrack(
                       key->sport, key->dport, (__u8)CNT_HANDLER_BLOCK_DROP, now);
             return XDP_DROP;
         }
-        if (precheck_new_tcp_syn(key, dest_port, false, now) == XDP_DROP)
+        if (precheck_new_tcp_syn(key, dest_port, false, now, cfg) == XDP_DROP)
             return XDP_DROP;
         try_tcp_port_dispatch(ctx, key, l3_off, inner_off, dest_port);
-        return allow_new_tcp_syn(key, dest_port, false, true, now);
+        return allow_new_tcp_syn(key, dest_port, false, true, now, cfg);
     }
 
 drop:
