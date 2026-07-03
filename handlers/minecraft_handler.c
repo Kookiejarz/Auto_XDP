@@ -18,6 +18,12 @@
 #define MC_BLOCK_NS   (300ULL * 1000000000ULL)
 #define MC_MAX_OUT_OF_ORDER 4
 
+#define MC_STATUS_RATE_WINDOW_NS (10ULL * 1000000000ULL)
+#define MC_STATUS_RATE_MAX       30   /* ~3/sec per /24 or /64 */
+
+#define MC_LOGIN_RATE_WINDOW_NS  (60ULL * 1000000000ULL)
+#define MC_LOGIN_RATE_MAX        20   /* per minute per /24 or /64 */
+
 #define MC_AWAIT_ACK            1
 #define MC_AWAIT_HANDSHAKE      2
 #define MC_AWAIT_STATUS_REQUEST 3
@@ -64,6 +70,19 @@ struct syn_rate_key_v4 {
 
 struct syn_rate_key_v6 {
     __u32 addr[4];
+};
+
+struct mc_rate_key_v4 {
+    __be32 prefix;
+};
+
+struct mc_rate_key_v6 {
+    __u32 prefix[2];
+};
+
+struct mc_rate_val {
+    __u64 window_start_ns;
+    __u32 count;
 };
 
 struct mc_pending_val {
@@ -128,6 +147,34 @@ struct {
     __type(value, __u64);
 } hblk6 SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 49152);
+    __type(key, struct mc_rate_key_v4);
+    __type(value, struct mc_rate_val);
+} mc_status_rate4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct mc_rate_key_v6);
+    __type(value, struct mc_rate_val);
+} mc_status_rate6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 49152);
+    __type(key, struct mc_rate_key_v4);
+    __type(value, struct mc_rate_val);
+} mc_login_rate4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct mc_rate_key_v6);
+    __type(value, struct mc_rate_val);
+} mc_login_rate6 SEC(".maps");
+
 static __always_inline void fill_flow_key(struct flow_key *key, const struct xdp_slot_ctx *sc)
 {
     __builtin_memset(key, 0, sizeof(*key));
@@ -162,6 +209,55 @@ static __always_inline void fill_block_key_v4(struct syn_rate_key_v4 *key, const
 static __always_inline void fill_block_key_v6(struct syn_rate_key_v6 *key, const struct flow_key *ct)
 {
     __builtin_memcpy(key->addr, ct->saddr, sizeof(key->addr));
+}
+
+static __always_inline void fill_rate_key_v4(struct mc_rate_key_v4 *key, const struct flow_key *ct)
+{
+    key->prefix = (__be32)ct->saddr[0] & bpf_htonl(0xFFFFFF00u);
+}
+
+static __always_inline void fill_rate_key_v6(struct mc_rate_key_v6 *key, const struct flow_key *ct)
+{
+    key->prefix[0] = ct->saddr[0];
+    key->prefix[1] = ct->saddr[1];
+}
+
+#define MC_RATE_CHECK(map, key, now, window_ns, max_count, over_limit)            \
+    do {                                                                          \
+        struct mc_rate_val *_v = bpf_map_lookup_elem((map), (key));              \
+        if (!_v) {                                                                \
+            struct mc_rate_val _init = { .window_start_ns = (now), .count = 1 }; \
+            bpf_map_update_elem((map), (key), &_init, BPF_ANY);                  \
+            (over_limit) = false;                                                \
+        } else if ((now) - _v->window_start_ns > (window_ns)) {                  \
+            _v->window_start_ns = (now);                                         \
+            _v->count = 1;                                                       \
+            (over_limit) = false;                                                \
+        } else {                                                                  \
+            _v->count++;                                                         \
+            (over_limit) = _v->count > (max_count);                              \
+        }                                                                         \
+    } while (0)
+
+static __always_inline bool mc_handshake_rate_exceeded(
+    const struct flow_key *ct, __u64 now,
+    void *rate4, void *rate6, __u64 window_ns, __u32 max_count)
+{
+    bool over_limit;
+
+    if (ct->family == CT_FAMILY_IPV4) {
+        struct mc_rate_key_v4 rkey;
+
+        fill_rate_key_v4(&rkey, ct);
+        MC_RATE_CHECK(rate4, &rkey, now, window_ns, max_count, over_limit);
+    } else {
+        struct mc_rate_key_v6 rkey;
+
+        fill_rate_key_v6(&rkey, ct);
+        MC_RATE_CHECK(rate6, &rkey, now, window_ns, max_count, over_limit);
+    }
+
+    return over_limit;
 }
 
 static __always_inline void cleanup_pending(const struct flow_key *ct)
@@ -230,55 +326,78 @@ static __always_inline struct mc_varint mc_varint_fail(void)
     return v;
 }
 
+#define MC_VARINT_BYTE(ptr, pend, dend, max, idx, shift, result)              \
+    do {                                                                      \
+        if ((max) < (idx))                                                    \
+            goto mc_varint_error;                                            \
+        if ((const void *)(ptr) >= (const void *)(dend))                     \
+            goto mc_varint_error;                                            \
+        barrier_var(ptr);                                                     \
+        if ((const void *)(ptr) >= (const void *)(pend))                     \
+            goto mc_varint_error;                                            \
+        barrier_var(ptr);                                                     \
+        __u8 _b = *(ptr)++;                                                   \
+        (result) |= ((__s32)(_b & 0x7F) << (shift));                         \
+        if (!(_b & 0x80))                                                     \
+            return (struct mc_varint){ .value = (result), .bytes = (idx) };  \
+    } while (0)
+
 static __always_inline struct mc_varint read_varint(
-    __u8 *ptr, const __u8 *end, __u8 max_bytes)
+    __u8 *ptr, const __u8 *end, __u8 max_bytes, const void *data_end)
 {
     __s32 result = 0;
 
-#define MC_VARINT_BYTE(idx, shift)                                                   \
-    do {                                                                              \
-        if (max_bytes < (idx))                                                        \
-            return mc_varint_fail();                                                  \
-        if (ptr + 1 > end)                                                            \
-            return mc_varint_fail();                                                  \
-        {                                                                             \
-            __u8 b = *ptr++;                                                          \
-            result |= ((__s32)(b & 0x7F) << (shift));                                 \
-            if (!(b & 0x80)) {                                                        \
-                struct mc_varint out = { .value = result, .bytes = (idx) };           \
-                return out;                                                            \
-            }                                                                         \
-        }                                                                             \
-    } while (0)
+    MC_VARINT_BYTE(ptr, end, data_end, max_bytes, 1, 0, result);
+    MC_VARINT_BYTE(ptr, end, data_end, max_bytes, 2, 7, result);
+    MC_VARINT_BYTE(ptr, end, data_end, max_bytes, 3, 14, result);
+    MC_VARINT_BYTE(ptr, end, data_end, max_bytes, 4, 21, result);
+    MC_VARINT_BYTE(ptr, end, data_end, max_bytes, 5, 28, result);
 
-    MC_VARINT_BYTE(1, 0);
-    MC_VARINT_BYTE(2, 7);
-    MC_VARINT_BYTE(3, 14);
-    MC_VARINT_BYTE(4, 21);
-    MC_VARINT_BYTE(5, 28);
-
-#undef MC_VARINT_BYTE
+mc_varint_error:
     return mc_varint_fail();
 }
 
-static __always_inline bool consume_bytes(__u8 **ptr, const __u8 *end, __u32 n)
+static __always_inline bool read_byte(__u8 **ptr, const __u8 *end, const void *data_end, __u8 *out)
 {
-    if (*ptr + n > end)
+    __u8 *p = *ptr;
+
+    if ((const void *)p >= data_end)
         return false;
-    *ptr += n;
+    barrier_var(p);
+    if (p >= end)
+        return false;
+    barrier_var(p);
+    *out = *p;
+    *ptr = p + 1;
     return true;
 }
 
-static __always_inline bool inspect_status_request(__u8 *start, const __u8 *end)
+static __always_inline bool consume_bytes(__u8 **ptr, const __u8 *end, __u32 n, const void *data_end)
+{
+    __u8 *p = *ptr;
+
+    n &= 0x1FFF;
+    barrier_var(n);
+    if ((const void *)(p + n) > data_end)
+        return false;
+    barrier_var(p);
+    if (p + n > end)
+        return false;
+    barrier_var(p);
+    *ptr = p + n;
+    return true;
+}
+
+static __always_inline bool inspect_status_request(__u8 *start, const __u8 *end, const void *data_end)
 {
     struct mc_varint v;
 
-    v = read_varint(start, end, 1);
+    v = read_varint(start, end, 1, data_end);
     if (!v.bytes || v.value != 1)
         return false;
     start += v.bytes;
 
-    v = read_varint(start, end, 1);
+    v = read_varint(start, end, 1, data_end);
     if (!v.bytes || v.value != 0)
         return false;
     start += v.bytes;
@@ -286,85 +405,90 @@ static __always_inline bool inspect_status_request(__u8 *start, const __u8 *end)
     return start == end;
 }
 
-static __always_inline bool inspect_ping_request(__u8 *start, const __u8 *end)
+static __always_inline bool inspect_ping_request(__u8 *start, const __u8 *end, const void *data_end)
 {
     struct mc_varint v;
 
-    v = read_varint(start, end, 1);
+    v = read_varint(start, end, 1, data_end);
     if (!v.bytes || v.value != 9)
         return false;
     start += v.bytes;
 
-    v = read_varint(start, end, 1);
+    v = read_varint(start, end, 1, data_end);
     if (!v.bytes || v.value != 1)
         return false;
     start += v.bytes;
 
-    if (!consume_bytes(&start, end, 8))
+    if (!consume_bytes(&start, end, 8, data_end))
         return false;
 
     return start == end;
 }
 
 static __always_inline bool inspect_login_packet(
-    __u8 *start, const __u8 *end, __s32 protocol_version)
+    __u8 *start, const __u8 *end, __s32 protocol_version, const void *data_end)
 {
     struct mc_varint v;
 
-    v = read_varint(start, end, MC_MAX_PACKET_LEN_BYTES);
+    v = read_varint(start, end, MC_MAX_PACKET_LEN_BYTES, data_end);
     if (!v.bytes || v.value < 2 || v.value > (MC_MAX_PACKET_ID_BYTES + MC_LOGIN_NAME_MAX + 4096))
         return false;
     start += v.bytes;
 
-    v = read_varint(start, end, 1);
+    v = read_varint(start, end, 1, data_end);
     if (!v.bytes || v.value != 0)
         return false;
     start += v.bytes;
 
-    v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES);
+    v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES, data_end);
     if (!v.bytes || v.value < 1 || v.value > MC_LOGIN_NAME_MAX)
         return false;
     start += v.bytes;
-    if (!consume_bytes(&start, end, (__u32)v.value))
-        return false;
+    {
+        __u32 name_len = (__u32)v.value;
+
+        if (name_len > MC_LOGIN_NAME_MAX)
+            return false;
+        barrier_var(name_len);
+        if (!consume_bytes(&start, end, name_len, data_end))
+            return false;
+    }
 
     if (protocol_version >= 759 && protocol_version < 761) {
         __u8 has_public_key;
 
-        if (!consume_bytes(&start, end, 1))
+        if (!read_byte(&start, end, data_end, &has_public_key))
             return false;
-        has_public_key = start[-1];
         if (has_public_key) {
-            if (!consume_bytes(&start, end, 8))
+            if (!consume_bytes(&start, end, 8, data_end))
                 return false;
 
-            v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES);
+            v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES, data_end);
             if (!v.bytes || v.value < 0 || v.value > MC_LOGIN_KEY_MAX)
                 return false;
             start += v.bytes;
-            if (!consume_bytes(&start, end, (__u32)v.value))
+            if (!consume_bytes(&start, end, (__u32)v.value, data_end))
                 return false;
 
-            v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES);
+            v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES, data_end);
             if (!v.bytes || v.value < 0 || v.value > MC_LOGIN_SIGNATURE_MAX)
                 return false;
             start += v.bytes;
-            if (!consume_bytes(&start, end, (__u32)v.value))
+            if (!consume_bytes(&start, end, (__u32)v.value, data_end))
                 return false;
         }
     }
 
     if (protocol_version >= 760) {
         if (protocol_version >= 764) {
-            if (!consume_bytes(&start, end, 16))
+            if (!consume_bytes(&start, end, 16, data_end))
                 return false;
         } else {
             __u8 has_uuid;
 
-            if (!consume_bytes(&start, end, 1))
+            if (!read_byte(&start, end, data_end, &has_uuid))
                 return false;
-            has_uuid = start[-1];
-            if (has_uuid && !consume_bytes(&start, end, 16))
+            if (has_uuid && !consume_bytes(&start, end, 16, data_end))
                 return false;
         }
     }
@@ -373,44 +497,44 @@ static __always_inline bool inspect_login_packet(
 }
 
 static __always_inline __s32 inspect_handshake(
-    __u8 *start, const __u8 *end, __s32 *protocol_version, __u8 **next_ptr)
+    __u8 *start, const __u8 *end, __s32 *protocol_version, __u8 **next_ptr, const void *data_end)
 {
     struct mc_varint v;
     __s32 intention;
     __u8 support_transfer;
 
-    if (start >= end)
+    if (start + 1 > end)
         return 0;
     if (start[0] == 0xFE)
         return MC_LEGACY_PING;
 
-    v = read_varint(start, end, MC_MAX_PACKET_LEN_BYTES);
+    v = read_varint(start, end, MC_MAX_PACKET_LEN_BYTES, data_end);
     if (!v.bytes || v.value < 4 || v.value > (MC_MAX_PACKET_ID_BYTES + MC_HANDSHAKE_HOST_MAX + 16))
         return 0;
     start += v.bytes;
 
-    v = read_varint(start, end, 1);
+    v = read_varint(start, end, 1, data_end);
     if (!v.bytes || v.value != 0)
         return 0;
     start += v.bytes;
 
-    v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES);
+    v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES, data_end);
     if (!v.bytes)
         return 0;
     *protocol_version = v.value;
     start += v.bytes;
 
-    v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES);
+    v = read_varint(start, end, MC_MAX_PACKET_ID_BYTES, data_end);
     if (!v.bytes || v.value < 0 || v.value > MC_HANDSHAKE_HOST_MAX)
         return 0;
     start += v.bytes;
-    if (!consume_bytes(&start, end, (__u32)v.value))
+    if (!consume_bytes(&start, end, (__u32)v.value, data_end))
         return 0;
 
-    if (!consume_bytes(&start, end, 2))
+    if (!consume_bytes(&start, end, 2, data_end))
         return 0;
 
-    v = read_varint(start, end, 1);
+    v = read_varint(start, end, 1, data_end);
     if (!v.bytes)
         return 0;
     intention = v.value;
@@ -445,16 +569,27 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
     __u32 payload_len;
     __u32 tcp_hdr_len;
     __u32 l4_and_payload_len;
+    __u32 l3_off;
+    __u32 inner_off_u32;
 
     if (!sc || sc->ip_proto != IPPROTO_TCP)
         return XDP_PASS;
 
-    inner_off = sc->inner_offset;
+    l3_off = (__u32)sc->l3_offset;
+    inner_off_u32 = (__u32)sc->inner_offset;
+    if (l3_off > 255 || inner_off_u32 > 255 || inner_off_u32 < l3_off)
+        return XDP_PASS;
+
+    inner_off = (__u16)inner_off_u32;
     family = sc->family;
     dest_port = (__u32)bpf_ntohs(sc->dport);
     fill_flow_key(&key, sc);
 
     if (family != CT_FAMILY_IPV4 && family != CT_FAMILY_IPV6)
+        return XDP_PASS;
+    if (family == CT_FAMILY_IPV4 && inner_off_u32 < l3_off + 20u)
+        return XDP_PASS;
+    if (family == CT_FAMILY_IPV6 && inner_off_u32 < l3_off + 40u)
         return XDP_PASS;
 
     /* Compute actual L4+payload length from the IP header *before* adjust_head.
@@ -465,17 +600,17 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
         void *pre_data = (void *)(long)ctx->data;
         void *pre_data_end = (void *)(long)ctx->data_end;
         if (family == CT_FAMILY_IPV4) {
-            struct iphdr *iph = (struct iphdr *)((char *)pre_data + sc->l3_offset);
+            struct iphdr *iph = (struct iphdr *)((char *)pre_data + l3_off);
             if ((void *)(iph + 1) > pre_data_end)
                 return XDP_PASS;
             __u32 ip_tot    = (__u32)bpf_ntohs(iph->tot_len);
-            __u32 ip_l4_off = (__u32)(sc->inner_offset - sc->l3_offset);
+            __u32 ip_l4_off = inner_off_u32 - l3_off;
             l4_and_payload_len = ip_tot > ip_l4_off ? ip_tot - ip_l4_off : 0;
         } else {
-            struct ipv6hdr *ip6h = (struct ipv6hdr *)((char *)pre_data + sc->l3_offset);
+            struct ipv6hdr *ip6h = (struct ipv6hdr *)((char *)pre_data + l3_off);
             if ((void *)(ip6h + 1) > pre_data_end)
                 return XDP_PASS;
-            __u32 ip6_hdr_and_ext = (__u32)(sc->inner_offset - sc->l3_offset);
+            __u32 ip6_hdr_and_ext = inner_off_u32 - l3_off;
             if (ip6_hdr_and_ext < 40u)
                 return XDP_PASS;
             __u32 ip6_plen = (__u32)bpf_ntohs(ip6h->payload_len);
@@ -555,6 +690,9 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
     if (payload_len > 0) {
         __u8 *cursor = payload;
 
+        if ((void *)(cursor + 1) > data_end)
+            return restore_and_return(ctx, inner_off, XDP_DROP);
+
         if (!tcp->ack)
             return penalize_and_drop(ctx, inner_off, &key, now);
 
@@ -568,7 +706,11 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
         }
 
         if (pending->state == MC_AWAIT_HANDSHAKE) {
-            __s32 next_state = inspect_handshake(cursor, payload_end, &pending->protocol_version, &cursor);
+            if ((void *)(cursor + MC_MAX_PACKET_LEN_BYTES) > data_end) {
+                pending->last_seen_ns = now;
+                return restore_and_return(ctx, inner_off, XDP_DROP);
+            }
+            __s32 next_state = inspect_handshake(cursor, payload_end, &pending->protocol_version, &cursor, data_end);
 
             if (!next_state) {
                 pending->last_seen_ns = now;
@@ -585,10 +727,13 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
         }
 
         if (pending->state == MC_AWAIT_STATUS_REQUEST) {
-            if (!inspect_status_request(cursor, payload_end)) {
+            if (!inspect_status_request(cursor, payload_end, data_end)) {
                 pending->last_seen_ns = now;
                 return restore_and_return(ctx, inner_off, XDP_DROP);
             }
+            if (mc_handshake_rate_exceeded(&key, now, &mc_status_rate4, &mc_status_rate6,
+                                            MC_STATUS_RATE_WINDOW_NS, MC_STATUS_RATE_MAX))
+                return penalize_and_drop(ctx, inner_off, &key, now);
             pending->state = MC_AWAIT_PING;
             pending->expected_seq += payload_len;
             pending->fails = 0;
@@ -597,7 +742,7 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
         }
 
         if (pending->state == MC_AWAIT_PING) {
-            if (!inspect_ping_request(cursor, payload_end)) {
+            if (!inspect_ping_request(cursor, payload_end, data_end)) {
                 pending->last_seen_ns = now;
                 return restore_and_return(ctx, inner_off, XDP_DROP);
             }
@@ -609,10 +754,13 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
         }
 
         if (pending->state == MC_AWAIT_LOGIN) {
-            if (!inspect_login_packet(cursor, payload_end, pending->protocol_version)) {
+            if (!inspect_login_packet(cursor, payload_end, pending->protocol_version, data_end)) {
                 pending->last_seen_ns = now;
                 return restore_and_return(ctx, inner_off, XDP_DROP);
             }
+            if (mc_handshake_rate_exceeded(&key, now, &mc_login_rate4, &mc_login_rate6,
+                                            MC_LOGIN_RATE_WINDOW_NS, MC_LOGIN_RATE_MAX))
+                return penalize_and_drop(ctx, inner_off, &key, now);
             return verify_and_pass(ctx, inner_off, &key, now);
         }
 

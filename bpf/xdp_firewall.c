@@ -43,13 +43,14 @@ static __always_inline int check_tcp_ipv4(
     // Malformed-packet check already ran above; fragments dropped before we arrive.
     if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
         __u64 now = bpf_ktime_get_ns();
+        struct xdp_runtime_cfg *cfg = runtime_cfg();
         if (is_trusted_v4(ip->saddr))
-            return allow_new_tcp_syn(&key, dest_port, true, false, now);
+            return allow_new_tcp_syn(&key, dest_port, true, false, now, cfg);
 
         struct trusted_v4_key tk = { .prefixlen = 32, .addr = ip->saddr };
         struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v4, &tk);
         if (av && acl_port_match(av, dest_port))
-            return allow_new_tcp_syn(&key, dest_port, true, false, now);
+            return allow_new_tcp_syn(&key, dest_port, true, false, now, cfg);
 
     }
 
@@ -87,15 +88,16 @@ static __always_inline int check_tcp_ipv6(
     // Malformed-packet check already ran above; fragments dropped before we arrive.
     if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
         __u64 now = bpf_ktime_get_ns();
+        struct xdp_runtime_cfg *cfg = runtime_cfg();
         if (is_trusted_v6(&ipv6->saddr))
-            return allow_new_tcp_syn(&key, dest_port, true, false, now);
+            return allow_new_tcp_syn(&key, dest_port, true, false, now, cfg);
 
         struct trusted_v6_key tk;
         tk.prefixlen = 128;
         __builtin_memcpy(tk.addr, &ipv6->saddr, 16);
         struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v6, &tk);
         if (av && acl_port_match(av, dest_port))
-            return allow_new_tcp_syn(&key, dest_port, true, false, now);
+            return allow_new_tcp_syn(&key, dest_port, true, false, now, cfg);
 
     }
 
@@ -158,6 +160,14 @@ static __always_inline int check_udp_ipv4(
         return XDP_DROP;
     }
 
+    // Trusted sources bypass the threat-intel blocklist and all rate limits at
+    // all times — mirrors the TCP path, where a trusted SYN returns before the
+    // AbuseIPDB/handler-block checks ever run.
+    if (is_trusted_v4(ip->saddr)) {
+        count(CNT_UDP_PASS);
+        return XDP_PASS;
+    }
+
     if (abuseipdb_active() && is_abuseipdb_v4(ip->saddr)) {
         count(CNT_ABUSEIPDB_DROP);
         count(CNT_UDP_DROP);
@@ -167,18 +177,18 @@ static __always_inline int check_udp_ipv4(
     }
 
     {
+        // Reached only by untrusted sources (trusted returned above), so the
+        // global UDP rate block applies unconditionally here.
         __u32 rl_key = 0;
         struct udp_percpu_local *local_pre = bpf_map_lookup_elem(&udp_percpu_acc, &rl_key);
         if (local_pre && local_pre->blocked_until_ns != 0) {
             if (now < local_pre->blocked_until_ns) {
-                if (!is_trusted_v4(ip->saddr)) {
-                    local_pre->local_bytes = 0;
-                    count(CNT_UDP_GLOBAL_RATE_DROP);
-                    count(CNT_UDP_DROP);
-                    emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
-                              key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
-                    return XDP_DROP;
-                }
+                local_pre->local_bytes = 0;
+                count(CNT_UDP_GLOBAL_RATE_DROP);
+                count(CNT_UDP_DROP);
+                emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                          key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+                return XDP_DROP;
             } else {
                 local_pre->blocked_until_ns = 0;
             }
@@ -191,11 +201,6 @@ static __always_inline int check_udp_ipv4(
             count(CNT_UDP_PASS);
             return XDP_PASS;
         }
-    }
-
-    if (is_trusted_v4(ip->saddr)) {
-        count(CNT_UDP_PASS);
-        return XDP_PASS;
     }
 
     {
@@ -306,19 +311,27 @@ static __always_inline int check_udp_ipv6(
         return XDP_DROP;
     }
 
+    // Trusted sources bypass all rate limits at all times (parallel to the IPv4
+    // path; the AbuseIPDB blocklist is IPv4-only, so there is nothing else to
+    // skip here).
+    if (is_trusted_v6(&ipv6->saddr)) {
+        count(CNT_UDP_PASS);
+        return XDP_PASS;
+    }
+
     {
+        // Reached only by untrusted sources (trusted returned above), so the
+        // global UDP rate block applies unconditionally here.
         __u32 rl_key = 0;
         struct udp_percpu_local *local_pre = bpf_map_lookup_elem(&udp_percpu_acc, &rl_key);
         if (local_pre && local_pre->blocked_until_ns != 0) {
             if (now < local_pre->blocked_until_ns) {
-                if (!is_trusted_v6(&ipv6->saddr)) {
-                    local_pre->local_bytes = 0;
-                    count(CNT_UDP_GLOBAL_RATE_DROP);
-                    count(CNT_UDP_DROP);
-                    emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
-                              key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
-                    return XDP_DROP;
-                }
+                local_pre->local_bytes = 0;
+                count(CNT_UDP_GLOBAL_RATE_DROP);
+                count(CNT_UDP_DROP);
+                emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
+                          key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+                return XDP_DROP;
             } else {
                 local_pre->blocked_until_ns = 0;
             }
@@ -331,11 +344,6 @@ static __always_inline int check_udp_ipv6(
             count(CNT_UDP_PASS);
             return XDP_PASS;
         }
-    }
-
-    if (is_trusted_v6(&ipv6->saddr)) {
-        count(CNT_UDP_PASS);
-        return XDP_PASS;
     }
 
     {

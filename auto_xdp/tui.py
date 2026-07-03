@@ -304,8 +304,26 @@ def _all_map_info() -> dict[str, dict[str, Any]]:
 
 def _dump_count(path: Path) -> int | None:
     try:
-        data = _run_json(["bpftool", "-j", "map", "dump", "pinned", str(path)])
-    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        out = subprocess.check_output(
+            ["bpftool", "-j", "map", "dump", "pinned", str(path)],
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    # bpftool -j emits a compact JSON array with one object per entry, each
+    # wrapped as {"key":...,"value":...} (or "values" for per-CPU maps). For a
+    # large conntrack/LRU map (10^5–10^6 entries) json.loads would build an
+    # equally large list of dicts just so we can take its length. Counting the
+    # per-entry "key" wrapper over the raw bytes yields the same number without
+    # materializing any of it — nested per-CPU/struct objects use other field
+    # names ("value"/"cpu"/struct members), never the wrapper key.
+    n = out.count(b'"key":')
+    if n:
+        return n
+    # Empty map ("[]") or an unexpected format: fall back to a real parse.
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
         return None
     return len(data) if isinstance(data, list) else None
 
@@ -383,8 +401,13 @@ def _collect_map_usage(
                 note = "cached"
             else:
                 current, note = _sample_count(path, high_churn_interval)
-        elif kind in {"array", "percpu_array"}:
-            current, note = _sample_count(path, count_interval)
+        elif kind in {"array", "percpu_array"} and maximum is not None:
+            # Array maps are dense — every index always exists, so the live
+            # entry count is exactly max_entries. Use the metadata instead of
+            # spawning a `bpftool map dump` per array map (tsc_port alone is a
+            # 65536-entry array dumped every cycle otherwise).
+            current = maximum
+            note = "array"
         elif kind in {"ringbuf", "prog_array"}:
             current = None
         else:
