@@ -1008,6 +1008,10 @@ Rules & Features:
 
 ---
 
+Development workflow: Auto XDP is developed with AI-assisted implementation. All architecture decisions, specs, and code review are done by me; every change is verified against the test suite and CI across supported distros before merging.
+
+---
+
 ## License
 
 [MPL 2.0](./LICENSE) © 2026 Yunheng Liu
