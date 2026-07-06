@@ -30,6 +30,10 @@ from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcileP
 
 log = logging.getLogger(__name__)
 
+# A rate-limit map slot holds either the standalone SYN-rate map or a per-field
+# view over the shared port-policy map; both expose active()/set()/delete().
+RateLimitMap = BpfSynRatePortsMap | BpfPortPolicyViewMap
+
 
 def _compute_cfg_flags(desired: DesiredState) -> int:
     flags = 0
@@ -125,13 +129,13 @@ class XdpBackend(PortBackend):
         self._conntrack_stale_rounds: dict[bytes, int] = {}
         self._tcp_policy_map: BpfPortPolicyMap | None = None
         self._udp_policy_map: BpfPortPolicyMap | None = None
-        self.syn_rate_map: BpfSynRatePortsMap | None = None
-        self.syn_agg_rate_map: BpfSynRatePortsMap | None = None
-        self.tcp_conn_limit_map: BpfSynRatePortsMap | None = None
-        self.tcp_conn_prefix_limit_map: BpfSynRatePortsMap | None = None
-        self.tcp_conn_port_limit_map: BpfSynRatePortsMap | None = None
-        self.udp_rate_map: BpfSynRatePortsMap | None = None
-        self.udp_agg_rate_map: BpfSynRatePortsMap | None = None
+        self.syn_rate_map: RateLimitMap | None = None
+        self.syn_agg_rate_map: RateLimitMap | None = None
+        self.tcp_conn_limit_map: RateLimitMap | None = None
+        self.tcp_conn_prefix_limit_map: RateLimitMap | None = None
+        self.tcp_conn_port_limit_map: RateLimitMap | None = None
+        self.udp_rate_map: RateLimitMap | None = None
+        self.udp_agg_rate_map: RateLimitMap | None = None
         self.acl_maps: BpfAclMaps | None = None
         self.runtime_config_map: BpfRuntimeConfigMap | None = None
         self.global_rl_map: BpfGlobalRlMap | None = None
@@ -185,11 +189,12 @@ class XdpBackend(PortBackend):
         self._risk_maps: BpfRiskMaps | None = None
         self._abuseipdb_syncer: AbuseIPDBSyncer | None = None
         try:
-            self._risk_maps = BpfRiskMaps(
-                cfg.ABUSEIPDB_RISK_MAP_PATH4,
-                self.runtime_config_map,
-            )
-            if cfg.ABUSEIPDB_ENABLED:
+            if self.runtime_config_map is not None:
+                self._risk_maps = BpfRiskMaps(
+                    cfg.ABUSEIPDB_RISK_MAP_PATH4,
+                    self.runtime_config_map,
+                )
+            if cfg.ABUSEIPDB_ENABLED and self._risk_maps is not None:
                 self._abuseipdb_syncer = AbuseIPDBSyncer(
                     self._risk_maps,
                     base_url=cfg.ABUSEIPDB_BASE_URL,
@@ -539,7 +544,7 @@ class XdpBackend(PortBackend):
 
     def _apply_rate_map_delta(
         self,
-        rate_map: BpfSynRatePortsMap,
+        rate_map: RateLimitMap,
         upserts: dict[int, int],
         removals: set[int],
         dry_run: bool,

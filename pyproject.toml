@@ -4,16 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-xdp"
-version = "26.5.12"
+version = "26.7.7"
 description = "Auto-sync Linux listening ports into XDP or nftables."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "tomli>=1.1.0; python_version < '3.11'",
-]
 license = { text = "MPL-2.0" }
 authors = [
     { name = "Yunheng Liu", email = "liu@liuu.org" },
+]
+dependencies = [
+    "tomli>=1.1.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.8",
 ]
 
 [project.scripts]
@@ -30,3 +35,18 @@ auto_xdp = ["xdp_required_maps.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+
+[tool.mypy]
+python_version = "3.10"
+platform = "linux"
+files = [
+    "auto_xdp",
+    "pkt_relay.py",
+    "auto_xdp_bpf_helpers.py",
+    "xdp_port_sync.py",
+]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true

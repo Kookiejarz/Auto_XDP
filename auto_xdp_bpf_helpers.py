@@ -13,6 +13,7 @@ import platform
 import socket
 import struct
 import subprocess
+import sys
 import time
 
 try:
@@ -67,11 +68,11 @@ def cmd_pin_maps(prog_id: int, pin_dir: str) -> int:
             pin_path = f"{pin_dir}/{name}"
             subprocess.check_call(["bpftool", "map", "pin", "id", str(map_id), pin_path])
         if not map_ids:
-            print("pin-maps failed: no map ids found in bpftool prog json", file=os.sys.stderr)
+            print("pin-maps failed: no map ids found in bpftool prog json", file=sys.stderr)
             return 1
         return 0
     except Exception as exc:
-        print(f"pin-maps failed: {exc}", file=os.sys.stderr)
+        print(f"pin-maps failed: {exc}", file=sys.stderr)
         return 1
 
 
@@ -139,7 +140,7 @@ def cmd_seed_tcp_conntrack(map_path_v4: str, map_path_v6: str) -> int:
         map_v4 = _open_optional_map(map_path_v4)
         map_v6 = _open_optional_map(map_path_v6)
     except OSError as exc:
-        print(f"seed-tcp-conntrack failed to open map: {exc}", file=os.sys.stderr)
+        print(f"seed-tcp-conntrack failed to open map: {exc}", file=sys.stderr)
         return 1
 
     if map_v4 is None and map_v6 is None:
@@ -153,6 +154,7 @@ def cmd_seed_tcp_conntrack(map_path_v4: str, map_path_v6: str) -> int:
     value_v4 = map_v4[1] if map_v4 is not None else None
     value_v6 = map_v6[1] if map_v6 is not None else None
     if map_v4 is not None:
+        assert value_v4 is not None  # value_v4 is set whenever map_v4 is
         struct.pack_into(
             "=I4xQQQ",
             attr_v4,
@@ -163,6 +165,7 @@ def cmd_seed_tcp_conntrack(map_path_v4: str, map_path_v6: str) -> int:
             0,
         )
     if map_v6 is not None:
+        assert value_v6 is not None  # value_v6 is set whenever map_v6 is
         struct.pack_into(
             "=I4xQQQ",
             attr_v6,
@@ -179,10 +182,12 @@ def cmd_seed_tcp_conntrack(map_path_v4: str, map_path_v6: str) -> int:
         try:
             packed = pack_ct_key(conn)
             if len(packed) == 12 and map_v4 is not None:
+                assert value_v4 is not None
                 ctypes.memmove(key_v4, packed, len(packed))
                 struct.pack_into("=Q", value_v4, 0, stamp)
                 bpf(BPF_MAP_UPDATE_ELEM, attr_v4)
             elif len(packed) == 36 and map_v6 is not None:
+                assert value_v6 is not None
                 ctypes.memmove(key_v6, packed, len(packed))
                 struct.pack_into("=Q", value_v6, 0, stamp)
                 bpf(BPF_MAP_UPDATE_ELEM, attr_v6)

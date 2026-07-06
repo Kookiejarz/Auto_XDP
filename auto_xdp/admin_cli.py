@@ -32,9 +32,9 @@ try:
     import tomllib  # Python 3.11+
 except ImportError:
     try:
-        import tomli as tomllib  # type: ignore[no-redef]
+        import tomli as tomllib
     except ImportError:
-        tomllib = None  # type: ignore[assignment]
+        tomllib = None
 
 
 _BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -1068,16 +1068,16 @@ def _cmd_slot_list(args: argparse.Namespace) -> int:
         print("")
     print("Available handlers:")
     for name in ("gre", "esp", "sctp"):
-        proto, obj_name = _BUILTIN_SLOT_INFO[name]
+        proto_num, obj_name = _BUILTIN_SLOT_INFO[name]
         obj_path = handlers_dir / obj_name
-        pin_path = slot_pin_dir / f"proto_{proto}"
+        pin_path = slot_pin_dir / f"proto_{proto_num}"
         if obj_path.exists():
             if pin_path.exists():
-                print(f"  {name:<6} (proto {proto})  [loaded]")
+                print(f"  {name:<6} (proto {proto_num})  [loaded]")
             else:
-                print(f"  {name:<6} (proto {proto})")
+                print(f"  {name:<6} (proto {proto_num})")
         else:
-            print(f"  {name:<6} (proto {proto})  [.o not found: {obj_path}]")
+            print(f"  {name:<6} (proto {proto_num})  [.o not found: {obj_path}]")
     return 0
 
 
@@ -1203,9 +1203,8 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
 
     print(f"Loaded handler for proto {proto} from {obj_path}")
     _ensure_config_exists(path)
-    slot_args = argparse.Namespace(config=str(path), name=builtin_name) if builtin_name else None
     if builtin_name:
-        _cmd_slot_enable_builtin(slot_args)
+        _cmd_slot_enable_builtin(argparse.Namespace(config=str(path), name=builtin_name))
     else:
         _cmd_slot_enable_custom(argparse.Namespace(config=str(path), proto=proto, path=str(obj_path)))
     print(f"  config: {path}")
@@ -1299,8 +1298,8 @@ def _cmd_port_handler_list(args: argparse.Namespace) -> int:
     if not available:
         print("  (none)")
         return 0
-    for path in available:
-        print(f"  {path.stem:<20} {path}")
+    for handler_path in available:
+        print(f"  {handler_path.stem:<20} {handler_path}")
     return 0
 
 
@@ -2340,6 +2339,9 @@ def _apply_xdp_accumulator(
     )
 
     if same_context:
+        # same_context already verified these are ints via isinstance above.
+        assert isinstance(prev_raw_total, int) and isinstance(prev_acc_total, int)
+        assert isinstance(prev_raw_drop, int) and isinstance(prev_acc_drop, int)
         if current_total >= prev_raw_total:
             acc_total = prev_acc_total + (current_total - prev_raw_total)
         else:
@@ -2372,6 +2374,8 @@ def _apply_xdp_accumulator(
     elif same_iface:
         # map_id changed (BPF reload) or bpftool couldn't get map_id:
         # treat current raw as new counts on top of previous accumulated total
+        # same_iface already verified these are ints via isinstance above.
+        assert isinstance(prev_acc_total, int) and isinstance(prev_acc_drop, int)
         acc_total = prev_acc_total + current_total
         acc_drop = prev_acc_drop + current_drop
 

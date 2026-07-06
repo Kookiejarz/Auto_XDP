@@ -9,9 +9,9 @@ try:
     import tomllib  # Python 3.11+
 except ImportError:
     try:
-        import tomli as tomllib  # type: ignore[no-redef]
+        import tomli as tomllib
     except ImportError:
-        tomllib = None  # type: ignore[assignment]
+        tomllib = None
 
 
 log = logging.getLogger(__name__)
@@ -184,6 +184,29 @@ TSC_PFX4_MAP_PATH = ""
 TSC_PFX6_MAP_PATH = ""
 TSC_PORT_MAP_PATH = ""
 
+# Map paths derived from BPF_PIN_DIR. Declared here so they are visible at
+# module scope; the real values are filled in by _set_bpf_pin_dir() below.
+BPF_PIN_DIR = ""
+TCP_MAP_PATH = ""
+UDP_MAP_PATH = ""
+SCTP_MAP_PATH = ""
+TCP_CONNTRACK_MAP_PATH4 = ""
+TCP_CONNTRACK_MAP_PATH6 = ""
+UDP_CONNTRACK_MAP_PATH4 = ""
+UDP_CONNTRACK_MAP_PATH6 = ""
+TRUSTED_IPS_MAP_PATH4 = ""
+TRUSTED_IPS_MAP_PATH6 = ""
+TCP_PORT_POLICY_MAP_PATH = ""
+UDP_PORT_POLICY_MAP_PATH = ""
+UDP_GLOBAL_RL_MAP_PATH = ""
+XDP_RUNTIME_CFG_MAP_PATH = ""
+TCP_ACL_MAP_PATH4 = ""
+TCP_ACL_MAP_PATH6 = ""
+UDP_ACL_MAP_PATH4 = ""
+UDP_ACL_MAP_PATH6 = ""
+SIT4_ENDPOINTS_MAP_PATH = ""
+REQUIRED_XDP_MAP_PATHS: tuple[str, ...] = ()
+
 
 def _set_bpf_pin_dir(pin_dir: str) -> None:
     """Update BPF_PIN_DIR and every derived map-path global in one place."""
@@ -194,7 +217,6 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     global TRUSTED_IPS_MAP_PATH4, TRUSTED_IPS_MAP_PATH6
     global TCP_PORT_POLICY_MAP_PATH, UDP_PORT_POLICY_MAP_PATH
     global UDP_GLOBAL_RL_MAP_PATH, XDP_RUNTIME_CFG_MAP_PATH
-    global BOGON_CFG_MAP_PATH, OBSERVABILITY_CFG_MAP_PATH
     global TCP_ACL_MAP_PATH4, TCP_ACL_MAP_PATH6
     global UDP_ACL_MAP_PATH4, UDP_ACL_MAP_PATH6
     global SIT4_ENDPOINTS_MAP_PATH
@@ -232,6 +254,7 @@ _set_bpf_pin_dir(_BPF_PIN_DIR)
 
 
 def normalize_cidr(cidr_str: str) -> str:
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network
     if ":" in cidr_str:
         net = ipaddress.IPv6Network(cidr_str, strict=False)
     else:
@@ -273,7 +296,7 @@ def _coerce_backend(value: object, default: str = BACKEND_AUTO) -> str:
 
 def _coerce_positive_float(value: object, path: str, default: float) -> float:
     try:
-        parsed = float(value)
+        parsed = float(value)  # type: ignore[arg-type]  # runtime-coerce arbitrary TOML value
     except (TypeError, ValueError):
         log.warning("Invalid %s %r; using %s", path, value, default)
         return default
@@ -285,7 +308,7 @@ def _coerce_positive_float(value: object, path: str, default: float) -> float:
 
 def _coerce_positive_int(value: object, path: str, default: int) -> int:
     try:
-        parsed = int(value)
+        parsed = int(value)  # type: ignore[call-overload]  # runtime-coerce arbitrary TOML value
     except (TypeError, ValueError):
         log.warning("Invalid %s %r; using %s", path, value, default)
         return default
@@ -297,7 +320,7 @@ def _coerce_positive_int(value: object, path: str, default: int) -> int:
 
 def _coerce_nonnegative_float(value: object, path: str, default: float) -> float:
     try:
-        parsed = float(value)
+        parsed = float(value)  # type: ignore[arg-type]  # runtime-coerce arbitrary TOML value
     except (TypeError, ValueError):
         log.warning("Invalid %s %r; using %s", path, value, default)
         return default
@@ -311,7 +334,7 @@ def _coerce_prefix_len(value: object, path: str, default: int, maximum: int) -> 
     if isinstance(value, str):
         value = value.removeprefix("/")
     try:
-        parsed = int(value)
+        parsed = int(value)  # type: ignore[call-overload]  # runtime-coerce arbitrary TOML value
     except (TypeError, ValueError):
         log.warning("Invalid %s %r; using %s", path, value, default)
         return default
