@@ -271,6 +271,7 @@ class BpfLpmMap(BpfFdMap):
         self._load_cache()
 
     def _pack_key(self, cidr_str: str) -> str:
+        net: ipaddress.IPv4Network | ipaddress.IPv6Network
         if self._family == socket.AF_INET:
             net = ipaddress.IPv4Network(cidr_str, strict=False)
         else:
@@ -412,6 +413,7 @@ class BpfAclMap(BpfFdMap):
         self._load_cache()
 
     def _pack_key(self, cidr_str: str) -> str:
+        net: ipaddress.IPv4Network | ipaddress.IPv6Network
         if self._family == socket.AF_INET:
             net = ipaddress.IPv4Network(cidr_str, strict=False)
         else:
@@ -804,7 +806,7 @@ class BpfPortPolicyMap(BpfFdMap):
     def __init__(self, path: str) -> None:
         super().__init__(path)
         self._max_entries: int = map_max_entries(self.fd)
-        self._cache: dict[int, tuple[int, int, int, int, int, int, int, int]] = {}
+        self._cache: dict[int, tuple[int, ...]] = {}
         self._key = ctypes.create_string_buffer(4)
         self._val = ctypes.create_string_buffer(self._STRUCT_SIZE)
         self._update_attr = ctypes.create_string_buffer(128)
@@ -839,10 +841,10 @@ class BpfPortPolicyMap(BpfFdMap):
             port = struct.unpack_from("=I", keys_buf, i * 4)[0]
             self._cache[port] = struct.unpack_from(self._STRUCT_FMT, vals_buf, i * self._STRUCT_SIZE)
 
-    def active_structs(self) -> dict[int, tuple[int, int, int, int, int, int, int, int]]:
+    def active_structs(self) -> dict[int, tuple[int, ...]]:
         return dict(self._cache)
 
-    def set_fields(self, port: int, fields: tuple[int, int, int, int, int, int, int, int], dry_run: bool = False) -> bool:
+    def set_fields(self, port: int, fields: tuple[int, ...], dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s port %d fields=%s", self.path, port, fields)
             return True

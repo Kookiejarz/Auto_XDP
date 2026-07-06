@@ -75,9 +75,9 @@ try:
     import tomllib
 except ImportError:
     try:
-        import tomli as tomllib  # type: ignore[no-redef]
+        import tomli as tomllib
     except ImportError:
-        tomllib = None  # type: ignore[assignment]
+        tomllib = None
 
 
 @dataclass
@@ -441,7 +441,7 @@ def _safe_service(port: int, proto: str) -> str:
     return name
 
 
-def _read_policy(path: str) -> dict[int, tuple[int, int, int, int, int, int]]:
+def _read_policy(path: str) -> dict[int, tuple[int, ...]]:
     if not Path(path).exists():
         return {}
     try:

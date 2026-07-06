@@ -67,7 +67,7 @@ def open_backend(name: str) -> PortBackend:
 
     xdp_status = _probe_backend(XdpBackend)
     if xdp_status.available:
-        backend = XdpBackend()
+        backend: PortBackend = XdpBackend()
         log.info("Backend selected: xdp")
         return backend
 
@@ -243,6 +243,9 @@ def watch(
                 last_event_t = time.monotonic() - cfg.DEBOUNCE_SECONDS
                 first_event_t = last_event_t
 
+            if backend is None:
+                continue
+
             now = time.monotonic()
             if last_event_t and (
                 now - last_event_t >= cfg.DEBOUNCE_SECONDS
@@ -258,6 +261,7 @@ def watch(
                     log.warning("Backend may be broken; will attempt to re-initialize.")
                     backend.close()
                     backend = None
+                    continue
 
                 last_event_t = 0.0
                 first_event_t = 0.0
