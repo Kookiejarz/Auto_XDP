@@ -15,14 +15,20 @@ NR_BPF: int = {
     "armv6l": 386,
 }.get(platform.machine(), 321)
 
+BPF_MAP_CREATE = 0
 BPF_MAP_LOOKUP_ELEM = 1
 BPF_MAP_UPDATE_ELEM = 2
 BPF_MAP_DELETE_ELEM = 3
 BPF_MAP_GET_NEXT_KEY = 4
 BPF_OBJ_GET = 7
+BPF_MAP_GET_FD_BY_ID = 14
 BPF_OBJ_GET_INFO_BY_FD = 15
 BPF_MAP_LOOKUP_BATCH = 24
 BPF_F_LOCK = 4
+
+BPF_MAP_TYPE_LRU_HASH = 9
+BPF_MAP_TYPE_ARRAY_OF_MAPS = 12
+BPF_F_INNER_MAP = 0x1000
 
 
 def bpf(cmd: int, attr: ctypes.Array | bytearray | memoryview) -> int:
@@ -70,3 +76,41 @@ def map_id(fd: int) -> int:
     bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
     # bpf_map_info: type(u32) at 0, id(u32) at 4
     return struct.unpack_from("=I", info, 4)[0]
+
+
+def map_create(map_type: int, key_size: int, value_size: int,
+               max_entries: int, map_flags: int = 0,
+               inner_map_fd: int = 0, name: bytes = b"") -> int:
+    """BPF_MAP_CREATE. Returns the new map fd (caller closes)."""
+    attr = ctypes.create_string_buffer(128)
+    struct.pack_into("=IIIIII", attr, 0, map_type, key_size, value_size,
+                     max_entries, map_flags, inner_map_fd)
+    # numa_node at 24 stays 0; map_name is 16 bytes at offset 28.
+    struct.pack_into("16s", attr, 28, name[:15])
+    return bpf(BPF_MAP_CREATE, attr)
+
+
+def map_get_fd_by_id(map_id_: int) -> int:
+    """BPF_MAP_GET_FD_BY_ID. Returns an fd for the map (caller closes)."""
+    attr = ctypes.create_string_buffer(128)
+    struct.pack_into("=I", attr, 0, map_id_)
+    return bpf(BPF_MAP_GET_FD_BY_ID, attr)
+
+
+def probe_inner_map_support() -> bool:
+    """True if the kernel accepts BPF_F_INNER_MAP inners in an
+    ARRAY_OF_MAPS outer (kernel 5.10+)."""
+    inner_fd = -1
+    outer_fd = -1
+    try:
+        inner_fd = map_create(BPF_MAP_TYPE_LRU_HASH, 4, 16, 1,
+                              BPF_F_INNER_MAP, name=b"axdp_probe_i")
+        outer_fd = map_create(BPF_MAP_TYPE_ARRAY_OF_MAPS, 4, 4, 1,
+                              inner_map_fd=inner_fd, name=b"axdp_probe_o")
+        return True
+    except OSError:
+        return False
+    finally:
+        for fd in (inner_fd, outer_fd):
+            if fd >= 0:
+                os.close(fd)
