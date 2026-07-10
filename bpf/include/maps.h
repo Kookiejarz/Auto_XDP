@@ -139,19 +139,48 @@ struct {
     __type(value, struct tcp_port_policy_cfg);
 } tcp_port_policies SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
-    __type(key, struct syn_rate_key_v4);
-    __type(value, struct syn_rate_val);
-} syn4 SEC(".maps");
+/* Per-port rate-limit isolation: outer array indexed directly by dport.
+ * Each occupied slot holds a per-port LRU created by userspace with
+ * BPF_F_INNER_MAP (capacities may differ per port; kernel 5.10+).
+ * NULL slot = no rate limit configured for that port. */
+#define RATE_MAP_DEFAULT_ENTRIES_V4 16384
+#define RATE_MAP_DEFAULT_ENTRIES_V6 4096
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
-    __type(key, struct syn_rate_key_v6);
-    __type(value, struct syn_rate_val);
-} syn6 SEC(".maps");
+#ifndef BPF_F_INNER_MAP
+#define BPF_F_INNER_MAP (1U << 12)
+#endif
+
+#define DEFINE_RATE_OUTER_V4(name)                                  \
+    struct {                                                        \
+        __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);                   \
+        __uint(max_entries, 65536);                                 \
+        __type(key, __u32);                                         \
+        __array(values, struct {                                    \
+            __uint(type, BPF_MAP_TYPE_LRU_HASH);                    \
+            __uint(max_entries, RATE_MAP_DEFAULT_ENTRIES_V4);       \
+            __uint(map_flags, BPF_F_INNER_MAP);                     \
+            __type(key, struct syn_rate_key_v4);                    \
+            __type(value, struct syn_rate_val);                     \
+        });                                                         \
+    } name SEC(".maps")
+
+#define DEFINE_RATE_OUTER_V6(name)                                  \
+    struct {                                                        \
+        __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);                   \
+        __uint(max_entries, 65536);                                 \
+        __type(key, __u32);                                         \
+        __array(values, struct {                                    \
+            __uint(type, BPF_MAP_TYPE_LRU_HASH);                    \
+            __uint(max_entries, RATE_MAP_DEFAULT_ENTRIES_V6);       \
+            __uint(map_flags, BPF_F_INNER_MAP);                     \
+            __type(key, struct syn_rate_key_v6);                    \
+            __type(value, struct syn_rate_val);                     \
+        });                                                         \
+    } name SEC(".maps")
+
+/* Per-source SYN rate state, one inner LRU per rate-limited port. */
+DEFINE_RATE_OUTER_V4(syn4);
+DEFINE_RATE_OUTER_V6(syn6);
 
 // Per-port UDP policy config, populated at runtime by xdp_port_sync.
 // Key: dest port (host byte order). Value: packet-rate and aggregate-byte-rate controls.
@@ -162,19 +191,9 @@ struct {
     __type(value, struct udp_port_policy_cfg);
 } udp_port_policies SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
-    __type(key, struct syn_rate_key_v4);
-    __type(value, struct syn_rate_val);
-} udprt4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
-    __type(key, struct syn_rate_key_v6);
-    __type(value, struct syn_rate_val);
-} udprt6 SEC(".maps");
+/* Per-source UDP rate state, one inner LRU per rate-limited port. */
+DEFINE_RATE_OUTER_V4(udprt4);
+DEFINE_RATE_OUTER_V6(udprt6);
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);

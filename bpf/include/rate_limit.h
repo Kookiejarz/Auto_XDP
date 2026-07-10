@@ -104,16 +104,18 @@ static __always_inline void fill_tcp_src_conn_key_v6(
 }
 
 
-/* Sliding-window limiter: reset on expiry, drop if unit_field + increment > max. */
+/* Sliding-window limiter: reset on expiry, drop if unit_field + increment > max.
+ * `map` is a map pointer expression (e.g. &synag4 or an inner map from
+ * a per-port ARRAY_OF_MAPS lookup). */
 #define WINDOW_RATE_CHECK(map, rkey, val_type, unit_field, now, window_ns, increment, max) \
     do {                                                                                    \
-        val_type *_rv = bpf_map_lookup_elem(&(map), &(rkey));                             \
+        val_type *_rv = bpf_map_lookup_elem((map), &(rkey));                              \
         if (!_rv) {                                                                         \
             val_type _new;                                                                  \
             __builtin_memset(&_new, 0, sizeof(_new));                                      \
             _new.window_start_ns = (now);                                                   \
             _new.unit_field = (increment);                                                  \
-            bpf_map_update_elem(&(map), &(rkey), &_new, BPF_ANY);                         \
+            bpf_map_update_elem((map), &(rkey), &_new, BPF_ANY);                          \
             return XDP_PASS;                                                                \
         }                                                                                   \
         if ((now) - _rv->window_start_ns >= (window_ns)) {                                 \
@@ -128,7 +130,7 @@ static __always_inline void fill_tcp_src_conn_key_v6(
     } while (0)
 
 static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
-                                          __u32 rate_max,
+                                          __u32 dest_port, __u32 rate_max,
                                           __u32 prefix_v4, __u32 prefix_v6,
                                           struct xdp_runtime_cfg *cfg)
 {
@@ -138,14 +140,22 @@ static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
     __u64 window_ns = cfg_rate_window_ns(cfg);
 
     if (key->family == CT_FAMILY_IPV4) {
+        void *inner = bpf_map_lookup_elem(&syn4, &dest_port);
+        if (!inner)
+            return XDP_PASS; /* no per-port map yet: pass, syncer will create it */
         struct syn_rate_key_v4 rkey;
         fill_source_rate_key_v4(&rkey, key, prefix_v4);
-        WINDOW_RATE_CHECK(syn4, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
     }
 
-    struct syn_rate_key_v6 rkey;
-    fill_source_rate_key_v6(&rkey, key, prefix_v6);
-    WINDOW_RATE_CHECK(syn6, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+    {
+        void *inner = bpf_map_lookup_elem(&syn6, &dest_port);
+        if (!inner)
+            return XDP_PASS;
+        struct syn_rate_key_v6 rkey;
+        fill_source_rate_key_v6(&rkey, key, prefix_v6);
+        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+    }
 }
 
 static __always_inline int syn_agg_rate_check(struct flow_key *key, __u64 now,
@@ -161,16 +171,16 @@ static __always_inline int syn_agg_rate_check(struct flow_key *key, __u64 now,
     if (key->family == CT_FAMILY_IPV4) {
         struct prefix_rate_key_v4 rkey;
         fill_prefix_rate_key_v4(&rkey, key, dest_port, prefix_v4);
-        WINDOW_RATE_CHECK(synag4, rkey, struct prefix_rate_val, units, now, window_ns, 1ULL, rate_max);
+        WINDOW_RATE_CHECK(&synag4, rkey, struct prefix_rate_val, units, now, window_ns, 1ULL, rate_max);
     }
 
     struct prefix_rate_key_v6 rkey;
     fill_prefix_rate_key_v6(&rkey, key, dest_port, prefix_v6);
-    WINDOW_RATE_CHECK(synag6, rkey, struct prefix_rate_val, units, now, window_ns, 1ULL, rate_max);
+    WINDOW_RATE_CHECK(&synag6, rkey, struct prefix_rate_val, units, now, window_ns, 1ULL, rate_max);
 }
 
 static __always_inline int udp_rate_check(struct flow_key *key, __u64 now,
-                                          __u32 rate_max,
+                                          __u32 dest_port, __u32 rate_max,
                                           __u32 prefix_v4, __u32 prefix_v6,
                                           struct xdp_runtime_cfg *cfg)
 {
@@ -180,14 +190,22 @@ static __always_inline int udp_rate_check(struct flow_key *key, __u64 now,
     __u64 window_ns = cfg_rate_window_ns(cfg);
 
     if (key->family == CT_FAMILY_IPV4) {
+        void *inner = bpf_map_lookup_elem(&udprt4, &dest_port);
+        if (!inner)
+            return XDP_PASS; /* no per-port map yet: pass, syncer will create it */
         struct syn_rate_key_v4 rkey;
         fill_source_rate_key_v4(&rkey, key, prefix_v4);
-        WINDOW_RATE_CHECK(udprt4, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
     }
 
-    struct syn_rate_key_v6 rkey;
-    fill_source_rate_key_v6(&rkey, key, prefix_v6);
-    WINDOW_RATE_CHECK(udprt6, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+    {
+        void *inner = bpf_map_lookup_elem(&udprt6, &dest_port);
+        if (!inner)
+            return XDP_PASS;
+        struct syn_rate_key_v6 rkey;
+        fill_source_rate_key_v6(&rkey, key, prefix_v6);
+        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+    }
 }
 
 static __always_inline int udp_agg_rate_check(struct flow_key *key, __u64 now,
@@ -204,12 +222,12 @@ static __always_inline int udp_agg_rate_check(struct flow_key *key, __u64 now,
     if (key->family == CT_FAMILY_IPV4) {
         struct prefix_rate_key_v4 rkey;
         fill_prefix_rate_key_v4(&rkey, key, dest_port, prefix_v4);
-        WINDOW_RATE_CHECK(udpag4, rkey, struct prefix_rate_val, units, now, window_ns, pkt_bytes, (__u64)rate_max);
+        WINDOW_RATE_CHECK(&udpag4, rkey, struct prefix_rate_val, units, now, window_ns, pkt_bytes, (__u64)rate_max);
     }
 
     struct prefix_rate_key_v6 rkey;
     fill_prefix_rate_key_v6(&rkey, key, dest_port, prefix_v6);
-    WINDOW_RATE_CHECK(udpag6, rkey, struct prefix_rate_val, units, now, window_ns, pkt_bytes, (__u64)rate_max);
+    WINDOW_RATE_CHECK(&udpag6, rkey, struct prefix_rate_val, units, now, window_ns, pkt_bytes, (__u64)rate_max);
 }
 
 static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
@@ -546,7 +564,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
     __u32 conn_port_limit_max   = policy ? policy->conn_port_limit_max   : 0;
 
     if (!bypass_rate) {
-        if (syn_rate_check(key, now, syn_rate_max, source_prefix_v4, source_prefix_v6, cfg) == XDP_DROP) {
+        if (syn_rate_check(key, now, dest_port, syn_rate_max, source_prefix_v4, source_prefix_v6, cfg) == XDP_DROP) {
             count(CNT_SYN_RATE_DROP);
             count(CNT_TCP_DROP);
             emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
