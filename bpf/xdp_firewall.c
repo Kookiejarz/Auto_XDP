@@ -221,7 +221,7 @@ static __always_inline int check_udp_ipv4(
     }
     policy = bpf_map_lookup_elem(&udp_port_policies, &dest_port);
     if (udp_rate_check(
-            &key, now,
+            &key, now, dest_port,
             policy ? policy->rate_max : 0,
             policy ? policy->source_prefix_v4 : 32,
             policy ? policy->source_prefix_v6 : 128,
@@ -366,7 +366,7 @@ static __always_inline int check_udp_ipv6(
     }
     policy = bpf_map_lookup_elem(&udp_port_policies, &dest_port);
     if (udp_rate_check(
-            &key, now,
+            &key, now, dest_port,
             policy ? policy->rate_max : 0,
             policy ? policy->source_prefix_v4 : 32,
             policy ? policy->source_prefix_v6 : 128,
