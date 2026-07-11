@@ -33,6 +33,10 @@ class DesiredState:
     tcp_conn_port_limits: dict[int, int] = field(default_factory=dict)
     udp_rate_limits: dict[int, int] = field(default_factory=dict)
     udp_agg_rate_limits: dict[int, int] = field(default_factory=dict)
+    # Per-port rate-limit inner map capacities (v4 entries); only ports whose
+    # tcp_syn/udp rate resolves > 0 get an entry.
+    tcp_rate_map_entries: dict[int, int] = field(default_factory=dict)
+    udp_rate_map_entries: dict[int, int] = field(default_factory=dict)
     acl_rules: dict[tuple[str, str], frozenset[int]] = field(default_factory=dict)
     bogon_filter_enabled: bool = False
     drop_events_enabled: bool = True

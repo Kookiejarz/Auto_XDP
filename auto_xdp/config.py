@@ -46,6 +46,12 @@ _UDP_RATE_BY_SERVICE: dict[str, int] = {}
 _UDP_AGG_BYTES_BY_PROC: dict[str, int] = {}
 _UDP_AGG_BYTES_BY_SERVICE: dict[str, int] = {}
 
+# Per-port rate-limit inner map capacities (ARRAY_OF_MAPS inners).
+RATE_MAP_ENTRIES_V4 = 16384
+RATE_MAP_ENTRIES_V6 = 4096
+_RATE_MAP_ENTRIES_BY_PROC: dict[str, int] = {}
+_RATE_MAP_ENTRIES_BY_SERVICE: dict[str, int] = {}
+
 # Default-on TCP protection knobs — applied when no explicit per-proc/service
 # entry exists. See docs/superpowers/specs/2026-05-06-tcp-default-on-protection-design.md.
 XDP_SENSITIVE_PORT_THRESHOLD = 5
@@ -350,6 +356,7 @@ def apply_toml_config(cfg: dict) -> None:
     global DISCOVERY_EXCLUDE_LOOPBACK, DISCOVERY_EXCLUDE_BIND_CIDRS, DISCOVERY_EXCLUDE_PORTS
     global PREFERRED_BACKEND, XDP_CONNTRACK_STALE_RECONCILES
     global RATE_LIMIT_SOURCE_PREFIX_V4, RATE_LIMIT_SOURCE_PREFIX_V6
+    global RATE_MAP_ENTRIES_V4, RATE_MAP_ENTRIES_V6
     global XDP_TCP_TIMEOUT_SECONDS, XDP_UDP_TIMEOUT_SECONDS
     global XDP_CONNTRACK_REFRESH_SECONDS, XDP_CONNTRACK_GC_INTERVAL_SECONDS
     global XDP_ICMP_BURST_PACKETS, XDP_ICMP_RATE_PPS
@@ -384,10 +391,14 @@ def apply_toml_config(cfg: dict) -> None:
     _UDP_RATE_BY_SERVICE.clear()
     _UDP_AGG_BYTES_BY_PROC.clear()
     _UDP_AGG_BYTES_BY_SERVICE.clear()
+    _RATE_MAP_ENTRIES_BY_PROC.clear()
+    _RATE_MAP_ENTRIES_BY_SERVICE.clear()
     DISCOVERY_EXCLUDE_BIND_CIDRS.clear()
     DISCOVERY_EXCLUDE_PORTS.clear()
     RATE_LIMIT_SOURCE_PREFIX_V4 = 32
     RATE_LIMIT_SOURCE_PREFIX_V6 = 128
+    RATE_MAP_ENTRIES_V4 = 16384
+    RATE_MAP_ENTRIES_V6 = 4096
 
     perm = cfg.get("permanent_ports", {})
     for p in perm.get("tcp", []):
@@ -441,6 +452,10 @@ def apply_toml_config(cfg: dict) -> None:
     _UDP_RATE_BY_SERVICE.update({k: int(v) for k, v in rl.get("udp_by_service", {}).items()})
     _UDP_AGG_BYTES_BY_PROC.update({k: int(v) for k, v in rl.get("udp_agg_bytes_by_proc", {}).items()})
     _UDP_AGG_BYTES_BY_SERVICE.update({k: int(v) for k, v in rl.get("udp_agg_bytes_by_service", {}).items()})
+    RATE_MAP_ENTRIES_V4 = int(rl.get("map_entries_v4", 16384))
+    RATE_MAP_ENTRIES_V6 = int(rl.get("map_entries_v6", 4096))
+    _RATE_MAP_ENTRIES_BY_PROC.update({k: int(v) for k, v in rl.get("map_entries_by_proc", {}).items()})
+    _RATE_MAP_ENTRIES_BY_SERVICE.update({k: int(v) for k, v in rl.get("map_entries_by_service", {}).items()})
 
     BOGON_FILTER_ENABLED = bool(cfg.get("firewall", {}).get("bogon_filter", True))
     ISATTACK = cfg.get("under_attack", {})

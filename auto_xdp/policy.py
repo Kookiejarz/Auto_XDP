@@ -143,6 +143,26 @@ def _tcp_conn_port_limit(port: int, proc: str = "") -> int:
     return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT
 
 
+def rate_map_entries_v6(v4_entries: int) -> int:
+    """Derive the v6 inner-map capacity from the v4 one.
+
+    Ports carrying the global v4 default use the operator's global v6
+    value; per-port overrides derive as v4/4 with a floor of 64."""
+    if v4_entries == cfg.RATE_MAP_ENTRIES_V4:
+        return cfg.RATE_MAP_ENTRIES_V6
+    return max(v4_entries // 4, 64)
+
+
+def _rate_map_entries(port: int, proc: str = "") -> int:
+    """v4 inner rate-map capacity for a rate-limited port."""
+    explicit = _explicit_lookup(
+        port, proc, cfg._RATE_MAP_ENTRIES_BY_PROC, cfg._RATE_MAP_ENTRIES_BY_SERVICE,
+    )
+    if explicit is not None:
+        return explicit
+    return cfg.RATE_MAP_ENTRIES_V4
+
+
 def _udp_port_rate_limit(port: int, proc: str = "") -> int:
     """Return the UDP rate limit for a port, or 0 to skip rate limiting."""
     return _resolve_service_limit(port, "udp", proc, cfg._UDP_RATE_BY_PROC, cfg._UDP_RATE_BY_SERVICE)
@@ -188,13 +208,28 @@ def resolve_desired_state(observed: ObservedState) -> DesiredState:
     udp_ports = set(observed.udp) | set(cfg.UDP_PERMANENT)
     sctp_ports = set(observed.sctp) | set(cfg.SCTP_PERMANENT)
 
+    tcp_syn_rate_limits = _resolve_port_limits(
+        tcp_ports, observed.tcp_processes, _port_rate_limit
+    )
+    udp_rate_limits = _resolve_port_limits(
+        udp_ports, observed.udp_processes, _udp_port_rate_limit
+    )
+    tcp_rate_map_entries = {
+        port: _rate_map_entries(port, observed.tcp_processes.get(port, ""))
+        for port, rate in tcp_syn_rate_limits.items() if rate > 0
+    }
+    udp_rate_map_entries = {
+        port: _rate_map_entries(port, observed.udp_processes.get(port, ""))
+        for port, rate in udp_rate_limits.items() if rate > 0
+    }
+
     return DesiredState(
         tcp_ports=tcp_ports,
         udp_ports=udp_ports,
         sctp_ports=sctp_ports,
         trusted_cidrs=set(cfg.TRUSTED_SRC_IPS),
         conntrack_entries=set(observed.established),
-        tcp_syn_rate_limits=_resolve_port_limits(tcp_ports, observed.tcp_processes, _port_rate_limit),
+        tcp_syn_rate_limits=tcp_syn_rate_limits,
         tcp_syn_agg_rate_limits=_resolve_port_limits(
             tcp_ports, observed.tcp_processes, _syn_aggregate_rate_limit
         ),
@@ -205,7 +240,9 @@ def resolve_desired_state(observed: ObservedState) -> DesiredState:
         tcp_conn_port_limits=_resolve_port_limits(
             tcp_ports, observed.tcp_processes, _tcp_conn_port_limit
         ),
-        udp_rate_limits=_resolve_port_limits(udp_ports, observed.udp_processes, _udp_port_rate_limit),
+        udp_rate_limits=udp_rate_limits,
+        tcp_rate_map_entries=tcp_rate_map_entries,
+        udp_rate_map_entries=udp_rate_map_entries,
         udp_agg_rate_limits=_resolve_port_limits(
             udp_ports, observed.udp_processes, _udp_aggregate_byte_limit
         ),
