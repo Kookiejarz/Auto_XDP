@@ -149,6 +149,10 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "tsc_pfx6",
     "tsc_port",
     "abuseipdb_v4",
+    "syn4",
+    "syn6",
+    "udprt4",
+    "udprt6",
 )
 
 
@@ -211,6 +215,10 @@ TCP_ACL_MAP_PATH6 = ""
 UDP_ACL_MAP_PATH4 = ""
 UDP_ACL_MAP_PATH6 = ""
 SIT4_ENDPOINTS_MAP_PATH = ""
+SYN4_MAP_PATH = ""
+SYN6_MAP_PATH = ""
+UDPRT4_MAP_PATH = ""
+UDPRT6_MAP_PATH = ""
 REQUIRED_XDP_MAP_PATHS: tuple[str, ...] = ()
 
 
@@ -226,6 +234,7 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     global TCP_ACL_MAP_PATH4, TCP_ACL_MAP_PATH6
     global UDP_ACL_MAP_PATH4, UDP_ACL_MAP_PATH6
     global SIT4_ENDPOINTS_MAP_PATH
+    global SYN4_MAP_PATH, SYN6_MAP_PATH, UDPRT4_MAP_PATH, UDPRT6_MAP_PATH
     global TSC_PFX4_MAP_PATH, TSC_PFX6_MAP_PATH, TSC_PORT_MAP_PATH
     global REQUIRED_XDP_MAP_PATHS
     global ABUSEIPDB_RISK_MAP_PATH4, ABUSEIPDB_CFG_MAP_PATH
@@ -248,6 +257,10 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     UDP_ACL_MAP_PATH4 = f"{pin_dir}/udp_acl_v4"
     UDP_ACL_MAP_PATH6 = f"{pin_dir}/udp_acl_v6"
     SIT4_ENDPOINTS_MAP_PATH = f"{pin_dir}/sit4_endpoints"
+    SYN4_MAP_PATH = f"{pin_dir}/syn4"
+    SYN6_MAP_PATH = f"{pin_dir}/syn6"
+    UDPRT4_MAP_PATH = f"{pin_dir}/udprt4"
+    UDPRT6_MAP_PATH = f"{pin_dir}/udprt6"
     TSC_PFX4_MAP_PATH = f"{pin_dir}/tsc_pfx4"
     TSC_PFX6_MAP_PATH = f"{pin_dir}/tsc_pfx6"
     TSC_PORT_MAP_PATH = f"{pin_dir}/tsc_port"

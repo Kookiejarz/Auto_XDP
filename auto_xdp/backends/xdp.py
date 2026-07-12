@@ -8,7 +8,7 @@ import shutil
 from auto_xdp import config as cfg
 from auto_xdp.backends.base import BackendStatus, PortBackend
 from auto_xdp.abuseipdb import AbuseIPDBSyncer, BpfRiskMaps
-from auto_xdp.bpf.syscall import map_id, obj_get
+from auto_xdp.bpf.syscall import map_id, obj_get, probe_inner_map_support
 from auto_xdp.bpf.maps import (
     BpfAclMaps,
     BpfArrayMap,
@@ -16,6 +16,7 @@ from auto_xdp.bpf.maps import (
     BpfGlobalRlMap,
     BpfPortPolicyMap,
     BpfPortPolicyViewMap,
+    BpfRateOuterMap,
     BpfRuntimeConfigMap,
     BpfSit4EndpointsMap,
     BpfSynRatePortsMap,
@@ -25,6 +26,7 @@ from auto_xdp.bpf.maps import (
     XDP_CFG_FLAG_DROP_EVENTS_DISABLED,
     XDP_CFG_FLAG_SLOT_DROP,
 )
+from auto_xdp.policy import rate_map_entries_v6
 from auto_xdp.services import service_name
 from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcilePlan
 
@@ -118,6 +120,17 @@ class XdpBackend(PortBackend):
                     checks=checks,
                 )
 
+        checks["inner_map_support"] = probe_inner_map_support()
+        if not checks["inner_map_support"]:
+            details["inner_map_support"] = "BPF_F_INNER_MAP probe failed"
+            return BackendStatus(
+                name=cls.name,
+                available=False,
+                reason="kernel lacks BPF_F_INNER_MAP map-in-map support (need 5.10+)",
+                details=details,
+                checks=checks,
+            )
+
         return BackendStatus(name=cls.name, available=True, checks=checks)
 
     def __init__(self) -> None:
@@ -187,6 +200,18 @@ class XdpBackend(PortBackend):
             log.debug("sit4_endpoints map opened; 6in4 tunnel endpoint control active.")
         except OSError as exc:
             log.debug("sit4_endpoints map unavailable (%s); 6in4 tunnel endpoint sync inactive.", exc)
+        self.syn4_outer: BpfRateOuterMap | None = None
+        self.syn6_outer: BpfRateOuterMap | None = None
+        self.udprt4_outer: BpfRateOuterMap | None = None
+        self.udprt6_outer: BpfRateOuterMap | None = None
+        try:
+            self.syn4_outer = BpfRateOuterMap(cfg.SYN4_MAP_PATH, 4, 16, "s4_")
+            self.syn6_outer = BpfRateOuterMap(cfg.SYN6_MAP_PATH, 16, 16, "s6_")
+            self.udprt4_outer = BpfRateOuterMap(cfg.UDPRT4_MAP_PATH, 4, 16, "u4_")
+            self.udprt6_outer = BpfRateOuterMap(cfg.UDPRT6_MAP_PATH, 16, 16, "u6_")
+            log.debug("rate outer maps opened; per-port rate-limit isolation active.")
+        except OSError as exc:
+            log.debug("rate outer maps unavailable (%s); per-port rate-limit isolation inactive.", exc)
         self._risk_maps: BpfRiskMaps | None = None
         self._abuseipdb_syncer: AbuseIPDBSyncer | None = None
         try:
@@ -250,6 +275,9 @@ class XdpBackend(PortBackend):
             self.sctp_map.close()
         if self.sit4_map is not None:
             self.sit4_map.close()
+        for outer in (self.syn4_outer, self.syn6_outer, self.udprt4_outer, self.udprt6_outer):
+            if outer is not None:
+                outer.close()
         if self._abuseipdb_syncer is not None:
             self._abuseipdb_syncer.stop()
         if self._risk_maps is not None:
@@ -325,6 +353,9 @@ class XdpBackend(PortBackend):
             total += self.acl_maps.verify()
         if self.sit4_map is not None:
             total += self.sit4_map.verify()
+        for outer in (self.syn4_outer, self.syn6_outer, self.udprt4_outer, self.udprt6_outer):
+            if outer is not None:
+                total += outer.verify()
         if total:
             log.warning(
                 "Kernel state verification found %d drifted map entr%s; caches repaired, corrective sync recommended.",
@@ -499,6 +530,25 @@ class XdpBackend(PortBackend):
                 "udp_agg",
             )
 
+        tcp_entries = desired_state.tcp_rate_map_entries
+        udp_entries = desired_state.udp_rate_map_entries
+        if self.syn4_outer is not None:
+            self._apply_rate_outer_delta(self.syn4_outer, tcp_entries, dry_run)
+        if self.syn6_outer is not None:
+            self._apply_rate_outer_delta(
+                self.syn6_outer,
+                {p: rate_map_entries_v6(c) for p, c in tcp_entries.items()},
+                dry_run,
+            )
+        if self.udprt4_outer is not None:
+            self._apply_rate_outer_delta(self.udprt4_outer, udp_entries, dry_run)
+        if self.udprt6_outer is not None:
+            self._apply_rate_outer_delta(
+                self.udprt6_outer,
+                {p: rate_map_entries_v6(c) for p, c in udp_entries.items()},
+                dry_run,
+            )
+
         if self._tcp_policy_map is not None:
             tcp_policy_ports = (
                 set(desired_state.tcp_syn_rate_limits)
@@ -581,6 +631,19 @@ class XdpBackend(PortBackend):
         for (proto, cidr) in plan.acl_rules_to_remove:
             if self._ok(self.acl_maps.delete(proto, cidr, dry_run)):
                 log.info("ACL %s %s removed", proto.upper(), cidr)
+
+    def _apply_rate_outer_delta(
+        self,
+        outer: BpfRateOuterMap,
+        desired: dict[int, int],
+        dry_run: bool,
+    ) -> None:
+        current = outer.active()
+        for port, capacity in desired.items():
+            if current.get(port) != capacity:
+                self._ok(outer.set(port, capacity, dry_run))
+        for port in set(current) - set(desired):
+            self._ok(outer.delete(port, dry_run))
 
     def _apply_rate_map_delta(
         self,
