@@ -1111,6 +1111,54 @@ class TcpDefaultOnSmokeTests(unittest.TestCase):
         self.assertIn(8080, plan.tcp_conn_prefix_limits_to_upsert)
         self.assertIn(8080, plan.tcp_conn_port_limits_to_upsert)
 
+
+class RateMapEntriesPolicyTests(unittest.TestCase):
+    """Per-port rate-limit inner map capacity resolution."""
+
+    def _resolve(self, **cfg_overrides):
+        observed = state_mod.ObservedState(
+            tcp={2222},
+            udp={5353},
+            tcp_processes={2222: "sshd"},
+            udp_processes={5353: "avahi"},
+        )
+        base = dict(
+            _SYN_RATE_BY_PROC={"sshd": 10},
+            _SYN_RATE_BY_SERVICE={},
+            _UDP_RATE_BY_PROC={"avahi": 50},
+            _UDP_RATE_BY_SERVICE={},
+            _RATE_MAP_ENTRIES_BY_PROC={},
+            _RATE_MAP_ENTRIES_BY_SERVICE={},
+            TCP_PERMANENT={},
+            UDP_PERMANENT={},
+            SCTP_PERMANENT={},
+        )
+        base.update(cfg_overrides)
+        with mock.patch.object(policy_mod, "service_name", return_value=""), \
+             mock.patch.multiple(policy_mod.cfg, **base):
+            return policy_mod.resolve_desired_state(observed)
+
+    def test_default_capacity_for_rate_limited_ports(self):
+        desired = self._resolve()
+        self.assertEqual(desired.tcp_rate_map_entries.get(2222),
+                         cfg.RATE_MAP_ENTRIES_V4)
+        self.assertEqual(desired.udp_rate_map_entries.get(5353),
+                         cfg.RATE_MAP_ENTRIES_V4)
+
+    def test_no_capacity_entry_when_rate_zero(self):
+        desired = self._resolve(_SYN_RATE_BY_PROC={"sshd": 0},
+                                _UDP_RATE_BY_PROC={})
+        self.assertNotIn(2222, desired.tcp_rate_map_entries)
+        self.assertNotIn(5353, desired.udp_rate_map_entries)
+
+    def test_per_proc_override(self):
+        desired = self._resolve(_RATE_MAP_ENTRIES_BY_PROC={"sshd": 2048})
+        self.assertEqual(desired.tcp_rate_map_entries[2222], 2048)
+
+    def test_v6_derivation_helper(self):
+        self.assertEqual(policy_mod.rate_map_entries_v6(16384), 4096)
+        self.assertEqual(policy_mod.rate_map_entries_v6(100), 64)  # floor
+
     def test_nftables_backend_ensure_ruleset_keeps_existing_complete_ruleset(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
         existing = subprocess.CompletedProcess(
@@ -1406,6 +1454,319 @@ class TcpDefaultOnSmokeTests(unittest.TestCase):
             {"1.2.3.4/32": "myhost", "10.0.0.0/8": "internal"},
             cli_log_level=None,
         )
+
+
+class FailingPortMap(FakePortMap):
+    def set(self, port, val, dry_run=False):
+        super().set(port, val, dry_run)
+        return dry_run  # real maps short-circuit True on dry-run; fail otherwise
+
+
+class FailingTrustedMap(FakeTrustedMap):
+    def set(self, key, val, dry_run=False):
+        super().set(key, val, dry_run)
+        return dry_run
+
+    def delete(self, key, dry_run=False):
+        super().delete(key, dry_run)
+        return dry_run
+
+
+class FailingConntrackMap(FakeConntrackMap):
+    def set(self, key, dry_run=False):
+        super().set(key, dry_run)
+        return dry_run
+
+    def delete(self, key, dry_run=False):
+        super().delete(key, dry_run)
+        return dry_run
+
+    def delete_dest_ports(self, ports, dry_run=False):
+        super().delete_dest_ports(ports, dry_run)
+        return 0
+
+
+class FailingSynRateMap(FakeSynRateMap):
+    def set(self, port, rate_max, dry_run=False):
+        super().set(port, rate_max, dry_run)
+        return dry_run
+
+    def delete(self, port, dry_run=False):
+        super().delete(port, dry_run)
+        return dry_run
+
+
+class FailingRuntimeConfigMap(FakeRuntimeConfigMap):
+    def set(self, fields, cfg_flags=0, dry_run=False):
+        super().set(fields, cfg_flags, dry_run)
+        return dry_run
+
+
+class FailingGlobalRlMap(FakeGlobalRlMap):
+    def set(self, byte_rate_max, dry_run=False):
+        super().set(byte_rate_max, dry_run)
+        return dry_run
+
+
+class FailingAclMaps:
+    def __init__(self):
+        self._active = {}
+        self.set_ops = []
+        self.delete_ops = []
+
+    def active_entries(self):
+        return dict(self._active)
+
+    def set(self, proto, cidr, ports, dry_run=False):
+        self.set_ops.append((proto, cidr, tuple(ports), dry_run))
+        self._active[(proto, cidr)] = frozenset(ports)
+        return dry_run
+
+    def delete(self, proto, cidr, dry_run=False):
+        self.delete_ops.append((proto, cidr, dry_run))
+        self._active.pop((proto, cidr), None)
+        return dry_run
+
+    def close(self):
+        pass
+
+
+class FailingSit4Map:
+    def __init__(self, active=None):
+        self._active = set(active or [])
+        self.set_ops = []
+        self.delete_ops = []
+
+    def active_keys(self):
+        return set(self._active)
+
+    def set(self, ip_str, dry_run=False):
+        self.set_ops.append((ip_str, dry_run))
+        self._active.add(ip_str)
+        return dry_run
+
+    def delete(self, ip_str, dry_run=False):
+        self.delete_ops.append((ip_str, dry_run))
+        self._active.discard(ip_str)
+        return dry_run
+
+    def close(self):
+        pass
+
+
+def _make_failing_backend():
+    backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+    backend.tcp_map = FailingPortMap({22, 80})
+    backend.udp_map = FailingPortMap({53, 9999})
+    backend.sctp_map = FailingPortMap({3868, 9899})
+    backend.trusted_map = FailingTrustedMap({"203.0.113.1/32"})
+    backend.conntrack_map = FailingConntrackMap({b"keep"})
+    backend.udp_conntrack_map = FailingConntrackMap()
+    backend.syn_rate_map = FailingSynRateMap()
+    backend.syn_agg_rate_map = FailingSynRateMap()
+    backend.tcp_conn_limit_map = FailingSynRateMap()
+    backend.tcp_conn_prefix_limit_map = None
+    backend.tcp_conn_port_limit_map = None
+    backend.udp_rate_map = FailingSynRateMap()
+    backend.udp_agg_rate_map = FailingSynRateMap()
+    backend.acl_maps = FailingAclMaps()
+    backend.runtime_config_map = FailingRuntimeConfigMap()
+    backend.global_rl_map = FailingGlobalRlMap()
+    backend.sit4_map = FailingSit4Map({"192.0.2.9"})
+    backend._conntrack_stale_rounds = {}
+    backend._tcp_policy_map = None
+    backend._udp_policy_map = None
+    return backend
+
+
+def _failing_desired_state():
+    return state_mod.DesiredState(
+        tcp_ports={22, 443},
+        udp_ports={53},
+        sctp_ports={3868, 2905},
+        trusted_cidrs={"198.51.100.5/32"},
+        conntrack_entries={b"keep", b"seed"},
+        tcp_syn_rate_limits={22: 2},
+        tcp_syn_agg_rate_limits={22: 16},
+        tcp_conn_limits={22: 32},
+        udp_rate_limits={53: 5000},
+        udp_agg_rate_limits={53: 6000000},
+        acl_rules={("tcp", "203.0.113.0/24"): frozenset({22, 443})},
+        udp_global_byte_rate=124_625_000,
+        xdp_runtime_config=(1, 2, 3, 4, 5, 6, 7),
+    )
+
+
+class ApplyFailureCountingTests(unittest.TestCase):
+    def _reconcile(self, backend, dry_run):
+        desired = _failing_desired_state()
+        with mock.patch.object(cfg, "TCP_PERMANENT", {}), \
+             mock.patch.object(cfg, "UDP_PERMANENT", {}), \
+             mock.patch.object(cfg, "SCTP_PERMANENT", {}), \
+             mock.patch.object(cfg, "TRUSTED_SRC_IPS", {}), \
+             mock.patch.object(cfg, "SIT4_ENDPOINTS", ["198.51.100.77"]):
+            backend.reconcile(desired, dry_run=dry_run, observed_state=state_mod.ObservedState())
+
+    def _total_ops(self, backend):
+        return (
+            len(backend.tcp_map.ops)
+            + len(backend.udp_map.ops)
+            + len(backend.sctp_map.ops)
+            + len(backend.trusted_map.set_ops)
+            + len(backend.trusted_map.delete_ops)
+            + len(backend.conntrack_map.ops)
+            + len(backend.conntrack_map.delete_ops)
+            + sum(
+                len(m.set_ops) + len(m.delete_ops)
+                for m in (
+                    backend.syn_rate_map,
+                    backend.syn_agg_rate_map,
+                    backend.tcp_conn_limit_map,
+                    backend.udp_rate_map,
+                    backend.udp_agg_rate_map,
+                )
+            )
+            + len(backend.runtime_config_map.ops)
+            + len(backend.global_rl_map.ops)
+            + len(backend.acl_maps.set_ops)
+            + len(backend.acl_maps.delete_ops)
+            + len(backend.sit4_map.set_ops)
+            + len(backend.sit4_map.delete_ops)
+        )
+
+    def test_counts_every_failed_map_update_and_warns(self):
+        backend = _make_failing_backend()
+        with self.assertLogs("auto_xdp.backends.xdp", level="WARNING") as logs:
+            self._reconcile(backend, dry_run=False)
+
+        total = self._total_ops(backend)
+        self.assertEqual(backend.last_apply_failures, total)
+        # Every operation class must have been exercised, so a missing _ok()
+        # wrapper in any of them would make the count diverge.
+        self.assertTrue(backend.tcp_map.ops)
+        self.assertTrue(backend.udp_map.ops)
+        self.assertTrue(backend.sctp_map.ops)
+        self.assertTrue(backend.trusted_map.set_ops)
+        self.assertTrue(backend.trusted_map.delete_ops)
+        self.assertTrue(backend.conntrack_map.ops)
+        self.assertTrue(backend.syn_rate_map.set_ops)
+        self.assertTrue(backend.udp_rate_map.set_ops)
+        self.assertTrue(backend.runtime_config_map.ops)
+        self.assertTrue(backend.global_rl_map.ops)
+        self.assertTrue(backend.acl_maps.set_ops)
+        self.assertTrue(backend.sit4_map.set_ops)
+        self.assertTrue(backend.sit4_map.delete_ops)
+        self.assertTrue(
+            any("failed this reconcile" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_dry_run_counts_no_failures(self):
+        backend = _make_failing_backend()
+        self._reconcile(backend, dry_run=True)
+        self.assertEqual(backend.last_apply_failures, 0)
+
+    def test_counter_resets_on_clean_round(self):
+        backend = _make_failing_backend()
+        self._reconcile(backend, dry_run=False)
+        self.assertGreater(backend.last_apply_failures, 0)
+        # Fakes updated their local state despite returning False, so the next
+        # round has nothing to apply and the counter must reset to zero.
+        self._reconcile(backend, dry_run=False)
+        self.assertEqual(backend.last_apply_failures, 0)
+
+
+class VerifyKernelStateTests(unittest.TestCase):
+    def _backend_with_verifiers(self, values):
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+        backend.tcp_map = types.SimpleNamespace(verify=lambda: values.get("tcp", 0))
+        backend.udp_map = types.SimpleNamespace(verify=lambda: values.get("udp", 0))
+        backend.sctp_map = None
+        backend.trusted_map = types.SimpleNamespace(verify=lambda: values.get("trusted", 0))
+        backend._tcp_policy_map = types.SimpleNamespace(verify=lambda: values.get("tcp_policy", 0))
+        backend._udp_policy_map = None
+        backend.acl_maps = types.SimpleNamespace(verify=lambda: values.get("acl", 0))
+        backend.sit4_map = None
+        return backend
+
+    def test_sums_discrepancies_and_warns(self):
+        backend = self._backend_with_verifiers(
+            {"tcp": 2, "udp": 0, "trusted": 1, "tcp_policy": 3, "acl": 1}
+        )
+        with self.assertLogs("auto_xdp.backends.xdp", level="WARNING") as logs:
+            total = backend.verify_kernel_state()
+        self.assertEqual(total, 7)
+        self.assertTrue(any("drifted" in line for line in logs.output), logs.output)
+
+    def test_zero_drift_is_silent_and_skips_missing_maps(self):
+        backend = self._backend_with_verifiers({})
+        with mock.patch.object(xdp_backend_mod.log, "warning") as warn:
+            self.assertEqual(backend.verify_kernel_state(), 0)
+        warn.assert_not_called()
+
+
+class MapVerifyTests(unittest.TestCase):
+    def _make_map(self, cache):
+        m = object.__new__(bpf_maps_mod.BpfSynRatePortsMap)
+        m.path = "/sys/fs/bpf/xdp_fw/tcp_syn_rate_ports"
+        m._cache = dict(cache)
+        return m
+
+    def test_verify_returns_zero_when_kernel_matches_cache(self):
+        m = self._make_map({22: 2, 80: 5})
+        m._read_kernel = lambda: {22: 2, 80: 5}
+        self.assertEqual(m.verify(), 0)
+        self.assertEqual(m._cache, {22: 2, 80: 5})
+
+    def test_verify_counts_drift_and_repairs_cache(self):
+        m = self._make_map({22: 2, 80: 5})
+        # 22 changed value, 80 missing from kernel, 443 extra in kernel: 3 diffs.
+        m._read_kernel = lambda: {22: 9, 443: 1}
+        with self.assertLogs("auto_xdp.bpf.maps", level="WARNING") as logs:
+            self.assertEqual(m.verify(), 3)
+        self.assertEqual(m._cache, {22: 9, 443: 1})
+        self.assertTrue(any("drift" in line for line in logs.output), logs.output)
+
+
+class SyncerVerifyTriggerTests(unittest.TestCase):
+    def _run_watch(self, backend, select_effects):
+        nl = mock.MagicMock()
+        with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
+             mock.patch.object(syncer_mod, "open_proc_connector", return_value=nl), \
+             mock.patch.object(syncer_mod, "_open_relay_client", return_value=None), \
+             mock.patch.object(syncer_mod, "drain_proc_events", return_value=True), \
+             mock.patch.object(syncer_mod, "sync_once") as sync_once, \
+             mock.patch.object(syncer_mod.select, "select", side_effect=select_effects), \
+             mock.patch.object(cfg, "DEBOUNCE_SECONDS", 0.0), \
+             mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
+            syncer_mod.watch(dry_run=False, backend_name="xdp")
+        return sync_once
+
+    def test_failed_apply_triggers_verify_and_corrective_sync(self):
+        backend = mock.MagicMock()
+        backend.last_apply_failures = 3
+        backend.is_stale.return_value = False
+        backend.verify_kernel_state.return_value = 0
+
+        sync_once = self._run_watch(
+            backend,
+            [([mock.ANY], [], []), ([], [], []), KeyboardInterrupt()],
+        )
+
+        # init sync + event sync + debounce-armed corrective sync
+        self.assertEqual(sync_once.call_count, 3)
+        self.assertTrue(backend.verify_kernel_state.called)
+
+    def test_periodic_stale_check_verifies_kernel_state(self):
+        backend = mock.MagicMock()
+        backend.last_apply_failures = 0
+        backend.is_stale.return_value = False
+        backend.verify_kernel_state.return_value = 0
+
+        self._run_watch(backend, [([], [], []), KeyboardInterrupt()])
+
+        backend.is_stale.assert_called_once()
+        backend.verify_kernel_state.assert_called_once()
 
 
 if __name__ == "__main__":
