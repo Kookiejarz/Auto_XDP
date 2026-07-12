@@ -121,6 +121,7 @@ class XdpBackend(PortBackend):
         return BackendStatus(name=cls.name, available=True, checks=checks)
 
     def __init__(self) -> None:
+        self.last_apply_failures: int = 0
         self.tcp_map = BpfArrayMap(cfg.TCP_MAP_PATH)
         self.udp_map = BpfArrayMap(cfg.UDP_MAP_PATH)
         self.trusted_map = BpfTrustedMaps(cfg.TRUSTED_IPS_MAP_PATH4, cfg.TRUSTED_IPS_MAP_PATH6)
@@ -300,6 +301,37 @@ class XdpBackend(PortBackend):
         plan.conntrack_entries_to_remove = stale_ready
         return plan
 
+    def _ok(self, result: bool) -> bool:
+        if not result:
+            self.last_apply_failures += 1
+        return result
+
+    def verify_kernel_state(self) -> int:
+        """Re-read userspace-owned config maps from the kernel and repair caches.
+
+        Returns the total number of discrepancies found (0 = kernel matches cache).
+        """
+        total = 0
+        total += self.tcp_map.verify()
+        total += self.udp_map.verify()
+        if self.sctp_map is not None:
+            total += self.sctp_map.verify()
+        total += self.trusted_map.verify()
+        if self._tcp_policy_map is not None:
+            total += self._tcp_policy_map.verify()
+        if self._udp_policy_map is not None:
+            total += self._udp_policy_map.verify()
+        if self.acl_maps is not None:
+            total += self.acl_maps.verify()
+        if self.sit4_map is not None:
+            total += self.sit4_map.verify()
+        if total:
+            log.warning(
+                "Kernel state verification found %d drifted map entr%s; caches repaired, corrective sync recommended.",
+                total, "y" if total == 1 else "ies",
+            )
+        return total
+
     def apply_reconcile_plan(
         self,
         plan: ReconcilePlan,
@@ -307,17 +339,18 @@ class XdpBackend(PortBackend):
         desired_state: DesiredState,
         observed_state: ObservedState | None = None,
     ) -> None:
+        self.last_apply_failures = 0
         changed = False
         trusted_permanent = set(cfg.TRUSTED_SRC_IPS)
 
         for port in sorted(plan.tcp_ports_to_add):
             tag = f" [{cfg.TCP_PERMANENT[port]}]" if port in cfg.TCP_PERMANENT else ""
-            if self.tcp_map.set(port, 1, dry_run):
+            if self._ok(self.tcp_map.set(port, 1, dry_run)):
                 log.debug("TCP +%d%s", port, tag)
                 changed = True
 
         for port in sorted(plan.tcp_ports_to_remove):
-            if self.tcp_map.set(port, 0, dry_run):
+            if self._ok(self.tcp_map.set(port, 0, dry_run)):
                 log.debug("TCP -%d  (stopped)", port)
                 changed = True
 
@@ -332,7 +365,7 @@ class XdpBackend(PortBackend):
                 )
 
         for key in plan.conntrack_entries_to_add:
-            if self.conntrack_map.set(key, dry_run):
+            if self._ok(self.conntrack_map.set(key, dry_run)):
                 self._conntrack_stale_rounds.pop(key, None)
                 changed = True
 
@@ -341,7 +374,7 @@ class XdpBackend(PortBackend):
 
         removed_conntrack = 0
         for key in plan.conntrack_entries_to_remove:
-            if self.conntrack_map.delete(key, dry_run):
+            if self._ok(self.conntrack_map.delete(key, dry_run)):
                 self._conntrack_stale_rounds.pop(key, None)
                 removed_conntrack += 1
                 changed = True
@@ -355,12 +388,12 @@ class XdpBackend(PortBackend):
 
         for port in sorted(plan.udp_ports_to_add):
             tag = f" [{cfg.UDP_PERMANENT[port]}]" if port in cfg.UDP_PERMANENT else ""
-            if self.udp_map.set(port, 1, dry_run):
+            if self._ok(self.udp_map.set(port, 1, dry_run)):
                 log.debug("UDP +%d%s", port, tag)
                 changed = True
 
         for port in sorted(plan.udp_ports_to_remove):
-            if self.udp_map.set(port, 0, dry_run):
+            if self._ok(self.udp_map.set(port, 0, dry_run)):
                 log.debug("UDP -%d  (stopped)", port)
                 changed = True
 
@@ -377,24 +410,24 @@ class XdpBackend(PortBackend):
         if self.sctp_map is not None:
             for port in sorted(plan.sctp_ports_to_add):
                 tag = f" [{cfg.SCTP_PERMANENT[port]}]" if port in cfg.SCTP_PERMANENT else ""
-                if self.sctp_map.set(port, 1, dry_run):
+                if self._ok(self.sctp_map.set(port, 1, dry_run)):
                     log.info("SCTP +%d%s", port, tag)
                     changed = True
 
             for port in sorted(plan.sctp_ports_to_remove):
-                if self.sctp_map.set(port, 0, dry_run):
+                if self._ok(self.sctp_map.set(port, 0, dry_run)):
                     log.info("SCTP -%d  (stopped)", port)
                     changed = True
 
         # HASH maps need delete, not write-zero, when trust entries disappear.
         for ip_str in sorted(plan.trusted_cidrs_to_add):
             tag = f" [{cfg.TRUSTED_SRC_IPS[ip_str]}]" if ip_str in cfg.TRUSTED_SRC_IPS else ""
-            if self.trusted_map.set(ip_str, 1, dry_run):
+            if self._ok(self.trusted_map.set(ip_str, 1, dry_run)):
                 log.info("TRUST +%s%s", ip_str, tag)
                 changed = True
 
         for ip_str in sorted(plan.trusted_cidrs_to_remove - trusted_permanent):
-            if self.trusted_map.delete(ip_str, dry_run):
+            if self._ok(self.trusted_map.delete(ip_str, dry_run)):
                 log.info("TRUST -%s  (removed)", ip_str)
                 changed = True
 
@@ -498,11 +531,11 @@ class XdpBackend(PortBackend):
             current = self.runtime_config_map.get()
             current_flags = self.runtime_config_map.get_cfg_flags() or 0
             if desired_state.xdp_runtime_config != current or cfg_flags != current_flags:
-                self.runtime_config_map.set(desired_state.xdp_runtime_config, cfg_flags, dry_run)
+                self._ok(self.runtime_config_map.set(desired_state.xdp_runtime_config, cfg_flags, dry_run))
 
         if self.global_rl_map is not None and plan.udp_global_byte_rate_update is not None:
             rate = plan.udp_global_byte_rate_update
-            if self.global_rl_map.set(rate, dry_run):
+            if self._ok(self.global_rl_map.set(rate, dry_run)):
                 if rate:
                     log.info("UDP global rate limit set to %d bytes/s", rate)
                 else:
@@ -512,11 +545,18 @@ class XdpBackend(PortBackend):
             desired_sit4 = set(cfg.SIT4_ENDPOINTS)
             current_sit4 = self.sit4_map.active_keys()
             for ip_str in sorted(desired_sit4 - current_sit4):
-                if self.sit4_map.set(ip_str, dry_run):
+                if self._ok(self.sit4_map.set(ip_str, dry_run)):
                     log.info("SIT4 +%s (6in4 tunnel endpoint added)", ip_str)
             for ip_str in sorted(current_sit4 - desired_sit4):
-                if self.sit4_map.delete(ip_str, dry_run):
+                if self._ok(self.sit4_map.delete(ip_str, dry_run)):
                     log.info("SIT4 -%s (6in4 tunnel endpoint removed)", ip_str)
+
+        if self.last_apply_failures and not dry_run:
+            log.warning(
+                "%d BPF map update%s failed this reconcile; kernel state may lag desired state.",
+                self.last_apply_failures,
+                "" if self.last_apply_failures == 1 else "s",
+            )
 
     def reconcile(
         self,
@@ -535,11 +575,11 @@ class XdpBackend(PortBackend):
         if self.acl_maps is None:
             return
         for (proto, cidr), ports in plan.acl_rules_to_upsert.items():
-            if self.acl_maps.set(proto, cidr, sorted(ports), dry_run):
+            if self._ok(self.acl_maps.set(proto, cidr, sorted(ports), dry_run)):
                 log.info("ACL %s %s ports %s", proto.upper(), cidr, sorted(ports))
 
         for (proto, cidr) in plan.acl_rules_to_remove:
-            if self.acl_maps.delete(proto, cidr, dry_run):
+            if self._ok(self.acl_maps.delete(proto, cidr, dry_run)):
                 log.info("ACL %s %s removed", proto.upper(), cidr)
 
     def _apply_rate_map_delta(
@@ -553,7 +593,7 @@ class XdpBackend(PortBackend):
     ) -> None:
         port_procs = {} if port_procs is None else port_procs
         for port, rate_max in upserts.items():
-            if rate_map.set(port, rate_max, dry_run):
+            if self._ok(rate_map.set(port, rate_max, dry_run)):
                 if kind == "tcp":
                     svc = port_procs.get(port) or service_name(port, "tcp") or "unknown"
                     log.info("SYN rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
@@ -572,7 +612,7 @@ class XdpBackend(PortBackend):
                     log.info("UDP aggregate port %d byte_rate_max=%d/s", port, rate_max)
 
         for port in removals:
-            if rate_map.delete(port, dry_run):
+            if self._ok(rate_map.delete(port, dry_run)):
                 if kind == "tcp":
                     log.info("SYN rate port %d removed (port no longer whitelisted)", port)
                 elif kind == "tcp_syn_agg":

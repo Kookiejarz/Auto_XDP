@@ -266,6 +266,17 @@ def watch(
                 last_event_t = 0.0
                 first_event_t = 0.0
 
+                apply_failures = getattr(backend, "last_apply_failures", 0)
+                if apply_failures and hasattr(backend, "verify_kernel_state"):
+                    log.warning(
+                        "Reconcile had %d failed map update(s); verifying kernel state.",
+                        apply_failures,
+                    )
+                    backend.verify_kernel_state()
+                    # Arm debounce so a corrective sync runs shortly.
+                    last_event_t = time.monotonic()
+                    first_event_t = last_event_t
+
             gc_interval = cfg.XDP_CONNTRACK_GC_INTERVAL_SECONDS
             if gc_interval > 0 and (time.monotonic() - last_gc_t >= gc_interval):
                 try:
@@ -283,6 +294,13 @@ def watch(
                     )
                     backend.close()
                     backend = None
+                elif hasattr(backend, "verify_kernel_state"):
+                    if backend.verify_kernel_state():
+                        # Drift found: arm debounce to schedule a corrective sync.
+                        _now = time.monotonic()
+                        if not first_event_t:
+                            first_event_t = _now
+                        last_event_t = _now
 
     except KeyboardInterrupt:
         log.info("Shutting down.")
