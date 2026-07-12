@@ -222,6 +222,34 @@ class FakeGlobalRlMap:
         self.closed = True
 
 
+class FakeRateOuterMap:
+    def __init__(self, initial=None):
+        self._active = dict(initial or {})
+        self.ops = []
+        self.closed = False
+
+    def active(self):
+        return dict(self._active)
+
+    def set(self, port, capacity, dry_run=False):
+        self.ops.append(("set", port, capacity, dry_run))
+        if not dry_run:
+            self._active[port] = capacity
+        return True
+
+    def delete(self, port, dry_run=False):
+        self.ops.append(("delete", port, dry_run))
+        if not dry_run:
+            self._active.pop(port, None)
+        return True
+
+    def verify(self):
+        return 0
+
+    def close(self):
+        self.closed = True
+
+
 def make_proc_event_message(what: int) -> bytes:
     payload = struct.pack("I", what)
     cn = struct.pack("IIIIHH", proc_events_mod._CN_IDX_PROC, 1, 0, 0, len(payload), 0) + payload
@@ -652,6 +680,10 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap({0})
         backend.sit4_map = None
+        backend.syn4_outer = FakeRateOuterMap()
+        backend.syn6_outer = FakeRateOuterMap()
+        backend.udprt4_outer = FakeRateOuterMap()
+        backend.udprt6_outer = FakeRateOuterMap()
         backend._conntrack_stale_rounds = {}
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
@@ -726,6 +758,10 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap()
         backend.sit4_map = None
+        backend.syn4_outer = FakeRateOuterMap()
+        backend.syn6_outer = FakeRateOuterMap()
+        backend.udprt4_outer = FakeRateOuterMap()
+        backend.udprt6_outer = FakeRateOuterMap()
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
@@ -761,6 +797,10 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap()
         backend.sit4_map = None
+        backend.syn4_outer = FakeRateOuterMap()
+        backend.syn6_outer = FakeRateOuterMap()
+        backend.udprt4_outer = FakeRateOuterMap()
+        backend.udprt6_outer = FakeRateOuterMap()
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
@@ -942,6 +982,10 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap()
         backend.sit4_map = None
+        backend.syn4_outer = FakeRateOuterMap()
+        backend.syn6_outer = FakeRateOuterMap()
+        backend.udprt4_outer = FakeRateOuterMap()
+        backend.udprt6_outer = FakeRateOuterMap()
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
@@ -1065,6 +1109,10 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend.bogon_cfg_map = None
         backend.sit4_map = None
+        backend.syn4_outer = FakeRateOuterMap()
+        backend.syn6_outer = FakeRateOuterMap()
+        backend.udprt4_outer = FakeRateOuterMap()
+        backend.udprt6_outer = FakeRateOuterMap()
         backend.global_rl_map = FakeGlobalRlMap()
         backend._abuseipdb_syncer = None
         backend._risk_maps = None
@@ -1077,6 +1125,10 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertTrue(backend.trusted_map.closed)
         self.assertTrue(backend.conntrack_map.closed)
         self.assertTrue(backend.udp_conntrack_map.closed)
+        self.assertTrue(backend.syn4_outer.closed)
+        self.assertTrue(backend.syn6_outer.closed)
+        self.assertTrue(backend.udprt4_outer.closed)
+        self.assertTrue(backend.udprt6_outer.closed)
         self.assertTrue(backend.runtime_config_map.closed)
         self.assertTrue(backend.global_rl_map.closed)
 
@@ -1554,6 +1606,18 @@ class FailingSit4Map:
         pass
 
 
+class FailingRateOuterMap(FakeRateOuterMap):
+    def set(self, port, capacity, dry_run=False):
+        self.ops.append(("set", port, capacity, dry_run))
+        self._active[port] = capacity
+        return dry_run
+
+    def delete(self, port, dry_run=False):
+        self.ops.append(("delete", port, dry_run))
+        self._active.pop(port, None)
+        return dry_run
+
+
 def _make_failing_backend():
     backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
     backend.tcp_map = FailingPortMap({22, 80})
@@ -1573,6 +1637,10 @@ def _make_failing_backend():
     backend.runtime_config_map = FailingRuntimeConfigMap()
     backend.global_rl_map = FailingGlobalRlMap()
     backend.sit4_map = FailingSit4Map({"192.0.2.9"})
+    backend.syn4_outer = FailingRateOuterMap()
+    backend.syn6_outer = FailingRateOuterMap()
+    backend.udprt4_outer = FailingRateOuterMap()
+    backend.udprt6_outer = FailingRateOuterMap()
     backend._conntrack_stale_rounds = {}
     backend._tcp_policy_map = None
     backend._udp_policy_map = None
@@ -1591,6 +1659,8 @@ def _failing_desired_state():
         tcp_conn_limits={22: 32},
         udp_rate_limits={53: 5000},
         udp_agg_rate_limits={53: 6000000},
+        tcp_rate_map_entries={22: 16384},
+        udp_rate_map_entries={53: 16384},
         acl_rules={("tcp", "203.0.113.0/24"): frozenset({22, 443})},
         udp_global_byte_rate=124_625_000,
         xdp_runtime_config=(1, 2, 3, 4, 5, 6, 7),
@@ -1632,6 +1702,15 @@ class ApplyFailureCountingTests(unittest.TestCase):
             + len(backend.acl_maps.delete_ops)
             + len(backend.sit4_map.set_ops)
             + len(backend.sit4_map.delete_ops)
+            + sum(
+                len(o.ops)
+                for o in (
+                    backend.syn4_outer,
+                    backend.syn6_outer,
+                    backend.udprt4_outer,
+                    backend.udprt6_outer,
+                )
+            )
         )
 
     def test_counts_every_failed_map_update_and_warns(self):
@@ -1656,6 +1735,10 @@ class ApplyFailureCountingTests(unittest.TestCase):
         self.assertTrue(backend.acl_maps.set_ops)
         self.assertTrue(backend.sit4_map.set_ops)
         self.assertTrue(backend.sit4_map.delete_ops)
+        self.assertTrue(backend.syn4_outer.ops)
+        self.assertTrue(backend.syn6_outer.ops)
+        self.assertTrue(backend.udprt4_outer.ops)
+        self.assertTrue(backend.udprt6_outer.ops)
         self.assertTrue(
             any("failed this reconcile" in line for line in logs.output),
             logs.output,
@@ -1676,6 +1759,85 @@ class ApplyFailureCountingTests(unittest.TestCase):
         self.assertEqual(backend.last_apply_failures, 0)
 
 
+def _make_outer_backend():
+    backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+    backend.tcp_map = FakePortMap()
+    backend.udp_map = FakePortMap()
+    backend.sctp_map = FakePortMap()
+    backend.trusted_map = FakeTrustedMap()
+    backend.conntrack_map = FakeConntrackMap()
+    backend.udp_conntrack_map = FakeConntrackMap()
+    backend.syn_rate_map = None
+    backend.syn_agg_rate_map = None
+    backend.tcp_conn_limit_map = None
+    backend.tcp_conn_prefix_limit_map = None
+    backend.tcp_conn_port_limit_map = None
+    backend.udp_rate_map = None
+    backend.udp_agg_rate_map = None
+    backend.acl_maps = None
+    backend.bogon_cfg_map = None
+    backend.observability_cfg_map = None
+    backend.sit4_map = None
+    backend.runtime_config_map = None
+    backend.global_rl_map = None
+    backend.syn4_outer = FakeRateOuterMap()
+    backend.syn6_outer = FakeRateOuterMap()
+    backend.udprt4_outer = FakeRateOuterMap()
+    backend.udprt6_outer = FakeRateOuterMap()
+    backend._conntrack_stale_rounds = {}
+    backend._tcp_policy_map = None
+    backend._udp_policy_map = None
+    return backend
+
+
+class RateOuterReconcileTests(unittest.TestCase):
+    def _reconcile(self, backend, desired, dry_run=False):
+        with mock.patch.object(cfg, "TCP_PERMANENT", {}), \
+             mock.patch.object(cfg, "UDP_PERMANENT", {}), \
+             mock.patch.object(cfg, "SCTP_PERMANENT", {}), \
+             mock.patch.object(cfg, "TRUSTED_SRC_IPS", {}):
+            backend.reconcile(desired, dry_run=dry_run, observed_state=state_mod.ObservedState())
+
+    def test_reconcile_creates_inner_for_rate_limited_ports(self):
+        backend = _make_outer_backend()
+        desired = state_mod.DesiredState(
+            tcp_ports={443},
+            udp_ports={5353},
+            tcp_syn_rate_limits={443: 100},
+            tcp_rate_map_entries={443: 16384},
+            udp_rate_limits={5353: 50},
+            udp_rate_map_entries={5353: 16384},
+        )
+        self._reconcile(backend, desired)
+        self.assertEqual(backend.syn4_outer.active(), {443: 16384})
+        self.assertEqual(backend.syn6_outer.active(), {443: 4096})
+        self.assertEqual(backend.udprt4_outer.active(), {5353: 16384})
+        self.assertEqual(backend.udprt6_outer.active(), {5353: 4096})
+
+    def test_reconcile_removes_stale_inner(self):
+        backend = _make_outer_backend()
+        for outer in (backend.syn4_outer, backend.syn6_outer,
+                      backend.udprt4_outer, backend.udprt6_outer):
+            outer._active = {22: 16384}
+        self._reconcile(backend, state_mod.DesiredState())
+        for outer in (backend.syn4_outer, backend.syn6_outer,
+                      backend.udprt4_outer, backend.udprt6_outer):
+            self.assertIn(("delete", 22, False), outer.ops)
+            self.assertEqual(outer.active(), {})
+
+
+class ProbeInnerMapSupportTests(unittest.TestCase):
+    def test_probe_unavailable_without_inner_map_support(self):
+        with mock.patch.object(xdp_backend_mod.shutil, "which", return_value="/usr/sbin/bpftool"), \
+             mock.patch.object(cfg, "REQUIRED_XDP_MAP_PATHS", ()), \
+             mock.patch.object(cfg, "XDP_OBJ_PATH", ""), \
+             mock.patch.object(cfg, "TC_OBJ_PATH", ""), \
+             mock.patch.object(xdp_backend_mod, "probe_inner_map_support", return_value=False):
+            status = backends_mod.XdpBackend.probe()
+        self.assertFalse(status.available)
+        self.assertIn("5.10", status.reason)
+
+
 class VerifyKernelStateTests(unittest.TestCase):
     def _backend_with_verifiers(self, values):
         backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
@@ -1687,15 +1849,20 @@ class VerifyKernelStateTests(unittest.TestCase):
         backend._udp_policy_map = None
         backend.acl_maps = types.SimpleNamespace(verify=lambda: values.get("acl", 0))
         backend.sit4_map = None
+        backend.syn4_outer = types.SimpleNamespace(verify=lambda: values.get("syn4", 0))
+        backend.syn6_outer = types.SimpleNamespace(verify=lambda: values.get("syn6", 0))
+        backend.udprt4_outer = None
+        backend.udprt6_outer = types.SimpleNamespace(verify=lambda: values.get("udprt6", 0))
         return backend
 
     def test_sums_discrepancies_and_warns(self):
         backend = self._backend_with_verifiers(
-            {"tcp": 2, "udp": 0, "trusted": 1, "tcp_policy": 3, "acl": 1}
+            {"tcp": 2, "udp": 0, "trusted": 1, "tcp_policy": 3, "acl": 1,
+             "syn4": 1, "udprt6": 2}
         )
         with self.assertLogs("auto_xdp.backends.xdp", level="WARNING") as logs:
             total = backend.verify_kernel_state()
-        self.assertEqual(total, 7)
+        self.assertEqual(total, 10)
         self.assertTrue(any("drifted" in line for line in logs.output), logs.output)
 
     def test_zero_drift_is_silent_and_skips_missing_maps(self):

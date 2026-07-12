@@ -31,3 +31,7 @@ tsc_pfx4
 tsc_pfx6
 tsc_port
 abuseipdb_v4
+syn4
+syn6
+udprt4
+udprt6
