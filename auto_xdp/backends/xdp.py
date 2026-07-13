@@ -120,13 +120,24 @@ class XdpBackend(PortBackend):
                     checks=checks,
                 )
 
-        checks["inner_map_support"] = probe_inner_map_support()
-        if not checks["inner_map_support"]:
-            details["inner_map_support"] = "BPF_F_INNER_MAP probe failed"
+        try:
+            checks["inner_map_support"] = probe_inner_map_support()
+        except PermissionError:
+            checks["inner_map_support"] = False
+            details["inner_map_support"] = "BPF map creation denied (EPERM)"
             return BackendStatus(
                 name=cls.name,
                 available=False,
-                reason="kernel lacks BPF_F_INNER_MAP map-in-map support (need 5.10+)",
+                reason="insufficient privileges to create BPF maps (run as root)",
+                details=details,
+                checks=checks,
+            )
+        if not checks["inner_map_support"]:
+            details["inner_map_support"] = "map-in-map probe failed"
+            return BackendStatus(
+                name=cls.name,
+                available=False,
+                reason="kernel lacks ARRAY_OF_MAPS map-in-map support (need 5.10+)",
                 details=details,
                 checks=checks,
             )

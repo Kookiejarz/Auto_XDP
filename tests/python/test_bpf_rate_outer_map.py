@@ -55,7 +55,7 @@ class RateOuterMapTests(unittest.TestCase):
             self.assertTrue(m.set(443, 8192))
         upd.assert_called_once()
         self.assertEqual(self.reg.created[0][:4],
-                         (4, 16, 8192, maps_mod.BPF_F_INNER_MAP))
+                         (4, 16, 8192, 0))
         self.assertEqual(m.active(), {443: 8192})
 
     def test_set_same_capacity_is_noop(self):

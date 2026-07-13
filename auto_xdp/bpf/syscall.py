@@ -28,7 +28,6 @@ BPF_F_LOCK = 4
 
 BPF_MAP_TYPE_LRU_HASH = 9
 BPF_MAP_TYPE_ARRAY_OF_MAPS = 12
-BPF_F_INNER_MAP = 0x1000
 
 
 def bpf(cmd: int, attr: ctypes.Array | bytearray | memoryview) -> int:
@@ -98,16 +97,22 @@ def map_get_fd_by_id(map_id_: int) -> int:
 
 
 def probe_inner_map_support() -> bool:
-    """True if the kernel accepts BPF_F_INNER_MAP inners in an
-    ARRAY_OF_MAPS outer (kernel 5.10+)."""
+    """True if the kernel accepts an LRU_HASH inner in an ARRAY_OF_MAPS
+    outer. No BPF_F_INNER_MAP: that flag is ARRAY-only and htab creation
+    rejects it with EINVAL; hash-type inners may differ in max_entries
+    without it (kernel 5.10+)."""
     inner_fd = -1
     outer_fd = -1
     try:
         inner_fd = map_create(BPF_MAP_TYPE_LRU_HASH, 4, 16, 1,
-                              BPF_F_INNER_MAP, name=b"axdp_probe_i")
+                              0, name=b"axdp_probe_i")
         outer_fd = map_create(BPF_MAP_TYPE_ARRAY_OF_MAPS, 4, 4, 1,
                               inner_map_fd=inner_fd, name=b"axdp_probe_o")
         return True
+    except PermissionError:
+        # EPERM means "can't create BPF maps at all" (non-root / no CAP_BPF),
+        # not "kernel lacks map-in-map" — let callers report it as such.
+        raise
     except OSError:
         return False
     finally:

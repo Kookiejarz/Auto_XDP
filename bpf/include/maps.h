@@ -140,16 +140,17 @@ struct {
 } tcp_port_policies SEC(".maps");
 
 /* Per-port rate-limit isolation: outer array indexed directly by dport.
- * Each occupied slot holds a per-port LRU created by userspace with
- * BPF_F_INNER_MAP (capacities may differ per port; kernel 5.10+).
+ * Each occupied slot holds a per-port LRU created by userspace (hash-type
+ * inner maps may differ in max_entries since kernel 5.10 — no flag needed;
+ * BPF_F_INNER_MAP is ARRAY-only and htab creation rejects it with EINVAL).
  * NULL slot = no rate limit configured for that port. */
 #define RATE_MAP_DEFAULT_ENTRIES_V4 16384
 #define RATE_MAP_DEFAULT_ENTRIES_V6 4096
 
-#ifndef BPF_F_INNER_MAP
-#define BPF_F_INNER_MAP (1U << 12)
-#endif
-
+/* Inner defs use __uint(key_size/value_size), not __type(): the inner map is a
+ * type-only template (never instantiated as a map), so clang's BTF pruning
+ * emits only a FWD for structs referenced solely through its pointer fields
+ * and libbpf then fails at object open with "can't determine value size". */
 #define DEFINE_RATE_OUTER_V4(name)                                  \
     struct {                                                        \
         __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);                   \
@@ -158,9 +159,8 @@ struct {
         __array(values, struct {                                    \
             __uint(type, BPF_MAP_TYPE_LRU_HASH);                    \
             __uint(max_entries, RATE_MAP_DEFAULT_ENTRIES_V4);       \
-            __uint(map_flags, BPF_F_INNER_MAP);                     \
-            __type(key, struct syn_rate_key_v4);                    \
-            __type(value, struct syn_rate_val);                     \
+            __uint(key_size, sizeof(struct syn_rate_key_v4));       \
+            __uint(value_size, sizeof(struct syn_rate_val));        \
         });                                                         \
     } name SEC(".maps")
 
@@ -172,9 +172,8 @@ struct {
         __array(values, struct {                                    \
             __uint(type, BPF_MAP_TYPE_LRU_HASH);                    \
             __uint(max_entries, RATE_MAP_DEFAULT_ENTRIES_V6);       \
-            __uint(map_flags, BPF_F_INNER_MAP);                     \
-            __type(key, struct syn_rate_key_v6);                    \
-            __type(value, struct syn_rate_val);                     \
+            __uint(key_size, sizeof(struct syn_rate_key_v6));       \
+            __uint(value_size, sizeof(struct syn_rate_val));        \
         });                                                         \
     } name SEC(".maps")
 
