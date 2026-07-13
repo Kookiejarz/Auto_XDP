@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file.
 
 
+## 2026-07-06
+
+### Changed
+- **Per-port rate-limit isolation via ARRAY_OF_MAPS** (`bpf/include/maps.h`):
+  `syn4`, `syn6`, `udprt4`, `udprt6` are now `BPF_MAP_TYPE_ARRAY_OF_MAPS`
+  outers indexed by destination port; the daemon creates one LRU inner map per
+  rate-limited port (`BPF_F_INNER_MAP`, capacity configurable via
+  `[rate_limits] map_entries_v4/map_entries_v6/map_entries_by_proc/map_entries_by_service`),
+  so a flood on one port can no longer evict another port's rate-limit state.
+  Pin names are unchanged, but external scripts reading these maps must now
+  dereference the inner map by dport.
+  **Kernel requirement**: the XDP backend now needs kernel 5.10+
+  (`BPF_F_INNER_MAP`); older kernels fall back to the nftables backend.
+
+### Added
+- **Map update failure reporting and kernel state verification** (Python):
+  `XdpBackend.apply_reconcile_plan` now counts failed BPF map updates
+  (`last_apply_failures`) instead of silently ignoring them; userspace-owned map wrappers
+  gain `verify()` which re-reads kernel contents, repairs the local cache, and reports
+  discrepancies; the syncer triggers `verify_kernel_state()` after failed applies and on
+  the periodic 30s health check, scheduling a corrective sync when drift is found.
+
 ## 2026-04-14
 
 ### Changed

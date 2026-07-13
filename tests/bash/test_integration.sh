@@ -295,8 +295,6 @@ print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIII', $rate_max, 0, 0, 32, 1
     bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
         key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1
 
-    # Pre-fill syn4 for _NS_IP with count=rate_max inside the current window
-    # so the next SYN overflows the limit.
     # syn_rate_val: window_start_ns(__u64 LE) + count(__u32 LE) + _pad(__u32)
     local now_ns rate_val_hex
     now_ns=$(_ktime_ns)
@@ -304,10 +302,22 @@ print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIII', $rate_max, 0, 0, 32, 1
 import struct
 print(' '.join(f'{b:02x}' for b in struct.pack('<QII', $now_ns, $rate_max, 0)))
 ")
+    # Create a per-port inner LRU (BPF_F_INNER_MAP = 0x1000) and install it
+    # into the syn4 outer slot for $port, then pre-fill the source's counter
+    # with count=rate_max inside the current window so the next SYN overflows.
+    local inner_pin="$_PIN_DIR/it_syn4_$port"
+    bpftool map create "$inner_pin" type lru_hash key 4 value 16 \
+        entries 1024 name "s4_$port" flags 0x1000 >/dev/null 2>&1 || {
+        echo "inner map create failed"; return 1; }
     bpftool map update pinned "$_PIN_DIR/syn4" \
+        key hex $(_u32le "$port") value pinned "$inner_pin" >/dev/null 2>&1
+    bpftool map update pinned "$inner_pin" \
         key hex $(_ip4be "$_NS_IP") value hex $rate_val_hex >/dev/null 2>&1
 
-    _tcp_probe "$port" && { echo "rate-limited SYN was not dropped"; return 1; }
+    local probe_rc=0
+    _tcp_probe "$port" && probe_rc=1
+    rm -f "$inner_pin"
+    [ "$probe_rc" -eq 1 ] && { echo "rate-limited SYN was not dropped"; return 1; }
     return 0
 }
 
