@@ -17,7 +17,7 @@ class MapCreateAttrTests(unittest.TestCase):
 
         with mock.patch.object(sc, "bpf", fake_bpf):
             fd = sc.map_create(sc.BPF_MAP_TYPE_LRU_HASH, 4, 16, 1024,
-                               sc.BPF_F_INNER_MAP, name=b"s4_443")
+                               0x1000, name=b"s4_443")
         self.assertEqual(fd, 42)
         self.assertEqual(captured["cmd"], sc.BPF_MAP_CREATE)
         mt, ks, vs, me, fl, inner = struct.unpack_from("=IIIIII", captured["raw"], 0)
@@ -64,6 +64,12 @@ class ProbeInnerMapSupportTests(unittest.TestCase):
         with mock.patch.object(sc, "map_create",
                                mock.Mock(side_effect=OSError(22, "EINVAL"))):
             self.assertFalse(sc.probe_inner_map_support())
+
+    def test_probe_raises_on_eperm(self):
+        with mock.patch.object(sc, "map_create",
+                               mock.Mock(side_effect=PermissionError(1, "EPERM"))):
+            with self.assertRaises(PermissionError):
+                sc.probe_inner_map_support()
 
 
 if __name__ == "__main__":

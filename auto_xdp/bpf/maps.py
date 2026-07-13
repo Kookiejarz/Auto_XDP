@@ -13,7 +13,6 @@ from typing import Any
 
 from auto_xdp import config as cfg
 from auto_xdp.bpf.syscall import (
-    BPF_F_INNER_MAP,
     BPF_F_LOCK,
     BPF_MAP_DELETE_ELEM,
     BPF_MAP_GET_NEXT_KEY,
@@ -867,7 +866,8 @@ class BpfSynRatePortsMap(CacheVerifyMixin, BpfFdMap):
 
 class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
     """ARRAY_OF_MAPS outer keyed by dport; each occupied slot holds a
-    per-port LRU inner created with BPF_F_INNER_MAP.
+    per-port LRU inner (no BPF_F_INNER_MAP — htab rejects that flag;
+    hash-type inners may differ in max_entries without it).
 
     Cache shape: {dport: inner max_entries}.
     """
@@ -955,7 +955,7 @@ class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
             inner_fd = map_create(BPF_MAP_TYPE_LRU_HASH,
                                   self._inner_key_size,
                                   self._inner_value_size,
-                                  capacity, BPF_F_INNER_MAP, name=name)
+                                  capacity, 0, name=name)
         except OSError as exc:
             log.error("rate outer %s: inner create port=%d entries=%d failed: %s",
                       self.path, port, capacity, exc)
