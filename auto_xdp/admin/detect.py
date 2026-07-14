@@ -1,23 +1,33 @@
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 from pathlib import Path
 
 
-def _iface_has_xdp(iface: str) -> bool:
+def iface_xdp_state(iface: str) -> str:
+    """Return the XDP attach state for iface: 'missing', 'generic', 'native', or 'off'."""
     if not iface:
-        return False
+        return "missing"
     try:
-        out = subprocess.check_output(
+        info = subprocess.check_output(
             ["ip", "-d", "link", "show", "dev", iface],
             stderr=subprocess.DEVNULL,
             text=True,
         )
-        return bool(re.search(r"xdp|xdpgeneric|xdpoffload", out))
     except (subprocess.CalledProcessError, OSError):
-        return False
+        return "missing"
+    if not info:
+        return "missing"
+    if "xdpgeneric" in info:
+        return "generic"
+    if "xdp" in info or "xdpoffload" in info:
+        return "native"
+    return "off"
+
+
+def _iface_has_xdp(iface: str) -> bool:
+    return iface_xdp_state(iface) in ("generic", "native")
 
 
 def _nft_table_exists(family: str, table: str) -> bool:

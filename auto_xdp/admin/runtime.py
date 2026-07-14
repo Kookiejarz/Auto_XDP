@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from auto_xdp.admin.detect import detect_backend as _detect_backend_impl
+from auto_xdp.admin.detect import iface_xdp_state as _iface_xdp_state
 
 
 @dataclass
@@ -70,22 +71,6 @@ def _ip_default_iface() -> str:
         if parts and parts[0] == "default" and len(parts) >= 5:
             return parts[4]
     return ""
-
-
-def _iface_info(iface: str) -> str:
-    result = _run_text(["ip", "-d", "link", "show", "dev", iface])
-    return result.stdout if result.returncode == 0 else ""
-
-
-def _iface_xdp_state(iface: str) -> str:
-    info = _iface_info(iface)
-    if not info:
-        return "missing"
-    if "xdpgeneric" in info:
-        return "generic"
-    if "xdp" in info or "xdpoffload" in info:
-        return "native"
-    return "off"
 
 
 def _iface_tc_egress_state(iface: str) -> str:

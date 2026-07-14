@@ -758,11 +758,6 @@ def _clip(text: str, width: int) -> str:
     return text[: max(0, width - 1)]
 
 
-def _map_visible_count(term_height: int) -> int:
-    top_h = max(8, int((term_height - 1) * 0.36))
-    return max(1, top_h - 3)
-
-
 def _box(win: Any, title: str) -> None:
     h, w = win.getmaxyx()
     if h < 2 or w < 2:

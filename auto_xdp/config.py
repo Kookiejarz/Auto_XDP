@@ -109,7 +109,6 @@ ABUSEIPDB_BASE_URL = "https://raw.githubusercontent.com/borestad/blocklist-abuse
 ABUSEIPDB_SOURCES: list[str] = ["s1003d"]
 ABUSEIPDB_REFRESH_SECONDS = 3600.0
 ABUSEIPDB_RISK_MAP_PATH4 = ""
-ABUSEIPDB_CFG_MAP_PATH = ""
 
 SLOT_DEFAULT_ACTION = "drop"
 
@@ -190,10 +189,6 @@ def load_required_xdp_map_names() -> tuple[str, ...]:
 
 REQUIRED_XDP_MAP_NAMES = load_required_xdp_map_names()
 
-TSC_PFX4_MAP_PATH = ""
-TSC_PFX6_MAP_PATH = ""
-TSC_PORT_MAP_PATH = ""
-
 # Map paths derived from BPF_PIN_DIR. Declared here so they are visible at
 # module scope; the real values are filled in by _set_bpf_pin_dir() below.
 BPF_PIN_DIR = ""
@@ -235,9 +230,8 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     global UDP_ACL_MAP_PATH4, UDP_ACL_MAP_PATH6
     global SIT4_ENDPOINTS_MAP_PATH
     global SYN4_MAP_PATH, SYN6_MAP_PATH, UDPRT4_MAP_PATH, UDPRT6_MAP_PATH
-    global TSC_PFX4_MAP_PATH, TSC_PFX6_MAP_PATH, TSC_PORT_MAP_PATH
     global REQUIRED_XDP_MAP_PATHS
-    global ABUSEIPDB_RISK_MAP_PATH4, ABUSEIPDB_CFG_MAP_PATH
+    global ABUSEIPDB_RISK_MAP_PATH4
     BPF_PIN_DIR = pin_dir
     TCP_MAP_PATH = f"{pin_dir}/tcp_whitelist"
     UDP_MAP_PATH = f"{pin_dir}/udp_whitelist"
@@ -261,11 +255,7 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     SYN6_MAP_PATH = f"{pin_dir}/syn6"
     UDPRT4_MAP_PATH = f"{pin_dir}/udprt4"
     UDPRT6_MAP_PATH = f"{pin_dir}/udprt6"
-    TSC_PFX4_MAP_PATH = f"{pin_dir}/tsc_pfx4"
-    TSC_PFX6_MAP_PATH = f"{pin_dir}/tsc_pfx6"
-    TSC_PORT_MAP_PATH = f"{pin_dir}/tsc_port"
     ABUSEIPDB_RISK_MAP_PATH4 = f"{pin_dir}/abuseipdb_v4"
-    ABUSEIPDB_CFG_MAP_PATH = f"{pin_dir}/abuseipdb_cfg"
     REQUIRED_XDP_MAP_PATHS = tuple(f"{pin_dir}/{n}" for n in REQUIRED_XDP_MAP_NAMES)
 
 
@@ -366,7 +356,7 @@ def _coerce_prefix_len(value: object, path: str, default: int, maximum: int) -> 
 def apply_toml_config(cfg: dict) -> None:
     global BOGON_FILTER_ENABLED, ISATTACK_MODE, DROP_EVENTS_ENABLED
     global LOG_LEVEL, DEBOUNCE_SECONDS
-    global DISCOVERY_EXCLUDE_LOOPBACK, DISCOVERY_EXCLUDE_BIND_CIDRS, DISCOVERY_EXCLUDE_PORTS
+    global DISCOVERY_EXCLUDE_LOOPBACK
     global PREFERRED_BACKEND, XDP_CONNTRACK_STALE_RECONCILES
     global RATE_LIMIT_SOURCE_PREFIX_V4, RATE_LIMIT_SOURCE_PREFIX_V6
     global RATE_MAP_ENTRIES_V4, RATE_MAP_ENTRIES_V6

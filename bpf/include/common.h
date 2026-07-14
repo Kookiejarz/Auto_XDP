@@ -84,54 +84,6 @@ static __always_inline struct xdp_runtime_cfg *runtime_cfg(void)
     return bpf_map_lookup_elem(&xdp_runtime_cfg, &key);
 }
 
-static __always_inline __u64 runtime_tcp_timeout_ns(void)
-{
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
-    return cfg && cfg->tcp_timeout_ns ? cfg->tcp_timeout_ns : 300ULL * NS_PER_SEC;
-}
-
-static __always_inline __u64 runtime_syn_timeout_ns(void)
-{
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
-    return cfg && cfg->syn_timeout_ns ? cfg->syn_timeout_ns : 30ULL * NS_PER_SEC;
-}
-
-static __always_inline __u64 runtime_udp_timeout_ns(void)
-{
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
-    return cfg && cfg->udp_timeout_ns ? cfg->udp_timeout_ns : 60ULL * NS_PER_SEC;
-}
-
-static __always_inline __u64 runtime_ct_refresh_ns(void)
-{
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
-    return cfg && cfg->ct_refresh_ns ? cfg->ct_refresh_ns : 30ULL * NS_PER_SEC;
-}
-
-static __always_inline __u64 runtime_icmp_token_max(void)
-{
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
-    return cfg && cfg->icmp_token_max ? cfg->icmp_token_max : 100ULL;
-}
-
-static __always_inline __u64 runtime_icmp_ns_per_token(void)
-{
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
-    return cfg && cfg->icmp_ns_per_token ? cfg->icmp_ns_per_token : NS_PER_SEC / 100ULL;
-}
-
-static __always_inline __u64 runtime_udp_global_window_ns(void)
-{
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
-    return cfg && cfg->udp_global_window_ns ? cfg->udp_global_window_ns : NS_PER_SEC;
-}
-
-static __always_inline __u64 runtime_rate_window_ns(void)
-{
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
-    return cfg && cfg->rate_window_ns ? cfg->rate_window_ns : NS_PER_SEC;
-}
-
 // cfg_*_ns(): pre-fetched cfg pointer variants — callers that already hold a
 // runtime_cfg() pointer use these to avoid redundant map lookups in hot paths.
 static __always_inline __u64 cfg_tcp_timeout_ns(struct xdp_runtime_cfg *cfg)
@@ -163,9 +115,6 @@ static __always_inline __u64 cfg_rate_window_ns(struct xdp_runtime_cfg *cfg)
 {
     return cfg && cfg->rate_window_ns ? cfg->rate_window_ns : NS_PER_SEC;
 }
-
-// default 10,000 pps; 0 = disabled (documented; actual value lives in map)
-#define UDP_GLOBAL_DEFAULT_RATE  10000U
 
 // BPF Maps: hot-updatable TCP/UDP port whitelists (ARRAY implementation)
 // The ARRAY map uses the port number (host byte order) as the array index (__u32 key).
