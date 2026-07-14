@@ -447,6 +447,9 @@ static __always_inline bool inspect_login_packet(
     {
         __u32 name_len = (__u32)v.value;
 
+        /* Logically redundant with the v.value check above, but the verifier
+         * needs an explicit bound on this register before the variable-length
+         * consume_bytes(); barrier_var keeps clang from optimizing it away. */
         if (name_len > MC_LOGIN_NAME_MAX)
             return false;
         barrier_var(name_len);
@@ -577,7 +580,7 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
 
     l3_off = (__u32)sc->l3_offset;
     inner_off_u32 = (__u32)sc->inner_offset;
-    if (l3_off > 255 || inner_off_u32 > 255 || inner_off_u32 < l3_off)
+    if (l3_off > 255 || inner_off_u32 > 255)
         return XDP_PASS;
 
     inner_off = (__u16)inner_off_u32;
@@ -690,6 +693,9 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
     if (payload_len > 0) {
         __u8 *cursor = payload;
 
+        /* Unreachable given the payload_end check above, but this is the
+         * direct ptr-vs-data_end form the verifier tracks; keep it so cursor
+         * reads below stay provably in bounds. */
         if ((void *)(cursor + 1) > data_end)
             return restore_and_return(ctx, inner_off, XDP_DROP);
 

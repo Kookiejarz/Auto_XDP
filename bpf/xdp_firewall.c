@@ -181,17 +181,12 @@ static __always_inline int check_udp_ipv4(
         // global UDP rate block applies unconditionally here.
         __u32 rl_key = 0;
         struct udp_percpu_local *local_pre = bpf_map_lookup_elem(&udp_percpu_acc, &rl_key);
-        if (local_pre && local_pre->blocked_until_ns != 0) {
-            if (now < local_pre->blocked_until_ns) {
-                local_pre->local_bytes = 0;
-                count(CNT_UDP_GLOBAL_RATE_DROP);
-                count(CNT_UDP_DROP);
-                emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
-                          key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
-                return XDP_DROP;
-            } else {
-                local_pre->blocked_until_ns = 0;
-            }
+        if (local_pre && udp_global_block_fast_path(local_pre, now) == XDP_DROP) {
+            count(CNT_UDP_GLOBAL_RATE_DROP);
+            count(CNT_UDP_DROP);
+            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
+                      key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+            return XDP_DROP;
         }
     }
 
@@ -324,17 +319,12 @@ static __always_inline int check_udp_ipv6(
         // global UDP rate block applies unconditionally here.
         __u32 rl_key = 0;
         struct udp_percpu_local *local_pre = bpf_map_lookup_elem(&udp_percpu_acc, &rl_key);
-        if (local_pre && local_pre->blocked_until_ns != 0) {
-            if (now < local_pre->blocked_until_ns) {
-                local_pre->local_bytes = 0;
-                count(CNT_UDP_GLOBAL_RATE_DROP);
-                count(CNT_UDP_DROP);
-                emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
-                          key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
-                return XDP_DROP;
-            } else {
-                local_pre->blocked_until_ns = 0;
-            }
+        if (local_pre && udp_global_block_fast_path(local_pre, now) == XDP_DROP) {
+            count(CNT_UDP_GLOBAL_RATE_DROP);
+            count(CNT_UDP_DROP);
+            emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
+                      key.sport, key.dport, (__u8)CNT_UDP_GLOBAL_RATE_DROP, now);
+            return XDP_DROP;
         }
     }
 
@@ -402,7 +392,7 @@ static __always_inline int check_udp_ipv6(
 }
 
 // ICMP token-bucket rate limiter: returns XDP_PASS or XDP_DROP.
-// Tokens refill at (1e9/runtime_icmp_ns_per_token()) per second up to runtime_icmp_token_max().
+// Tokens refill at (1e9/cfg->icmp_ns_per_token) per second up to cfg->icmp_token_max.
 static __always_inline int icmp_rate_limit(void)
 {
     __u32 key = 0;
