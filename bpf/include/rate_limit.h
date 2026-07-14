@@ -687,6 +687,22 @@ static __always_inline int allow_new_tcp_syn(struct flow_key *key, __u32 dest_po
 
 #define UDP_GLOBAL_BATCH_BYTES (65536ULL)
 
+// Per-CPU fast path of the global UDP block: returns XDP_DROP while a block
+// verdict is active, clearing it once expired. Shared by the early pre-checks
+// in the UDP handlers and by udp_global_rate_check().
+static __always_inline int udp_global_block_fast_path(struct udp_percpu_local *local,
+                                                      __u64 now)
+{
+    if (local->blocked_until_ns != 0) {
+        if (now < local->blocked_until_ns) {
+            local->local_bytes = 0;
+            return XDP_DROP;
+        }
+        local->blocked_until_ns = 0;
+    }
+    return XDP_PASS;
+}
+
 static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes,
                                                  struct xdp_runtime_cfg *cfg)
 {
@@ -701,13 +717,8 @@ static __always_inline int udp_global_rate_check(__u64 now, __u64 pkt_bytes,
         return XDP_PASS;
 
     // Per-CPU fast path: check block verdict without any spinlock.
-    if (local->blocked_until_ns != 0) {
-        if (now < local->blocked_until_ns) {
-            local->local_bytes = 0;
-            return XDP_DROP;
-        }
-        local->blocked_until_ns = 0;
-    }
+    if (udp_global_block_fast_path(local, now) == XDP_DROP)
+        return XDP_DROP;
 
     local->local_bytes += pkt_bytes;
     if (local->local_bytes < UDP_GLOBAL_BATCH_BYTES)
