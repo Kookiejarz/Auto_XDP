@@ -304,7 +304,6 @@ class TestAbuseIPDBConfig(unittest.TestCase):
         import auto_xdp.config as cfg_mod
         pin_dir = cfg_mod.BPF_PIN_DIR
         self.assertEqual(cfg_mod.ABUSEIPDB_RISK_MAP_PATH4, f"{pin_dir}/abuseipdb_v4")
-        self.assertEqual(cfg_mod.ABUSEIPDB_CFG_MAP_PATH, f"{pin_dir}/abuseipdb_cfg")
 
 
 if __name__ == "__main__":

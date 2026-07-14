@@ -65,14 +65,6 @@ struct udp_percpu_local {
     __u64 blocked_until_ns;     // per-CPU copy of the block verdict for the fast-drop path
 };
 
-// Per-port SYN rate limit config, populated at runtime by xdp_port_sync.
-// Key: dest port (host byte order). Value: rate_max SYNs/window (0 = disabled).
-// Ports absent from this map are NOT rate-limited (e.g. HTTP/HTTPS).
-struct syn_rate_port_cfg {
-    __u32 rate_max; // max SYNs per source IP per configured rate window; 0 = skip
-    __u32 _pad;
-};
-
 struct tcp_port_policy_cfg {
     __u32 syn_rate_max;             /* view idx 0 */
     __u32 syn_agg_rate_max;         /* view idx 1 */

@@ -112,39 +112,6 @@ class ReconcilePlan:
     drop_events_update: bool | None = None
     udp_global_byte_rate_update: int | None = None
 
-    def is_noop(self) -> bool:
-        return not any((
-            self.tcp_ports_to_add,
-            self.tcp_ports_to_remove,
-            self.udp_ports_to_add,
-            self.udp_ports_to_remove,
-            self.sctp_ports_to_add,
-            self.sctp_ports_to_remove,
-            self.trusted_cidrs_to_add,
-            self.trusted_cidrs_to_remove,
-            self.conntrack_entries_to_add,
-            self.conntrack_entries_to_remove,
-            self.tcp_syn_rate_limits_to_upsert,
-            self.tcp_syn_rate_limits_to_remove,
-            self.tcp_syn_agg_rate_limits_to_upsert,
-            self.tcp_syn_agg_rate_limits_to_remove,
-            self.tcp_conn_limits_to_upsert,
-            self.tcp_conn_limits_to_remove,
-            self.tcp_conn_prefix_limits_to_upsert,
-            self.tcp_conn_prefix_limits_to_remove,
-            self.tcp_conn_port_limits_to_upsert,
-            self.tcp_conn_port_limits_to_remove,
-            self.udp_rate_limits_to_upsert,
-            self.udp_rate_limits_to_remove,
-            self.udp_agg_rate_limits_to_upsert,
-            self.udp_agg_rate_limits_to_remove,
-            self.acl_rules_to_upsert,
-            self.acl_rules_to_remove,
-            self.bogon_filter_update is not None,
-            self.drop_events_update is not None,
-            self.udp_global_byte_rate_update is not None,
-        ))
-
 
 def _dict_upserts(desired: dict[int, int], applied: dict[int, int]) -> dict[int, int]:
     return {key: value for key, value in desired.items() if applied.get(key) != value}

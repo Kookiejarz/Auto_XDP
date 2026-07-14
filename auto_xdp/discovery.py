@@ -302,7 +302,7 @@ def _get_listening_ports_netlink() -> ObservedState:
     systemd_socket_map: dict[int, str] | None = None
 
     def _proc_name(inode: int) -> str:
-        nonlocal inode_pid, systemd_socket_map
+        nonlocal inode_pid
         if not inode:
             return ""
         if inode_pid is None:

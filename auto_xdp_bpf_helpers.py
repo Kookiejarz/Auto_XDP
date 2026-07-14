@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Helpers for Auto XDP BPF map operations."""
+"""Helpers for Auto XDP BPF map operations.
+
+Deliberately self-contained: setup bootstrap (lib/setup/build.sh) may fetch
+this single file to a temp path and run it before the auto_xdp package exists
+on the host, so the bpf()/obj_get()/pack_ct_key* duplicates of
+auto_xdp/bpf/syscall.py and auto_xdp/discovery.py must stay local — do not
+replace them with package imports.
+"""
 
 from __future__ import annotations
 

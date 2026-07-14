@@ -12,10 +12,6 @@ struct gre_hdr {
     __be16 proto;
 };
 
-#define GRE_FLAG_CSUM (1 << 15)
-#define GRE_FLAG_KEY  (1 << 13)
-#define GRE_FLAG_SEQ  (1 << 12)
-
 SEC("xdp/gre")
 int xdp_gre_handler(struct xdp_md *ctx)
 {

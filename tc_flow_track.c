@@ -46,8 +46,6 @@ struct vlan_hdr {
 
 // Conntrack timeouts and refresh intervals (must match XDP)
 #define TCP_TIMEOUT_NS       (300ULL * 1000000000ULL)
-#define UDP_TIMEOUT_NS       (60ULL  * 1000000000ULL)
-#define SCTP_TIMEOUT_NS      (300ULL * 1000000000ULL)
 #define CT_REFRESH_INTERVAL  (30ULL  * 1000000000ULL)
 
 struct flow_key {
