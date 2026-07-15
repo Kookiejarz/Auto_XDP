@@ -2123,7 +2123,10 @@ def _read_xdp_rows(bpf_pin_dir: str) -> list[tuple[str, int, int]]:
         )
         data = json.loads(out)
     except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as exc:
-        raise RuntimeError(f"Failed to read XDP counters: {exc}") from exc
+        hint = ""
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            hint = " (reading pinned BPF maps needs root; try: sudo axdp stats)"
+        raise RuntimeError(f"Failed to read XDP counters: {exc}{hint}") from exc
 
     def _bytelist_to_int(lst: list) -> int:
         try:
@@ -2787,6 +2790,10 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    except PermissionError as exc:
+        print(f"Permission denied: {exc}", file=sys.stderr)
+        print("This command needs root; try re-running with sudo.", file=sys.stderr)
+        return 77
 
 
 if __name__ == "__main__":
