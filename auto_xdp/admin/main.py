@@ -54,6 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    except PermissionError as exc:
+        print(f"Permission denied: {exc}", file=sys.stderr)
+        print("This command needs root; try re-running with sudo.", file=sys.stderr)
+        return 77
 
 
 if __name__ == "__main__":

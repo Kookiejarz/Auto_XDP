@@ -135,6 +135,15 @@ load_config() {
     fi
 }
 
+# Fail fast with a uniform hint when a state-changing subcommand runs without
+# root, instead of surfacing a Python traceback from whichever layer hits
+# EPERM first (config rewrite, pinned map access, systemctl, ...).
+require_root() {
+    [[ ${EUID:-$(id -u)} -eq 0 ]] && return 0
+    printf 'axdp %s needs root; try: sudo axdp %s\n' "$*" "$*" >&2
+    exit 77
+}
+
 # Drop CWD from sys.path before delegating to a module so an `auto_xdp/`
 # directory in the caller's working directory cannot shadow the installed package.
 PY_BOOTSTRAP='import sys, runpy; sys.path[:] = [p for p in sys.path if p]; runpy.run_module(sys.argv.pop(1), run_name="__main__", alter_sys=True)'
@@ -205,6 +214,7 @@ run_log_level() {
         return $?
     fi
 
+    require_root "log-level $level"
     [[ -f "$TOML_CONFIG" ]] || run_config init
     run_admin_config log-level "$level"
     reload_daemon
@@ -219,6 +229,7 @@ run_under_attack() {
         return $?
     fi
 
+    require_root "under-attack $mode"
     [[ -f "$TOML_CONFIG" ]] || run_config init
     run_admin_config under-attack "$mode"
     reload_daemon
@@ -544,6 +555,7 @@ run_config() {
             run_admin_config config show "$@"
             ;;
         init)
+            require_root "config init"
             run_admin_config config init "$@"
             ;;
         -h|--help)
@@ -557,6 +569,7 @@ run_config() {
 run_trust() {
     local sub="${1:-list}"
     shift || true
+    case "$sub" in add|del) require_root "trust $sub" ;; esac
     case "$sub" in
         list)
             run_admin_config trust list
@@ -581,6 +594,7 @@ run_trust() {
 run_acl() {
     local sub="${1:-list}"
     shift || true
+    case "$sub" in add|del) require_root "acl $sub" ;; esac
     case "$sub" in
         list)
             run_admin_config acl list
@@ -605,6 +619,7 @@ run_acl() {
 run_permanent() {
     local sub="${1:-list}"
     shift || true
+    case "$sub" in add|del) require_root "permanent $sub" ;; esac
     case "$sub" in
         list)
             run_admin_config permanent list
@@ -629,6 +644,7 @@ run_permanent() {
 run_slot() {
     local sub="${1:-list}"
     shift || true
+    case "$sub" in load|unload) require_root "slot $sub" ;; esac
 
     case "$sub" in
         list|load|unload)
@@ -644,6 +660,7 @@ run_slot() {
 run_port_handler() {
     local sub="${1:-list}"
     shift || true
+    case "$sub" in load|unload) require_root "port-handler $sub" ;; esac
 
     case "$sub" in
         list|load|unload)
@@ -668,6 +685,7 @@ run_exclude() {
             shift || true
             case "$action" in
                 add|del)
+                    require_root "exclude port $action"
                     [[ -f "$TOML_CONFIG" ]] || run_config init
                     run_admin_config exclude port "$action" "$@"
                     reload_daemon
@@ -683,6 +701,7 @@ run_exclude() {
             shift || true
             case "$action" in
                 add|del)
+                    require_root "exclude src $action"
                     [[ -f "$TOML_CONFIG" ]] || run_config init
                     run_admin_config exclude src "$action" "$@"
                     reload_daemon
@@ -733,6 +752,7 @@ main() {
             ;;
         sync)
             shift || true
+            require_root "sync"
             ensure_installed "$RUNNER_SCRIPT"
             exec "$RUNNER_SCRIPT" --sync-once "$@"
             ;;
@@ -778,6 +798,7 @@ main() {
             ;;
         start|stop|restart|status)
             shift || true
+            [[ "$cmd" != "status" ]] && require_root "$cmd"
             run_service_cmd "$cmd"
             ;;
         help|-h|--help)

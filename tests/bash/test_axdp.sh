@@ -7,60 +7,8 @@ BASE_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 # shellcheck source=tests/bash/testlib.sh
 source "$REPO_ROOT/tests/bash/testlib.sh"
 
-test_format_helpers_render_human_output() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    assert_eq "$(human_bytes 1536)" "1.50 KiB" || return 1
-    assert_eq "$(human_bytes -1)" "-" || return 1
-    assert_eq "$(human_bps 1500)" "1.50 Kbps" || return 1
-    assert_eq "$(format_rate 10 125 1)" "10.00 pps / 1.00 Kbps"
-)
-
-test_parse_stats_args_sets_expected_flags() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    WATCH_MODE=0
-    SHOW_RATES=0
-    INTERVAL=1
-    IFACE=""
-
-    parse_stats_args --watch --rates --interval 5 --interface eth9 || return 1
-    assert_eq "$WATCH_MODE" "1" || return 1
-    assert_eq "$SHOW_RATES" "1" || return 1
-    assert_eq "$INTERVAL" "5" || return 1
-    assert_eq "$IFACE" "eth9"
-)
-
-test_parse_ports_args_sets_expected_flags() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    PORTS_WATCH=0
-    PORTS_INTERVAL=2
-
-    parse_ports_args watch --interval 7 || return 1
-    assert_eq "$PORTS_WATCH" "1" || return 1
-    assert_eq "$PORTS_INTERVAL" "7" || return 1
-
-    PORTS_WATCH=0
-    PORTS_INTERVAL=2
-
-    parse_ports_args --watch || return 1
-    assert_eq "$PORTS_WATCH" "1"
-)
-
-test_csv_helpers_sort_and_diff_ports() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local sorted
-    sorted=$(csv_to_sorted_lines "443,22,80")
-    assert_eq "$sorted" $'22\n80\n443' || return 1
-    assert_eq "$(diff_csv "22,80" "22,443" added)" "443" || return 1
-    assert_eq "$(diff_csv "22,80" "22,443" removed)" "80"
-)
+# NOTE: stats/ports formatting, flag parsing, and csv helpers migrated to
+# Python (auto_xdp/admin_cli.py); covered by tests/python/test_admin_cli.py.
 
 test_run_log_level_reads_and_updates_config() (
     source "$REPO_ROOT/axdp"
@@ -69,6 +17,8 @@ test_run_log_level_reads_and_updates_config() (
     local tmpdir
     tmpdir=$(mktemp -d)
     TOML_CONFIG="$tmpdir/config.toml"
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    require_root() { :; }
     cat >"$TOML_CONFIG" <<'EOF_CFG'
 [daemon]
 log_level = "info"
@@ -94,6 +44,8 @@ test_run_under_attack_reads_and_updates_config() (
     local tmpdir
     tmpdir=$(mktemp -d)
     TOML_CONFIG="$tmpdir/config.toml"
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    require_root() { :; }
     cat >"$TOML_CONFIG" <<'EOF_CFG'
 [under_attack]
 enabled = false
@@ -153,6 +105,9 @@ test_main_reports_stale_admin_cli_for_tui() (
     local tmpdir output status
     tmpdir=$(mktemp -d)
     PYTHON_LIB_DIR="$tmpdir/python"
+    # Keep a real installed /etc/auto_xdp/auto_xdp.env from overriding the fake
+    # PYTHON_LIB_DIR when this suite runs on a host with Auto XDP installed.
+    CONFIG_FILE="$tmpdir/absent.env"
     mkdir -p "$PYTHON_LIB_DIR/auto_xdp"
     touch "$PYTHON_LIB_DIR/auto_xdp/__init__.py"
     cat >"$PYTHON_LIB_DIR/auto_xdp/admin_cli.py" <<'EOF_PY'
@@ -187,6 +142,8 @@ test_config_updates_preserve_unrelated_sections() (
     local tmpdir
     tmpdir=$(mktemp -d)
     TOML_CONFIG="$tmpdir/config.toml"
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    require_root() { :; }
     reload_daemon() { :; }
 
     cat >"$TOML_CONFIG" <<'EOF_CFG'
@@ -224,6 +181,8 @@ test_run_permanent_supports_sctp_ports() (
     local tmpdir
     tmpdir=$(mktemp -d)
     TOML_CONFIG="$tmpdir/config.toml"
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    require_root() { :; }
     reload_daemon() { :; }
 
     cat >"$TOML_CONFIG" <<'EOF_CFG'
@@ -292,6 +251,9 @@ test_detect_backend_reports_missing_state() (
     RUN_STATE_DIR="$tmpdir/run"
     BPF_PIN_DIR="$tmpdir/bpf"
     mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
+    # Point at a table that never exists so a live auto_xdp nftables install on
+    # the host cannot make detection succeed.
+    NFT_TABLE="axdp_test_absent"
 
     PATH="$tmpdir/bin:$BASE_PATH"
     IFACE="eth0"
@@ -488,6 +450,7 @@ test_run_backend_reports_runtime_state_and_conntrack_counts() (
     RUN_STATE_DIR="$tmpdir/run"
     BPF_PIN_DIR="$tmpdir/bpf"
     CONFIG_FILE="$tmpdir/auto_xdp.env"
+    PYTHON_LIB_DIR="$REPO_ROOT"
     mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
     printf 'xdp\n' > "$RUN_STATE_DIR/backend"
     printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
@@ -545,6 +508,7 @@ test_run_backend_json_reports_runtime_state_and_conntrack_counts() (
     RUN_STATE_DIR="$tmpdir/run"
     BPF_PIN_DIR="$tmpdir/bpf"
     CONFIG_FILE="$tmpdir/auto_xdp.env"
+    PYTHON_LIB_DIR="$REPO_ROOT"
     mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
     printf 'xdp\n' > "$RUN_STATE_DIR/backend"
     printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
@@ -662,6 +626,8 @@ test_slot_load_sctp_reuses_shared_maps() (
     BPF_PIN_DIR="$tmpdir/bpf"
     INSTALL_DIR="$tmpdir/install"
     TOML_CONFIG="$tmpdir/config.toml"
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    require_root() { :; }
     mkdir -p "$BPF_PIN_DIR/handlers" "$INSTALL_DIR/handlers" "$tmpdir/bin"
     touch \
         "$BPF_PIN_DIR/slot_ctx_map" \
@@ -698,6 +664,8 @@ test_slot_load_custom_c_compiles_and_persists_object_path() (
     BPF_PIN_DIR="$tmpdir/bpf"
     INSTALL_DIR="$tmpdir/install"
     TOML_CONFIG="$tmpdir/config.toml"
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    require_root() { :; }
     mkdir -p "$BPF_PIN_DIR/handlers" "$INSTALL_DIR/handlers" "$tmpdir/bin"
     touch \
         "$BPF_PIN_DIR/slot_ctx_map" \
@@ -743,10 +711,6 @@ EOF_BPFSH
     assert_file_contains "$TOML_CONFIG" 'path = "'"$INSTALL_DIR"'/handlers/custom_99_custom_handler.o"'
 )
 
-run_test "axdp formats human-readable counters and rates" test_format_helpers_render_human_output
-run_test "axdp parses stats flags" test_parse_stats_args_sets_expected_flags
-run_test "axdp parses ports flags" test_parse_ports_args_sets_expected_flags
-run_test "axdp sorts and diffs csv port lists" test_csv_helpers_sort_and_diff_ports
 run_test "axdp reads and updates runtime log level" test_run_log_level_reads_and_updates_config
 run_test "axdp reads and updates under-attack mode" test_run_under_attack_reads_and_updates_config
 run_test "axdp dispatches under-attack command correctly" test_main_dispatches_under_attack_command
