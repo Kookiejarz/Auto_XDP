@@ -54,25 +54,20 @@ existing_install_detected() {
     return 1
 }
 
-confirm_existing_install_step() {
-    if ! existing_install_detected; then
-        return 0
+# Existing installs are replaced in place, without prompting: runtime files are
+# repo-managed and safe to overwrite. User-edited config.toml is still guarded
+# separately by install_toml_config. Stray services/processes are always
+# stopped so the new deployment starts clean.
+replace_existing_install_step() {
+    if existing_install_detected; then
+        step_begin "Replacing existing installation"
+        stop_existing_service
+        step_ok "services stopped; runtime files will be overwritten"
+    else
+        step_begin "Checking existing installation"
+        stop_existing_service
+        step_ok "none found"
     fi
-
-    step_begin "Checking existing installation"
-    if confirm_yes_no "Existing Auto XDP installation detected. Replace installed runtime files and restart the service? [y/N] " "abort"; then
-        step_ok "confirmed"
-        return 0
-    fi
-
-    step_warn "aborted"
-    die "Installation aborted; existing deployment left untouched."
-}
-
-stop_existing_service_step() {
-    step_begin "Stopping existing service"
-    stop_existing_service
-    step_ok
 }
 
 write_config() {
@@ -397,6 +392,10 @@ install_toml_config() {
         if ! confirm_yes_no "config.toml already exists at ${toml_target}. Replace with repo default? [y/N] "; then
             return 0
         fi
+        # User-edited config is about to be replaced (interactive yes or
+        # --force); keep a copy so the settings are recoverable.
+        place_file "$toml_target" "${toml_target}.bak"
+        info "Backed up existing config to ${toml_target}.bak"
     fi
 
     if ! fetch_local_or_remote "config.toml" "config.toml" "$toml_target"; then

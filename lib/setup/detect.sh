@@ -94,9 +94,9 @@ detect_init_system() {
     fi
 }
 
-detect_environment_step() {
-    step_begin "Detecting default package manager"
+# Silent: resolves PKG_MANAGER/INIT_SYSTEM only; the result is reported in the
+# basic-info block printed at the top of the run.
+detect_environment() {
     detect_pkg_manager || die "No supported package manager found."
     detect_init_system
-    step_ok "Found: $PKG_MANAGER"
 }

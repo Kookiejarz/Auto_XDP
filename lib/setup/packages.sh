@@ -56,10 +56,17 @@ pkg_install_optional() {
 package_list_for_manager() {
     case "$PKG_MANAGER" in
         apt-get)
-            echo "clang llvm libbpf-dev build-essential iproute2 curl python3 python3-pip nftables gcc-multilib"
+            # gcc-multilib only exists on x86_64; requesting it elsewhere makes
+            # apt abort the whole install transaction.
+            local multilib=""
+            if [[ "$(uname -m)" == "x86_64" ]]; then
+                multilib=" gcc-multilib"
+            fi
+            echo "clang llvm libbpf-dev build-essential iproute2 curl python3 python3-pip nftables${multilib}"
             ;;
         dnf|yum)
-            echo "clang llvm libbpf-devel bpftool iproute curl python3 python3-pip gcc make nftables"
+            # tc lives in iproute-tc on Fedora/RHEL, not in iproute.
+            echo "clang llvm libbpf-devel bpftool iproute iproute-tc curl python3 python3-pip gcc make nftables"
             ;;
         zypper)
             echo "clang llvm libbpf-devel bpftool iproute2 curl python3 python3-pip gcc make nftables"
@@ -111,14 +118,17 @@ install_packages() {
     mapfile -t package_list < <(package_list_for_manager | tr ' ' '\n')
     mapfile -t optional_list < <(optional_package_list_for_manager | tr ' ' '\n')
 
-    pkg_update
-    pkg_install "${package_list[@]}"
+    pkg_update || warn "Package index refresh failed; trying install with cached index"
+    pkg_install "${package_list[@]}" || return 1
     for optional_package in "${optional_list[@]}"; do
         [[ -n "$optional_package" ]] || continue
         pkg_install_optional "$optional_package"
     done
 
-    [[ "$PKG_MANAGER" == "apt-get" ]] && install_bpftool_apt
+    if [[ "$PKG_MANAGER" == "apt-get" ]]; then
+        install_bpftool_apt
+    fi
+    return 0
 }
 
 ensure_psutil() {
@@ -190,29 +200,49 @@ PY
     esac
 }
 
+_tool_present() {
+    command -v "$1" &>/dev/null
+}
+
+# One checklist line per tool: ✓ when present, ✗ when missing. Missing tools
+# are installed via the package manager, then re-checked line by line.
 check_required_tools_step() {
     local missing=()
     local cmd
 
     step_begin "Checking required tools"
     for cmd in clang bpftool python3 curl ip tc nft; do
-        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+        substep_run "$cmd" _tool_present "$cmd" || missing+=("$cmd")
     done
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        step_warn "Missing: ${missing[*]} — installing via $PKG_MANAGER"
-        step_begin "Installing missing packages via $PKG_MANAGER"
-        install_packages || die_with_next "Package installation failed." "install the missing packages manually, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
-        step_ok
-        step_begin "Verifying installed tools"
+        substep_run "Installing via $PKG_MANAGER: ${missing[*]}" install_packages \
+            || die_with_next "Package installation failed." "install the missing packages manually, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
+        for cmd in "${missing[@]}"; do
+            if ! substep_run "$cmd (after install)" _tool_present "$cmd"; then
+                case "$cmd" in
+                    clang|bpftool)
+                        warn "$cmd still missing — XDP backend may be unavailable"
+                        ;;
+                    tc)
+                        warn "tc still missing — TCP/UDP/SCTP egress reply tracking will be skipped"
+                        ;;
+                    nft)
+                        warn "nft still missing — nftables fallback backend will be unavailable"
+                        ;;
+                esac
+            fi
+        done
     fi
 
-    command -v python3 &>/dev/null || die_with_next "python3 not found after installation." "install Python 3.10 or newer, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
-    ensure_python_runtime
-    command -v curl &>/dev/null || die_with_next "curl not found after installation." "install curl, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
-    command -v ip &>/dev/null || die_with_next "ip command not found after installation." "install iproute2/iproute, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
-    ensure_psutil
-    ensure_tomli_for_python310
+    _tool_present python3 || die_with_next "python3 not found after installation." "install Python 3.10 or newer, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
+    _tool_present curl || die_with_next "curl not found after installation." "install curl, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
+    _tool_present ip || die_with_next "ip command not found after installation." "install iproute2/iproute, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
+    substep_run "python3 >= 3.10" ensure_python_runtime
+    substep_run "python3 psutil module" ensure_psutil \
+        || die_with_next "Failed to install the psutil Python module." "install python3-psutil (or pip install psutil), then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
+    substep_run "python3 TOML support" ensure_tomli_for_python310 \
+        || die_with_next "Failed to install the tomli Python module." "install python3-tomli (or pip install tomli), then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
     PYTHON3_BIN=$(command -v python3)
-    step_ok
+    IN_STEP=0; _STEP_NEWLINED=0; _PENDING_NL=0
 }

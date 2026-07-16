@@ -139,6 +139,7 @@ XDP_FALLBACK_REASON=""
 PYTHON3_BIN=""
 CHECK_UPDATES=0
 FORCE=0
+EXISTING_INSTALL=0
 CHECK_ENV=0
 DRY_RUN=0
 INTERNAL_PHASE2=0
@@ -314,18 +315,22 @@ main() {
         exit 0
     fi
 
-    print_installer_banner
+    # Detection runs silently first so the basic-info block opens the output;
+    # per-item checks and install steps follow; the LOGO + deployment details
+    # come last.
     detect_privilege_mode
+    detect_environment
+    resolve_target_interfaces
+    if existing_install_detected; then
+        EXISTING_INSTALL=1
+    fi
+    print_basic_info
     check_github_updates_once
-    resolve_target_interfaces_step
-    detect_environment_step
-    print_setup_plan
     # First system-mutating step ahead: acquire sudo once (no-op when root).
     priv_init
     check_required_tools_step
     bootstrap_bpf_helper_step
-    confirm_existing_install_step
-    stop_existing_service_step
+    replace_existing_install_step
     compile_bpf_objects_step
     install_xdp_required_maps_step
     install_runtime_files_step

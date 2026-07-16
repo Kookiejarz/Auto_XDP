@@ -99,22 +99,22 @@ substep_run() {
 #   root  -> already EUID 0; the helpers run commands directly
 #   sudo  -> sudo is on PATH; the helpers escalate per command
 # The first password prompt is deferred to priv_init, called right before the
-# first system-mutating step, so the banner/detection/plan run as the user.
+# first system-mutating step, so detection and the basic-info block run as the
+# user.
 # ---------------------------------------------------------------------------
 PRIV_MODE="root"
 PRIV_PRIMED=0
 _PRIV_KEEPALIVE_PID=""
 
+# Silent: resolves PRIV_MODE only; the result is reported in the basic-info
+# block printed at the top of the run.
 detect_privilege_mode() {
-    step_begin "Checking privileges"
     if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
         PRIV_MODE="root"
-        step_ok "running as root"
         return 0
     fi
     if command -v sudo >/dev/null 2>&1; then
         PRIV_MODE="sudo"
-        step_ok "non-root; will escalate via sudo when needed"
         return 0
     fi
     die_with_next "Some steps need root, but neither root nor sudo is available." \
@@ -274,24 +274,33 @@ parse_args() {
     fi
 }
 
-print_installer_banner() {
-    echo -e "\n${BOLD}${CYAN}  ╔═══════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}  ║      Auto XDP Installer           ║${NC}"
-    echo -e "${BOLD}${CYAN}  ╚═══════════════════════════════════╝${NC}\n"
-}
-
-print_setup_plan() {
-    echo -e "${BOLD}Auto XDP setup plan${NC}"
+# Basic-info block printed before any install step. Detection (privileges,
+# distro, package manager, interfaces, existing install) must already be done.
+print_basic_info() {
+    echo -e "\n${BOLD}${CYAN}Auto XDP Installer${NC}\n"
+    echo -e "${BOLD}Basic information${NC}"
+    echo "  distro         : ${DISTRO_NAME} (${DISTRO_FAMILY} family)"
+    echo "  kernel         : $(uname -r) $(uname -m)"
     if [[ ${#IFACES[@]} -eq 1 ]]; then
-        echo "  interface      : ${IFACES[0]}"
+        echo "  interface      : ${IFACES[0]}  [${IFACE_SOURCE:-arguments}]"
     else
-        echo "  interfaces     : ${IFACES[*]}"
+        echo "  interfaces     : ${IFACES[*]}  [${IFACE_SOURCE:-arguments}]"
     fi
     echo "  backend        : auto (XDP preferred, nftables fallback)"
     echo "  package manager: $PKG_MANAGER"
     echo "  service manager: $INIT_SYSTEM"
+    if [[ "$PRIV_MODE" == "root" ]]; then
+        echo "  privilege      : root"
+    else
+        echo "  privilege      : ${USER:-$(id -un)} (sudo escalation when needed)"
+    fi
     echo "  install dir    : $INSTALL_DIR"
     echo "  config dir     : $CONFIG_DIR"
+    if [[ ${EXISTING_INSTALL:-0} -eq 1 ]]; then
+        echo -e "  existing       : ${YELLOW}detected${NC} — runtime files will be replaced"
+    else
+        echo "  existing       : none (fresh install)"
+    fi
     echo ""
 }
 
@@ -314,16 +323,60 @@ get_active_interfaces() {
         || true
 }
 
-resolve_target_interfaces_step() {
-    step_begin "Detecting network interfaces"
+# How the target interfaces were chosen; shown in the basic-info block and the
+# deployment summary so a reinstall never silently changes coverage.
+IFACE_SOURCE="arguments"
+
+# Reuse the IFACES recorded by a previous install so a bare re-run keeps
+# covering the same interfaces. Saved interfaces that no longer exist are
+# dropped (with a note in IFACE_SOURCE); returns 1 when nothing usable remains.
+_reuse_installed_ifaces() {
+    [[ -r "$CONFIG_FILE" ]] || return 1
+
+    local line="" saved=""
+    line=$(grep -m1 '^IFACES=' "$CONFIG_FILE" 2>/dev/null) || return 1
+    saved="${line#IFACES=}"
+    saved="${saved%\"}"
+    saved="${saved#\"}"
+    [[ -n "$saved" ]] || return 1
+
+    local -a valid=() gone=()
+    local _iface
+    for _iface in $saved; do
+        if ip link show "$_iface" &>/dev/null; then
+            valid+=("$_iface")
+        else
+            gone+=("$_iface")
+        fi
+    done
+    [[ ${#valid[@]} -gt 0 ]] || return 1
+
+    IFACES=("${valid[@]}")
+    if [[ ${#gone[@]} -gt 0 ]]; then
+        IFACE_SOURCE="existing install; dropped missing: ${gone[*]}"
+    else
+        IFACE_SOURCE="existing install"
+    fi
+    return 0
+}
+
+_detect_default_route_iface() {
+    local _default_iface
+    _default_iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    [[ -n "$_default_iface" ]] || die "Cannot detect default interface. Specify manually: sudo bash $0 eth0"
+    IFACES=("$_default_iface")
+    IFACE_SOURCE="default route auto-detect"
+}
+
+# Silent: resolves IFACES/IFACE only; the result is reported in the basic-info
+# block printed at the top of the run.
+resolve_target_interfaces() {
     if [[ $ALL_IFACES -eq 1 ]]; then
         mapfile -t IFACES < <(get_active_interfaces)
         [[ ${#IFACES[@]} -gt 0 ]] || die "No active non-loopback interfaces found."
+        IFACE_SOURCE="all active interfaces"
     elif [[ ${#IFACES[@]} -eq 0 ]]; then
-        local _default_iface
-        _default_iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-        [[ -n "$_default_iface" ]] || die "Cannot detect default interface. Specify manually: sudo bash $0 eth0"
-        IFACES=("$_default_iface")
+        _reuse_installed_ifaces || _detect_default_route_iface
     fi
 
     local _iface
@@ -332,7 +385,6 @@ resolve_target_interfaces_step() {
     done
 
     IFACE="${IFACES[0]}"
-    step_ok "Found: ${IFACES[*]}"
 }
 
 # Backward-compatible alias; the up-front root requirement is gone. Privilege
@@ -357,9 +409,9 @@ EOF
     echo -e "${GREEN}Deployment summary${NC}"
     echo -e "  Status         : ${OK_MARK} complete"
     if [[ ${#IFACES[@]} -eq 1 ]]; then
-        echo "  Interface      : ${IFACES[0]}"
+        echo "  Interface      : ${IFACES[0]}  [${IFACE_SOURCE:-arguments}]"
     else
-        echo "  Interfaces     : ${IFACES[*]}"
+        echo "  Interfaces     : ${IFACES[*]}  [${IFACE_SOURCE:-arguments}]"
     fi
     if [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
         echo "  Backend        : XDP ($ACTIVE_XDP_MODE mode)"
