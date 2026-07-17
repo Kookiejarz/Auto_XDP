@@ -27,9 +27,10 @@ confirm_yes_no() {
         return 0
     fi
 
-    if [[ -r /dev/tty ]]; then
-        printf "%s" "$prompt" > /dev/tty
-        read -r reply < /dev/tty
+    if [[ -r /dev/tty ]] && exec 3<>/dev/tty 2>/dev/null; then
+        printf "%s" "$prompt" >&3
+        read -r reply <&3
+        exec 3>&-
     elif [[ -t 0 ]]; then
         read -r -p "$prompt" reply
     else
