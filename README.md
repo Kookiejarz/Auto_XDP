@@ -209,7 +209,7 @@ Incoming Packet
 ## Quick Start
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/v26.6.10a/setup_xdp.sh | sudo bash
+curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/v26.7.7a/setup_xdp.sh | sudo bash
 ```
 
 ### Install a Specific Release
@@ -1005,6 +1005,10 @@ Rules & Features:
 - https://github.com/danger-dream/ebpf-firewall
 - https://github.com/R00tS3c/XDP-eBPF-Anti-DDoS-Firewall
 - https://github.com/Outfluencer/Minecraft-XDP-eBPF
+
+---
+
+Development workflow: Auto XDP is developed with AI-assisted implementation. All architecture decisions, specs, and code review are done by me; every change is verified against the test suite and CI across supported distros before merging.
 
 ---
 
