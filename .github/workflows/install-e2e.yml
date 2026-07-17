@@ -1,0 +1,116 @@
+name: CI / Install E2E
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Explicit bash so every run step gets -o pipefail; installer failures must
+# not be masked by `| tee` exiting 0.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  suite:
+    name: Bash + Python suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Run full distro suite (unit tests + installer smoke)
+        run: bash tests/run-distro-suite.sh
+
+  install-vm:
+    name: Full install on runner VM (systemd)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Run installer end to end
+        run: sudo bash setup_xdp.sh 2>&1 | tee install.log
+
+      - name: Verify output contract (basic info -> checks -> LOGO/summary)
+        run: |
+          awk '/Basic information/{bi=NR} /Checking required tools/{ct=NR} /Deployment summary/{ds=NR} END{exit !(bi && ct && ds && bi<ct && ct<ds)}' install.log
+          ! grep -q '╔' install.log
+          grep -q 'existing       : none (fresh install)' install.log
+
+      - name: Verify installed artifacts and services
+        run: |
+          test -x /usr/local/bin/axdp
+          test -x /usr/local/bin/auto_xdp_start.sh
+          test -f /usr/local/lib/auto_xdp/auto_xdp_bpf_helpers.py
+          test -f /etc/auto_xdp/config.toml
+          sudo systemctl is-enabled xdp-port-sync
+          sudo axdp status
+
+      - name: Rerun installer (overwrite path, no prompt)
+        run: |
+          sudo bash setup_xdp.sh 2>&1 | tee reinstall.log
+          grep -q 'existing       : .*runtime files will be replaced' reinstall.log
+          grep -q 'Replacing existing installation' reinstall.log
+          grep -q 'Deployment summary' reinstall.log
+
+      - name: Teardown (always)
+        if: always()
+        run: |
+          sudo systemctl stop xdp-port-sync auto-xdp-relay 2>/dev/null || true
+          iface=$(ip route show default | awk '/default/ {print $5; exit}')
+          sudo ip link set dev "$iface" xdp off 2>/dev/null || true
+          sudo nft delete table inet auto_xdp 2>/dev/null || true
+
+  install-container:
+    name: Full install in container (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debian
+            image: debian:12-slim
+            preinstall: apt-get update && apt-get install -y bash ca-certificates curl git python3 procps iproute2
+          - name: fedora
+            image: fedora:41
+            preinstall: dnf -y install bash ca-certificates curl git python3 procps-ng awk iproute
+          - name: alpine
+            image: alpine:3.20
+            preinstall: apk add --no-cache bash ca-certificates curl git python3 procps gawk grep sed coreutils iproute2
+    container:
+      image: ${{ matrix.image }}
+      options: --privileged
+    steps:
+      - name: Install bootstrap dependencies
+        run: ${{ matrix.preinstall }}
+
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Run installer end to end
+        run: bash setup_xdp.sh 2>&1 | tee install.log
+
+      - name: Verify output contract and artifacts
+        run: |
+          awk '/Basic information/{bi=NR} /Checking required tools/{ct=NR} /Deployment summary/{ds=NR} END{exit !(bi && ct && ds && bi<ct && ct<ds)}' install.log
+          ! grep -q '╔' install.log
+          test -x /usr/local/bin/axdp
+          test -f /etc/auto_xdp/config.toml
+
+      - name: Rerun installer (overwrite path, no prompt)
+        run: |
+          bash setup_xdp.sh 2>&1 | tee reinstall.log
+          grep -q 'Replacing existing installation' reinstall.log
+          grep -q 'Deployment summary' reinstall.log
