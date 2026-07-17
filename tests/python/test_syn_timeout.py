@@ -97,16 +97,22 @@ class SynTimeoutPolicyTests(unittest.TestCase):
 class GcExpiredSynFlagTests(unittest.TestCase):
     """gc_expired must handle CT_SYN_PENDING flag in stored ktime values."""
 
+    # Fixed monotonic baseline: real time.monotonic_ns() uptime on a fresh CI
+    # runner can be under 400s, so anchoring offsets to the live clock risks
+    # a negative timestamp (struct.pack_into("=Q", ...) rejects it). gc_expired
+    # reads time.monotonic_ns() itself, so it must be patched to this baseline too.
+    _NOW_NS = 10_000_000_000_000
+
     def test_established_entry_expired_gets_deleted(self):
         """Normal established entry (no flag) older than tcp_timeout is deleted."""
         from auto_xdp.bpf import maps as bpf_maps
 
-        now_ns = time.monotonic_ns()
-        old_ts = now_ns - 400_000_000_000  # 400s old, > 300s tcp_timeout
+        old_ts = self._NOW_NS - 400_000_000_000  # 400s old, > 300s tcp_timeout
         key = b"\x00" * 12
         instance, fake_bpf = _make_fake_map({key: old_ts})
 
-        with mock.patch.object(bpf_maps, "bpf", side_effect=fake_bpf):
+        with mock.patch.object(bpf_maps, "bpf", side_effect=fake_bpf), \
+                mock.patch.object(bpf_maps.time, "monotonic_ns", return_value=self._NOW_NS):
             result = bpf_maps.BpfConntrackMap.gc_expired(instance, 300_000_000_000)
 
         self.assertEqual(result, 1)
@@ -115,13 +121,13 @@ class GcExpiredSynFlagTests(unittest.TestCase):
         """Entry with SYN_PENDING flag, age > syn_timeout_ns, must be deleted."""
         from auto_xdp.bpf import maps as bpf_maps
 
-        now_ns = time.monotonic_ns()
-        old_ts = now_ns - 15_000_000_000   # 15s old
+        old_ts = self._NOW_NS - 15_000_000_000   # 15s old
         stored_val = old_ts | _CT_SYN_PENDING
         key = b"\x01" * 12
         instance, fake_bpf = _make_fake_map({key: stored_val})
 
-        with mock.patch.object(bpf_maps, "bpf", side_effect=fake_bpf):
+        with mock.patch.object(bpf_maps, "bpf", side_effect=fake_bpf), \
+                mock.patch.object(bpf_maps.time, "monotonic_ns", return_value=self._NOW_NS):
             result = bpf_maps.BpfConntrackMap.gc_expired(
                 instance, 300_000_000_000, syn_timeout_ns=10_000_000_000
             )
@@ -132,13 +138,13 @@ class GcExpiredSynFlagTests(unittest.TestCase):
         """Entry with SYN_PENDING flag, age < syn_timeout_ns, must NOT be deleted."""
         from auto_xdp.bpf import maps as bpf_maps
 
-        now_ns = time.monotonic_ns()
-        recent_ts = now_ns - 3_000_000_000  # 3s old
+        recent_ts = self._NOW_NS - 3_000_000_000  # 3s old
         stored_val = recent_ts | _CT_SYN_PENDING
         key = b"\x02" * 12
         instance, fake_bpf = _make_fake_map({key: stored_val})
 
-        with mock.patch.object(bpf_maps, "bpf", side_effect=fake_bpf):
+        with mock.patch.object(bpf_maps, "bpf", side_effect=fake_bpf), \
+                mock.patch.object(bpf_maps.time, "monotonic_ns", return_value=self._NOW_NS):
             result = bpf_maps.BpfConntrackMap.gc_expired(
                 instance, 300_000_000_000, syn_timeout_ns=10_000_000_000
             )
@@ -149,14 +155,14 @@ class GcExpiredSynFlagTests(unittest.TestCase):
         """Without syn_timeout_ns, flag is masked and tcp_timeout governs."""
         from auto_xdp.bpf import maps as bpf_maps
 
-        now_ns = time.monotonic_ns()
         # 15s old half-open: should NOT be deleted against 300s tcp_timeout
-        recent_ts = now_ns - 15_000_000_000
+        recent_ts = self._NOW_NS - 15_000_000_000
         stored_val = recent_ts | _CT_SYN_PENDING
         key = b"\x03" * 12
         instance, fake_bpf = _make_fake_map({key: stored_val})
 
-        with mock.patch.object(bpf_maps, "bpf", side_effect=fake_bpf):
+        with mock.patch.object(bpf_maps, "bpf", side_effect=fake_bpf), \
+                mock.patch.object(bpf_maps.time, "monotonic_ns", return_value=self._NOW_NS):
             result = bpf_maps.BpfConntrackMap.gc_expired(instance, 300_000_000_000)
 
         self.assertEqual(result, 0, "15s half-open must not be deleted by 300s tcp_timeout alone")
