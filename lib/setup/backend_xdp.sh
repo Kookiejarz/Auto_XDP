@@ -19,7 +19,12 @@ cleanup_existing_xdp() {
     if [[ $any_xdp -eq 1 ]]; then
         local iface_list="${xdp_ifaces[*]}"
         info "Existing XDP program detected on: $iface_list — will replace"
-        if confirm_yes_no "Unload the existing XDP program from all interfaces and continue? [y/N] " "abort"; then
+        # A detected reinstall (EXISTING_INSTALL=1) means this is our own prior
+        # attach; same no-prompt precedent as replace_existing_install_step.
+        # Only prompt when some other XDP program is present on a fresh install.
+        if [[ ${EXISTING_INSTALL:-0} -eq 1 ]]; then
+            :
+        elif confirm_yes_no "Unload the existing XDP program from all interfaces and continue? [y/N] " "abort"; then
             :
         else
             confirm_rc=$?
