@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-xdp"
-version = "26.7.7"
+version = "26.7.17"
 description = "Auto-sync Linux listening ports into XDP or nftables."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "mypy>=1.8",
+    "pytest>=7.0",
 ]
 
 [project.scripts]
