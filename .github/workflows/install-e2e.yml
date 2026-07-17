@@ -94,6 +94,7 @@ jobs:
       options: --privileged
     steps:
       - name: Install bootstrap dependencies
+        shell: sh
         run: ${{ matrix.preinstall }}
 
       - name: Check out repository
