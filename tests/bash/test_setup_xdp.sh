@@ -193,7 +193,7 @@ test_confirm_yes_no_force_and_no_tty_abort_modes() (
     }
 )
 
-test_confirm_existing_install_step_aborts_without_confirmation() (
+test_replace_existing_install_step_replaces_without_prompt() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
@@ -202,21 +202,25 @@ test_confirm_existing_install_step_aborts_without_confirmation() (
     CONFIG_FILE="$tmpdir/auto_xdp.env"
     : >"$CONFIG_FILE"
 
-    confirm_yes_no() { return 1; }
+    confirm_yes_no() { echo "PROMPTED"; return 1; }
+    stop_existing_service() { :; }
 
     log="$tmpdir/output.log"
     set +e
-    ( confirm_existing_install_step ) >"$log" 2>&1
+    ( replace_existing_install_step ) >"$log" 2>&1
     status=$?
     set -e
     output=$(<"$log")
 
-    [[ $status -ne 0 ]] || {
-        printf 'expected confirm_existing_install_step to abort when confirmation is denied\n'
+    [[ $status -eq 0 ]] || {
+        printf 'expected replace_existing_install_step to proceed without prompting\n'
         return 1
     }
-    assert_contains "$output" "Checking existing installation" || return 1
-    assert_contains "$output" "Installation aborted; existing deployment left untouched."
+    assert_contains "$output" "Replacing existing installation" || return 1
+    [[ "$output" != *PROMPTED* ]] || {
+        printf 'unexpected confirmation prompt during existing-install replacement\n'
+        return 1
+    }
 )
 
 test_fetch_local_or_remote_uses_local_copy_without_network() (
@@ -576,13 +580,15 @@ EOF_TCSH
     assert_file_contains "$tmpdir/bpftool.log" "map name sctp_conntrack pinned $BPF_PIN_DIR/sctp_conntrack"
 )
 
-test_resolve_target_interfaces_step_uses_default_route_interface() (
+test_resolve_target_interfaces_uses_default_route_interface() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
     ALL_IFACES=0
     IFACE=""
     IFACES=()
+    # Keep a real installed auto_xdp.env from feeding saved interfaces in.
+    CONFIG_FILE="/nonexistent/auto_xdp.env"
 
     ip() {
         case "$*" in
@@ -598,9 +604,103 @@ test_resolve_target_interfaces_step_uses_default_route_interface() (
         esac
     }
 
-    resolve_target_interfaces_step >/dev/null || return 1
+    resolve_target_interfaces >/dev/null || return 1
     assert_eq "$IFACE" "eth9" || return 1
     assert_eq "${IFACES[*]}" "eth9"
+)
+
+test_resolve_target_interfaces_reuses_installed_env_ifaces() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    CONFIG_FILE="$tmpdir/auto_xdp.env"
+    printf 'IFACES="eth7 eth8"\nIFACE="eth7"\n' >"$CONFIG_FILE"
+
+    ALL_IFACES=0
+    IFACES=()
+    IFACE=""
+
+    ip() {
+        case "$*" in
+            "link show eth7"|"link show eth8") return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    resolve_target_interfaces || return 1
+    assert_eq "${IFACES[*]}" "eth7 eth8" || return 1
+    assert_eq "$IFACE_SOURCE" "existing install"
+)
+
+test_resolve_target_interfaces_drops_missing_saved_ifaces() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    CONFIG_FILE="$tmpdir/auto_xdp.env"
+    printf 'IFACES="eth7 gone0"\n' >"$CONFIG_FILE"
+
+    ALL_IFACES=0
+    IFACES=()
+    IFACE=""
+
+    ip() {
+        case "$*" in
+            "link show eth7") return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    resolve_target_interfaces || return 1
+    assert_eq "${IFACES[*]}" "eth7" || return 1
+    assert_contains "$IFACE_SOURCE" "dropped missing: gone0"
+)
+
+test_resolve_target_interfaces_detects_when_saved_ifaces_all_gone() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    CONFIG_FILE="$tmpdir/auto_xdp.env"
+    printf 'IFACES="gone0 gone1"\n' >"$CONFIG_FILE"
+
+    ALL_IFACES=0
+    IFACES=()
+    IFACE=""
+
+    ip() {
+        case "$*" in
+            "route show default") echo "default via 192.0.2.1 dev eth9" ;;
+            "link show eth9") return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    resolve_target_interfaces || return 1
+    assert_eq "${IFACES[*]}" "eth9" || return 1
+    assert_eq "$IFACE_SOURCE" "default route auto-detect"
+)
+
+test_install_toml_config_backs_up_before_replace() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    CONFIG_DIR="$tmpdir/etc"
+    mkdir -p "$CONFIG_DIR"
+    printf 'user_setting = 1\n' >"$CONFIG_DIR/config.toml"
+
+    FORCE=1
+    fetch_local_or_remote() { printf 'repo_default = 1\n' >"$3"; }
+
+    install_toml_config >/dev/null || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml.bak" "user_setting = 1" || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml" "repo_default = 1"
 )
 
 test_check_required_tools_step_only_requires_runtime_commands() (
@@ -858,6 +958,11 @@ test_detect_privilege_mode_uses_sudo_when_not_root() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
+    # EUID is read-only in bash; sudo-mode selection is untestable as root.
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        return 0
+    fi
+
     local tmpdir
     tmpdir=$(mktemp -d)
     _install_fake_sudo "$tmpdir/bin" "$tmpdir/sudo.log"
@@ -871,6 +976,11 @@ test_detect_privilege_mode_uses_sudo_when_not_root() (
 test_detect_privilege_mode_fails_without_root_or_sudo() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
+
+    # EUID is read-only in bash; the no-root-no-sudo case is untestable as root.
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        return 0
+    fi
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -914,6 +1024,11 @@ test_as_root_escalates_in_sudo_mode() (
 test_can_write_path_detects_unwritable_destinations() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
+
+    # Root writes through chmod 000; the unwritable case is untestable as root.
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        return 0
+    fi
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -1025,6 +1140,254 @@ test_backend_phase_dispatch_runs_inline_when_root() (
     [[ -f "$tmpdir/backend_ran" ]] || { printf 'backend phase did not run inline\n'; return 1; }
 )
 
+test_package_list_gates_gcc_multilib_by_arch() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    PKG_MANAGER="apt-get"
+
+    uname() { echo "x86_64"; }
+    local x86_list
+    x86_list=$(package_list_for_manager)
+
+    uname() { echo "aarch64"; }
+    local arm_list
+    arm_list=$(package_list_for_manager)
+
+    assert_contains "$x86_list" "gcc-multilib" || return 1
+    [[ "$arm_list" != *gcc-multilib* ]] || {
+        printf 'gcc-multilib must not be requested on non-x86_64 (apt aborts the whole transaction)\n'
+        return 1
+    }
+    assert_contains "$arm_list" "build-essential"
+)
+
+test_install_packages_propagates_required_install_failure() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    PKG_MANAGER="apt-get"
+    package_list_for_manager() { echo "pkg-a pkg-b"; }
+    optional_package_list_for_manager() { echo "pkg-opt"; }
+    pkg_update() { :; }
+    pkg_install() { return 100; }
+    pkg_install_optional() { printf 'optional install must not run after required failure\n'; return 0; }
+
+    install_packages >/dev/null 2>&1
+    assert_eq "$?" "1"
+)
+
+test_install_packages_succeeds_on_non_apt_managers() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    package_list_for_manager() { echo "pkg-a"; }
+    optional_package_list_for_manager() { echo "pkg-opt"; }
+    pkg_update() { :; }
+    pkg_install() { :; }
+    pkg_install_optional() { :; }
+
+    local mgr
+    for mgr in dnf zypper pacman apk; do
+        PKG_MANAGER="$mgr"
+        install_packages >/dev/null 2>&1 || {
+            printf 'install_packages must return 0 on %s when installs succeed\n' "$mgr"
+            return 1
+        }
+    done
+)
+
+test_check_required_tools_step_dies_when_install_fails() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir log status output cmd
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/bin"
+    for cmd in clang python3 curl ip tc nft; do
+        printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
+        chmod +x "$tmpdir/bin/$cmd"
+    done
+
+    PKG_MANAGER="apk"
+    install_packages() { return 1; }
+
+    log="$tmpdir/out.log"
+    ( PATH="$tmpdir/bin"; check_required_tools_step ) >"$log" 2>&1
+    status=$?
+    output=$(<"$log")
+
+    [[ $status -ne 0 ]] || {
+        printf 'expected check_required_tools_step to die when package install fails\n'
+        return 1
+    }
+    assert_contains "$output" "bpftool" || return 1
+    assert_contains "$output" "Package installation failed."
+)
+
+test_check_required_tools_step_rechecks_missing_tools() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir output cmd
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/bin" "$tmpdir/extra"
+    for cmd in clang bpftool python3 curl ip tc; do
+        printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
+        chmod +x "$tmpdir/bin/$cmd"
+    done
+    printf '#!/bin/sh\nexit 0\n' >"$tmpdir/extra/nft"
+    chmod +x "$tmpdir/extra/nft"
+
+    PKG_MANAGER="apk"
+    EXTRA_BIN="$tmpdir/extra"
+    install_packages() { PATH="$PATH:$EXTRA_BIN"; }
+    ensure_psutil() { :; }
+
+    output=$( PATH="$tmpdir/bin"; check_required_tools_step 2>&1 ) || return 1
+    assert_contains "$output" "nft (after install)"
+)
+
+test_replace_existing_install_step_reports_fresh_install() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    existing_install_detected() { return 1; }
+    stop_existing_service() { :; }
+
+    local output
+    output=$(replace_existing_install_step 2>&1) || return 1
+    assert_contains "$output" "Checking existing installation" || return 1
+    assert_contains "$output" "none found"
+)
+
+test_print_basic_info_renders_required_fields() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    PRIV_MODE="root"
+    DISTRO_NAME="TestOS"
+    DISTRO_FAMILY="debian"
+    PKG_MANAGER="apt-get"
+    INIT_SYSTEM="systemd"
+    IFACES=(eth9)
+
+    local output
+    EXISTING_INSTALL=1
+    output=$(print_basic_info)
+    assert_contains "$output" "TestOS" || return 1
+    assert_contains "$output" "eth9" || return 1
+    assert_contains "$output" "privilege      : root" || return 1
+    assert_contains "$output" "runtime files will be replaced" || return 1
+
+    EXISTING_INSTALL=0
+    output=$(print_basic_info)
+    assert_contains "$output" "none (fresh install)"
+)
+
+# Anti-drift: the hardcoded header list used by curl|bash installs must cover
+# every header in bpf/include/, or remote installs silently compile without
+# newly added headers.
+test_remote_bpf_header_list_matches_repo_headers() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local listed hdr base
+    listed=$(grep -o '_bpf_headers=([^)]*)' "$REPO_ROOT/lib/setup/build.sh" \
+        | sed 's/_bpf_headers=(//; s/)//')
+    [[ -n "$listed" ]] || {
+        printf '_bpf_headers list not found in lib/setup/build.sh\n'
+        return 1
+    }
+
+    for hdr in "$REPO_ROOT"/bpf/include/*.h; do
+        base=$(basename "$hdr")
+        [[ " $listed " == *" $base "* || "$listed" == "$base "* || "$listed" == *" $base" || "$listed" == "$base" ]] || {
+            printf 'bpf/include/%s missing from _bpf_headers curl|bash list in lib/setup/build.sh\n' "$base"
+            return 1
+        }
+    done
+)
+
+# Anti-drift: --check-update must keep covering every installed source tree;
+# a rename or new directory outside these globs would silently skip updates.
+test_check_update_candidates_cover_installed_sources() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    cd "$REPO_ROOT" || return 1
+    local list f
+    list=$(_check_update_candidate_files)
+    for f in \
+        setup_xdp.sh \
+        axdp \
+        config.toml \
+        xdp_port_sync.py \
+        pkt_relay.py \
+        auto_xdp_bpf_helpers.py \
+        tc_flow_track.c \
+        lib/setup/install.sh \
+        lib/setup/packages.sh \
+        runtime/auto_xdp_start.sh \
+        runtime/auto_xdp_runtime_common.sh \
+        bpf/xdp_firewall.c \
+        bpf/include/maps.h \
+        handlers/Makefile \
+        auto_xdp/admin/main.py \
+        auto_xdp/backends/xdp.py \
+        auto_xdp/bpf/maps.py \
+        auto_xdp/xdp_required_maps.txt; do
+        [[ "$list" == *"$f"* ]] || {
+            printf '%s missing from check-update candidate files\n' "$f"
+            return 1
+        }
+    done
+)
+
+# Anti-drift: installer output contract — basic info first, per-item checks and
+# install steps in the middle, LOGO + deployment summary last.
+test_main_orders_basic_info_checks_then_summary() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local body prefix
+    body=$(declare -f main)
+
+    [[ "$body" != *print_installer_banner* ]] || {
+        printf 'main must not print the old banner box\n'
+        return 1
+    }
+
+    local -a ordered=(
+        detect_privilege_mode
+        detect_environment
+        resolve_target_interfaces
+        existing_install_detected
+        print_basic_info
+        priv_init
+        check_required_tools_step
+        replace_existing_install_step
+        compile_bpf_objects_step
+        install_runtime_files_step
+        run_backend_phase_dispatch
+        print_deployment_summary
+    )
+    local prev_pos=-1 name pos
+    for name in "${ordered[@]}"; do
+        prefix=${body%%"$name"*}
+        pos=${#prefix}
+        [[ $pos -lt ${#body} ]] || {
+            printf 'main no longer calls %s\n' "$name"
+            return 1
+        }
+        [[ $pos -gt $prev_pos ]] || {
+            printf 'main calls %s out of order\n' "$name"
+            return 1
+        }
+        prev_pos=$pos
+    done
+)
+
 run_test "setup_xdp detects distro families" test_detect_os_release_maps_supported_families
 run_test "setup_xdp prefers distro package-manager order" test_detect_pkg_manager_prefers_family_order
 run_test "setup_xdp reports missing package managers" test_detect_pkg_manager_fails_when_no_manager_exists
@@ -1032,7 +1395,7 @@ run_test "setup_xdp detects systemd and openrc" test_detect_init_system_supports
 run_test "setup_xdp package lists cover supported managers" test_package_lists_cover_all_supported_managers
 run_test "setup_xdp dry-run report emits CI fields" test_dry_run_report_emits_ci_fields
 run_test "setup_xdp confirmation handles force and no-tty abort" test_confirm_yes_no_force_and_no_tty_abort_modes
-run_test "setup_xdp aborts when existing install is not confirmed" test_confirm_existing_install_step_aborts_without_confirmation
+run_test "setup_xdp replaces existing install without prompting" test_replace_existing_install_step_replaces_without_prompt
 run_test "setup_xdp prefers local files when available" test_fetch_local_or_remote_uses_local_copy_without_network
 run_test "setup_xdp check-update confirms all changed files once" test_check_github_updates_lists_and_confirms_once
 run_test "setup_xdp writes queue auto tuning into runtime config" test_write_config_enables_queue_auto_tuning
@@ -1045,7 +1408,11 @@ run_test "setup_xdp prints info lines within active step output" test_info_print
 run_test "setup_xdp prints substep success and failure markers" test_substep_run_prints_success_and_failure_markers
 run_test "setup_xdp validates pinned map set completeness" test_xdp_maps_ready_requires_all_expected_pins
 run_test "setup_xdp reuses SCTP conntrack map for tc egress" test_load_tc_egress_program_reuses_sctp_conntrack_map
-run_test "setup_xdp resolves default route interface for step helper" test_resolve_target_interfaces_step_uses_default_route_interface
+run_test "setup_xdp resolves default route interface for step helper" test_resolve_target_interfaces_uses_default_route_interface
+run_test "setup_xdp reuses installed env interfaces on reinstall" test_resolve_target_interfaces_reuses_installed_env_ifaces
+run_test "setup_xdp drops missing saved interfaces with note" test_resolve_target_interfaces_drops_missing_saved_ifaces
+run_test "setup_xdp re-detects when all saved interfaces are gone" test_resolve_target_interfaces_detects_when_saved_ifaces_all_gone
+run_test "setup_xdp backs up config.toml before forced replace" test_install_toml_config_backs_up_before_replace
 run_test "setup_xdp keeps clang and bpftool optional for runtime tool checks" test_check_required_tools_step_only_requires_runtime_commands
 run_test "setup_xdp backend step falls back to nftables" test_deploy_backend_step_falls_back_to_nftables
 run_test "setup_xdp service step warns when no init system exists" test_install_runtime_service_step_warns_without_init_system
@@ -1063,6 +1430,16 @@ run_test "setup_xdp detects unwritable destinations" test_can_write_path_detects
 run_test "setup_xdp write_file writes to writable paths without sudo" test_write_file_writes_content_without_escalation
 run_test "setup_xdp priv_init is a no-op when root" test_priv_init_is_noop_when_root
 run_test "setup_xdp priv_init primes sudo once" test_priv_init_primes_sudo_once
+run_test "setup_xdp gates gcc-multilib by architecture" test_package_list_gates_gcc_multilib_by_arch
+run_test "setup_xdp propagates required package install failures" test_install_packages_propagates_required_install_failure
+run_test "setup_xdp package install succeeds on non-apt managers" test_install_packages_succeeds_on_non_apt_managers
+run_test "setup_xdp dies when tool package install fails" test_check_required_tools_step_dies_when_install_fails
+run_test "setup_xdp rechecks missing tools after package install" test_check_required_tools_step_rechecks_missing_tools
+run_test "setup_xdp reports fresh install when nothing is installed" test_replace_existing_install_step_reports_fresh_install
+run_test "setup_xdp basic info block renders required fields" test_print_basic_info_renders_required_fields
+run_test "setup_xdp remote header list matches bpf/include" test_remote_bpf_header_list_matches_repo_headers
+run_test "setup_xdp check-update candidates cover installed sources" test_check_update_candidates_cover_installed_sources
+run_test "setup_xdp main keeps info-checks-summary output order" test_main_orders_basic_info_checks_then_summary
 run_test "setup_xdp parses internal phase2 flags" test_parse_args_accepts_internal_phase2_flags
 run_test "setup_xdp round-trips backend results" test_emit_backend_results_roundtrips_state
 run_test "setup_xdp runs backend phase inline when root" test_backend_phase_dispatch_runs_inline_when_root

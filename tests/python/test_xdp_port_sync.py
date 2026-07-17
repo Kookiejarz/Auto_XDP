@@ -515,7 +515,10 @@ class XdpPortSyncTests(unittest.TestCase):
             ),
         ]
 
-        with mock.patch("auto_xdp.discovery.psutil", fake_psutil), \
+        # Force the psutil fallback path; on Linux the netlink fast path would
+        # read the real host sockets and ignore these fakes.
+        with mock.patch("auto_xdp.discovery._IS_LINUX", False), \
+             mock.patch("auto_xdp.discovery.psutil", fake_psutil), \
              mock.patch("auto_xdp.discovery._net_connections", return_value=fake_connections), \
              mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_LOOPBACK", True), \
              mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_BIND_CIDRS", ["10.0.0.0/8", "fd00::/8"]):
@@ -877,7 +880,10 @@ class XdpPortSyncTests(unittest.TestCase):
             ),
         ]
 
-        with mock.patch.object(discovery_mod, "psutil", FakePsutil), \
+        # Force the psutil fallback path; on Linux the netlink fast path would
+        # read the real host sockets and ignore these fakes.
+        with mock.patch.object(discovery_mod, "_IS_LINUX", False), \
+             mock.patch.object(discovery_mod, "psutil", FakePsutil), \
              mock.patch.object(discovery_mod, "_net_connections", object()):
             state = discovery_mod.get_listening_ports(cached_conns=conns)
 
