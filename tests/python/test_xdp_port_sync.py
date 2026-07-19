@@ -1941,6 +1941,48 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
         backend.is_stale.assert_called_once()
         backend.verify_kernel_state.assert_called_once()
 
+    def test_netlink_unavailable_does_not_block_relay_sync(self):
+        backend = mock.MagicMock()
+        backend.last_apply_failures = 0
+        backend.is_stale.return_value = False
+        backend.verify_kernel_state.return_value = 0
+        relay = mock.MagicMock()
+
+        with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
+             mock.patch.object(syncer_mod, "open_proc_connector", return_value=None), \
+             mock.patch.object(syncer_mod, "_open_relay_client", return_value=relay) as open_relay, \
+             mock.patch.object(syncer_mod, "_drain_relay_lines", return_value=True), \
+             mock.patch.object(syncer_mod, "sync_once") as sync_once, \
+             mock.patch.object(
+                 syncer_mod.select,
+                 "select",
+                 side_effect=[([relay], [], []), KeyboardInterrupt()],
+             ), \
+             mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
+            syncer_mod.watch(dry_run=False, backend_name="xdp")
+
+        open_relay.assert_called()
+        # Initial reconcile plus the relay-triggered reconcile.
+        self.assertEqual(sync_once.call_count, 2)
+
+    def test_periodic_reconcile_runs_without_event_sources(self):
+        backend = mock.MagicMock()
+        backend.last_apply_failures = 0
+        backend.is_stale.return_value = False
+        backend.verify_kernel_state.return_value = 0
+
+        with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
+             mock.patch.object(syncer_mod, "open_proc_connector", return_value=None), \
+             mock.patch.object(syncer_mod, "_open_relay_client", return_value=None), \
+             mock.patch.object(syncer_mod, "sync_once") as sync_once, \
+             mock.patch.object(syncer_mod.time, "sleep", side_effect=[None, KeyboardInterrupt()]), \
+             mock.patch.object(syncer_mod, "FULL_RECONCILE_INTERVAL_SECONDS", 0.0), \
+             mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
+            syncer_mod.watch(dry_run=False, backend_name="xdp")
+
+        # Initial reconcile plus a timer-triggered full reconcile.
+        self.assertEqual(sync_once.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
