@@ -433,6 +433,7 @@ install_runtime_files_step() {
 
 load_configured_slot_handlers_step() {
     [[ "${ACTIVE_BACKEND:-nftables}" == "xdp" ]] || return 0
+    [[ ${AUTO_XDP_HANDLERS_PRELOADED:-0} -eq 0 ]] || return 0
 
     step_begin "Loading configured slot handlers"
     if load_slot_handlers; then
@@ -444,6 +445,7 @@ load_configured_slot_handlers_step() {
 
 load_configured_port_handlers_step() {
     [[ "${ACTIVE_BACKEND:-nftables}" == "xdp" ]] || return 0
+    [[ ${AUTO_XDP_HANDLERS_PRELOADED:-0} -eq 0 ]] || return 0
 
     step_begin "Loading configured per-port handlers"
     if load_port_handlers; then
