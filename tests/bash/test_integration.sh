@@ -46,8 +46,11 @@ if [[ ! -f "$_XDP_OBJ" ]]; then
     _asm_inc=$(clang -print-file-name=include 2>/dev/null) || {
         echo "skip: clang include path not found"; exit 0
     }
+    _include_args=(-I "$REPO_ROOT/bpf/include" -I "$_asm_inc")
+    _multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
+    [[ ! -d "$_multiarch_inc" ]] || _include_args+=(-I "$_multiarch_inc")
     clang -O2 -g -target bpf \
-        -I "$REPO_ROOT/bpf/include" -I "$_asm_inc" \
+        "${_include_args[@]}" \
         -c "$_src" -o "$_XDP_OBJ" 2>/dev/null || {
         echo "skip: XDP compile failed"; exit 0
     }
@@ -82,12 +85,13 @@ _setup() {
 
     bpftool prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
         pinmaps "$_PIN_DIR" >/dev/null 2>&1
-    ip link set dev "$_VETH" xdp generic pinned "$_PIN_DIR/prog"
+    _configure_test_runtime
+    ip link set dev "$_VETH" xdpgeneric pinned "$_PIN_DIR/prog"
     echo "generic" > "$_RUN_DIR/xdp_mode"
 }
 
 _teardown() {
-    ip link set dev "$_VETH" xdp generic off 2>/dev/null || true
+    ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
     ip netns del "$_NS" 2>/dev/null || true
     ip link del "$_VETH" 2>/dev/null || true
     rm -rf "$_PIN_DIR" "$_RUN_DIR"
@@ -108,6 +112,40 @@ _ip4be() { python3 -c "import socket; print(' '.join(f'{b:02x}' for b in socket.
 _u16be() { python3 -c "import struct; print(' '.join(f'{b:02x}' for b in struct.pack('>H', $1)))"; }
 # Current kernel monotonic time in ns (same epoch as bpf_ktime_get_ns)
 _ktime_ns() { python3 -c "import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))"; }
+
+# Read a little-endian __u32 from bpftool's JSON output. Depending on the
+# bpftool version, raw values are emitted as an array of hex-byte strings
+# rather than as a scalar.
+_map_lookup_u32() {
+    local map_path="$1" key_hex="$2"
+    bpftool -j map lookup pinned "$map_path" key hex $key_hex \
+        | python3 -c '
+import json, struct, sys
+
+value = json.load(sys.stdin)["value"]
+if isinstance(value, list):
+    raw = bytes(int(byte, 0) if isinstance(byte, str) else byte for byte in value)
+    print(struct.unpack_from("<I", raw)[0])
+elif isinstance(value, str):
+    print(int(value, 0))
+else:
+    print(int(value))
+'
+}
+
+# Integration traffic uses an RFC1918 veth subnet. Production defaults treat
+# private source addresses as bogons, so disable that independent policy here;
+# otherwise whitelist, ACL, conntrack, and rate-limit assertions never reach
+# the code paths they claim to exercise.
+_configure_test_runtime() {
+    local value_hex
+    value_hex=$(python3 -c '
+import struct
+print(" ".join(f"{byte:02x}" for byte in struct.pack("<QQQQQQQQII", *([0] * 8), 1, 0)))
+')
+    bpftool map update pinned "$_PIN_DIR/xdp_runtime_cfg" \
+        key hex 00 00 00 00 value hex $value_hex >/dev/null
+}
 
 # Send TCP SYN from inside the namespace to _HOST_IP:PORT.
 # Returns 0 if XDP passes (kernel sends RST or accepts), 1 if XDP drops (timeout).
@@ -162,22 +200,31 @@ test_attach() {
         }
     done < <(xdp_required_map_names)
 
-    ip -d link show "$_VETH" | grep -q "xdp" || {
+    ip -d link show "$_VETH" | grep -q "prog/xdp" || {
         echo "XDP not shown in ip link output for $_VETH"
         return 1
     }
 }
 
 test_reload() {
+    local map_id
+
     xdp_maps_ready || { echo "xdp_maps_ready failed with full map set"; return 1; }
+
+    map_id=$(bpftool -j map show pinned "$_PIN_DIR/tcp_ct4" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') || {
+        echo "failed to resolve tcp_ct4 map id"; return 1;
+    }
 
     rm "$_PIN_DIR/tcp_ct4"
     xdp_maps_ready && { echo "xdp_maps_ready should detect missing tcp_ct4"; return 1; }
 
-    # Re-pin by loading into a temporary prog pin, which repins all maps.
-    bpftool prog load "$_XDP_OBJ" "$_PIN_DIR/prog2" type xdp \
-        pinmaps "$_PIN_DIR" >/dev/null 2>&1 || true
-    rm -f "$_PIN_DIR/prog2"
+    # Removing a pin does not destroy a map still referenced by the attached
+    # program. Re-pin that exact map; loading a second program with pinmaps
+    # would collide with every map name that remains in this directory.
+    bpftool map pin id "$map_id" "$_PIN_DIR/tcp_ct4" >/dev/null || {
+        echo "failed to re-pin tcp_ct4 map id $map_id"; return 1;
+    }
 
     xdp_maps_ready || { echo "xdp_maps_ready failed after re-pinning"; return 1; }
 }
@@ -198,18 +245,14 @@ test_port_sync() {
     # Enable port; SYN should pass and receive RST (no listener on host).
     bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
         key hex $key_hex value hex 01 00 00 00 >/dev/null 2>&1
-    lookup_val=$(bpftool -j map lookup pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $key_hex 2>/dev/null \
-        | python3 -c "import json,sys; d=json.load(sys.stdin); v=d.get('value',0); print(int(v,16) if isinstance(v,str) else int(v))" 2>/dev/null)
+    lookup_val=$(_map_lookup_u32 "$_PIN_DIR/tcp_whitelist" "$key_hex")
     assert_eq "$lookup_val" "1" "whitelist enabled" || return 1
     _tcp_probe "$port" || { echo "SYN to whitelisted port was dropped"; return 1; }
 
     # Disable port; SYN should be dropped (timeout).
     bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
         key hex $key_hex value hex 00 00 00 00 >/dev/null 2>&1
-    lookup_val=$(bpftool -j map lookup pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $key_hex 2>/dev/null \
-        | python3 -c "import json,sys; d=json.load(sys.stdin); v=d.get('value',0); print(int(v,16) if isinstance(v,str) else int(v))" 2>/dev/null)
+    lookup_val=$(_map_lookup_u32 "$_PIN_DIR/tcp_whitelist" "$key_hex")
     assert_eq "$lookup_val" "0" "whitelist disabled" || return 1
     _tcp_probe "$port" && { echo "SYN to non-whitelisted port was not dropped"; return 1; }
 
@@ -285,12 +328,12 @@ test_rate_limit() {
     bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
         key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1
 
-    # tcp_port_policy_cfg: syn_rate_max + syn_agg_rate_max + conn_limit_max +
-    #                      source_prefix_v4 + source_prefix_v6 + _pad (__u32 × 6)
+    # tcp_port_policy_cfg: three rate/connection limits, two source prefixes,
+    # two additional connection limits, and padding (__u32 x 8).
     local policy_hex
     policy_hex=$(python3 -c "
 import struct
-print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIII', $rate_max, 0, 0, 32, 128, 0)))
+print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIIIII', $rate_max, 0, 0, 32, 128, 0, 0, 0)))
 ")
     bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
         key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1
@@ -302,12 +345,13 @@ print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIII', $rate_max, 0, 0, 32, 1
 import struct
 print(' '.join(f'{b:02x}' for b in struct.pack('<QII', $now_ns, $rate_max, 0)))
 ")
-    # Create a per-port inner LRU (BPF_F_INNER_MAP = 0x1000) and install it
-    # into the syn4 outer slot for $port, then pre-fill the source's counter
-    # with count=rate_max inside the current window so the next SYN overflows.
+    # Create a per-port inner LRU and install it into the syn4 outer slot for
+    # $port, then pre-fill the source's counter with count=rate_max inside the
+    # current window so the next SYN overflows. BPF_F_INNER_MAP is valid for
+    # array inner maps, not LRU hash maps; the latter are created with flags 0.
     local inner_pin="$_PIN_DIR/it_syn4_$port"
     bpftool map create "$inner_pin" type lru_hash key 4 value 16 \
-        entries 1024 name "s4_$port" flags 0x1000 >/dev/null 2>&1 || {
+        entries 1024 name "s4_$port" flags 0 >/dev/null 2>&1 || {
         echo "inner map create failed"; return 1; }
     bpftool map update pinned "$_PIN_DIR/syn4" \
         key hex $(_u32le "$port") value pinned "$inner_pin" >/dev/null 2>&1
@@ -330,12 +374,13 @@ test_service_restart() {
         key hex $ct_key value hex $ct_val >/dev/null 2>&1
 
     # Simulate service restart: detach, wipe pins, reload, re-attach.
-    ip link set dev "$_VETH" xdp generic off 2>/dev/null || true
+    ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
     rm -rf "$_PIN_DIR"
     mkdir -p "$_PIN_DIR"
     bpftool prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
         pinmaps "$_PIN_DIR" >/dev/null 2>&1
-    ip link set dev "$_VETH" xdp generic pinned "$_PIN_DIR/prog"
+    _configure_test_runtime
+    ip link set dev "$_VETH" xdpgeneric pinned "$_PIN_DIR/prog"
 
     [[ -f "$_PIN_DIR/prog" ]] || { echo "prog pin missing after reload"; return 1; }
     xdp_maps_ready || { echo "maps not ready after reload"; return 1; }

@@ -309,7 +309,7 @@ if echo "$args" | grep -q "show.*eth0\b\|show dev eth0"; then
     printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether\n"
 elif echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
     printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
-elif echo "$args" | grep -q "set.*eth0.*xdp generic"; then
+elif echo "$args" | grep -q "set.*eth0.*xdpgeneric"; then
     exit 0
 elif echo "$args" | grep -q "set.*eth0.*xdp "; then
     exit 1
@@ -375,6 +375,23 @@ EOF_IP
     _IFACES=(eth0 eth1)
     ensure_xdp_loaded || return 1
     assert_eq "$(cat "$RUN_STATE_DIR/xdp_mode")" "generic"
+)
+
+test_select_backend_refuses_nftables_while_xdp_remains_attached() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    RUN_STATE_DIR="$tmpdir/run"
+    mkdir -p "$RUN_STATE_DIR"
+    resolve_preferred_backend() { printf 'auto\n'; }
+    ensure_xdp_loaded() { return 2; }
+
+    select_backend >/dev/null 2>&1
+    local status=$?
+    assert_eq "$status" "1" || return 1
+    [[ ! -e "$RUN_STATE_DIR/backend" ]]
 )
 
 test_detect_backend_multi_iface_second_only() (
@@ -726,6 +743,7 @@ run_test "axdp detects xdp backend with mixed native and generic ifaces" test_de
 run_test "auto_xdp_start records generic xdp_mode when re-attach falls back to generic" test_ensure_xdp_reattach_records_generic_mode_on_fallback
 run_test "auto_xdp_start records native xdp_mode when re-attach succeeds natively" test_ensure_xdp_reattach_records_native_mode_when_all_native
 run_test "auto_xdp_start records generic xdp_mode when existing iface already in generic mode" test_ensure_xdp_reattach_records_generic_when_existing_iface_is_generic
+run_test "auto_xdp_start refuses nftables while XDP remains attached" test_select_backend_refuses_nftables_while_xdp_remains_attached
 run_test "axdp backend reports runtime attach state and conntrack counts" test_run_backend_reports_runtime_state_and_conntrack_counts
 run_test "axdp backend json reports runtime attach state and conntrack counts" test_run_backend_json_reports_runtime_state_and_conntrack_counts
 run_test "axdp conntrack summarizes destination ports" test_run_conntrack_summarizes_destination_ports
