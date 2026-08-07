@@ -95,24 +95,30 @@ def _open_relay_client(sock_path: str) -> "_socket.socket | None":
         return None
 
 
-def _drain_relay_lines(relay_sock: "_socket.socket") -> bool:
+def _drain_relay_lines(
+    relay_sock: "_socket.socket",
+    pending: bytearray | None = None,
+) -> bool:
     """Read available lines from the relay socket.
 
     Returns True if any port_change event was found.
     Raises ConnectionResetError if the relay closed the connection.
     """
-    buf = b""
+    if pending is None:
+        pending = bytearray()
     try:
         while True:
             chunk = relay_sock.recv(4096)
             if not chunk:
                 raise ConnectionResetError("relay disconnected")
-            buf += chunk
+            pending.extend(chunk)
     except BlockingIOError:
         pass
 
     found = False
-    for raw_line in buf.split(b"\n"):
+    while (line_end := pending.find(b"\n")) >= 0:
+        raw_line = bytes(pending[:line_end])
+        del pending[: line_end + 1]
         if not raw_line:
             continue
         try:
@@ -149,6 +155,7 @@ def watch(
     signal.signal(signal.SIGHUP, _on_sighup)
 
     relay_sock: "_socket.socket | None" = None
+    relay_pending = bytearray()
     last_relay_connect_t = -EVENT_SOURCE_RETRY_INTERVAL_SECONDS
 
     try:
@@ -187,6 +194,7 @@ def watch(
                 relay_sock = _open_relay_client(cfg.RINGBUF_SOCKET_PATH)
                 last_relay_connect_t = now_mono
                 if relay_sock:
+                    relay_pending.clear()
                     log.info("Connected to pkt_relay for port_change events.")
 
             debounce_s = cfg.DEBOUNCE_SECONDS
@@ -219,7 +227,7 @@ def watch(
                     last_event_t = _now
                 if relay_sock is not None and relay_sock in rdy:
                     try:
-                        if _drain_relay_lines(relay_sock):
+                        if _drain_relay_lines(relay_sock, relay_pending):
                             log.debug("port_change from relay → immediate sync.")
                             try:
                                 sync_once(backend, dry_run)
@@ -234,6 +242,7 @@ def watch(
                         log.info("pkt_relay disconnected; reverting to proc_connector only.")
                         relay_sock.close()
                         relay_sock = None
+                        relay_pending.clear()
                         last_relay_connect_t = time.monotonic()
             except OSError as exc:
                 log.warning("Netlink event error (%s); reconnecting proc connector.", exc)

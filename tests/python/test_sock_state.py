@@ -133,6 +133,23 @@ class TestSyncerDrainRelayLines(unittest.TestCase):
         with self.assertRaises(ConnectionResetError):
             syncer_mod._drain_relay_lines(fake_sock)
 
+    def test_port_change_split_across_reads_is_preserved(self):
+        line = json.dumps({
+            "type": "port_change", "port": 9999, "action": "open",
+            "proto": "tcp", "ts_ns": 1, "seen_at": 1.0, "family": 4,
+        }).encode() + b"\n"
+        split_at = len(line) // 2
+        pending = bytearray()
+        fake_sock = mock.MagicMock()
+        fake_sock.recv.side_effect = [line[:split_at], BlockingIOError()]
+
+        self.assertFalse(syncer_mod._drain_relay_lines(fake_sock, pending))
+        self.assertEqual(bytes(pending), line[:split_at])
+
+        fake_sock.recv.side_effect = [line[split_at:], BlockingIOError()]
+        self.assertTrue(syncer_mod._drain_relay_lines(fake_sock, pending))
+        self.assertEqual(pending, bytearray())
+
 
 import auto_xdp.tui as tui_mod
 import threading
