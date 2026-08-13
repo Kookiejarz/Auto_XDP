@@ -871,48 +871,15 @@ Traverses IPv6 extension headers up to **6 levels deep** to locate the transport
 ## Uninstall
 
 ```bash
-# Load installed interface list when available.
-# If the config is gone, set IFACES manually, e.g. IFACES="eth0 eth1".
-if [ -f /etc/auto_xdp/auto_xdp.env ]; then
-  . /etc/auto_xdp/auto_xdp.env
-fi
-IFACES="${IFACES:-${IFACE:-eth0}}"
+sudo axdp uninstall
+```
 
-# Stop runtime services first
-systemctl disable --now xdp-port-sync auto-xdp-relay 2>/dev/null || true
-rc-service xdp-port-sync stop 2>/dev/null || true
-rc-service auto-xdp-relay stop 2>/dev/null || true
-rc-update del xdp-port-sync default 2>/dev/null || true
-rc-update del auto-xdp-relay default 2>/dev/null || true
+The command stops and disables both services, detaches XDP from every configured interface, removes only Auto XDP's fixed `tc` filter (`pref 49152 handle 1`) without deleting the shared `clsact` qdisc, deletes the `nftables` fallback table, clears the live/candidate/rollback BPF pin generations, and removes all installed runtime files, service definitions, configuration, and state. If network cleanup cannot be verified, it keeps the runtime files so the uninstall can be retried safely.
 
-# Detach XDP and remove the TCP/UDP reply tracker from each protected interface
-for iface in $IFACES; do
-  ip link set dev "$iface" xdp off 2>/dev/null || true
-  ip link set dev "$iface" xdpgeneric off 2>/dev/null || true
-  ip link set dev "$iface" xdpoffload off 2>/dev/null || true
-  tc filter del dev "$iface" egress pref 49152 2>/dev/null || true
-  tc qdisc del dev "$iface" clsact 2>/dev/null || true
-done
+If `/etc/auto_xdp/auto_xdp.env` has already been removed, provide the protected interfaces explicitly:
 
-# Remove pinned maps and nftables fallback table
-rm -rf /sys/fs/bpf/xdp_fw
-nft delete table inet auto_xdp 2>/dev/null || true
-
-# Remove init service files
-rm -f /etc/systemd/system/xdp-port-sync.service
-rm -f /etc/systemd/system/auto-xdp-relay.service
-systemctl daemon-reload 2>/dev/null || true
-rm -f /etc/init.d/xdp-port-sync
-rm -f /etc/init.d/auto-xdp-relay
-
-# Remove installed runtime files
-rm -f /usr/local/bin/xdp_port_sync.py
-rm -f /usr/local/bin/pkt_relay.py
-rm -f /usr/local/bin/axdp
-rm -f /usr/local/bin/auto_xdp_start.sh
-rm -rf /usr/local/lib/auto_xdp
-rm -rf /etc/auto_xdp
-rm -rf /run/auto_xdp /var/run/auto_xdp
+```bash
+sudo axdp uninstall eth0 eth1
 ```
 
 ---
