@@ -14,6 +14,7 @@ readonly _VETH_IN="axdp_v1"
 readonly _HOST_IP="10.99.0.1"
 readonly _NS_IP="10.99.0.2"
 readonly _PIN_DIR="/sys/fs/bpf/axdp_integ"
+readonly _DEBUG_PIN_DIR="/sys/fs/bpf/axdp_integ_debug"
 readonly _RUN_DIR="/run/axdp_integ"
 readonly _XDP_OBJ="/tmp/axdp_integ_fw.o"
 
@@ -68,8 +69,39 @@ source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
 # ---------------------------------------------------------------------------
 # Setup / teardown
 # ---------------------------------------------------------------------------
+_load_xdp_program() {
+    local phase="${1:-load}"
+    local load_log status debug_status
+    load_log=$(mktemp)
+
+    bpftool prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
+        pinmaps "$_PIN_DIR" >"$load_log" 2>&1
+    status=$?
+    if [[ $status -eq 0 ]]; then
+        rm -f "$load_log"
+        return 0
+    fi
+
+    printf 'error: XDP program load failed during %s (exit %d)\n' "$phase" "$status" >&2
+    printf '%s\n' '--- bpftool load output ---' >&2
+    cat "$load_log" >&2
+    rm -f "$load_log"
+
+    # Preserve full libbpf map-creation and verifier context in CI. A separate
+    # pin directory avoids collisions with anything left by the first load.
+    rm -rf "$_DEBUG_PIN_DIR"
+    mkdir -p "$_DEBUG_PIN_DIR"
+    printf '%s\n' '--- bpftool -d verifier output ---' >&2
+    bpftool -d prog load "$_XDP_OBJ" "$_DEBUG_PIN_DIR/prog" type xdp \
+        pinmaps "$_DEBUG_PIN_DIR" >&2
+    debug_status=$?
+    printf '%s\n' "--- bpftool -d exited $debug_status ---" >&2
+    rm -rf "$_DEBUG_PIN_DIR"
+    return "$status"
+}
+
 _setup() {
-    rm -rf "$_PIN_DIR" "$_RUN_DIR"
+    rm -rf "$_PIN_DIR" "$_DEBUG_PIN_DIR" "$_RUN_DIR"
     mkdir -p "$_PIN_DIR" "$_RUN_DIR"
 
     ip netns del "$_NS" 2>/dev/null || true
@@ -84,10 +116,9 @@ _setup() {
     ip netns exec "$_NS" ip link set "$_VETH_IN" up
     ip netns exec "$_NS" ip link set lo up
 
-    bpftool prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
-        pinmaps "$_PIN_DIR" >/dev/null 2>&1
-    _configure_test_runtime
-    ip link set dev "$_VETH" xdpgeneric pinned "$_PIN_DIR/prog"
+    _load_xdp_program "integration setup" || return 1
+    _configure_test_runtime || return 1
+    ip link set dev "$_VETH" xdpgeneric pinned "$_PIN_DIR/prog" || return 1
     echo "generic" > "$_RUN_DIR/xdp_mode"
 }
 
@@ -95,7 +126,7 @@ _teardown() {
     ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
     ip netns del "$_NS" 2>/dev/null || true
     ip link del "$_VETH" 2>/dev/null || true
-    rm -rf "$_PIN_DIR" "$_RUN_DIR"
+    rm -rf "$_PIN_DIR" "$_DEBUG_PIN_DIR" "$_RUN_DIR"
 }
 trap '_teardown' EXIT
 
@@ -378,10 +409,9 @@ test_service_restart() {
     ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
     rm -rf "$_PIN_DIR"
     mkdir -p "$_PIN_DIR"
-    bpftool prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
-        pinmaps "$_PIN_DIR" >/dev/null 2>&1
-    _configure_test_runtime
-    ip link set dev "$_VETH" xdpgeneric pinned "$_PIN_DIR/prog"
+    _load_xdp_program "service restart" || return 1
+    _configure_test_runtime || return 1
+    ip link set dev "$_VETH" xdpgeneric pinned "$_PIN_DIR/prog" || return 1
 
     [[ -f "$_PIN_DIR/prog" ]] || { echo "prog pin missing after reload"; return 1; }
     xdp_maps_ready || { echo "maps not ready after reload"; return 1; }
@@ -395,35 +425,44 @@ test_service_restart() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-_setup
+_require_setup() {
+    local test_name="$1"
+    if _setup; then
+        return 0
+    fi
+    printf 'fatal: integration setup failed before %s\n' "$test_name" >&2
+    exit 1
+}
+
+_require_setup "attach test"
 run_test "attach: XDP loads and pins all required maps" test_attach
 _teardown
 
-_setup
+_require_setup "reload test"
 run_test "reload: xdp_maps_ready detects missing map pin" test_reload
 _teardown
 
-_setup
+_require_setup "fallback test"
 run_test "fallback: veth attach uses generic XDP mode" test_fallback
 _teardown
 
-_setup
+_require_setup "port sync test"
 run_test "port sync: tcp_whitelist allows and blocks TCP SYN by port" test_port_sync
 _teardown
 
-_setup
+_require_setup "UDP reply test"
 run_test "UDP reply: udp_ct4 CT entry passes inbound reply packet" test_udp_reply
 _teardown
 
-_setup
+_require_setup "ACL test"
 run_test "ACL: tcp_acl_v4 entry permits SYN without whitelist" test_acl
 _teardown
 
-_setup
+_require_setup "rate limit test"
 run_test "rate limit: excess SYNs from same IP are dropped" test_rate_limit
 _teardown
 
-_setup
+_require_setup "service restart test"
 run_test "service restart: XDP re-attaches and accepts traffic after reload" test_service_restart
 _teardown
 

@@ -101,11 +101,31 @@ jobs:
           mkdir -p /sys/fs/bpf
           mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
 
+      - name: Report kernel and BPF environment
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          uname -a
+          clang --version
+          bpftool version
+          ip -Version
+          mountpoint /sys/fs/bpf
+          ulimit -l
+          bpftool feature probe kernel 2>&1 || echo "warning: kernel feature probe failed"
+
       - name: Load, attach, and exercise the XDP program
         shell: bash
         run: |
           set -Eeuo pipefail
-          integration_log="$(mktemp)"
-          trap 'rm -f "$integration_log"' EXIT
+          integration_log="$GITHUB_WORKSPACE/kernel-integration.log"
           bash ./tests/bash/test_integration.sh 2>&1 | tee "$integration_log"
           grep -Eq '^all [1-9][0-9]* tests passed$' "$integration_log"
+
+      - name: Upload kernel verifier diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-integration-debug-${{ github.run_id }}
+          path: kernel-integration.log
+          if-no-files-found: warn
+          retention-days: 7
