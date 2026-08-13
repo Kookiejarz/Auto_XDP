@@ -49,11 +49,12 @@ if [[ ! -f "$_XDP_OBJ" ]]; then
     _include_args=(-I "$REPO_ROOT/bpf/include" -I "$_asm_inc")
     _multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
     [[ ! -d "$_multiarch_inc" ]] || _include_args+=(-I "$_multiarch_inc")
-    clang -O2 -g -target bpf \
+    if ! clang -O2 -g -target bpf \
         "${_include_args[@]}" \
-        -c "$_src" -o "$_XDP_OBJ" 2>/dev/null || {
-        echo "skip: XDP compile failed"; exit 0
-    }
+        -c "$_src" -o "$_XDP_OBJ"; then
+        echo "error: XDP compile failed" >&2
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------------
