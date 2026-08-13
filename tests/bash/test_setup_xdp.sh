@@ -241,6 +241,80 @@ test_fetch_local_or_remote_uses_local_copy_without_network() (
     assert_file_contains "$dst" "local copy"
 )
 
+test_local_source_defaults_to_main_ref() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    assert_eq "$AUTO_XDP_SOURCE_REF" "refs/heads/main" || return 1
+    assert_eq "$RAW_URL" "https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/heads/main"
+)
+
+test_explicit_source_ref_selects_matching_remote_tree() (
+    AUTO_XDP_SOURCE_REF="refs/tags/v26.7.7a"
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    assert_eq "$RAW_URL" "https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/v26.7.7a"
+)
+
+test_remote_stdin_install_requires_explicit_ref() (
+    set +e
+
+    local output status
+    output=$(env -u AUTO_XDP_SOURCE_REF -u AUTO_XDP_FORCE_REMOTE \
+        bash -s -- --help < "$REPO_ROOT/setup_xdp.sh" 2>&1)
+    status=$?
+
+    [[ $status -ne 0 ]] || {
+        printf 'expected stdin install without a source ref to fail\n'
+        return 1
+    }
+    assert_contains "$output" "Remote installation requires AUTO_XDP_SOURCE_REF"
+)
+
+test_backend_phase_dispatch_preserves_remote_ref_across_sudo() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    PREFER_REMOTE_SOURCES=1
+    AUTO_XDP_SOURCE_REF="refs/tags/v26.7.7a"
+    PRIV_MODE="sudo"
+    IFACES=(eth0)
+    FORCE=0
+
+    _resolve_self_path() { printf '%s' "$tmpdir/setup_xdp.sh"; }
+    as_root() {
+        printf '%s\n' "$*" > "$tmpdir/as-root.log"
+        local previous="" arg
+        for arg in "$@"; do
+            if [[ "$previous" == "--result-file" ]]; then
+                printf 'ACTIVE_BACKEND=%q\n' "xdp" > "$arg"
+                break
+            fi
+            previous="$arg"
+        done
+    }
+
+    run_backend_phase_dispatch || return 1
+
+    assert_file_contains "$tmpdir/as-root.log" "AUTO_XDP_SOURCE_REF=refs/tags/v26.7.7a" || return 1
+    assert_file_contains "$tmpdir/as-root.log" "AUTO_XDP_FORCE_REMOTE=1"
+)
+
+test_readme_release_install_uses_one_local_archive_tree() (
+    local readme
+    readme=$(<"$REPO_ROOT/README.md")
+
+    assert_contains "$readme" "Auto_XDP/archive/refs/tags/" || return 1
+    assert_contains "$readme" 'cd "$auto_xdp_tmp"' || return 1
+    [[ "$readme" != *"raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/"* ]] || {
+        printf 'README still recommends a raw tag entry script\n'
+        return 1
+    }
+)
+
 test_check_github_updates_lists_and_confirms_once() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -1911,6 +1985,11 @@ run_test "setup_xdp dry-run report emits CI fields" test_dry_run_report_emits_ci
 run_test "setup_xdp confirmation handles force and no-tty abort" test_confirm_yes_no_force_and_no_tty_abort_modes
 run_test "setup_xdp replaces existing install without prompting" test_replace_existing_install_step_replaces_without_prompt
 run_test "setup_xdp prefers local files when available" test_fetch_local_or_remote_uses_local_copy_without_network
+run_test "setup_xdp local source defaults to main ref" test_local_source_defaults_to_main_ref
+run_test "setup_xdp explicit ref selects matching remote tree" test_explicit_source_ref_selects_matching_remote_tree
+run_test "setup_xdp stdin install requires explicit ref" test_remote_stdin_install_requires_explicit_ref
+run_test "setup_xdp preserves remote ref across sudo" test_backend_phase_dispatch_preserves_remote_ref_across_sudo
+run_test "README release install uses one local archive tree" test_readme_release_install_uses_one_local_archive_tree
 run_test "setup_xdp check-update confirms all changed files once" test_check_github_updates_lists_and_confirms_once
 run_test "setup_xdp writes queue auto tuning into runtime config" test_write_config_enables_queue_auto_tuning
 run_test "setup_xdp sizes combined channels to available CPUs" test_auto_tune_interface_parallelism_sets_combined_channels

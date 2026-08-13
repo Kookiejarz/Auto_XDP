@@ -20,7 +20,9 @@ jobs:
         env:
           NEW_VERSION: ${{ github.event.release.tag_name }}
         run: |
-          sed -i "s|refs/tags/v[^/]*|refs/tags/$NEW_VERSION|g" README.md
+          [[ "$NEW_VERSION" =~ ^v[0-9A-Za-z._-]+$ ]]
+          sed -i -E "s|^  AUTO_XDP_VERSION=v[^[:space:]]*$|  AUTO_XDP_VERSION=$NEW_VERSION|" README.md
+          grep -qx "  AUTO_XDP_VERSION=$NEW_VERSION" README.md
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add README.md
