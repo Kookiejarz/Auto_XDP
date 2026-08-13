@@ -51,3 +51,31 @@ jobs:
 
       - name: Build BPF objects natively on ${{ matrix.name }}
         run: bash ./tests/bash/test_bpf_build.sh
+
+  kernel-integration:
+    name: Kernel Load + XDP Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: debian:12-slim
+      options: --privileged
+    steps:
+      - name: Install kernel test dependencies
+        run: >-
+          apt-get update && apt-get install -y
+          bash clang llvm libbpf-dev bpftool iproute2 python3
+          util-linux
+
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Mount BPF filesystem
+        run: |
+          mkdir -p /sys/fs/bpf
+          mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
+
+      - name: Load, attach, and exercise the XDP program
+        run: |
+          integration_log=$(mktemp)
+          bash ./tests/bash/test_integration.sh | tee "$integration_log"
+          grep -Eq '^all [1-9][0-9]* tests passed$' "$integration_log"
