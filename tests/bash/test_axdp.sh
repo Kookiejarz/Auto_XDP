@@ -77,6 +77,43 @@ test_main_dispatches_under_attack_command() (
     assert_eq "$called" "yes:on"
 )
 
+test_check_update_propagates_main_ref_to_downloaded_installer() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/bin"
+    cat > "$tmpdir/bin/curl" <<'EOF_CURL'
+#!/bin/sh
+out=""
+url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+if [ "$url" = "https://api.github.com/repos/Kookiejarz/Auto_XDP/commits/main" ]; then
+    printf '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n'
+    exit 0
+fi
+cat > "$out" <<'EOF_INSTALLER'
+#!/bin/bash
+printf '%s|%s|%s\n' "$AUTO_XDP_SOURCE_REF" "$AUTO_XDP_FORCE_REMOTE" "$*" > "$AXDP_UPDATE_TEST_LOG"
+EOF_INSTALLER
+EOF_CURL
+    chmod +x "$tmpdir/bin/curl"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+    AXDP_UPDATE_TEST_LOG="$tmpdir/update.log"
+    export AXDP_UPDATE_TEST_LOG
+
+    run_check_update --force || return 1
+    assert_file_contains "$tmpdir/update.log" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|1|--check-update --force"
+)
+
 test_main_loads_configured_ifaces_for_tui() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -888,6 +925,7 @@ EOF_BPFSH
 run_test "axdp reads and updates runtime log level" test_run_log_level_reads_and_updates_config
 run_test "axdp reads and updates under-attack mode" test_run_under_attack_reads_and_updates_config
 run_test "axdp dispatches under-attack command correctly" test_main_dispatches_under_attack_command
+run_test "axdp check-update propagates its source ref" test_check_update_propagates_main_ref_to_downloaded_installer
 run_test "axdp loads configured interfaces for tui" test_main_loads_configured_ifaces_for_tui
 run_test "axdp reports stale admin_cli for tui" test_main_reports_stale_admin_cli_for_tui
 run_test "axdp preserves unrelated TOML sections on config update" test_config_updates_preserve_unrelated_sections
