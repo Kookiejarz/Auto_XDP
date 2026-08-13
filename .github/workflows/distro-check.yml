@@ -8,37 +8,51 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   native-build:
     name: Native Build (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: debian
             image: debian:12-slim
+            experimental: false
             install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib bpftool
           - name: ubuntu
             image: ubuntu:24.04
-            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib linux-tools-common linux-tools-generic; ln -sf /usr/lib/linux-tools/*/bpftool /usr/local/bin/bpftool 2>/dev/null || true
+            experimental: false
+            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib linux-tools-common linux-tools-generic; bpftool_path="$(find /usr/lib/linux-tools -type f -name bpftool -print -quit)"; test -n "$bpftool_path"; ln -sf "$bpftool_path" /usr/local/bin/bpftool; bpftool version
           - name: fedora
             image: fedora:41
+            experimental: false
             install: dnf -y install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
           - name: opensuse
             image: opensuse/tumbleweed
+            experimental: true
             install: zypper --non-interactive refresh && zypper --non-interactive install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-devel bpftool gcc make
           - name: arch
             image: archlinux:latest
+            experimental: true
             install: "pacman -Sy --noconfirm --needed bash ca-certificates coreutils curl gawk git grep python sed iproute2 clang llvm libbpf base-devel bpf"
           - name: alpine
             image: alpine:3.20
+            experimental: false
             install: apk add --no-cache bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev bpftool build-base linux-headers
           - name: almalinux
             image: almalinux:10
+            experimental: false
             install: dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
           - name: rockylinux
             image: rockylinux:9
+            experimental: false
             install: dnf -y install dnf-plugins-core && dnf config-manager --enable crb && dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
     container:
       image: ${{ matrix.image }}
@@ -49,7 +63,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Verify build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for command_name in bash clang llvm-strip bpftool ip python3; do
+            command -v "$command_name"
+          done
+          clang --version
+          bpftool version
+
       - name: Build BPF objects natively on ${{ matrix.name }}
+        shell: bash
         run: bash ./tests/bash/test_bpf_build.sh
 
   kernel-integration:
@@ -61,10 +86,12 @@ jobs:
       options: --privileged
     steps:
       - name: Install kernel test dependencies
-        run: >-
-          apt-get update && apt-get install -y
-          bash clang llvm libbpf-dev bpftool iproute2 python3
-          util-linux
+        run: |
+          apt-get update
+          apt-get install -y bash clang llvm libbpf-dev bpftool iproute2 python3 util-linux
+          if [ "$(uname -m)" = "x86_64" ]; then
+            apt-get install -y gcc-multilib
+          fi
 
       - name: Check out repository
         uses: actions/checkout@v6
@@ -75,7 +102,10 @@ jobs:
           mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
 
       - name: Load, attach, and exercise the XDP program
+        shell: bash
         run: |
-          integration_log=$(mktemp)
-          bash ./tests/bash/test_integration.sh | tee "$integration_log"
+          set -Eeuo pipefail
+          integration_log="$(mktemp)"
+          trap 'rm -f "$integration_log"' EXIT
+          bash ./tests/bash/test_integration.sh 2>&1 | tee "$integration_log"
           grep -Eq '^all [1-9][0-9]* tests passed$' "$integration_log"
