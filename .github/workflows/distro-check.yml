@@ -29,7 +29,7 @@ jobs:
           - name: ubuntu
             image: ubuntu:24.04
             experimental: false
-            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib linux-tools-common linux-tools-generic; bpftool_path="$(find /usr/lib/linux-tools -type f -name bpftool -print -quit)"; test -n "$bpftool_path"; ln -sf "$bpftool_path" /usr/local/bin/bpftool; bpftool version
+            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib linux-tools-common linux-tools-generic; bpftool_path="$(find /usr/lib/linux-tools -name bpftool -print -quit)"; test -x "$bpftool_path"; ln -sf "$bpftool_path" /usr/local/bin/bpftool; bpftool version
           - name: fedora
             image: fedora:41
             experimental: false
