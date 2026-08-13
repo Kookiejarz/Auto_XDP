@@ -143,14 +143,11 @@ ensure_xdp_loaded() {
 
     ensure_bpffs
 
-    cleanup_failed_load() {
-        cleanup_tc_egress_filter
-        local _iface
-        for _iface in "${_IFACES[@]}"; do
-            ip link set dev "$_iface" xdp off 2>/dev/null || true
-        done
-        rm -rf "$BPF_PIN_DIR"
-    }
+    # A killed loader can leave a staged or rollback generation behind. Resume
+    # or verify it before the healthy fast path accepts existing attachments.
+    if [[ -e "${BPF_PIN_DIR}_next" || -e "${BPF_PIN_DIR}_rollback" ]]; then
+        _auto_xdp_finish_interrupted_reload || return 1
+    fi
 
     # If the prog is already pinned and maps are intact, just re-attach any
     # interface that has lost its XDP program (e.g. after a link bounce).
@@ -161,7 +158,7 @@ ensure_xdp_loaded() {
                 _any_missing=1
                 if ip link set dev "$_iface" xdp pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
                     echo "[auto_xdp] re-attached XDP (native) on $_iface" >&2
-                elif ip link set dev "$_iface" xdp generic pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
+                elif ip link set dev "$_iface" xdpgeneric pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
                     echo "[auto_xdp] re-attached XDP (generic) on $_iface" >&2
                     _xdp_mode="generic"
                 else
@@ -181,74 +178,48 @@ ensure_xdp_loaded() {
 
     [[ -f "$BPF_PIN_DIR/prog" ]] && echo "[auto_xdp] existing XDP maps incomplete; reloading runtime objects" >&2
 
-    # Explicitly detach old programs before removing their pins so that the
-    # kernel reference count drops to zero immediately. Without this step:
-    #  - If the old XDP was native and the new load falls back to generic,
-    #    ip-link only replaces the generic slot; the old native program keeps
-    #    its interface reference and becomes a zombie.
-    #  - If tc filter replace fails later, the old tc program keeps its filter
-    #    reference and also becomes a zombie.
-    # Detach first, then wipe pins, so no window exists where a program has
-    # neither a pin nor an interface reference yet isn't freed.
-    cleanup_tc_egress_filter
-    for _iface in "${_IFACES[@]}"; do
-        ip link set dev "$_iface" xdp off 2>/dev/null || true
-        ip link set dev "$_iface" xdp generic off 2>/dev/null || true
-        ip link set dev "$_iface" xdp offload off 2>/dev/null || true
-    done
-
-    rm -rf "$BPF_PIN_DIR"
-    mkdir -p "$BPF_PIN_DIR"
-
-    bpftool prog load "$XDP_OBJ_PATH" "$BPF_PIN_DIR/prog" type xdp \
-        pinmaps "$BPF_PIN_DIR" >/dev/null 2>&1 || return 1
-    xdp_maps_ready || {
-        echo "[auto_xdp] pinned XDP maps incomplete after pinning; fallback to nftables" >&2
-        cleanup_failed_load
-        return 1
-    }
-    seed_existing_tcp_conntrack
-    load_tc_egress_program || true
-    load_sock_state_tracker || true
-    load_slot_handlers || true
-    load_port_handlers || true
-
-    local _iface _attached=0 _xdp_mode="native" _native_err _generic_err
-    for _iface in "${_IFACES[@]}"; do
-        ethtool -K "$_iface" lro off 2>/dev/null || true
-        if _native_err=$(ip link set dev "$_iface" xdp pinned "$BPF_PIN_DIR/prog" 2>&1); then
-            echo "[auto_xdp] attached XDP (native) on $_iface" >&2
-            _attached=$((_attached + 1))
-        elif _generic_err=$(ip link set dev "$_iface" xdp generic pinned "$BPF_PIN_DIR/prog" 2>&1); then
-            echo "[auto_xdp] attached XDP (generic) on $_iface" >&2
-            _xdp_mode="generic"
-            _attached=$((_attached + 1))
-        else
-            echo "[auto_xdp] warning: could not attach XDP to $_iface; skipping" >&2
-            [[ -n "$_native_err" ]] && echo "[auto_xdp]   ↳ native:  $_native_err" >&2
-            [[ -n "$_generic_err" ]] && echo "[auto_xdp]   ↳ generic: $_generic_err" >&2
+    # Build and seed a candidate map generation while the current XDP/tc
+    # programs remain attached. The shared switch helper restores every
+    # interface and filter if any replace operation fails.
+    if ! transactional_reload_xdp; then
+        echo "[auto_xdp] transactional XDP/tc reload failed; previous protection preserved or restored" >&2
+        if _auto_xdp_any_target_has_xdp; then
+            echo "[auto_xdp] refusing nftables fallback while XDP remains attached" >&2
+            return 2
         fi
-    done
+        return 1
+    fi
 
-    [[ $_attached -gt 0 ]] || { cleanup_failed_load; return 1; }
+    load_sock_state_tracker || true
     auto_tune_interface_parallelism || true
-    echo "$_xdp_mode" > "${RUN_STATE_DIR}/xdp_mode"
+    echo "$AUTO_XDP_SWITCH_MODE" > "${RUN_STATE_DIR}/xdp_mode"
     return 0
 }
 
 select_backend() {
     mkdir -p "$RUN_STATE_DIR"
-    local preferred_backend
+    local preferred_backend xdp_status=1
     preferred_backend=$(resolve_preferred_backend)
 
-    if [[ "$preferred_backend" != "nftables" ]] && ensure_xdp_loaded; then
-        echo "xdp" > "${RUN_STATE_DIR}/backend"
-        if command -v nft &>/dev/null && nft list table inet auto_xdp &>/dev/null 2>&1; then
-            if nft delete table inet auto_xdp 2>/dev/null; then
-                echo "[auto_xdp] nftables inet auto_xdp table removed (replaced by XDP)"
-            fi
+    if [[ "$preferred_backend" != "nftables" ]]; then
+        if ensure_xdp_loaded; then
+            xdp_status=0
+        else
+            xdp_status=$?
         fi
-        return 0
+        if [[ $xdp_status -eq 0 ]]; then
+            echo "xdp" > "${RUN_STATE_DIR}/backend"
+            if command -v nft &>/dev/null && nft list table inet auto_xdp &>/dev/null 2>&1; then
+                if nft delete table inet auto_xdp 2>/dev/null; then
+                    echo "[auto_xdp] nftables inet auto_xdp table removed (replaced by XDP)"
+                fi
+            fi
+            return 0
+        fi
+        if [[ $xdp_status -eq 2 ]]; then
+            echo "[auto_xdp] XDP reload failed with an attachment still active; backend selection aborted" >&2
+            return 1
+        fi
     fi
 
     command -v nft &>/dev/null || {

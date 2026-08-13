@@ -2,23 +2,22 @@
 # Sourced by setup_xdp.sh after build.sh and runtime_common.
 
 cleanup_existing_xdp() {
-    cleanup_tc_egress_filter
-
     # Scan ALL system interfaces, not just IFACES: a previous install may have
-    # attached XDP to different interfaces. Only detaching IFACES leaves old
-    # programs attached, keeping their map references alive and leaking map
-    # generations on every reinstall.
-    local iface any_xdp=0 xdp_ifaces=()
+    # attached XDP to different interfaces. Discovery and confirmation happen
+    # before staging, but the programs remain attached until the candidate XDP
+    # and tc programs have both committed successfully.
+    local iface any_xdp=0
+    XDP_PREVIOUS_IFACES=()
     for iface in $(ls /sys/class/net/ 2>/dev/null); do
         if ip -d link show dev "$iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
-            xdp_ifaces+=("$iface")
+            XDP_PREVIOUS_IFACES+=("$iface")
             any_xdp=1
         fi
     done
 
     if [[ $any_xdp -eq 1 ]]; then
-        local iface_list="${xdp_ifaces[*]}"
-        info "Existing XDP program detected on: $iface_list — will replace"
+        local iface_list="${XDP_PREVIOUS_IFACES[*]}"
+        info "Existing XDP program detected on: $iface_list — transactional replacement planned"
         # A detected reinstall (EXISTING_INSTALL=1) means this is our own prior
         # attach; same no-prompt precedent as replace_existing_install_step.
         # Only prompt when some other XDP program is present on a fresh install.
@@ -38,33 +37,11 @@ cleanup_existing_xdp() {
             esac
         fi
 
-        for iface in "${xdp_ifaces[@]}"; do
-            ip link set dev "$iface" xdp off 2>/dev/null || true
-            ip link set dev "$iface" xdp generic off 2>/dev/null || true
-            ip link set dev "$iface" xdp offload off 2>/dev/null || true
-        done
-
-        # Verify detach; fall back to bpftool if ip link wasn't enough.
-        for iface in "${xdp_ifaces[@]}"; do
-            if ip -d link show dev "$iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
-                warn "ip link could not clear XDP from $iface; trying bpftool..."
-                bpftool net detach xdp dev "$iface" 2>/dev/null || true
-                bpftool net detach xdpgeneric dev "$iface" 2>/dev/null || true
-                if ip -d link show dev "$iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
-                    die "Failed to clear the existing XDP program from $iface. Detach it manually and rerun."
-                fi
-            fi
-        done
     fi
-
-    if [[ -d "$BPF_PIN_DIR" ]]; then
-        info "Removing stale BPF pin directory $BPF_PIN_DIR"
-        rm -rf "$BPF_PIN_DIR"
-    fi
-    mkdir -p "$BPF_PIN_DIR"
 }
 
 deploy_xdp_backend() {
+    XDP_FALLBACK_BLOCKED=0
     if [[ ! -f "$XDP_OBJ_INSTALLED" ]]; then
         XDP_FALLBACK_REASON="compiled XDP object not found"
         warn "XDP unavailable: compiled object not found; continuing with nftables backend."
@@ -74,55 +51,42 @@ deploy_xdp_backend() {
     ensure_bpffs
     cleanup_existing_xdp
 
-    if ! bpftool prog load "$XDP_OBJ_INSTALLED" "$BPF_PIN_DIR/prog" type xdp \
-            pinmaps "$BPF_PIN_DIR"; then
-        XDP_FALLBACK_REASON="bpftool failed to load the XDP program"
-        warn "XDP unavailable: bpftool program load failed; continuing with nftables backend."
-        rm -rf "$BPF_PIN_DIR"
+    if ! transactional_reload_xdp; then
+        XDP_FALLBACK_REASON="transactional XDP/tc switch failed; previous attachment was preserved or restored"
+        warn "XDP upgrade failed transactionally; previous protection was preserved or restored."
+        if _auto_xdp_any_target_has_xdp; then
+            XDP_FALLBACK_BLOCKED=1
+            warn "Refusing nftables fallback while XDP remains attached."
+        fi
         return 1
     fi
 
-    if ! xdp_maps_ready; then
-        XDP_FALLBACK_REASON="pinned XDP maps are incomplete"
-        warn "XDP unavailable: pinned maps are incomplete; continuing with nftables backend."
-        rm -rf "$BPF_PIN_DIR"
-        return 1
-    fi
-
-    seed_existing_tcp_conntrack
-    load_tc_egress_program || true
+    ACTIVE_XDP_MODE="$AUTO_XDP_SWITCH_MODE"
     load_sock_state_tracker || true
 
-    local iface attached=0 _native_err _generic_err
-    ACTIVE_XDP_MODE="native"
-    for iface in "${IFACES[@]}"; do
-        ethtool -K "$iface" lro off 2>/dev/null || true
-        if _native_err=$(ip link set dev "$iface" xdp pinned "$BPF_PIN_DIR/prog" 2>&1); then
-            attached=$((attached + 1))
-        elif _generic_err=$(ip link set dev "$iface" xdp generic pinned "$BPF_PIN_DIR/prog" 2>&1); then
-            ACTIVE_XDP_MODE="generic"
-            attached=$((attached + 1))
-        else
-            warn "Failed to attach XDP to $iface (skipping this interface)"
-            [[ -n "$_native_err" ]] && warn "  native : $_native_err"
-            [[ -n "$_generic_err" ]] && warn "  generic: $_generic_err"
+    # Old attachments on interfaces removed from IFACES are detached only after
+    # the target interfaces and tc filters have committed successfully.
+    local old_iface target keep
+    for old_iface in "${XDP_PREVIOUS_IFACES[@]}"; do
+        keep=0
+        for target in "${IFACES[@]}"; do
+            [[ "$old_iface" == "$target" ]] && keep=1
+        done
+        if [[ $keep -eq 0 ]]; then
+            ip link set dev "$old_iface" xdp off 2>/dev/null || true
+            ip link set dev "$old_iface" xdpgeneric off 2>/dev/null || true
+            ip link set dev "$old_iface" xdpoffload off 2>/dev/null || true
+            if command -v tc &>/dev/null; then
+                tc filter del dev "$old_iface" egress \
+                    pref "${TC_FILTER_PREF:-49152}" \
+                    handle "${TC_FILTER_HANDLE:-1}" 2>/dev/null || true
+            fi
         fi
     done
 
-    if [[ $attached -gt 0 ]]; then
-        auto_tune_interface_parallelism || true
-        ACTIVE_BACKEND="xdp"
-        return 0
-    fi
-
-    XDP_FALLBACK_REASON="XDP attach failed on all target interfaces"
-    warn "XDP unavailable: attach failed on all target interfaces; continuing with nftables backend."
-    cleanup_tc_egress_filter
-    for iface in "${IFACES[@]}"; do
-        ip link set dev "$iface" xdp off 2>/dev/null || true
-    done
-    rm -rf "$BPF_PIN_DIR"
-    return 1
+    auto_tune_interface_parallelism || true
+    ACTIVE_BACKEND="xdp"
+    return 0
 }
 
 deploy_backend_step() {
@@ -132,6 +96,10 @@ deploy_backend_step() {
         XDP_FALLBACK_REASON=""
         step_ok "XDP $ACTIVE_XDP_MODE mode"
     else
+        if [[ ${XDP_FALLBACK_BLOCKED:-0} -eq 1 ]]; then
+            step_fail "XDP reload failed while an XDP attachment remains active; nftables fallback was not started."
+            return 1
+        fi
         ACTIVE_BACKEND="nftables"
         ACTIVE_XDP_MODE="none"
         if ensure_nftables_available; then

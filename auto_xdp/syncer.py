@@ -1,4 +1,4 @@
-"""Sync orchestration: one-shot sync and event-driven daemon loop."""
+"""Sync orchestration: one-shot, event-driven, and periodic reconciliation."""
 from __future__ import annotations
 
 import json as _json
@@ -27,6 +27,11 @@ TRUSTED_SRC_IPS = cfg.TRUSTED_SRC_IPS
 # Without this, busy systems (containers, cron storms) never see a quiet window
 # longer than DEBOUNCE_SECONDS and sync stalls for tens of seconds.
 DEBOUNCE_MAX_WAIT_SECONDS = 1.0
+# A full discovery/reconcile is the safety net for missed proc/socket events.
+# Event-triggered reconciles also perform a full discovery, so this interval is
+# the maximum time the daemon may go without re-reading the system state.
+FULL_RECONCILE_INTERVAL_SECONDS = 30.0
+EVENT_SOURCE_RETRY_INTERVAL_SECONDS = 5.0
 
 
 def observe_system_state():
@@ -90,24 +95,30 @@ def _open_relay_client(sock_path: str) -> "_socket.socket | None":
         return None
 
 
-def _drain_relay_lines(relay_sock: "_socket.socket") -> bool:
+def _drain_relay_lines(
+    relay_sock: "_socket.socket",
+    pending: bytearray | None = None,
+) -> bool:
     """Read available lines from the relay socket.
 
     Returns True if any port_change event was found.
     Raises ConnectionResetError if the relay closed the connection.
     """
-    buf = b""
+    if pending is None:
+        pending = bytearray()
     try:
         while True:
             chunk = relay_sock.recv(4096)
             if not chunk:
                 raise ConnectionResetError("relay disconnected")
-            buf += chunk
+            pending.extend(chunk)
     except BlockingIOError:
         pass
 
     found = False
-    for raw_line in buf.split(b"\n"):
+    while (line_end := pending.find(b"\n")) >= 0:
+        raw_line = bytes(pending[:line_end])
+        del pending[: line_end + 1]
         if not raw_line:
             continue
         try:
@@ -131,8 +142,10 @@ def watch(
 
     last_event_t = 0.0
     first_event_t = 0.0
+    last_reconcile_t = 0.0
     last_gc_t = 0.0
     last_stale_check_t = 0.0
+    last_netlink_connect_t = -EVENT_SOURCE_RETRY_INTERVAL_SECONDS
     reload_requested = False
 
     def _on_sighup(signum: int, frame: object) -> None:
@@ -142,8 +155,8 @@ def watch(
     signal.signal(signal.SIGHUP, _on_sighup)
 
     relay_sock: "_socket.socket | None" = None
-    last_relay_connect_t = 0.0
-    RELAY_RETRY_INTERVAL = 5.0
+    relay_pending = bytearray()
+    last_relay_connect_t = -EVENT_SOURCE_RETRY_INTERVAL_SECONDS
 
     try:
         while True:
@@ -153,38 +166,60 @@ def watch(
                     backend = open_backend(backend_name)
                     log.info("Backend initialized.")
                     sync_once(backend, dry_run)
+                    last_reconcile_t = time.monotonic()
                     last_event_t = 0.0
                     first_event_t = 0.0
-                except OSError as exc:
+                except (OSError, RuntimeError) as exc:
                     log.error("Failed to open backend: %s. Retrying in 5s...", exc)
                     time.sleep(5)
                     continue
 
-            # Re-subscribe to netlink if needed
-            if nl is None:
+            # Netlink is an optional acceleration path. Failure must not stop
+            # relay events, the periodic safety reconcile, GC, or drift checks.
+            now_mono = time.monotonic()
+            if (
+                nl is None
+                and now_mono - last_netlink_connect_t
+                >= EVENT_SOURCE_RETRY_INTERVAL_SECONDS
+            ):
                 nl = open_proc_connector()
-                if nl is None:
-                    time.sleep(5)
-                    continue
+                last_netlink_connect_t = now_mono
 
             # Optionally subscribe to pkt_relay for instant port_change triggers.
-            now_mono = time.monotonic()
-            if relay_sock is None and now_mono - last_relay_connect_t >= RELAY_RETRY_INTERVAL:
+            if (
+                relay_sock is None
+                and now_mono - last_relay_connect_t
+                >= EVENT_SOURCE_RETRY_INTERVAL_SECONDS
+            ):
                 relay_sock = _open_relay_client(cfg.RINGBUF_SOCKET_PATH)
                 last_relay_connect_t = now_mono
                 if relay_sock:
+                    relay_pending.clear()
                     log.info("Connected to pkt_relay for port_change events.")
 
             debounce_s = cfg.DEBOUNCE_SECONDS
             timeout = max(0.05, debounce_s - (time.monotonic() - last_event_t)) if last_event_t else 1.0
+            if last_reconcile_t:
+                until_reconcile = max(
+                    0.05,
+                    FULL_RECONCILE_INTERVAL_SECONDS
+                    - (time.monotonic() - last_reconcile_t),
+                )
+                timeout = min(timeout, until_reconcile)
 
-            select_fds = [nl]
+            select_fds = []
+            if nl is not None:
+                select_fds.append(nl)
             if relay_sock is not None:
                 select_fds.append(relay_sock)
 
             try:
-                rdy, _, _ = select.select(select_fds, [], [], timeout)
-                if rdy and drain_proc_events(nl):
+                if select_fds:
+                    rdy, _, _ = select.select(select_fds, [], [], timeout)
+                else:
+                    time.sleep(timeout)
+                    rdy = []
+                if nl is not None and nl in rdy and drain_proc_events(nl):
                     log.debug("Proc event -> debounce armed.")
                     _now = time.monotonic()
                     if not first_event_t:
@@ -192,10 +227,13 @@ def watch(
                     last_event_t = _now
                 if relay_sock is not None and relay_sock in rdy:
                     try:
-                        if _drain_relay_lines(relay_sock):
+                        if _drain_relay_lines(relay_sock, relay_pending):
                             log.debug("port_change from relay → immediate sync.")
                             try:
                                 sync_once(backend, dry_run)
+                                last_reconcile_t = time.monotonic()
+                                last_event_t = 0.0
+                                first_event_t = 0.0
                             except (OSError, RuntimeError) as exc:
                                 log.error("Sync error (port_change): %s", exc)
                                 backend.close()
@@ -204,13 +242,14 @@ def watch(
                         log.info("pkt_relay disconnected; reverting to proc_connector only.")
                         relay_sock.close()
                         relay_sock = None
+                        relay_pending.clear()
                         last_relay_connect_t = time.monotonic()
             except OSError as exc:
-                log.warning("Netlink error (%s); reconnecting proc connector.", exc)
+                log.warning("Netlink event error (%s); reconnecting proc connector.", exc)
                 if nl:
                     nl.close()
                 nl = None
-                continue
+                last_netlink_connect_t = time.monotonic()
 
             if reload_requested:
                 reload_requested = False
@@ -256,6 +295,7 @@ def watch(
                 log.debug("Sync triggered by event.")
                 try:
                     sync_once(backend, dry_run)
+                    last_reconcile_t = time.monotonic()
                 except (OSError, RuntimeError) as exc:
                     log.error("Sync error: %s", exc)
                     log.warning("Backend may be broken; will attempt to re-initialize.")
@@ -276,6 +316,25 @@ def watch(
                     # Arm debounce so a corrective sync runs shortly.
                     last_event_t = time.monotonic()
                     first_event_t = last_event_t
+
+            if (
+                time.monotonic() - last_reconcile_t
+                >= FULL_RECONCILE_INTERVAL_SECONDS
+            ):
+                log.debug("Periodic safety reconcile.")
+                try:
+                    sync_once(backend, dry_run)
+                    last_reconcile_t = time.monotonic()
+                    # This was a full discovery, so it also satisfies any
+                    # pending event-triggered reconcile.
+                    last_event_t = 0.0
+                    first_event_t = 0.0
+                except (OSError, RuntimeError) as exc:
+                    log.error("Periodic sync error: %s", exc)
+                    log.warning("Backend may be broken; will attempt to re-initialize.")
+                    backend.close()
+                    backend = None
+                    continue
 
             gc_interval = cfg.XDP_CONNTRACK_GC_INTERVAL_SECONDS
             if gc_interval > 0 and (time.monotonic() - last_gc_t >= gc_interval):

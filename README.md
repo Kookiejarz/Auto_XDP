@@ -45,6 +45,7 @@ It is built for single-host self-protection: VPSes, public cloud instances, home
 - [Install From Source](#install-from-source)
 - [What `setup_xdp.sh` Does](#what-setup_xdpsh-does-step-by-step)
 - [Automated Distro Checks](#automated-distro-checks)
+- [Testing](#testing)
 - [BPF Maps](#bpf-maps)
 - [Why ARRAY instead of HASH?](#why-array-instead-of-hash)
 - [Auto-Sync Daemon](#auto-sync-daemon)
@@ -152,7 +153,7 @@ Incoming Packet
 
 1. **`xdp_firewall.c`** — eBPF/XDP kernel program that filters packets at wire speed
 2. **`tc_flow_track.c`** — eBPF `tc` egress helper that records outbound IPv4/IPv6 TCP SYN packets and UDP reply tuples
-3. **`xdp_port_sync.py`** — userspace daemon that syncs TCP/UDP listening ports and trusted IPv4 source IPs
+3. **`xdp_port_sync.py`** — userspace daemon that reconciles discovered sockets and configured policy into the active backend; proc-connector and relay events provide fast triggers, while an independent 30-second full discovery repairs missed events and drift
 4. **`pkt_relay.py`** — userspace daemon that drains the `pkt_ringbuf` BPF ring buffer and broadcasts packet events (DROP/ALLOW) over a Unix socket; runs as the `auto-xdp-relay` service
 5. **`auto_xdp/tui.py`** — htop-like live TUI client (`axdp tui`) that subscribes to the relay socket and displays packet events, port deltas, and per-counter rates
 6. **`auto_xdp/abuseipdb.py`** — threat-intel syncer that fetches `borestad/blocklist-abuseipdb` IPv4 lists and writes them to the `abuseipdb_v4` LPM trie
@@ -165,16 +166,16 @@ Incoming Packet
 
 - **Wire-speed filtering** via XDP (bypasses kernel network stack)
 - **~40–65 ns per-packet latency** measured on real hardware (see [Benchmarks](#-real-world-performance-benchmark))
-- **Auto-sync whitelist**: daemon watches listening sockets and updates the active backend in real time
+- **Event-driven plus periodic reconciliation**: proc-connector and relay events trigger fast updates, while an independent 30-second full socket discovery reconciles desired and kernel state; a failed Netlink event source does not block relay triggers, the timer, conntrack GC, or drift verification
 - **IPv4 + IPv6 TCP conntrack hardening**: pure SYN creates temporary state with a short configurable SYN timeout; unsolicited ACK packets are dropped
 - **Kernel-side outbound state tracking**: a `tc` egress program records host-initiated IPv4/IPv6 TCP SYN packets and UDP reply tuples so return traffic can be matched at XDP without reopening the old bypasses
 - **IPv4 + IPv6 UDP hardening**: inbound server ports use `udp_whitelist`, reply traffic can be matched by separate `udp_ct4`/`udp_ct6` maps, and trusted IPv4/IPv6 sources can bypass UDP rate limits only after the destination port is open
 - **IPv6 support**, including extension header traversal on both XDP and tc egress, plus explicit non-initial fragment drops
 - **6in4 (SIT) tunnel endpoint filtering**: a `sit4_endpoints` map allows only configured outer IPv4 sources for proto-41 encapsulated traffic; unconfigured tunnel packets are dropped
 - **Per-CIDR port ACL rules**: `axdp acl add tcp CIDR PORT...` can explicitly allow TCP ports for selected source CIDRs independently of auto-discovery; UDP ACL rules apply after the UDP destination port is already whitelisted
-- **Under-attack mode**: `axdp under-attack on` suspends process-event-driven sync so the whitelist stays static; only explicit `axdp sync` calls or the 30-second safety timer can change allowed ports
+- **Under-attack mode**: `axdp under-attack on` disables high-volume packet event emission and reduces TUI map-sampling work; socket discovery and policy reconciliation continue so protection does not drift
 - **Periodic conntrack sync (seeding established flows)**: the daemon periodically seeds existing IPv4/IPv6 TCP sessions into `tcp_ct4`/`tcp_ct6`, which helps preserve active sessions after re-attaching XDP or manual map clears
-- **Reload-safe XDP attach**: the installer also pre-seeds existing sessions before initial attach.
+- **Transactional XDP/tc reloads**: a fully validated and policy-seeded candidate generation replaces each active program without a detach-first gap; any partial multi-interface failure restores the previous XDP and tc generation on interfaces already switched
 - **Pinned BPF maps** that survive reloads and can be updated at runtime 
 - **ICMP token-bucket rate limiter**: XDP-level protection against ICMP/ICMPv6 ping floods; 100 pps burst cap with per-second token refill, while ARP and IPv6 NDP control traffic (RS/RA/NS/NA) are always passed
 - **Per-source SYN/UDP rate limiting (anti-brute-force)**: configurable per-port limits tracked per source IP by default, or per configured source CIDR via `rate_limits.source_cidr_v4` / `source_cidr_v6`
@@ -277,10 +278,10 @@ The generated runtime config stores the interface list, and the boot-time loader
 4. Uses local `xdp_firewall.c` / `tc_flow_track.c` / `xdp_port_sync.py` / `axdp` by default from a local checkout; when run from `stdin`, it prefers the matching GitHub copies
 5. Compiles the XDP and tc BPF objects when the host has the required toolchain
 6. Installs `xdp_required_maps.txt` before attaching XDP so the map readiness check uses the current version
-7. Pre-seeds current IPv4/IPv6 established TCP sessions into `tcp_ct4`/`tcp_ct6` before attaching XDP
-8. Loads and attaches a `tc clsact egress` program on each target interface to record outbound TCP SYN and UDP reply tuples
-9. Tries to attach XDP on each target interface in native mode, then generic mode
-10. Falls back to `nftables` automatically if XDP cannot be attached
+7. Loads a candidate BPF pin generation, validates its complete map ABI, and pre-seeds runtime config, discovered port policy, ACLs, rate-limit state, and current IPv4/IPv6 sessions before switching traffic
+8. Replaces XDP on each target interface in native mode or generic fallback mode while retaining the previous pinned generation for rollback
+9. Replaces the fixed-priority `tc clsact` egress tracker; if any XDP or tc switch fails, restores the previous programs on every interface already changed
+10. Commits the candidate generation only after the complete XDP/tc switch succeeds; otherwise keeps the previous generation active, or uses `nftables` when XDP cannot be established
 11. Installs the runtime launcher at `/usr/local/bin/auto_xdp_start.sh`
 12. Installs the sync daemon at `/usr/local/bin/xdp_port_sync.py`
 13. Installs the packet event relay at `/usr/local/bin/pkt_relay.py`
@@ -306,6 +307,34 @@ If you only want the package-manager and init-system probe from the installer, u
 ```bash
 bash setup_xdp.sh --check-env
 ```
+
+---
+
+## Testing
+
+Run the portable repository suite from the project root:
+
+```bash
+bash ./tests/run-distro-suite.sh
+```
+
+It performs shell and Python syntax checks, installer and CLI tests, the Python unit suite, and Linux installer smoke checks. The installer tests include deterministic failure injection for candidate validation, partial XDP attach, `tc` attach, rollback, and successful generation commit. Syncer tests separately verify that relay-triggered and timer-triggered reconciliation continue when the Netlink proc connector is unavailable.
+
+The kernel integration suite requires root, `clang`, `bpftool`, `iproute2`, Python 3, a mounted `bpffs`, network namespaces, and generic XDP support:
+
+```bash
+sudo bash ./tests/bash/test_integration.sh
+```
+
+Its eight checks cover real BPF program/map loading, exact map re-pinning after a missing pin, generic-mode attachment, TCP whitelist allow/drop behavior, UDP reply conntrack, TCP ACL admission, per-port SYN limiting, and detach/reload/re-attach behavior. The suite uses an isolated RFC1918 veth subnet and disables only the bogon policy in its test runtime map so packets reach the admission branch each case is intended to verify; production bogon defaults are unchanged.
+
+The native compile-only matrix remains available separately:
+
+```bash
+bash ./tests/bash/test_bpf_build.sh
+```
+
+Tests that cannot acquire their required kernel capabilities must report a skip before assertions run; an exit status of zero caused only by an early prerequisite skip is not equivalent to an integration pass.
 
 ---
 
@@ -367,11 +396,11 @@ Originally, this project used **BPF_MAP_TYPE_HASH** for the whitelist. It transi
 
 ## Auto-Sync Daemon
 
-The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/auto_xdp_start.sh` and provides **real-time updates** for either backend:
+The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/auto_xdp_start.sh` and provides event-driven updates plus periodic correction for either backend:
 
-1. **Event-driven**: Uses Linux **Netlink Process Connector** to detect `exec()` and `exit()` events immediately.
+1. **Independent Event Sources**: Linux **Netlink Process Connector** events are debounced, while relay `port_change` events trigger immediate reconciliation. Either source can reconnect or fail without disabling the other.
 2. **Efficient Discovery**: Uses `psutil` to read `/proc` directly for listening ports (no slow `ss` or `netstat` subprocesses, yeahhh).
-3. **Safety Fallback**: Performs a full sync every **30 seconds** to ensure consistency.
+3. **Independent Safety Reconcile**: Performs a full discovery and reconcile every **30 seconds**, even when no event source is available, to repair missed events and kernel-map drift.
 4. **Backend Sync**: Updates either pinned BPF maps or `nftables` sets, depending on what the host supports.
 5. **UDP Discovery Rule**: Because UDP has no `LISTEN` state, the daemon syncs unconnected bound UDP sockets (no remote peer) into `udp_whitelist`, which is a practical approximation of server-style UDP ports.
 6. **Trusted Source IPs/CIDRs**: Optional IPv4/IPv6 addresses or CIDR ranges can be synced into the XDP-side `trusted_ipv4`/`trusted_ipv6` LPM trie maps. In XDP mode, trusted TCP sources can pass pure SYN packets without the auto-discovered TCP whitelist; trusted UDP sources still require the destination UDP port to be whitelisted first.
@@ -403,7 +432,7 @@ sudo axdp restart
 | Always keep a port open | `sudo axdp permanent add tcp 2222 alt-ssh` | Supports `tcp`, `udp`, and `sctp`; useful when a port must remain allowed even if the process restarts |
 | Trust an admin/source network | `sudo axdp trust add 10.0.0.0/8 office-net` | TCP trusted sources may reach non-discovered ports; UDP trusted sources still require the destination UDP port to be open |
 | Allow selected CIDRs to selected ports | `sudo axdp acl add tcp 203.0.113.0/24 443 8443` | TCP ACLs can open specific ports for the CIDR; UDP ACLs apply only after the UDP port is already whitelisted |
-| Freeze automatic port changes during an incident | `sudo axdp under-attack on` | Suspends process-event-driven sync; use `sudo axdp under-attack off` to resume normal behavior |
+| Reduce observability overhead during an incident | `sudo axdp under-attack on` | Disables packet event emission and high-churn TUI map sampling; port discovery and reconciliation continue |
 | Change daemon verbosity | `sudo axdp log-level debug` | Valid levels: `debug`, `info`, `warning`, `error` |
 
 Examples:
@@ -547,7 +576,7 @@ sudo axdp conntrack
 sudo axdp conntrack tcp
 sudo axdp conntrack udp
 
-# Under-attack mode: suspend process-event-driven sync (whitelist becomes static)
+# Under-attack mode: reduce packet-event and TUI sampling overhead
 sudo axdp under-attack
 sudo axdp under-attack on
 sudo axdp under-attack off
@@ -663,7 +692,7 @@ sudo axdp backend
 # Conntrack visibility
 sudo axdp conntrack
 
-# Under-attack mode (freeze whitelist)
+# Under-attack mode (discovery/reconciliation remains active)
 sudo axdp under-attack on
 sudo axdp under-attack off
 
@@ -790,7 +819,7 @@ Operational notes:
   - If **ACK** is set and no conntrack entry exists → count `CNT_TCP_CT_MISS` and **DROP**
   - Otherwise → **DROP**
 - **Kernel assist**: a `tc` egress program records host-initiated IPv4/IPv6 TCP SYN packets immediately, closing the race where a very short outbound connection could receive SYN-ACK before conntrack state existed.
-- **Reload assist**: `setup_xdp.sh` pre-seeds existing IPv4/IPv6 TCP sessions into `tcp_conntrack` before re-attaching XDP, which helps preserve active sessions during reinstall/restart.
+- **Transactional reload assist**: the installer and boot loader build and validate a separate map generation, pre-seed current policy and IPv4/IPv6 TCP sessions, switch XDP and `tc` without detaching first, and restore the previous generation if a later interface or `tc` step fails.
 
 ### TCP Malformed Packet Detection
 
@@ -842,48 +871,15 @@ Traverses IPv6 extension headers up to **6 levels deep** to locate the transport
 ## Uninstall
 
 ```bash
-# Load installed interface list when available.
-# If the config is gone, set IFACES manually, e.g. IFACES="eth0 eth1".
-if [ -f /etc/auto_xdp/auto_xdp.env ]; then
-  . /etc/auto_xdp/auto_xdp.env
-fi
-IFACES="${IFACES:-${IFACE:-eth0}}"
+sudo axdp uninstall
+```
 
-# Stop runtime services first
-systemctl disable --now xdp-port-sync auto-xdp-relay 2>/dev/null || true
-rc-service xdp-port-sync stop 2>/dev/null || true
-rc-service auto-xdp-relay stop 2>/dev/null || true
-rc-update del xdp-port-sync default 2>/dev/null || true
-rc-update del auto-xdp-relay default 2>/dev/null || true
+The command stops and disables both services, detaches XDP from every configured interface, removes only Auto XDP's fixed `tc` filter (`pref 49152 handle 1`) without deleting the shared `clsact` qdisc, deletes the `nftables` fallback table, clears the live/candidate/rollback BPF pin generations, and removes all installed runtime files, service definitions, configuration, and state. If network cleanup cannot be verified, it keeps the runtime files so the uninstall can be retried safely.
 
-# Detach XDP and remove the TCP/UDP reply tracker from each protected interface
-for iface in $IFACES; do
-  ip link set dev "$iface" xdp off 2>/dev/null || true
-  ip link set dev "$iface" xdp generic off 2>/dev/null || true
-  ip link set dev "$iface" xdp offload off 2>/dev/null || true
-  tc filter del dev "$iface" egress pref 49152 2>/dev/null || true
-  tc qdisc del dev "$iface" clsact 2>/dev/null || true
-done
+If `/etc/auto_xdp/auto_xdp.env` has already been removed, provide the protected interfaces explicitly:
 
-# Remove pinned maps and nftables fallback table
-rm -rf /sys/fs/bpf/xdp_fw
-nft delete table inet auto_xdp 2>/dev/null || true
-
-# Remove init service files
-rm -f /etc/systemd/system/xdp-port-sync.service
-rm -f /etc/systemd/system/auto-xdp-relay.service
-systemctl daemon-reload 2>/dev/null || true
-rm -f /etc/init.d/xdp-port-sync
-rm -f /etc/init.d/auto-xdp-relay
-
-# Remove installed runtime files
-rm -f /usr/local/bin/xdp_port_sync.py
-rm -f /usr/local/bin/pkt_relay.py
-rm -f /usr/local/bin/axdp
-rm -f /usr/local/bin/auto_xdp_start.sh
-rm -rf /usr/local/lib/auto_xdp
-rm -rf /etc/auto_xdp
-rm -rf /run/auto_xdp /var/run/auto_xdp
+```bash
+sudo axdp uninstall eth0 eth1
 ```
 
 ---

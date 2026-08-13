@@ -309,7 +309,7 @@ if echo "$args" | grep -q "show.*eth0\b\|show dev eth0"; then
     printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether\n"
 elif echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
     printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
-elif echo "$args" | grep -q "set.*eth0.*xdp generic"; then
+elif echo "$args" | grep -q "set.*eth0.*xdpgeneric"; then
     exit 0
 elif echo "$args" | grep -q "set.*eth0.*xdp "; then
     exit 1
@@ -375,6 +375,23 @@ EOF_IP
     _IFACES=(eth0 eth1)
     ensure_xdp_loaded || return 1
     assert_eq "$(cat "$RUN_STATE_DIR/xdp_mode")" "generic"
+)
+
+test_select_backend_refuses_nftables_while_xdp_remains_attached() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    RUN_STATE_DIR="$tmpdir/run"
+    mkdir -p "$RUN_STATE_DIR"
+    resolve_preferred_backend() { printf 'auto\n'; }
+    ensure_xdp_loaded() { return 2; }
+
+    select_backend >/dev/null 2>&1
+    local status=$?
+    assert_eq "$status" "1" || return 1
+    [[ ! -e "$RUN_STATE_DIR/backend" ]]
 )
 
 test_detect_backend_multi_iface_second_only() (
@@ -617,6 +634,163 @@ test_cli_help_runs_without_runtime_state() (
     assert_contains "$output" "Usage: axdp"
 )
 
+test_uninstall_removes_all_auto_xdp_artifacts() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local ops_log="$tmpdir/ops.log"
+
+    BPF_PIN_DIR="$tmpdir/sys/fs/bpf/xdp_fw"
+    INSTALL_DIR="$tmpdir/usr/local/lib/auto_xdp"
+    CONFIG_DIR="$tmpdir/etc/auto_xdp"
+    CONFIG_FILE="$CONFIG_DIR/auto_xdp.env"
+    TOML_CONFIG="$CONFIG_DIR/config.toml"
+    RUN_STATE_DIR="$tmpdir/run/auto_xdp"
+    RUN_STATE_COMPAT_DIR="$tmpdir/var/run/auto_xdp"
+    SYNC_SCRIPT="$tmpdir/usr/local/bin/xdp_port_sync.py"
+    RELAY_SCRIPT="$tmpdir/usr/local/bin/pkt_relay.py"
+    RUNNER_SCRIPT="$tmpdir/usr/local/bin/auto_xdp_start.sh"
+    AXDP_CMD="$tmpdir/usr/local/bin/axdp"
+    SYSTEMD_UNIT_DIR="$tmpdir/etc/systemd/system"
+    OPENRC_INIT_DIR="$tmpdir/etc/init.d"
+    OPENRC_RUN_DIR="$tmpdir/run"
+    AUTO_XDP_PROC_ROOT="$tmpdir/proc"
+    IFACES="eth0 eth1"
+    IFACE="eth0"
+
+    mkdir -p \
+        "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next" "${BPF_PIN_DIR}_rollback" \
+        "$INSTALL_DIR" "$CONFIG_DIR" "$RUN_STATE_DIR" "$RUN_STATE_COMPAT_DIR" \
+        "$(dirname "$SYNC_SCRIPT")" "$SYSTEMD_UNIT_DIR" "$OPENRC_INIT_DIR"
+    touch \
+        "$SYNC_SCRIPT" "$RELAY_SCRIPT" "$RUNNER_SCRIPT" "$AXDP_CMD" \
+        "$SYSTEMD_UNIT_DIR/xdp-port-sync.service" \
+        "$SYSTEMD_UNIT_DIR/auto-xdp-relay.service" \
+        "$OPENRC_INIT_DIR/xdp-port-sync" \
+        "$OPENRC_INIT_DIR/auto-xdp-relay" \
+        "$OPENRC_RUN_DIR/xdp-port-sync.pid" \
+        "$OPENRC_RUN_DIR/auto-xdp-relay.pid" \
+        "$CONFIG_FILE" "$TOML_CONFIG"
+
+    require_root() { return 0; }
+    systemctl() { printf 'systemctl %s\n' "$*" >>"$ops_log"; return 0; }
+    rc-service() { printf 'rc-service %s\n' "$*" >>"$ops_log"; return 0; }
+    rc-update() { printf 'rc-update %s\n' "$*" >>"$ops_log"; return 0; }
+    ip() {
+        printf 'ip %s\n' "$*" >>"$ops_log"
+        case "$*" in
+            "link show dev "*) return 0 ;;
+            "-d link show dev "*) printf '2: test: <UP>\n'; return 0 ;;
+        esac
+        return 0
+    }
+    tc() {
+        printf 'tc %s\n' "$*" >>"$ops_log"
+        return 0
+    }
+    nft() {
+        printf 'nft %s\n' "$*" >>"$ops_log"
+        case "$*" in
+            "list table "*) return 1 ;;
+        esac
+        return 0
+    }
+
+    run_uninstall >/dev/null 2>&1 || return 1
+
+    local path
+    for path in \
+        "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next" "${BPF_PIN_DIR}_rollback" \
+        "$INSTALL_DIR" "$CONFIG_DIR" "$RUN_STATE_DIR" "$RUN_STATE_COMPAT_DIR" \
+        "$SYNC_SCRIPT" "$RELAY_SCRIPT" "$RUNNER_SCRIPT" "$AXDP_CMD" \
+        "$SYSTEMD_UNIT_DIR/xdp-port-sync.service" \
+        "$SYSTEMD_UNIT_DIR/auto-xdp-relay.service" \
+        "$OPENRC_INIT_DIR/xdp-port-sync" \
+        "$OPENRC_INIT_DIR/auto-xdp-relay" \
+        "$OPENRC_RUN_DIR/xdp-port-sync.pid" \
+        "$OPENRC_RUN_DIR/auto-xdp-relay.pid"; do
+        [[ ! -e "$path" ]] || {
+            printf 'uninstall left artifact: %s\n' "$path"
+            return 1
+        }
+    done
+
+    assert_file_contains "$ops_log" \
+        "tc filter del dev eth0 egress protocol all pref 49152 handle 1 bpf" || return 1
+    assert_file_contains "$ops_log" "ip link set dev eth1 xdpgeneric off" || return 1
+    if grep -q "qdisc del" "$ops_log"; then
+        printf 'uninstall deleted the shared clsact qdisc\n'
+        return 1
+    fi
+)
+
+test_uninstall_keeps_runtime_when_xdp_detach_fails() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/sys/fs/bpf/xdp_fw"
+    INSTALL_DIR="$tmpdir/usr/local/lib/auto_xdp"
+    AUTO_XDP_PROC_ROOT="$tmpdir/proc"
+    IFACES="eth0"
+    mkdir -p "$BPF_PIN_DIR" "$INSTALL_DIR"
+
+    require_root() { return 0; }
+    systemctl() { return 0; }
+    ip() {
+        case "$*" in
+            "link show dev eth0") return 0 ;;
+            "-d link show dev eth0") printf '2: eth0: <UP> prog/xdp id 42\n'; return 0 ;;
+        esac
+        return 0
+    }
+    tc() { return 0; }
+    nft() { return 1; }
+
+    run_uninstall >/dev/null 2>&1
+    local status=$?
+    assert_eq "$status" "1" || return 1
+    [[ -d "$BPF_PIN_DIR" && -d "$INSTALL_DIR" ]] || {
+        printf 'uninstall removed retry assets after detach verification failed\n'
+        return 1
+    }
+)
+
+test_uninstall_stops_only_exact_runtime_process_argv() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    AUTO_XDP_PROC_ROOT="$tmpdir/proc"
+    SYNC_SCRIPT="/usr/local/bin/xdp_port_sync.py"
+    mkdir -p "$AUTO_XDP_PROC_ROOT/100" "$AUTO_XDP_PROC_ROOT/101"
+    printf 'bash\0-lc\0test /usr/local/bin/xdp_port_sync.py\0' \
+        >"$AUTO_XDP_PROC_ROOT/100/cmdline"
+    printf 'python3\0/usr/local/bin/xdp_port_sync.py\0--watch\0' \
+        >"$AUTO_XDP_PROC_ROOT/101/cmdline"
+
+    local killed="$tmpdir/killed"
+    kill() { printf '%s\n' "$1" >>"$killed"; }
+
+    _stop_runtime_processes
+
+    assert_eq "$(<"$killed")" "101"
+)
+
+test_main_dispatches_uninstall_command() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    load_config() { return 0; }
+    run_uninstall() { printf 'uninstall %s\n' "$*"; }
+
+    assert_eq "$(main uninstall eth9)" "uninstall eth9"
+)
+
 test_slot_load_sctp_reuses_shared_maps() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -726,10 +900,15 @@ run_test "axdp detects xdp backend with mixed native and generic ifaces" test_de
 run_test "auto_xdp_start records generic xdp_mode when re-attach falls back to generic" test_ensure_xdp_reattach_records_generic_mode_on_fallback
 run_test "auto_xdp_start records native xdp_mode when re-attach succeeds natively" test_ensure_xdp_reattach_records_native_mode_when_all_native
 run_test "auto_xdp_start records generic xdp_mode when existing iface already in generic mode" test_ensure_xdp_reattach_records_generic_when_existing_iface_is_generic
+run_test "auto_xdp_start refuses nftables while XDP remains attached" test_select_backend_refuses_nftables_while_xdp_remains_attached
 run_test "axdp backend reports runtime attach state and conntrack counts" test_run_backend_reports_runtime_state_and_conntrack_counts
 run_test "axdp backend json reports runtime attach state and conntrack counts" test_run_backend_json_reports_runtime_state_and_conntrack_counts
 run_test "axdp conntrack summarizes destination ports" test_run_conntrack_summarizes_destination_ports
 run_test "axdp help works without installation" test_cli_help_runs_without_runtime_state
+run_test "axdp uninstall removes all owned artifacts" test_uninstall_removes_all_auto_xdp_artifacts
+run_test "axdp uninstall keeps retry assets after detach failure" test_uninstall_keeps_runtime_when_xdp_detach_fails
+run_test "axdp uninstall stops only exact runtime process argv" test_uninstall_stops_only_exact_runtime_process_argv
+run_test "axdp dispatches uninstall with explicit interfaces" test_main_dispatches_uninstall_command
 run_test "axdp slot load sctp reuses shared SCTP maps" test_slot_load_sctp_reuses_shared_maps
 run_test "axdp slot load custom c compiles and persists object path" test_slot_load_custom_c_compiles_and_persists_object_path
 
