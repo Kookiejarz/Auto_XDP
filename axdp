@@ -3,7 +3,9 @@ set -euo pipefail
 
 CONFIG_FILE="/etc/auto_xdp/auto_xdp.env"
 TOML_CONFIG="/etc/auto_xdp/config.toml"
+CONFIG_DIR="/etc/auto_xdp"
 RUN_STATE_DIR="/run/auto_xdp"
+RUN_STATE_COMPAT_DIR="/var/run/auto_xdp"
 BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 INSTALL_DIR="/usr/local/lib/auto_xdp"
 PYTHON_LIB_DIR="${INSTALL_DIR}/python"
@@ -11,9 +13,16 @@ NFT_FAMILY="inet"
 NFT_TABLE="auto_xdp"
 NFT_CHAIN="input"
 RUNNER_SCRIPT="/usr/local/bin/auto_xdp_start.sh"
+SYNC_SCRIPT="/usr/local/bin/xdp_port_sync.py"
+RELAY_SCRIPT="/usr/local/bin/pkt_relay.py"
+AXDP_CMD="/usr/local/bin/axdp"
 SERVICE_NAME="xdp-port-sync"
 RELAY_SERVICE_NAME="auto-xdp-relay"
 SYSTEMD_RUN_DIR="${SYSTEMD_RUN_DIR:-/run/systemd/system}"
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+OPENRC_INIT_DIR="${OPENRC_INIT_DIR:-/etc/init.d}"
+OPENRC_RUN_DIR="${OPENRC_RUN_DIR:-/run}"
+AUTO_XDP_PROC_ROOT="${AUTO_XDP_PROC_ROOT:-/proc}"
 RAW_URL="https://raw.githubusercontent.com/Kookiejarz/auto_xdp/main"
 
 PORTS_WATCH=0
@@ -40,6 +49,7 @@ Commands:
   stop                   Stop the installed service
   restart                Restart the installed service
   status                 Show service status
+  uninstall [IFACE...]   Completely remove Auto XDP from this host
   config show            Show current TOML config
   config init            Create default config.toml (if missing)
   trust list             List trusted source IPs/CIDRs
@@ -113,6 +123,161 @@ run_service_cmd() {
 
     echo "No supported init system detected for service control." >&2
     exit 1
+}
+
+_remove_owned_tree() {
+    local path="${1%/}" expected_base="$2"
+    [[ ! -e "$path" && ! -L "$path" ]] && return 0
+    if [[ "$path" != /* || "$path" == "/" || "${path##*/}" != "$expected_base" ]]; then
+        printf 'Refusing to remove unexpected directory: %s\n' "$path" >&2
+        return 1
+    fi
+    rm -rf -- "$path"
+}
+
+_remove_owned_file() {
+    local path="$1" expected_base="$2"
+    [[ ! -e "$path" && ! -L "$path" ]] && return 0
+    if [[ "$path" != /* || "${path##*/}" != "$expected_base" ]]; then
+        printf 'Refusing to remove unexpected file: %s\n' "$path" >&2
+        return 1
+    fi
+    rm -f -- "$path"
+}
+
+_stop_runtime_processes() {
+    local proc_dir pid arg matched
+    local -a argv=()
+
+    for proc_dir in "$AUTO_XDP_PROC_ROOT"/[0-9]*; do
+        [[ -r "$proc_dir/cmdline" ]] || continue
+        pid=${proc_dir##*/}
+        [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+
+        argv=()
+        while IFS= read -r -d '' arg; do
+            argv+=("$arg")
+        done < "$proc_dir/cmdline"
+
+        matched=0
+        for arg in "${argv[@]}"; do
+            case "$arg" in
+                "$RUNNER_SCRIPT"|"$SYNC_SCRIPT"|"$RELAY_SCRIPT")
+                    matched=1
+                    break
+                    ;;
+            esac
+        done
+        [[ $matched -eq 1 ]] || continue
+        kill "$pid" >/dev/null 2>&1 || true
+    done
+}
+
+run_uninstall() {
+    require_root "uninstall"
+
+    local -a uninstall_ifaces=()
+    if [[ $# -gt 0 ]]; then
+        uninstall_ifaces=("$@")
+    elif declare -p IFACES >/dev/null 2>&1 && declare -p IFACES 2>/dev/null | grep -q '^declare -a'; then
+        uninstall_ifaces=("${IFACES[@]}")
+    else
+        read -r -a uninstall_ifaces <<< "${IFACES:-${IFACE:-}}"
+    fi
+    if [[ ${#uninstall_ifaces[@]} -eq 0 ]]; then
+        printf 'Cannot determine protected interfaces. Retry with: sudo axdp uninstall IFACE...\n' >&2
+        return 1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "$SERVICE_NAME" "$RELAY_SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+        rc-service "$RELAY_SERVICE_NAME" stop >/dev/null 2>&1 || true
+    fi
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+        rc-update del "$RELAY_SERVICE_NAME" default >/dev/null 2>&1 || true
+    fi
+    _stop_runtime_processes
+
+    local iface failures=0
+    if ! command -v ip >/dev/null 2>&1; then
+        printf 'ip command is required to detach XDP programs.\n' >&2
+        return 1
+    fi
+    for iface in "${uninstall_ifaces[@]}"; do
+        [[ -n "$iface" ]] || continue
+        if ! ip link show dev "$iface" >/dev/null 2>&1; then
+            continue
+        fi
+        ip link set dev "$iface" xdp off >/dev/null 2>&1 || true
+        ip link set dev "$iface" xdpgeneric off >/dev/null 2>&1 || true
+        ip link set dev "$iface" xdpoffload off >/dev/null 2>&1 || true
+        if ip -d link show dev "$iface" 2>/dev/null \
+                | grep -Eq 'prog/xdp|xdpgeneric|xdpoffload|(^|[[:space:]])xdp([[:space:]]|$)'; then
+            printf 'Failed to detach XDP from %s.\n' "$iface" >&2
+            failures=1
+        fi
+
+        if command -v tc >/dev/null 2>&1; then
+            tc filter del dev "$iface" egress \
+                protocol all pref 49152 handle 1 bpf >/dev/null 2>&1 || true
+            if tc filter show dev "$iface" egress pref 49152 handle 1 2>/dev/null | grep -q .; then
+                printf 'Failed to remove Auto XDP tc filter from %s.\n' "$iface" >&2
+                failures=1
+            fi
+        else
+            printf 'tc command is required to remove the egress tracker from %s.\n' "$iface" >&2
+            failures=1
+        fi
+    done
+
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
+        if nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+            printf 'Failed to remove nftables table %s %s.\n' "$NFT_FAMILY" "$NFT_TABLE" >&2
+            failures=1
+        fi
+    else
+        printf 'nft command is required to verify removal of the fallback table.\n' >&2
+        failures=1
+    fi
+
+    if [[ $failures -ne 0 ]]; then
+        printf 'Uninstall stopped before deleting runtime files so it can be retried safely.\n' >&2
+        return 1
+    fi
+
+    _remove_owned_tree "${BPF_PIN_DIR}_next" "xdp_fw_next" || failures=1
+    _remove_owned_tree "${BPF_PIN_DIR}_rollback" "xdp_fw_rollback" || failures=1
+    _remove_owned_tree "$BPF_PIN_DIR" "xdp_fw" || failures=1
+
+    _remove_owned_file "$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service" "${SERVICE_NAME}.service" || failures=1
+    _remove_owned_file "$SYSTEMD_UNIT_DIR/${RELAY_SERVICE_NAME}.service" "${RELAY_SERVICE_NAME}.service" || failures=1
+    _remove_owned_file "$OPENRC_INIT_DIR/$SERVICE_NAME" "$SERVICE_NAME" || failures=1
+    _remove_owned_file "$OPENRC_INIT_DIR/$RELAY_SERVICE_NAME" "$RELAY_SERVICE_NAME" || failures=1
+    _remove_owned_file "$OPENRC_RUN_DIR/${SERVICE_NAME}.pid" "${SERVICE_NAME}.pid" || failures=1
+    _remove_owned_file "$OPENRC_RUN_DIR/${RELAY_SERVICE_NAME}.pid" "${RELAY_SERVICE_NAME}.pid" || failures=1
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    _remove_owned_file "$SYNC_SCRIPT" "xdp_port_sync.py" || failures=1
+    _remove_owned_file "$RELAY_SCRIPT" "pkt_relay.py" || failures=1
+    _remove_owned_file "$RUNNER_SCRIPT" "auto_xdp_start.sh" || failures=1
+    _remove_owned_tree "$INSTALL_DIR" "auto_xdp" || failures=1
+    _remove_owned_tree "$RUN_STATE_DIR" "auto_xdp" || failures=1
+    _remove_owned_tree "$RUN_STATE_COMPAT_DIR" "auto_xdp" || failures=1
+    _remove_owned_tree "$CONFIG_DIR" "auto_xdp" || failures=1
+    _remove_owned_file "$AXDP_CMD" "axdp" || failures=1
+
+    if [[ $failures -ne 0 ]]; then
+        printf 'Auto XDP uninstall completed with errors.\n' >&2
+        return 1
+    fi
+    printf 'Auto XDP has been completely uninstalled.\n'
 }
 
 ensure_installed() {
@@ -800,6 +965,10 @@ main() {
             shift || true
             [[ "$cmd" != "status" ]] && require_root "$cmd"
             run_service_cmd "$cmd"
+            ;;
+        uninstall)
+            shift || true
+            run_uninstall "$@"
             ;;
         help|-h|--help)
             usage
