@@ -51,6 +51,34 @@ _auto_xdp_truthy() {
     return 1
 }
 
+_auto_xdp_resolve_preferred_backend() {
+    local config_path="${1:-${TOML_CONFIG:-}}"
+    local default="${2:-${PREFERRED_BACKEND:-auto}}"
+
+    [[ -f "$config_path" ]] || {
+        printf '%s\n' "$default"
+        return 0
+    }
+    "${PYTHON3_BIN:-python3}" - "$config_path" "$default" <<'PY'
+import sys
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        print(sys.argv[2])
+        raise SystemExit(0)
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        value = str(tomllib.load(handle).get("daemon", {}).get("preferred_backend", sys.argv[2])).lower()
+except Exception:
+    value = sys.argv[2]
+print(value if value in {"auto", "xdp", "nftables"} else sys.argv[2])
+PY
+}
+
 _auto_xdp_expand_cpu_ranges() {
     local raw="${1:-}" part start end cpu
     IFS=',' read -ra _auto_xdp_parts <<< "$raw"
@@ -562,16 +590,161 @@ _auto_xdp_attach_mode() {
 
 _auto_xdp_attach_candidate() {
     local iface="$1" prog="$2"
-    if _auto_xdp_attach_mode "$iface" "$prog" native 2>/dev/null; then
-        AUTO_XDP_LAST_ATTACH_MODE="native"
-        return 0
+    local preference="auto:auto" requested="auto" preferred="auto"
+    local attach_error="" last_error=""
+    preference=$(_auto_xdp_saved_iface_mode "$iface") || preference="auto:auto"
+    if [[ "$preference" == *:* ]]; then
+        requested=${preference%%:*}
+        preferred=${preference#*:}
+    else
+        preferred="$preference"
     fi
-    if _auto_xdp_attach_mode "$iface" "$prog" generic 2>/dev/null; then
-        AUTO_XDP_LAST_ATTACH_MODE="generic"
-        return 0
-    fi
+    local -a modes=(native generic)
+    case "$requested" in
+        native) modes=(native) ;;
+        generic) modes=(generic) ;;
+        *) [[ "$preferred" == "generic" ]] && modes=(generic native) ;;
+    esac
+    local mode
+    for mode in "${modes[@]}"; do
+        if attach_error=$(_auto_xdp_attach_mode "$iface" "$prog" "$mode" 2>&1); then
+            AUTO_XDP_LAST_ATTACH_MODE="$mode"
+            return 0
+        fi
+        [[ -z "$attach_error" ]] || last_error="$attach_error"
+    done
     AUTO_XDP_LAST_ATTACH_MODE=""
+    if [[ -n "$last_error" ]]; then
+        last_error=${last_error//$'\n'/; }
+        _auto_xdp_warn "XDP attach failed on $iface: $last_error"
+    fi
     return 1
+}
+
+_auto_xdp_saved_iface_mode() {
+    local iface="$1" state_path="${MACHINE_STATE:-/etc/auto_xdp/machine-state.json}"
+    [[ -f "$state_path" ]] || {
+        printf 'auto:auto\n'
+        return 0
+    }
+    "${PYTHON3_BIN:-python3}" - "$state_path" "$iface" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as handle:
+        state = json.load(handle).get("interfaces", {}).get(sys.argv[2], {})
+        requested = state.get("requested_mode", "auto")
+        mode = state.get("xdp_mode", "auto")
+except Exception:
+    requested = "auto"
+    mode = "auto"
+if requested not in {"auto", "native", "generic"}:
+    requested = "auto"
+if mode not in {"native", "generic"}:
+    mode = "auto"
+print(f"{requested}:{mode}")
+PY
+}
+
+_auto_xdp_runtime_generation() {
+    local metadata=""
+    for metadata in \
+        "${INSTALL_DIR:-}/release.json" \
+        "${CURRENT_LINK:-/usr/local/lib/auto_xdp/current}/release.json"; do
+        [[ -f "$metadata" ]] || continue
+        "${PYTHON3_BIN:-python3}" - "$metadata" <<'PY' 2>/dev/null && return 0
+import json, sys
+with open(sys.argv[1]) as handle:
+    value = json.load(handle).get("release")
+if not isinstance(value, str) or not value:
+    raise SystemExit(1)
+print(value)
+PY
+    done
+    printf '%s\n' "${RUNTIME_GENERATION:-${RELEASE_NAME:-verified}}"
+}
+
+_auto_xdp_record_xdp_state() {
+    local prog="$1" program_id="" iface_var="" iface mode tc_state generation
+    local machine_state="${MACHINE_STATE:-/etc/auto_xdp/machine-state.json}"
+    local runtime_state="${RUNTIME_STATE:-/etc/auto_xdp/runtime-state.json}"
+    local requested="${REQUESTED_BACKEND:-${PREFERRED_BACKEND:-auto}}"
+    local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+    program_id=$(_auto_xdp_pinned_prog_id "$prog") || return 1
+    generation=$(_auto_xdp_runtime_generation)
+    iface_var=$(_auto_xdp_iface_var_name) || return 1
+    local -n state_ifaces="$iface_var"
+    local -a args=()
+    for iface in "${state_ifaces[@]}"; do
+        mode=$(_auto_xdp_iface_xdp_mode "$iface")
+        tc_state="off"
+        if tc filter show dev "$iface" egress pref "${TC_FILTER_PREF:-49152}" \
+                handle "${TC_FILTER_HANDLE:-1}" 2>/dev/null | grep -q .; then
+            tc_state="attached"
+        fi
+        [[ "$mode" == "native" || "$mode" == "generic" ]] || return 1
+        [[ "$tc_state" == "attached" ]] || return 1
+        args+=(--interface-state "${iface}=${mode}:${program_id}:${tc_state}")
+    done
+    PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
+        "${PYTHON3_BIN:-python3}" -m auto_xdp.install_state record \
+        --machine-state "$machine_state" \
+        --runtime-state "$runtime_state" \
+        --requested-backend "$requested" \
+        --active-backend xdp \
+        --generation "$generation" \
+        "${args[@]}" >/dev/null
+}
+
+_auto_xdp_pinned_prog_id() {
+    bpftool -j prog show pinned "$1" 2>/dev/null | "${PYTHON3_BIN:-python3}" -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, list):
+        data = data[0]
+    value = data.get("id") if isinstance(data, dict) else None
+    if not isinstance(value, int):
+        raise ValueError
+    print(value)
+except (IndexError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+'
+}
+
+_auto_xdp_iface_prog_id() {
+    ip -j -d link show dev "$1" 2>/dev/null | "${PYTHON3_BIN:-python3}" -c '
+import json, sys
+
+def ids(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if (key == "id" or key.endswith("prog_id")) and isinstance(child, int):
+                yield child
+            else:
+                yield from ids(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from ids(child)
+
+try:
+    data = json.load(sys.stdin)
+    if isinstance(data, list):
+        data = data[0]
+    xdp = data.get("xdp") if isinstance(data, dict) else None
+    found = list(ids(xdp))
+    if not found:
+        raise ValueError
+    print(found[0])
+except (IndexError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+'
+}
+
+_auto_xdp_verify_iface_program() {
+    local iface="$1" prog="$2" expected_id="" actual_id=""
+    expected_id=$(_auto_xdp_pinned_prog_id "$prog") || return 1
+    actual_id=$(_auto_xdp_iface_prog_id "$iface") || return 1
+    [[ "$actual_id" == "$expected_id" ]]
 }
 
 _auto_xdp_rollback_iface() {
@@ -579,14 +752,15 @@ _auto_xdp_rollback_iface() {
 
     if [[ "$old_mode" == "none" ]]; then
         _auto_xdp_detach_mode "$iface" "$new_mode"
-        return 0
+        [[ "$(_auto_xdp_iface_xdp_mode "$iface")" == "none" ]]
+        return
     fi
 
     # Replacing the candidate with the old pin is atomic even if the attach
     # mode changed. If this fails, the candidate remains attached and both pin
     # generations are retained by the caller for recovery.
     _auto_xdp_attach_mode "$iface" "$old_prog" "$old_mode" \
-        >/dev/null 2>&1 || {
+        >/dev/null 2>&1 && _auto_xdp_verify_iface_program "$iface" "$old_prog" || {
         _auto_xdp_warn "Failed to restore previous XDP on $iface; candidate remains attached."
         return 1
     }
@@ -623,8 +797,10 @@ PYEOF
 
 _auto_xdp_record_switch_mode() {
     local mode="$1"
-    if [[ "$mode" == "generic" || -z "${AUTO_XDP_SWITCH_MODE:-}" ]]; then
+    if [[ -z "${AUTO_XDP_SWITCH_MODE:-}" ]]; then
         AUTO_XDP_SWITCH_MODE="$mode"
+    elif [[ "$AUTO_XDP_SWITCH_MODE" != "$mode" ]]; then
+        AUTO_XDP_SWITCH_MODE="mixed"
     fi
 }
 
@@ -659,7 +835,8 @@ _auto_xdp_finish_interrupted_reload() {
         BPF_PIN_DIR="$saved_pin_dir"
         AUTO_XDP_SWITCH_MODE=""
         for iface in "${recovery_ifaces[@]}"; do
-            if ! _auto_xdp_attach_candidate "$iface" "$candidate_dir/prog"; then
+            if ! _auto_xdp_attach_candidate "$iface" "$candidate_dir/prog" \
+                    || ! _auto_xdp_verify_iface_program "$iface" "$candidate_dir/prog"; then
                 _auto_xdp_warn "Could not resume candidate XDP on $iface; retaining both generations."
                 return 1
             fi
@@ -688,6 +865,10 @@ _auto_xdp_finish_interrupted_reload() {
             mv "$live_dir" "$rollback_dir" || return 1
         fi
         mv "$candidate_dir" "$live_dir" || return 1
+        if ! _auto_xdp_record_xdp_state "$live_dir/prog"; then
+            _auto_xdp_warn "Could not persist verified per-interface XDP state; retaining rollback generation."
+            return 1
+        fi
         rm -rf "$rollback_dir"
         AUTO_XDP_HANDLERS_PRELOADED=1
         AUTO_XDP_RECOVERY_HANDLED=1
@@ -701,7 +882,8 @@ _auto_xdp_finish_interrupted_reload() {
     preseed_xdp_candidate_handlers || return 1
     AUTO_XDP_SWITCH_MODE=""
     for iface in "${recovery_ifaces[@]}"; do
-        if ! _auto_xdp_attach_candidate "$iface" "$live_dir/prog"; then
+        if ! _auto_xdp_attach_candidate "$iface" "$live_dir/prog" \
+                || ! _auto_xdp_verify_iface_program "$iface" "$live_dir/prog"; then
             _auto_xdp_warn "Could not verify live XDP on $iface; retaining the rollback generation."
             return 1
         fi
@@ -714,9 +896,111 @@ _auto_xdp_finish_interrupted_reload() {
         return 1
     fi
     TC_ROLLBACK_PROG_PATH="$saved_tc_rollback"
+    if ! _auto_xdp_record_xdp_state "$live_dir/prog"; then
+        _auto_xdp_warn "Could not persist verified per-interface XDP state; retaining the rollback generation."
+        return 1
+    fi
     rm -rf "$rollback_dir"
     AUTO_XDP_HANDLERS_PRELOADED=1
     AUTO_XDP_RECOVERY_HANDLED=1
+}
+
+_auto_xdp_restore_interrupted_reload() {
+    local live_dir="$BPF_PIN_DIR"
+    local candidate_dir="${BPF_PIN_DIR}_next"
+    local rollback_dir="${BPF_PIN_DIR}_rollback"
+    local stable_dir="" discard_dir="" stable_id="" discard_id=""
+    local iface_var="" iface mode actual_id="" stable_tc=""
+    local replacement_dir="${BPF_PIN_DIR}_failed_${BASHPID:-$$}"
+
+    if [[ -e "$live_dir" && -e "$candidate_dir" && -e "$rollback_dir" ]]; then
+        _auto_xdp_warn "Live, candidate, and rollback XDP generations all exist; refusing ambiguous recovery."
+        return 1
+    fi
+
+    if [[ -e "$candidate_dir" ]]; then
+        stable_dir="$live_dir"
+        discard_dir="$candidate_dir"
+    elif [[ -e "$rollback_dir" ]]; then
+        # The candidate was already renamed to live. The rollback directory is
+        # the last fully committed generation and is therefore the safe side.
+        stable_dir="$rollback_dir"
+        discard_dir="$live_dir"
+    else
+        return 0
+    fi
+
+    [[ -e "$stable_dir/prog" && -e "$discard_dir/prog" ]] || {
+        _auto_xdp_warn "Interrupted XDP pins are incomplete; refusing unsafe cleanup."
+        return 1
+    }
+    stable_id=$(_auto_xdp_pinned_prog_id "$stable_dir/prog") || {
+        _auto_xdp_warn "Could not identify stable XDP program at $stable_dir/prog."
+        return 1
+    }
+    discard_id=$(_auto_xdp_pinned_prog_id "$discard_dir/prog") || {
+        _auto_xdp_warn "Could not identify interrupted XDP program at $discard_dir/prog."
+        return 1
+    }
+
+    iface_var=$(_auto_xdp_iface_var_name) || return 1
+    local -n restore_ifaces="$iface_var"
+    for iface in "${restore_ifaces[@]}"; do
+        mode=$(_auto_xdp_iface_xdp_mode "$iface")
+        [[ "$mode" != "none" ]] || continue
+        actual_id=$(_auto_xdp_iface_prog_id "$iface") || {
+            _auto_xdp_warn "Could not identify the XDP program attached to $iface; recovery pins were retained."
+            return 1
+        }
+        if [[ "$actual_id" == "$stable_id" ]]; then
+            continue
+        fi
+        if [[ "$actual_id" != "$discard_id" ]]; then
+            _auto_xdp_warn "XDP program $actual_id on $iface belongs to neither recovery generation; refusing replacement."
+            return 1
+        fi
+        if ! _auto_xdp_attach_mode "$iface" "$stable_dir/prog" "$mode" >/dev/null 2>&1 \
+                || ! _auto_xdp_verify_iface_program "$iface" "$stable_dir/prog"; then
+            _auto_xdp_warn "Could not restore stable XDP program $stable_id on $iface; recovery pins were retained."
+            return 1
+        fi
+    done
+
+    stable_tc="${stable_dir}/tc_egress_prog"
+    for iface in "${restore_ifaces[@]}"; do
+        if [[ -e "$stable_tc" ]]; then
+            tc qdisc add dev "$iface" clsact 2>/dev/null || true
+            tc filter replace dev "$iface" egress \
+                pref "${TC_FILTER_PREF:-49152}" handle "${TC_FILTER_HANDLE:-1}" \
+                bpf direct-action object-pinned "$stable_tc" >/dev/null 2>&1 || {
+                _auto_xdp_warn "Could not restore stable tc program on $iface; recovery pins were retained."
+                return 1
+            }
+        elif tc filter show dev "$iface" egress \
+                pref "${TC_FILTER_PREF:-49152}" handle "${TC_FILTER_HANDLE:-1}" \
+                2>/dev/null | grep -q .; then
+            _auto_xdp_warn "A tc filter remains on $iface but the stable rollback pin is missing."
+            return 1
+        fi
+    done
+
+    if [[ "$stable_dir" == "$rollback_dir" ]]; then
+        [[ ! -e "$replacement_dir" ]] || return 1
+        mv "$live_dir" "$replacement_dir" || return 1
+        if ! mv "$rollback_dir" "$live_dir"; then
+            mv "$replacement_dir" "$live_dir" 2>/dev/null || true
+            return 1
+        fi
+        rm -rf "$replacement_dir"
+    else
+        rm -rf "$candidate_dir"
+        [[ ! -e "$rollback_dir" ]] || rm -rf "$rollback_dir"
+    fi
+
+    AUTO_XDP_HANDLERS_PRELOADED=0
+    AUTO_XDP_RECOVERY_HANDLED=0
+    _auto_xdp_warn "Restored the last committed XDP generation; continuing with a fresh candidate."
+    return 0
 }
 
 transactional_reload_xdp() {
@@ -748,7 +1032,10 @@ transactional_reload_xdp() {
     AUTO_XDP_HANDLERS_PRELOADED=0
 
     if [[ -e "$rollback_dir" || -e "$candidate_dir" ]]; then
-        _auto_xdp_finish_interrupted_reload || return 1
+        if ! _auto_xdp_finish_interrupted_reload; then
+            _auto_xdp_warn "Interrupted candidate could not be committed; restoring the last committed generation."
+            _auto_xdp_restore_interrupted_reload || return 1
+        fi
         [[ ${AUTO_XDP_RECOVERY_HANDLED:-0} -eq 1 ]] && return 0
     fi
 
@@ -784,21 +1071,24 @@ transactional_reload_xdp() {
         if _auto_xdp_attach_candidate "$iface" "$candidate_dir/prog"; then
             new_modes+=("$AUTO_XDP_LAST_ATTACH_MODE")
             switched=$((switched + 1))
-        else
-            _auto_xdp_warn "Failed to attach candidate XDP to $iface; rolling back switched interfaces."
-            for ((index = 0; index < switched; index++)); do
-                _auto_xdp_rollback_iface "${switch_ifaces[$index]}" \
-                    "${old_modes[$index]}" "${new_modes[$index]}" \
-                    "$live_dir/prog" || rollback_ok=0
-            done
-            if [[ $rollback_ok -eq 1 ]]; then
-                rm -rf "$candidate_dir"
-            else
-                _auto_xdp_warn "XDP rollback was incomplete; retaining both pin generations for recovery."
+            if _auto_xdp_verify_iface_program "$iface" "$candidate_dir/prog"; then
+                continue
             fi
-            AUTO_XDP_SWITCH_ROLLED_BACK=$rollback_ok
-            return 1
+            _auto_xdp_warn "Candidate XDP attach on $iface could not be verified."
         fi
+        _auto_xdp_warn "Failed to attach candidate XDP to $iface; rolling back switched interfaces."
+        for ((index = 0; index < switched; index++)); do
+            _auto_xdp_rollback_iface "${switch_ifaces[$index]}" \
+                "${old_modes[$index]}" "${new_modes[$index]}" \
+                "$live_dir/prog" || rollback_ok=0
+        done
+        if [[ $rollback_ok -eq 1 ]]; then
+            rm -rf "$candidate_dir"
+        else
+            _auto_xdp_warn "XDP rollback was incomplete; retaining both pin generations for recovery."
+        fi
+        AUTO_XDP_SWITCH_ROLLED_BACK=$rollback_ok
+        return 1
     done
 
     local saved_tc_rollback="${TC_ROLLBACK_PROG_PATH:-}"
@@ -830,6 +1120,10 @@ transactional_reload_xdp() {
         mv "$live_dir" "$rollback_dir" || return 1
     fi
     mv "$candidate_dir" "$live_dir" || return 1
+    if ! _auto_xdp_record_xdp_state "$live_dir/prog"; then
+        _auto_xdp_warn "Could not persist verified per-interface XDP state; retaining rollback generation."
+        return 1
+    fi
     rm -rf "$rollback_dir"
     AUTO_XDP_SWITCH_MODE=""
     for mode in "${new_modes[@]}"; do
@@ -880,7 +1174,7 @@ load_sock_state_tracker() {
 }
 
 load_slot_handlers() {
-    local handlers_dir="${AUTO_XDP_HANDLERS_DIR:-${HANDLERS_DIR:-${INSTALL_DIR}/handlers}}"
+    local handlers_dir="${AUTO_XDP_BUILTIN_HANDLERS_DIR:-${INSTALL_DIR}/handlers}"
     local py_bin="${PYTHON3_BIN:-python3}"
     local strict="${AUTO_XDP_STRICT_HANDLERS:-0}"
 
@@ -1014,7 +1308,7 @@ preseed_xdp_candidate_handlers() {
 
 load_port_handlers() {
     local py_bin="${PYTHON3_BIN:-python3}"
-    local install_dir="${INSTALL_DIR:-/usr/local/lib/auto_xdp}"
+    local install_dir="${INSTALL_DIR:-/usr/local/lib/auto_xdp/current}"
     local strict="${AUTO_XDP_STRICT_HANDLERS:-0}"
 
     [[ -e "${BPF_PIN_DIR}/slot_ctx_map" ]] || {

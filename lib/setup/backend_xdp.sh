@@ -90,12 +90,30 @@ deploy_xdp_backend() {
 }
 
 deploy_backend_step() {
+    REQUESTED_BACKEND=$(_auto_xdp_resolve_preferred_backend "$TOML_CONFIG" "auto")
     step_begin "Loading backend on ${IFACES[*]}"
+    if [[ "$REQUESTED_BACKEND" == "nftables" ]]; then
+        ACTIVE_BACKEND="nftables"
+        ACTIVE_XDP_MODE="none"
+        XDP_FALLBACK_REASON="explicitly selected by daemon.preferred_backend"
+        if ensure_nftables_available; then
+            PENDING_NFT_CUTOVER=1
+            step_ok "nftables candidate; XDP removal follows policy verification"
+            return 0
+        fi
+        step_fail "nftables was explicitly requested but is unavailable"
+        return 1
+    fi
+
     if deploy_xdp_backend; then
         cleanup_existing_nftables
         XDP_FALLBACK_REASON=""
         step_ok "XDP $ACTIVE_XDP_MODE mode"
     else
+        if [[ "$REQUESTED_BACKEND" == "xdp" ]]; then
+            step_fail "XDP was explicitly requested and transactional loading failed; fallback disabled"
+            return 1
+        fi
         if [[ ${XDP_FALLBACK_BLOCKED:-0} -eq 1 ]]; then
             step_fail "XDP reload failed while an XDP attachment remains active; nftables fallback was not started."
             return 1
@@ -103,6 +121,7 @@ deploy_backend_step() {
         ACTIVE_BACKEND="nftables"
         ACTIVE_XDP_MODE="none"
         if ensure_nftables_available; then
+            PENDING_NFT_CUTOVER=1
             step_ok "nftables fallback"
         else
             die "Neither XDP nor nftables backend is available."
