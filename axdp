@@ -4,17 +4,20 @@ set -euo pipefail
 CONFIG_FILE="/etc/auto_xdp/auto_xdp.env"
 TOML_CONFIG="/etc/auto_xdp/config.toml"
 CONFIG_DIR="/etc/auto_xdp"
+RELAY_GROUP="auto-xdp"
+RELAY_GROUP_MARKER="${CONFIG_DIR}/.relay-group-created"
 RUN_STATE_DIR="/run/auto_xdp"
-RUN_STATE_COMPAT_DIR="/var/run/auto_xdp"
 BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
-INSTALL_DIR="/usr/local/lib/auto_xdp"
+INSTALL_ROOT="/usr/local/lib/auto_xdp"
+INSTALL_DIR="${INSTALL_ROOT}/current"
 PYTHON_LIB_DIR="${INSTALL_DIR}/python"
+HANDLERS_DIR="/etc/auto_xdp/handlers"
 NFT_FAMILY="inet"
 NFT_TABLE="auto_xdp"
 NFT_CHAIN="input"
-RUNNER_SCRIPT="/usr/local/bin/auto_xdp_start.sh"
-SYNC_SCRIPT="/usr/local/bin/xdp_port_sync.py"
-RELAY_SCRIPT="/usr/local/bin/pkt_relay.py"
+RUNNER_SCRIPT="${INSTALL_DIR}/auto_xdp_start.sh"
+SYNC_SCRIPT="${INSTALL_DIR}/xdp_port_sync.py"
+RELAY_SCRIPT="${INSTALL_DIR}/pkt_relay.py"
 AXDP_CMD="/usr/local/bin/axdp"
 SERVICE_NAME="xdp-port-sync"
 RELAY_SERVICE_NAME="auto-xdp-relay"
@@ -145,9 +148,61 @@ _remove_owned_file() {
     rm -f -- "$path"
 }
 
+_relay_group_has_members() {
+    local entry gid members user_name user_gid
+    entry=$(getent group "$RELAY_GROUP" 2>/dev/null) || return 1
+    gid=$(printf '%s\n' "$entry" | cut -d: -f3)
+    members=$(printf '%s\n' "$entry" | cut -d: -f4)
+    [[ -n "$members" ]] && return 0
+
+    while IFS=: read -r user_name _ _ user_gid _; do
+        [[ -n "$user_name" && "$user_gid" == "$gid" ]] && return 0
+    done < <(getent passwd 2>/dev/null || true)
+    return 1
+}
+
+_remove_owned_relay_group() {
+    # The marker distinguishes a group created by this installer from a
+    # pre-existing administrator-owned group with the same name.
+    [[ -f "$RELAY_GROUP_MARKER" && ! -L "$RELAY_GROUP_MARKER" ]] || return 0
+    if ! getent group "$RELAY_GROUP" >/dev/null 2>&1; then
+        _remove_owned_file "$RELAY_GROUP_MARKER" ".relay-group-created"
+        return $?
+    fi
+    if _relay_group_has_members; then
+        printf 'Preserving %s group because it has members.\n' "$RELAY_GROUP" >&2
+        _remove_owned_file "$RELAY_GROUP_MARKER" ".relay-group-created"
+        return $?
+    fi
+
+    if command -v groupdel >/dev/null 2>&1; then
+        groupdel "$RELAY_GROUP" >/dev/null 2>&1 || return 1
+    elif command -v delgroup >/dev/null 2>&1; then
+        delgroup "$RELAY_GROUP" >/dev/null 2>&1 || return 1
+    else
+        printf 'Cannot remove installer-owned group %s: groupdel/delgroup not found.\n' "$RELAY_GROUP" >&2
+        return 1
+    fi
+    _remove_owned_file "$RELAY_GROUP_MARKER" ".relay-group-created"
+}
+
+_runtime_process_matches() {
+    local pid="$1" arg
+    [[ -r "$AUTO_XDP_PROC_ROOT/$pid/cmdline" ]] || return 1
+    while IFS= read -r -d '' arg; do
+        case "$arg" in
+            "$RUNNER_SCRIPT"|"$SYNC_SCRIPT"|"$RELAY_SCRIPT")
+                return 0
+                ;;
+        esac
+    done < "$AUTO_XDP_PROC_ROOT/$pid/cmdline"
+    return 1
+}
+
 _stop_runtime_processes() {
     local proc_dir pid arg matched
     local -a argv=()
+    local -a matched_pids=()
 
     for proc_dir in "$AUTO_XDP_PROC_ROOT"/[0-9]*; do
         [[ -r "$proc_dir/cmdline" ]] || continue
@@ -162,14 +217,31 @@ _stop_runtime_processes() {
         matched=0
         for arg in "${argv[@]}"; do
             case "$arg" in
-                "$RUNNER_SCRIPT"|"$SYNC_SCRIPT"|"$RELAY_SCRIPT")
-                    matched=1
-                    break
-                    ;;
+                "$RUNNER_SCRIPT"|"$SYNC_SCRIPT"|"$RELAY_SCRIPT") matched=1; break ;;
             esac
         done
         [[ $matched -eq 1 ]] || continue
+        matched_pids+=("$pid")
         kill "$pid" >/dev/null 2>&1 || true
+    done
+
+    local alive=0 attempt
+    for ((attempt = 0; attempt < 50; attempt++)); do
+        alive=0
+        for pid in "${matched_pids[@]}"; do
+            if _runtime_process_matches "$pid"; then
+                alive=1
+                break
+            fi
+        done
+        [[ $alive -eq 0 ]] && return 0
+        sleep 0.1
+    done
+
+    # A graceful shutdown is preferred, but uninstall must not leave a
+    # privileged relay alive while its pins and runtime files are removed.
+    for pid in "${matched_pids[@]}"; do
+        _runtime_process_matches "$pid" && kill -KILL "$pid" >/dev/null 2>&1 || true
     done
 }
 
@@ -269,7 +341,7 @@ run_uninstall() {
     _remove_owned_file "$RUNNER_SCRIPT" "auto_xdp_start.sh" || failures=1
     _remove_owned_tree "$INSTALL_DIR" "auto_xdp" || failures=1
     _remove_owned_tree "$RUN_STATE_DIR" "auto_xdp" || failures=1
-    _remove_owned_tree "$RUN_STATE_COMPAT_DIR" "auto_xdp" || failures=1
+    _remove_owned_relay_group || failures=1
     _remove_owned_tree "$CONFIG_DIR" "auto_xdp" || failures=1
     _remove_owned_file "$AXDP_CMD" "axdp" || failures=1
 

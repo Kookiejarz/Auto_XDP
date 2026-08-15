@@ -1,4 +1,5 @@
 import struct
+import socket
 import time
 import unittest
 
@@ -55,6 +56,10 @@ class TestSockStateReader(unittest.TestCase):
 
 
 import json
+import os
+import stat
+import tempfile
+from pathlib import Path
 from unittest import mock
 import pkt_relay as relay_mod
 
@@ -103,6 +108,106 @@ class TestRelayBroadcastPortChange(unittest.TestCase):
         server._broadcast(ev)
         decoded = json.loads(sent[0].decode().strip())
         self.assertEqual(decoded["type"], "event")
+
+    def test_history_retention_uses_relay_wall_clock_not_bpf_timestamp(self):
+        server = self._make_relay()
+        server._history.extend(
+            [
+                {"ts_ns": 1, "seen_at": 994.0},
+                {"ts_ns": 2, "seen_at": 996.0},
+            ]
+        )
+        with mock.patch.object(relay_mod.time, "time", return_value=1000.0):
+            server._trim_history()
+        self.assertEqual(len(server._history), 1)
+        self.assertEqual(server._history[0]["seen_at"], 996.0)
+
+
+class TestRelaySecurity(unittest.TestCase):
+    def _relay(self, directory: str) -> relay_mod.RelayServer:
+        rb = mock.MagicMock()
+        rb.drain.return_value = iter([])
+        rb.fileno.return_value = 99
+        return relay_mod.RelayServer(
+            rb,
+            sock_path=str(Path(directory) / "pkt_events.sock"),
+            retention_seconds=5,
+            max_events=10,
+            max_history_send=2,
+        )
+
+    def test_socket_directory_and_node_are_restricted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = self._relay(directory)
+            server._open_server()
+            try:
+                parent_mode = stat.S_IMODE(os.stat(directory).st_mode)
+                socket_mode = stat.S_IMODE(os.stat(server._sock_path).st_mode)
+                self.assertEqual(parent_mode, 0o750)
+                self.assertEqual(socket_mode, relay_mod.SOCKET_MODE)
+            finally:
+                server._cleanup()
+
+    def test_socket_path_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            target.write_text("not a socket")
+            socket_path = Path(directory) / "pkt_events.sock"
+            socket_path.symlink_to(target)
+            server = self._relay(directory)
+            with self.assertRaises(RuntimeError):
+                server._open_server()
+            self.assertEqual(target.read_text(), "not a socket")
+
+    def test_unauthorized_client_is_rejected_before_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = self._relay(directory)
+            server._open_server()
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                client.connect(server._sock_path)
+                with mock.patch.object(relay_mod, "_peer_is_authorized", return_value=False):
+                    server._accept_client()
+                self.assertEqual(server._clients, {})
+            finally:
+                client.close()
+                server._cleanup()
+
+    @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "Linux SO_PEERCRED is required")
+    def test_peer_credentials_authorize_same_process(self):
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.assertTrue(relay_mod._peer_is_authorized(left))
+            self.assertTrue(relay_mod._peer_is_authorized(right))
+        finally:
+            left.close()
+            right.close()
+
+    def test_pid_file_is_locked_and_removed_only_by_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = str(Path(directory) / "relay.pid")
+            fd = relay_mod._write_pid(pid_path)
+            try:
+                self.assertEqual(
+                    stat.S_IMODE(os.stat(pid_path).st_mode),
+                    relay_mod.PID_FILE_MODE,
+                )
+                self.assertEqual(Path(pid_path).read_text(), f"{os.getpid()}\n")
+                with self.assertRaises(OSError):
+                    relay_mod._write_pid(pid_path)
+            finally:
+                relay_mod._remove_pid(pid_path, fd)
+            self.assertFalse(os.path.exists(pid_path))
+
+    def test_pid_symlink_is_rejected_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            target.write_text("protected")
+            pid_path = Path(directory) / "relay.pid"
+            pid_path.symlink_to(target)
+            with self.assertRaises(OSError):
+                relay_mod._write_pid(str(pid_path))
+            self.assertEqual(target.read_text(), "protected")
 
 
 import auto_xdp.syncer as syncer_mod
