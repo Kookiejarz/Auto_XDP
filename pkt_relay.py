@@ -14,6 +14,7 @@ import argparse
 import collections
 import ctypes
 import ctypes.util
+import fcntl
 import json
 import logging
 import mmap
@@ -23,6 +24,7 @@ import queue
 import select
 import signal
 import socket
+import stat
 import struct
 import sys
 import threading
@@ -43,6 +45,9 @@ SOCK_STATE_TRACEPOINT   = "sock/inet_sock_set_state"
 SOCK_STATE_RB_MAX_ENTRIES = 1 << 16   # 64 KiB — must match C definition
 SOCKET_PATH        = "/var/run/auto_xdp/pkt_events.sock"
 PID_FILE           = "/var/run/auto_xdp/pkt_relay.pid"
+RUNTIME_DIR_MODE   = 0o750
+SOCKET_MODE        = 0o660
+PID_FILE_MODE      = 0o600
 RINGBUF_MAX_ENTRIES = 1 << 22   # 4 MiB — must match C definition
 RETENTION_SECONDS  = 300
 MAX_EVENTS         = 100_000
@@ -102,6 +107,68 @@ _REASON_NAMES: dict[int, str] = {
 _PKT_EVENT_SIZE = 48   # sizeof(struct pkt_event)
 _AF_INET        = 2
 _AF_INET6       = 10
+
+
+def _secure_parent_dir(path: str) -> str:
+    """Create and validate a private runtime directory for a control file."""
+    parent = os.path.abspath(os.path.dirname(path) or ".")
+    os.makedirs(parent, mode=RUNTIME_DIR_MODE, exist_ok=True)
+    try:
+        info = os.stat(parent, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect runtime directory {parent}: {exc}") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"runtime path is not a directory: {parent}")
+    if info.st_uid not in (0, os.geteuid()):
+        raise RuntimeError(f"runtime directory is not owned by root or the service user: {parent}")
+    # Group read/execute is allowed for the dedicated operator group; writes
+    # by group/other and all other-world permissions are never safe here.
+    if info.st_mode & 0o022:
+        raise RuntimeError(f"runtime directory is writable by group or other: {parent}")
+    os.chmod(parent, RUNTIME_DIR_MODE)
+    return parent
+
+
+def _peer_credentials(conn: socket.socket) -> tuple[int, int, int] | None:
+    """Return Linux SO_PEERCRED (pid, uid, gid), or None if unavailable."""
+    option = getattr(socket, "SO_PEERCRED", None)
+    if option is None:
+        return None
+    try:
+        raw = conn.getsockopt(socket.SOL_SOCKET, option, struct.calcsize("=3i"))
+    except OSError:
+        return None
+    if len(raw) != struct.calcsize("=3i"):
+        return None
+    return struct.unpack("=3i", raw)
+
+
+def _peer_groups(pid: int) -> set[int]:
+    """Read supplementary groups for a peer when procfs exposes them."""
+    if sys.platform != "linux":
+        return set()
+    try:
+        with open(f"/proc/{pid}/status", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("Groups:"):
+                    return {int(value) for value in line.split()[1:]}
+    except (OSError, ValueError):
+        pass
+    return set()
+
+
+def _peer_is_authorized(conn: socket.socket) -> bool:
+    credentials = _peer_credentials(conn)
+    if credentials is None:
+        return False
+    pid, uid, gid = credentials
+    service_uid = os.geteuid()
+    service_gid = os.getegid()
+    if uid == service_uid:
+        return True
+    if gid == service_gid:
+        return True
+    return service_gid in _peer_groups(pid)
 
 # perf_event_open-based tracepoint attachment (fallback when bpftool link create
 # is unavailable). Attachment lifetime is tied to the returned fds.
@@ -314,21 +381,32 @@ class RelayServer:
     # internal helpers
 
     def _open_server(self) -> None:
-        os.makedirs(os.path.dirname(self._sock_path) or ".", exist_ok=True)
+        _secure_parent_dir(self._sock_path)
         try:
-            os.unlink(self._sock_path)
+            existing = os.lstat(self._sock_path)
         except FileNotFoundError:
-            pass
+            existing = None
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISSOCK(existing.st_mode):
+                raise RuntimeError(f"refusing to replace non-socket path: {self._sock_path}")
+            if existing.st_uid not in (0, os.geteuid()):
+                raise RuntimeError(f"socket is not owned by root or the service user: {self._sock_path}")
+            os.unlink(self._sock_path)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.setblocking(False)
-        srv.bind(self._sock_path)
-        srv.listen(32)
-        self._server = srv
+        try:
+            srv.setblocking(False)
+            srv.bind(self._sock_path)
+            os.chmod(self._sock_path, SOCKET_MODE, follow_symlinks=False)
+            srv.listen(32)
+            self._server = srv
+        except Exception:
+            srv.close()
+            raise
         log.info("Listening on %s", self._sock_path)
 
     def _trim_history(self) -> None:
-        cutoff = time.time_ns() - self._retention_ns
-        while self._history and self._history[0]["ts_ns"] < cutoff:
+        cutoff = time.time() - (self._retention_ns / 1e9)
+        while self._history and self._history[0].get("seen_at", 0.0) < cutoff:
             self._history.popleft()
 
     def _send_line(self, sock: socket.socket, obj: object) -> bool:
@@ -343,6 +421,10 @@ class RelayServer:
         try:
             conn, _ = self._server.accept()
         except OSError:
+            return
+        if not _peer_is_authorized(conn):
+            log.warning("Rejected unauthorized relay client")
+            conn.close()
             return
         conn.setblocking(False)
         self._trim_history()
@@ -476,17 +558,48 @@ class RelayServer:
 
 # PID file
 
-def _write_pid(path: str) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        f.write(f"{os.getpid()}\n")
+def _write_pid(path: str) -> int:
+    """Create and lock a PID file without following symlinks.
 
-
-def _remove_pid(path: str) -> None:
+    The returned descriptor must remain open for the lifetime of the process;
+    the advisory lock is the authoritative single-instance guard.
+    """
+    _secure_parent_dir(path)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("secure PID files require O_NOFOLLOW")
+    flags = os.O_RDWR | os.O_CREAT | nofollow | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags, PID_FILE_MODE)
     try:
-        os.unlink(path)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.fchmod(fd, PID_FILE_MODE)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _remove_pid(path: str, fd: int) -> None:
+    try:
+        if fd >= 0:
+            expected = os.fstat(fd)
+            try:
+                actual = os.lstat(path)
+            except FileNotFoundError:
+                actual = None
+            if (
+                actual is not None
+                and actual.st_dev == expected.st_dev
+                and actual.st_ino == expected.st_ino
+            ):
+                os.unlink(path)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
     except FileNotFoundError:
-        pass
+        if fd >= 0:
+            os.close(fd)
 
 
 # entry point
@@ -578,8 +691,6 @@ def main() -> None:
         sock_state_reader=ss_reader,
     )
 
-    _write_pid(args.pid_file)
-
     def _on_signal(signum: int, _frame: object) -> None:
         log.info("received signal %d, shutting down", signum)
         relay.stop()
@@ -587,16 +698,18 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT,  _on_signal)
 
+    pid_fd = -1
     try:
+        pid_fd = _write_pid(args.pid_file)
         relay.run()
     finally:
+        _remove_pid(args.pid_file, pid_fd)
         rb.close()
         for _pfd in _perf_fds:
             try:
                 os.close(_pfd)
             except OSError:
                 pass
-        _remove_pid(args.pid_file)
 
 
 if __name__ == "__main__":

@@ -318,6 +318,8 @@ _setup_reattach_test_env() {
     # bpftool must exist in PATH for ensure_xdp_loaded to proceed
     printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/bpftool"
     chmod +x "$tmpdir/bin/bpftool"
+    printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/tc"
+    chmod +x "$tmpdir/bin/tc"
 
     PATH="$tmpdir/bin:$BASE_PATH"
 
@@ -344,6 +346,12 @@ _setup_reattach_test_env() {
             return 0
         fi
         return 1
+    }
+    TC_RESTORE_STATUS=0
+    TC_RESTORE_CALLED=0
+    _auto_xdp_restore_tc_egress() {
+        TC_RESTORE_CALLED=$((TC_RESTORE_CALLED + 1))
+        return "$TC_RESTORE_STATUS"
     }
     _auto_xdp_record_xdp_state() { return 0; }
 }
@@ -431,6 +439,61 @@ EOF_IP
     _IFACES=(eth0 eth1)
     ensure_xdp_loaded || return 1
     assert_eq "$(cat "$RUN_STATE_DIR/xdp_mode")" "generic"
+)
+
+test_ensure_xdp_reattach_restores_tc_and_blocks_fallback_on_failure() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+    TC_RESTORE_STATUS=1
+
+    cat >"$tmpdir/bin/ip" <<'EOF_IP'
+#!/bin/sh
+args="$*"
+if echo "$args" | grep -q "show.*eth0\\b\\|show dev eth0"; then
+    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\\n    link/ether\\n"
+elif echo "$args" | grep -q "set.*eth0.*xdp "; then
+    exit 0
+fi
+exit 0
+EOF_IP
+    chmod +x "$tmpdir/bin/ip"
+
+    _IFACES=(eth0)
+    ensure_xdp_loaded >/dev/null 2>&1
+    local status=$?
+    assert_eq "$status" "2" || return 1
+    assert_eq "$TC_RESTORE_CALLED" "1"
+)
+
+test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+    mkdir -p "${BPF_PIN_DIR}_next"
+    touch "${BPF_PIN_DIR}_next/prog"
+    _IFACES=(eth0)
+
+    _auto_xdp_finish_interrupted_reload() {
+        printf 'resume\n' >> "$tmpdir/recovery.log"
+        return 1
+    }
+    _auto_xdp_restore_interrupted_reload() {
+        printf 'restore\n' >> "$tmpdir/recovery.log"
+        rm -rf "${BPF_PIN_DIR}_next"
+        return 0
+    }
+    _auto_xdp_verify_iface_program() { return 0; }
+
+    ensure_xdp_loaded >/dev/null 2>&1 || return 1
+    assert_eq "$(cat "$tmpdir/recovery.log")" $'resume\nrestore' || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" ]]
 )
 
 test_select_backend_refuses_nftables_while_xdp_remains_attached() (
@@ -703,6 +766,8 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
     CONFIG_DIR="$tmpdir/etc/auto_xdp"
     CONFIG_FILE="$CONFIG_DIR/auto_xdp.env"
     TOML_CONFIG="$CONFIG_DIR/config.toml"
+    RELAY_GROUP="auto-xdp"
+    RELAY_GROUP_MARKER="$CONFIG_DIR/.relay-group-created"
     RUN_STATE_DIR="$tmpdir/run/auto_xdp"
     RUN_STATE_COMPAT_DIR="$tmpdir/var/run/auto_xdp"
     SYNC_SCRIPT="$tmpdir/usr/local/bin/xdp_port_sync.py"
@@ -728,9 +793,17 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         "$OPENRC_INIT_DIR/auto-xdp-relay" \
         "$OPENRC_RUN_DIR/xdp-port-sync.pid" \
         "$OPENRC_RUN_DIR/auto-xdp-relay.pid" \
-        "$CONFIG_FILE" "$TOML_CONFIG"
+        "$CONFIG_FILE" "$TOML_CONFIG" "$RELAY_GROUP_MARKER"
 
     require_root() { return 0; }
+    getent() {
+        case "$1" in
+            group) printf 'auto-xdp:x:991:\n'; return 0 ;;
+            passwd) return 1 ;;
+        esac
+        return 1
+    }
+    groupdel() { printf 'groupdel %s\n' "$1" >>"$ops_log"; return 0; }
     systemctl() { printf 'systemctl %s\n' "$*" >>"$ops_log"; return 0; }
     rc-service() { printf 'rc-service %s\n' "$*" >>"$ops_log"; return 0; }
     rc-update() { printf 'rc-update %s\n' "$*" >>"$ops_log"; return 0; }
@@ -776,10 +849,37 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
     assert_file_contains "$ops_log" \
         "tc filter del dev eth0 egress protocol all pref 49152 handle 1 bpf" || return 1
     assert_file_contains "$ops_log" "ip link set dev eth1 xdpgeneric off" || return 1
+    assert_file_contains "$ops_log" "groupdel auto-xdp" || return 1
     if grep -q "qdisc del" "$ops_log"; then
         printf 'uninstall deleted the shared clsact qdisc\n'
         return 1
     fi
+)
+
+test_uninstall_preserves_used_relay_group() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir groupdel_called=0
+    tmpdir=$(mktemp -d)
+    CONFIG_DIR="$tmpdir/etc/auto_xdp"
+    RELAY_GROUP="auto-xdp"
+    RELAY_GROUP_MARKER="$CONFIG_DIR/.relay-group-created"
+    mkdir -p "$CONFIG_DIR"
+    touch "$RELAY_GROUP_MARKER"
+
+    getent() {
+        case "$1" in
+            group) printf 'auto-xdp:x:991:operator\n'; return 0 ;;
+            passwd) return 1 ;;
+        esac
+        return 1
+    }
+    groupdel() { groupdel_called=1; return 0; }
+
+    _remove_owned_relay_group || return 1
+    [[ $groupdel_called -eq 0 ]] || return 1
+    [[ ! -e "$RELAY_GROUP_MARKER" ]] || return 1
 )
 
 test_uninstall_keeps_runtime_when_xdp_detach_fails() (
@@ -830,7 +930,7 @@ test_uninstall_stops_only_exact_runtime_process_argv() (
         >"$AUTO_XDP_PROC_ROOT/101/cmdline"
 
     local killed="$tmpdir/killed"
-    kill() { printf '%s\n' "$1" >>"$killed"; }
+    kill() { printf '%s\n' "$1" >>"$killed"; rm -rf "$AUTO_XDP_PROC_ROOT/$1"; }
 
     _stop_runtime_processes
 
@@ -957,12 +1057,15 @@ run_test "axdp detects xdp backend with mixed native and generic ifaces" test_de
 run_test "auto_xdp_start records generic xdp_mode when re-attach falls back to generic" test_ensure_xdp_reattach_records_generic_mode_on_fallback
 run_test "auto_xdp_start records native xdp_mode when re-attach succeeds natively" test_ensure_xdp_reattach_records_native_mode_when_all_native
 run_test "auto_xdp_start records generic xdp_mode when existing iface already in generic mode" test_ensure_xdp_reattach_records_generic_when_existing_iface_is_generic
+run_test "auto_xdp_start restores tc and blocks fallback after XDP re-attach failure" test_ensure_xdp_reattach_restores_tc_and_blocks_fallback_on_failure
+run_test "auto_xdp_start restores stable XDP after interrupted candidate failure" test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails
 run_test "auto_xdp_start refuses nftables while XDP remains attached" test_select_backend_refuses_nftables_while_xdp_remains_attached
 run_test "axdp backend reports runtime attach state and conntrack counts" test_run_backend_reports_runtime_state_and_conntrack_counts
 run_test "axdp backend json reports runtime attach state and conntrack counts" test_run_backend_json_reports_runtime_state_and_conntrack_counts
 run_test "axdp conntrack summarizes destination ports" test_run_conntrack_summarizes_destination_ports
 run_test "axdp help works without installation" test_cli_help_runs_without_runtime_state
 run_test "axdp uninstall removes all owned artifacts" test_uninstall_removes_all_auto_xdp_artifacts
+run_test "axdp uninstall preserves a used relay group" test_uninstall_preserves_used_relay_group
 run_test "axdp uninstall keeps retry assets after detach failure" test_uninstall_keeps_runtime_when_xdp_detach_fails
 run_test "axdp uninstall stops only exact runtime process argv" test_uninstall_stops_only_exact_runtime_process_argv
 run_test "axdp dispatches uninstall with explicit interfaces" test_main_dispatches_uninstall_command
