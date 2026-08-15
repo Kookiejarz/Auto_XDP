@@ -13,10 +13,13 @@ readonly _VETH="axdp_v0"
 readonly _VETH_IN="axdp_v1"
 readonly _HOST_IP="10.99.0.1"
 readonly _NS_IP="10.99.0.2"
+readonly _HOST_IP6="2001:db8:99::1"
+readonly _NS_IP6="2001:db8:99::2"
 readonly _PIN_DIR="/sys/fs/bpf/axdp_integ"
 readonly _DEBUG_PIN_DIR="/sys/fs/bpf/axdp_integ_debug"
 readonly _RUN_DIR="/run/axdp_integ"
 readonly _XDP_OBJ="/tmp/axdp_integ_fw.o"
+readonly _TC_OBJ="/tmp/axdp_integ_tc.o"
 
 # ---------------------------------------------------------------------------
 # Prerequisites
@@ -39,23 +42,32 @@ fi
 ip netns del "${_NS}_chk" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Compile XDP object once (cached at _XDP_OBJ)
+# Compile XDP object from current sources. Never reuse a leftover /tmp object
+# after the repository has changed.
 # ---------------------------------------------------------------------------
-if [[ ! -f "$_XDP_OBJ" ]]; then
-    _src="$REPO_ROOT/bpf/xdp_firewall.c"
-    [[ -f "$_src" ]] || { echo "skip: $_src not found"; exit 0; }
-    _asm_inc=$(clang -print-file-name=include 2>/dev/null) || {
-        echo "skip: clang include path not found"; exit 0
-    }
-    _include_args=(-I "$REPO_ROOT/bpf/include" -I "$_asm_inc")
-    _multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
-    [[ ! -d "$_multiarch_inc" ]] || _include_args+=(-I "$_multiarch_inc")
-    if ! clang -O2 -g -target bpf \
-        "${_include_args[@]}" \
-        -c "$_src" -o "$_XDP_OBJ"; then
-        echo "error: XDP compile failed" >&2
-        exit 1
-    fi
+_src="$REPO_ROOT/bpf/xdp_firewall.c"
+[[ -f "$_src" ]] || { echo "skip: $_src not found"; exit 0; }
+_asm_inc=$(clang -print-file-name=include 2>/dev/null) || {
+    echo "skip: clang include path not found"; exit 0
+}
+_include_args=(-I "$REPO_ROOT/bpf/include" -I "$_asm_inc")
+_multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
+[[ ! -d "$_multiarch_inc" ]] || _include_args+=(-I "$_multiarch_inc")
+rm -f "$_XDP_OBJ"
+if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+    "${_include_args[@]}" \
+    -c "$_src" -o "$_XDP_OBJ"; then
+    echo "error: XDP compile failed" >&2
+    exit 1
+fi
+_tc_src="$REPO_ROOT/tc_flow_track.c"
+[[ -f "$_tc_src" ]] || { echo "skip: $_tc_src not found"; exit 0; }
+rm -f "$_TC_OBJ"
+if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+    "${_include_args[@]}" \
+    -c "$_tc_src" -o "$_TC_OBJ"; then
+    echo "error: tc egress compile failed" >&2
+    exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -111,8 +123,10 @@ _setup() {
     ip link add "$_VETH" type veth peer name "$_VETH_IN"
     ip link set "$_VETH_IN" netns "$_NS"
     ip addr add "${_HOST_IP}/24" dev "$_VETH"
+    ip -6 addr add "${_HOST_IP6}/64" dev "$_VETH" nodad
     ip link set "$_VETH" up
     ip netns exec "$_NS" ip addr add "${_NS_IP}/24" dev "$_VETH_IN"
+    ip netns exec "$_NS" ip -6 addr add "${_NS_IP6}/64" dev "$_VETH_IN" nodad
     ip netns exec "$_NS" ip link set "$_VETH_IN" up
     ip netns exec "$_NS" ip link set lo up
 
@@ -124,6 +138,9 @@ _setup() {
 
 _teardown() {
     ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
+    tc filter del dev "$_VETH" egress pref 49152 handle 1 2>/dev/null || true
+    tc qdisc del dev "$_VETH" clsact 2>/dev/null || true
+    nft delete table inet axdp_integ 2>/dev/null || true
     ip netns del "$_NS" 2>/dev/null || true
     ip link del "$_VETH" 2>/dev/null || true
     rm -rf "$_PIN_DIR" "$_DEBUG_PIN_DIR" "$_RUN_DIR"
@@ -140,6 +157,7 @@ _u32le() { python3 -c "import struct; print(' '.join(f'{b:02x}' for b in struct.
 _u64le() { python3 -c "import struct; print(' '.join(f'{b:02x}' for b in struct.pack('<Q', $1)))"; }
 # Encode dotted-decimal IPv4 as __be32 (network order) hex bytes
 _ip4be() { python3 -c "import socket; print(' '.join(f'{b:02x}' for b in socket.inet_aton('$1')))"; }
+_ip6be() { python3 -c "import socket; print(' '.join(f'{b:02x}' for b in socket.inet_pton(socket.AF_INET6, '$1')))"; }
 # Encode port as __be16 (network order) hex bytes
 _u16be() { python3 -c "import struct; print(' '.join(f'{b:02x}' for b in struct.pack('>H', $1)))"; }
 # Current kernel monotonic time in ns (same epoch as bpf_ktime_get_ns)
@@ -183,9 +201,12 @@ print(" ".join(f"{byte:02x}" for byte in struct.pack("<QQQQQQQQII", *([0] * 8), 
 # Returns 0 if XDP passes (kernel sends RST or accepts), 1 if XDP drops (timeout).
 _tcp_probe() {
     local port="$1"
-    ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" <<'PYEOF' 2>/dev/null
+    local dest="${2:-$_HOST_IP}"
+    local family="${3:-inet}"
+    ip netns exec "$_NS" python3 - "$dest" "$port" "$family" <<'PYEOF' 2>/dev/null
 import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+af = socket.AF_INET6 if sys.argv[3] == "inet6" else socket.AF_INET
+s = socket.socket(af, socket.SOCK_STREAM)
 s.settimeout(0.8)
 try:
     s.connect((sys.argv[1], int(sys.argv[2])))
@@ -330,6 +351,32 @@ PYEOF
     }
 }
 
+_attach_tc_egress() {
+    command -v tc >/dev/null 2>&1 || { echo "tc not found"; return 1; }
+    bpftool prog load "$_TC_OBJ" "$_PIN_DIR/tc_egress_prog" type classifier \
+        map name tcp_ct4 pinned "$_PIN_DIR/tcp_ct4" \
+        map name tcp_ct6 pinned "$_PIN_DIR/tcp_ct6" \
+        map name udp_ct4 pinned "$_PIN_DIR/udp_ct4" \
+        map name udp_ct6 pinned "$_PIN_DIR/udp_ct6" \
+        map name sctp_conntrack pinned "$_PIN_DIR/sctp_conntrack" \
+        map name xdp_runtime_cfg pinned "$_PIN_DIR/xdp_runtime_cfg" >/dev/null || {
+        echo "failed to load tc egress program against shared maps"
+        return 1
+    }
+    tc qdisc add dev "$_VETH" clsact 2>/dev/null || true
+    tc filter replace dev "$_VETH" egress pref 49152 handle 1 \
+        bpf direct-action object-pinned "$_PIN_DIR/tc_egress_prog" >/dev/null || {
+        echo "failed to attach tc egress filter"
+        return 1
+    }
+}
+
+_map_has_key() {
+    local map_path="$1"
+    shift
+    bpftool map lookup pinned "$map_path" key hex "$@" >/dev/null 2>&1
+}
+
 test_acl() {
     local port=7702
 
@@ -424,6 +471,103 @@ test_service_restart() {
     _tcp_probe 7705 || { echo "traffic not passing after service restart"; return 1; }
 }
 
+test_tc_egress_udp_reply() {
+    local sport=5200 dport=9902
+    local key_hex
+
+    _attach_tc_egress || return 1
+
+    python3 - "$_HOST_IP" "$dport" "$_NS_IP" "$sport" <<'PYEOF' &
+import socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((sys.argv[1], int(sys.argv[2])))
+time.sleep(0.2)
+s.sendto(b'axdp-tc', (sys.argv[3], int(sys.argv[4])))
+s.close()
+PYEOF
+    local send_pid=$!
+    sleep 0.4
+    wait "$send_pid" 2>/dev/null || true
+
+    # Reverse tuple recorded by tc: sport=remote, dport=local, saddr=remote, daddr=local.
+    key_hex="$(_u16be "$sport") $(_u16be "$dport") $(_ip4be "$_NS_IP") $(_ip4be "$_HOST_IP")"
+    _map_has_key "$_PIN_DIR/udp_ct4" $key_hex || {
+        echo "tc egress did not insert udp_ct4 reverse tuple"
+        return 1
+    }
+
+    local recv_file
+    recv_file=$(mktemp)
+    _udp_listen_py "$dport" >"$recv_file" 2>/dev/null &
+    local listen_pid=$!
+    sleep 0.15
+    ip netns exec "$_NS" python3 - "$_NS_IP" "$sport" "$_HOST_IP" "$dport" <<'PYEOF' 2>/dev/null
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((sys.argv[1], int(sys.argv[2])))
+s.sendto(b'axdp-tc-reply', (sys.argv[3], int(sys.argv[4])))
+PYEOF
+    sleep 0.4
+    kill "$listen_pid" 2>/dev/null || true
+    wait "$listen_pid" 2>/dev/null || true
+    local got
+    got=$(<"$recv_file")
+    rm -f "$recv_file"
+    [[ "$got" == *"axdp-tc-reply"* ]] || {
+        echo "inbound UDP reply after tc-created conntrack was dropped"
+        return 1
+    }
+}
+
+test_ipv6_whitelist() {
+    local port=7706
+    ip -6 neigh replace "$_NS_IP6" lladdr "$(ip netns exec "$_NS" cat /sys/class/net/$_VETH_IN/address)" \
+        dev "$_VETH" nud permanent 2>/dev/null || true
+    ip netns exec "$_NS" ip -6 neigh replace "$_HOST_IP6" \
+        lladdr "$(cat /sys/class/net/$_VETH/address)" dev "$_VETH_IN" nud permanent 2>/dev/null || true
+    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
+        key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1
+    _tcp_probe "$port" "$_HOST_IP6" inet6 || {
+        echo "IPv6 SYN to whitelisted port was dropped"
+        return 1
+    }
+    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
+        key hex $(_u32le "$port") value hex 00 00 00 00 >/dev/null 2>&1
+    _tcp_probe "$port" "$_HOST_IP6" inet6 && {
+        echo "IPv6 SYN to non-whitelisted port was not dropped"
+        return 1
+    }
+    return 0
+}
+
+test_nftables_packet_path() {
+    command -v nft >/dev/null 2>&1 || { echo "nft not found"; return 1; }
+    ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
+
+    PYTHONPATH="$REPO_ROOT" python3 - <<'PYEOF' || return 1
+from auto_xdp import config as cfg
+from auto_xdp.backends.nftables import NftablesBackend
+from auto_xdp.state import DesiredState
+
+cfg.NFT_FAMILY = "inet"
+cfg.NFT_TABLE = "axdp_integ"
+cfg.BOGON_FILTER_ENABLED = False
+cfg.SLOT_DEFAULT_ACTION = "drop"
+backend = NftablesBackend()
+try:
+    backend.reconcile(
+        DesiredState(tcp_ports={7707}, bogon_filter_enabled=False),
+        dry_run=False,
+    )
+finally:
+    backend.close()
+PYEOF
+
+    _tcp_probe 7707 || { echo "nftables did not accept SYN to allowed TCP port"; return 1; }
+    _tcp_probe 7708 && { echo "nftables did not drop SYN to closed TCP port"; return 1; }
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -466,6 +610,18 @@ _teardown
 
 _require_setup "service restart test"
 run_test "service restart: XDP re-attaches and accepts traffic after reload" test_service_restart
+_teardown
+
+_require_setup "tc egress test"
+run_test "tc egress: outbound UDP creates reverse conntrack that XDP honors" test_tc_egress_udp_reply
+_teardown
+
+_require_setup "IPv6 whitelist test"
+run_test "IPv6: tcp_whitelist allows and blocks IPv6 TCP SYN by port" test_ipv6_whitelist
+_teardown
+
+_require_setup "nftables packet test"
+run_test "nftables: real kernel ruleset allows and blocks TCP SYN" test_nftables_packet_path
 _teardown
 
 finish_tests

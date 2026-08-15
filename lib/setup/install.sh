@@ -225,6 +225,19 @@ install_xdp_required_maps() {
     fi
 }
 
+install_xdp_map_abi() {
+    local target="${INSTALL_DIR}/xdp_map_abi.txt"
+    priv_mkdir "$INSTALL_DIR"
+    if [[ -f "${BUILD_STAGING_DIR:-}/xdp_map_abi.txt" ]]; then
+        place_file "${BUILD_STAGING_DIR}/xdp_map_abi.txt" "$target"
+    elif ! fetch_local_or_remote \
+            "auto_xdp/xdp_map_abi.txt" \
+            "auto_xdp/xdp_map_abi.txt" \
+            "$target"; then
+        die "Failed to install auto_xdp/xdp_map_abi.txt"
+    fi
+}
+
 install_runtime_common_script() {
     local target="${INSTALL_DIR}/auto_xdp_runtime_common.sh"
     if ! fetch_local_or_remote "$RUNTIME_COMMON_SRC" "$RUNTIME_COMMON_SRC" "$target"; then
@@ -393,6 +406,7 @@ build_release_payload() {
     local rc=0
     substep_run "Installing staged BPF objects" install_compiled_bpf_objects || rc=1
     substep_run "Installing XDP required maps list" install_xdp_required_maps || rc=1
+    substep_run "Installing XDP map ABI manifest" install_xdp_map_abi || rc=1
     substep_run "Installing sync daemon" install_sync_script || rc=1
     substep_run "Installing Python support package" install_python_support_package || rc=1
     substep_run "Installing relay helper" install_relay_script || rc=1

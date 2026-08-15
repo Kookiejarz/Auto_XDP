@@ -171,7 +171,7 @@ _check_update_candidate_files() {
         [[ -f "$path" ]] && printf '%s\n' "$path"
     done
 
-    for path in lib/setup/*.sh runtime/*.sh bpf/*.c bpf/include/*.h handlers/Makefile handlers/*.c handlers/*.h auto_xdp/*.py auto_xdp/admin/*.py auto_xdp/backends/*.py auto_xdp/bpf/*.py auto_xdp/xdp_required_maps.txt; do
+    for path in lib/setup/*.sh runtime/*.sh bpf/*.c bpf/include/*.h handlers/Makefile handlers/*.c handlers/*.h auto_xdp/*.py auto_xdp/admin/*.py auto_xdp/backends/*.py auto_xdp/bpf/*.py auto_xdp/xdp_required_maps.txt auto_xdp/xdp_map_abi.txt; do
         [[ -f "$path" ]] && printf '%s\n' "$path"
     done | sort -u
 }

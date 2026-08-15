@@ -302,6 +302,46 @@ _map_value_size_ok() {
     [[ -z "$_got" || "$_got" == "$_want" ]]
 }
 
+_map_max_entries_ok() {
+    local _path="$1" _want="$2" _got=""
+    _got=$(bpftool map show pinned "$_path" 2>/dev/null \
+               | sed -n 's/.*max_entries \([0-9]*\).*/\1/p')
+    # Keep non-Linux/unit-test environments compatible when bpftool cannot
+    # inspect a placeholder pin; real Linux pins report max_entries here.
+    [[ -z "$_got" || "$_got" == "$_want" ]]
+}
+
+_xdp_map_abi_file() {
+    local candidate=""
+    for candidate in \
+        "${XDP_MAP_ABI_FILE:-}" \
+        "${BPF_PIN_DIR}/xdp_map_abi.txt" \
+        "${AUTO_XDP_RUNTIME_COMMON_DIR}/xdp_map_abi.txt" \
+        "${AUTO_XDP_RUNTIME_COMMON_DIR}/../auto_xdp/xdp_map_abi.txt" \
+        "${INSTALL_DIR:-}/xdp_map_abi.txt"; do
+        [[ -n "$candidate" && -f "$candidate" ]] || continue
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    return 1
+}
+
+_xdp_map_abi_ready() {
+    local abi_file="" map_name="" expected=""
+    abi_file=$(_xdp_map_abi_file) || {
+        _auto_xdp_warn "XDP map ABI manifest is missing; forcing runtime reload"
+        return 1
+    }
+    while read -r map_name expected; do
+        [[ -z "$map_name" || "$map_name" == \#* ]] && continue
+        [[ "$expected" =~ ^[0-9]+$ ]] || return 1
+        _map_max_entries_ok "${BPF_PIN_DIR}/${map_name}" "$expected" || {
+            _auto_xdp_warn "${map_name} max_entries mismatch; forcing XDP reload"
+            return 1
+        }
+    done <"$abi_file"
+}
+
 xdp_maps_ready() {
     local map_name=""
     while IFS= read -r map_name; do
@@ -322,6 +362,7 @@ xdp_maps_ready() {
         _auto_xdp_warn "udp_global_rl value_size mismatch; forcing XDP reload"
         return 1
     }
+    _xdp_map_abi_ready || return 1
 }
 
 _auto_xdp_required_maps_file() {
@@ -459,10 +500,11 @@ load_tc_egress_program() {
     if ! bpftool prog load "$tc_obj_path" "$tc_prog_path" \
         type classifier \
         map name tcp_ct4 pinned "${BPF_PIN_DIR}/tcp_ct4" \
-        map name tcp_ct6 pinned "${BPF_PIN_DIR}/tcp_ct6" \
-        map name udp_ct4 pinned "${BPF_PIN_DIR}/udp_ct4" \
-        map name udp_ct6 pinned "${BPF_PIN_DIR}/udp_ct6" \
-        map name sctp_conntrack pinned "${BPF_PIN_DIR}/sctp_conntrack" >/dev/null 2>&1; then
+         map name tcp_ct6 pinned "${BPF_PIN_DIR}/tcp_ct6" \
+         map name udp_ct4 pinned "${BPF_PIN_DIR}/udp_ct4" \
+         map name udp_ct6 pinned "${BPF_PIN_DIR}/udp_ct6" \
+         map name sctp_conntrack pinned "${BPF_PIN_DIR}/sctp_conntrack" \
+         map name xdp_runtime_cfg pinned "${BPF_PIN_DIR}/xdp_runtime_cfg" >/dev/null 2>&1; then
         _auto_xdp_warn "Failed to load tc egress program; outbound TCP/UDP/SCTP reply tracking will be limited."
         return 1
     fi
@@ -536,6 +578,53 @@ load_tc_egress_program() {
     done
 
     [[ $attached -eq $total && $total -gt 0 ]]
+}
+
+_auto_xdp_restore_tc_egress() {
+    local tc_prog_path="${BPF_PIN_DIR}/tc_egress_prog"
+    local iface_var iface restored
+    local -a restored_ifaces=()
+
+    command -v tc &>/dev/null || {
+        _auto_xdp_warn "tc not found; cannot restore the egress tracker."
+        return 1
+    }
+
+    iface_var=$(_auto_xdp_iface_var_name) || return 1
+    local -n ifaces_ref="$iface_var"
+    [[ ${#ifaces_ref[@]} -gt 0 ]] || return 1
+
+    # Reuse the pinned program when only filters were lost after an interface
+    # reset. This avoids replacing healthy filters on other interfaces.
+    if [[ ! -e "$tc_prog_path" ]]; then
+        load_tc_egress_program
+        return $?
+    fi
+
+    for iface in "${ifaces_ref[@]}"; do
+        if tc filter show dev "$iface" egress pref "${TC_FILTER_PREF:-49152}" \
+                handle "${TC_FILTER_HANDLE:-1}" 2>/dev/null | grep -q .; then
+            continue
+        fi
+        tc qdisc add dev "$iface" clsact 2>/dev/null || true
+        if tc filter replace dev "$iface" egress \
+                pref "${TC_FILTER_PREF:-49152}" \
+                handle "${TC_FILTER_HANDLE:-1}" \
+                bpf direct-action object-pinned "$tc_prog_path" >/dev/null 2>&1; then
+            _auto_xdp_info "Restored tc egress TCP/UDP/SCTP tracker on $iface."
+            restored_ifaces+=("$iface")
+            continue
+        fi
+
+        _auto_xdp_warn "Failed to restore tc egress filter on $iface; rolling back restored filters."
+        for restored in "${restored_ifaces[@]}"; do
+            tc filter del dev "$restored" egress \
+                pref "${TC_FILTER_PREF:-49152}" \
+                handle "${TC_FILTER_HANDLE:-1}" 2>/dev/null || true
+        done
+        return 1
+    done
+    return 0
 }
 
 _auto_xdp_iface_xdp_mode() {

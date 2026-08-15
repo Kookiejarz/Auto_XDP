@@ -9,13 +9,19 @@ Usage: constructed and started by XdpBackend when [abuseipdb] enabled = true.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import socket
 import threading
 import urllib.error
 import urllib.request
 
-from auto_xdp.bpf.maps import BpfBaseMap, BpfLpmMap, BpfRuntimeConfigMap
+from auto_xdp.bpf.maps import (
+    XDP_CFG_FLAG_ABUSEIPDB_ENABLED,
+    BpfBaseMap,
+    BpfLpmMap,
+    BpfRuntimeConfigMap,
+)
 
 log = logging.getLogger(__name__)
 
@@ -78,55 +84,88 @@ class BpfRiskMaps(BpfBaseMap):
             m.close()
 
     def set_active(self, active: bool) -> None:
-        from auto_xdp.bpf.maps import XDP_CFG_FLAG_ABUSEIPDB_ENABLED
         flags = self._runtime_cfg.get_cfg_flags() or 0
         if active:
             flags |= XDP_CFG_FLAG_ABUSEIPDB_ENABLED
         else:
             flags &= ~XDP_CFG_FLAG_ABUSEIPDB_ENABLED
         timing = self._runtime_cfg.get() or (0,) * 8
-        self._runtime_cfg.set(timing, flags)
+        if not self._runtime_cfg.set(timing, flags):
+            raise OSError("failed to update AbuseIPDB active flag")
+
+    @staticmethod
+    def _normalize_v4(ips: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_ip in ips:
+            value = raw_ip.strip()
+            if not value or value.startswith("#"):
+                continue
+            if ":" in value:
+                try:
+                    ipaddress.IPv6Network(value, strict=False)
+                except ValueError as exc:
+                    raise ValueError(f"invalid IPv6 blocklist entry: {value!r}") from exc
+                continue
+            try:
+                cidr = str(ipaddress.IPv4Network(
+                    value if "/" in value else f"{value}/32",
+                    strict=False,
+                ))
+            except ValueError as exc:
+                raise ValueError(f"invalid IPv4 blocklist entry: {value!r}") from exc
+            if cidr not in seen:
+                seen.add(cidr)
+                normalized.append(cidr)
+        return normalized
 
     def replace_all(self, ips: list[str]) -> int:
-        """Replace all map entries with *ips*, then set the active flag.
+        """Replace all map entries with *ips* without an empty-map window.
 
-        Clears the map first, then writes the new entries. Sets active=1
-        when at least one IP was loaded, active=0 otherwise (fail-open while
-        the map is empty during an update cycle). IPv6 entries in *ips* are
-        ignored.
+        Input is fully validated before touching the BPF map. New entries are
+        written before stale entries are removed, so readers see either the old
+        blocklist or a fail-closed union of old and new entries. Any update
+        failure rolls back the changes and leaves the previous active flag in
+        place. IPv6 entries in *ips* are validated and ignored.
 
         Returns the count of v4 entries successfully written.
         """
-        for cidr in list(self._map4.active_keys()):
-            self._map4.delete(cidr)
+        target = set(self._normalize_v4(ips))
+        previous = set(self._map4.active_keys())
+        previous_flags = self._runtime_cfg.get_cfg_flags() or 0
+        flag_mask = XDP_CFG_FLAG_ABUSEIPDB_ENABLED
+        previous_active = bool(previous_flags & flag_mask)
+        added: list[str] = []
+        removed: list[str] = []
 
-        v4 = 0
-        overflow_v4 = 0
-        v4_seen: set[str] = set()
-        for ip in ips:
-            ip = ip.strip()
-            if not ip or ip.startswith("#"):
-                continue
-            if ":" in ip:
-                continue
-            cidr = ip if "/" in ip else f"{ip}/32"
-            if cidr in v4_seen:
-                continue
-            v4_seen.add(cidr)
-            if self._map4.set(cidr, 1):
-                v4 += 1
-            else:
-                overflow_v4 += 1
+        try:
+            for cidr in sorted(target - previous):
+                if not self._map4.set(cidr, 1):
+                    raise RuntimeError(f"failed to stage AbuseIPDB entry {cidr}")
+                added.append(cidr)
 
-        if overflow_v4:
-            log.warning(
-                "AbuseIPDB v4 map full: %d entries dropped (loaded=%d). "
-                "Increase max_entries in bpf/include/maps.h or use a smaller source window.",
-                overflow_v4, v4,
-            )
+            for cidr in sorted(previous - target):
+                if not self._map4.delete(cidr):
+                    raise RuntimeError(f"failed to remove stale AbuseIPDB entry {cidr}")
+                removed.append(cidr)
 
-        self.set_active(bool(v4))
-        return v4
+            self.set_active(bool(target))
+        except Exception:
+            # Remove staged entries first, then restore stale entries. This
+            # ordering also works when the map was full before the update.
+            for cidr in reversed(added):
+                if not self._map4.delete(cidr):
+                    log.error("Failed to roll back staged AbuseIPDB entry %s", cidr)
+            for cidr in removed:
+                if not self._map4.set(cidr, 1):
+                    log.error("Failed to restore AbuseIPDB entry %s", cidr)
+            try:
+                self.set_active(previous_active)
+            except OSError:
+                log.error("Failed to restore AbuseIPDB active flag")
+            raise
+
+        return len(target)
 
     def clear_all(self) -> None:
         self.replace_all([])
@@ -191,5 +230,5 @@ class AbuseIPDBSyncer:
         try:
             v4 = self._maps.replace_all(ips)
             log.info("AbuseIPDB: loaded %d IPv4 risk IPs", v4)
-        except OSError as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             log.error("AbuseIPDB map update failed: %s", exc)

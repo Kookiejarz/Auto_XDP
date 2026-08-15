@@ -184,12 +184,24 @@ class TestBpfRiskMaps(unittest.TestCase):
     def test_replace_all_logs_warning_when_v4_overflows(self):
         rm, map4, _ = self._make()
         map4.capacity = 2
-        with self.assertLogs("auto_xdp.abuseipdb", level="WARNING") as cm:
-            v4 = rm.replace_all(["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"])
-        self.assertEqual(v4, 2)
-        log_output = "\n".join(cm.output)
-        self.assertIn("v4", log_output.lower())
-        self.assertIn("2", log_output)  # 2 overflow entries
+        with self.assertRaises(RuntimeError):
+            rm.replace_all(["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"])
+        self.assertEqual(map4._entries, {})
+
+    def test_replace_all_rejects_invalid_input_before_mutating(self):
+        rm, map4, _ = self._make()
+        rm.replace_all(["1.2.3.4"])
+        with self.assertRaises(ValueError):
+            rm.replace_all(["5.6.7.8", "not-an-ip"])
+        self.assertEqual(map4._entries, {"1.2.3.4/32": 1})
+
+    def test_replace_all_keeps_previous_entries_when_update_fails(self):
+        rm, map4, _ = self._make()
+        rm.replace_all(["1.2.3.4"])
+        map4.capacity = 1
+        with self.assertRaises(RuntimeError):
+            rm.replace_all(["5.6.7.8"])
+        self.assertEqual(map4._entries, {"1.2.3.4/32": 1})
 
     def test_replace_all_no_warning_when_no_overflow(self):
         rm, _, _ = self._make()
@@ -247,6 +259,14 @@ class TestAbuseIPDBSyncer(unittest.TestCase):
             syncer._refresh()
         self.assertIn("1.2.3.4/32", map4._entries)
 
+    def test_refresh_retains_previous_state_when_blocklist_is_invalid(self):
+        syncer, _, map4 = self._make_syncer()
+        map4._entries["1.2.3.4/32"] = 1
+        with mock.patch("auto_xdp.abuseipdb.fetch_blocklist", return_value=["invalid"]), \
+             self.assertLogs("auto_xdp.abuseipdb", level="ERROR"):
+            syncer._refresh()
+        self.assertEqual(map4._entries, {"1.2.3.4/32": 1})
+
     def test_start_and_stop_thread(self):
         syncer, _, _ = self._make_syncer(refresh_seconds=3600.0)
         with mock.patch.object(syncer, "_refresh"):
@@ -299,6 +319,25 @@ class TestAbuseIPDBConfig(unittest.TestCase):
         import auto_xdp.config as cfg_mod
         cfg_mod.apply_toml_config({"abuseipdb": {"refresh_seconds": 7200}})
         self.assertEqual(cfg_mod.ABUSEIPDB_REFRESH_SECONDS, 7200.0)
+
+    def test_apply_toml_config_rolls_back_on_invalid_value(self):
+        import auto_xdp.config as cfg_mod
+        trusted_alias = cfg_mod.TRUSTED_SRC_IPS
+        cfg_mod.apply_toml_config({
+            "trusted_ips": {"198.51.100.8/32": "old"},
+            "permanent_ports": {"tcp": [443]},
+        })
+        try:
+            with self.assertRaises(ValueError):
+                cfg_mod.apply_toml_config({
+                    "trusted_ips": {"203.0.113.8/32": "new"},
+                    "permanent_ports": {"tcp": ["invalid"]},
+                })
+            self.assertEqual(cfg_mod.TCP_PERMANENT, {443: "config"})
+            self.assertIs(cfg_mod.TRUSTED_SRC_IPS, trusted_alias)
+            self.assertEqual(trusted_alias, {"198.51.100.8/32": "old"})
+        finally:
+            cfg_mod.apply_toml_config({})
 
     def test_map_paths_derived_from_bpf_pin_dir(self):
         import auto_xdp.config as cfg_mod

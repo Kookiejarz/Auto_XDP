@@ -577,7 +577,16 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         if (nexthdr == IPPROTO_NONE)
             return XDP_PASS;
 
-        if (bogon_filter_active() && is_bogon_v6(&ipv6->saddr)) {
+        bool ndp_control = false;
+        if (nexthdr == IPPROTO_ICMPV6 &&
+            (void *)((struct icmp6hdr *)trans_data + 1) <= data_end) {
+            __u8 icmp6_type = ((struct icmp6hdr *)trans_data)->icmp6_type;
+            ndp_control = icmp6_type >= 133 && icmp6_type <= 137;
+        }
+
+        /* NDP, including DAD (NS from ::), is link-local control traffic and
+         * must be admitted before the public-source bogon policy. */
+        if (bogon_filter_active() && !ndp_control && is_bogon_v6(&ipv6->saddr)) {
             count(CNT_BOGON_DROP);
             { __u32 s[4], d[4];
               __builtin_memcpy(s, &ipv6->saddr, 16);

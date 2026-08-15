@@ -10,6 +10,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "xdp_slot_ctx.h"
+#include "map_sizes.h"
 
 #define CT_FAMILY_IPV4 2
 #define CT_FAMILY_IPV6 10
@@ -106,70 +107,70 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 196608);
+    __uint(max_entries, CT_MAP_MAX_ENTRIES_V4);
     __type(key, struct ct_key_v4);
     __type(value, __u64);
 } tcp_ct4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, CT_MAP_MAX_ENTRIES_V6);
     __type(key, struct ct_key_v6);
     __type(value, __u64);
 } tcp_ct6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 49152);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
     __type(key, struct ct_key_v4);
     __type(value, __u32);
 } tcp_pd4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 16384);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
     __type(key, struct ct_key_v6);
     __type(value, __u32);
 } tcp_pd6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 49152);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
     __type(key, struct syn_rate_key_v4);
     __type(value, __u64);
 } hblk4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 16384);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
     __type(key, struct syn_rate_key_v6);
     __type(value, __u64);
 } hblk6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 49152);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
     __type(key, struct mc_rate_key_v4);
     __type(value, struct mc_rate_val);
 } mc_status_rate4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 16384);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
     __type(key, struct mc_rate_key_v6);
     __type(value, struct mc_rate_val);
 } mc_status_rate6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 49152);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
     __type(key, struct mc_rate_key_v4);
     __type(value, struct mc_rate_val);
 } mc_login_rate4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 16384);
+    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
     __type(key, struct mc_rate_key_v6);
     __type(value, struct mc_rate_val);
 } mc_login_rate6 SEC(".maps");
@@ -610,7 +611,7 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
     l3_off = (__u32)sc->l3_offset;
     inner_off_u32 = (__u32)sc->inner_offset;
     if (l3_off > 255 || inner_off_u32 > 255)
-        return XDP_PASS;
+        return XDP_DROP;
 
     inner_off = (__u16)inner_off_u32;
     family = sc->family;

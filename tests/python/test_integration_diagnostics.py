@@ -20,7 +20,7 @@ def test_setup_failure_stops_before_dependent_integration_cases():
     source = (ROOT / "tests/bash/test_integration.sh").read_text()
 
     assert '_load_xdp_program "integration setup" || return 1' in source
-    assert source.count('_require_setup "') == 8
+    assert source.count('_require_setup "') == 13
     assert "fatal: integration setup failed before" in source
 
 

@@ -88,7 +88,7 @@ jobs:
       - name: Install kernel test dependencies
         run: |
           apt-get update
-          apt-get install -y bash clang llvm libbpf-dev bpftool iproute2 python3 util-linux
+          apt-get install -y bash clang llvm libbpf-dev bpftool iproute2 python3 util-linux nftables
           if [ "$(uname -m)" = "x86_64" ]; then
             apt-get install -y gcc-multilib
           fi

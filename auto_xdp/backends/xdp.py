@@ -385,12 +385,6 @@ class XdpBackend(PortBackend):
         changed = False
         trusted_permanent = set(cfg.TRUSTED_SRC_IPS)
 
-        for port in sorted(plan.tcp_ports_to_add):
-            tag = f" [{cfg.TCP_PERMANENT[port]}]" if port in cfg.TCP_PERMANENT else ""
-            if self._ok(self.tcp_map.set(port, 1, dry_run)):
-                log.debug("TCP +%d%s", port, tag)
-                changed = True
-
         for port in sorted(plan.tcp_ports_to_remove):
             if self._ok(self.tcp_map.set(port, 0, dry_run)):
                 log.debug("TCP -%d  (stopped)", port)
@@ -427,12 +421,6 @@ class XdpBackend(PortBackend):
                 removed_conntrack,
                 "y" if removed_conntrack == 1 else "ies",
             )
-
-        for port in sorted(plan.udp_ports_to_add):
-            tag = f" [{cfg.UDP_PERMANENT[port]}]" if port in cfg.UDP_PERMANENT else ""
-            if self._ok(self.udp_map.set(port, 1, dry_run)):
-                log.debug("UDP +%d%s", port, tag)
-                changed = True
 
         for port in sorted(plan.udp_ports_to_remove):
             if self._ok(self.udp_map.set(port, 0, dry_run)):
@@ -611,6 +599,29 @@ class XdpBackend(PortBackend):
             for ip_str in sorted(current_sit4 - desired_sit4):
                 if self._ok(self.sit4_map.delete(ip_str, dry_run)):
                     log.info("SIT4 -%s (6in4 tunnel endpoint removed)", ip_str)
+
+        # BPF maps do not provide a transaction.  Prepare all protection state
+        # first, then expose new TCP/UDP ports only if that preparation passed.
+        # A failed map update leaves the port closed and is retried next round.
+        if self.last_apply_failures:
+            if plan.tcp_ports_to_add or plan.udp_ports_to_add:
+                log.warning(
+                    "Keeping new TCP/UDP ports closed because protection setup "
+                    "failed (%d map update failure(s)).",
+                    self.last_apply_failures,
+                )
+        else:
+            for port in sorted(plan.tcp_ports_to_add):
+                tag = f" [{cfg.TCP_PERMANENT[port]}]" if port in cfg.TCP_PERMANENT else ""
+                if self._ok(self.tcp_map.set(port, 1, dry_run)):
+                    log.debug("TCP +%d%s", port, tag)
+                    changed = True
+
+            for port in sorted(plan.udp_ports_to_add):
+                tag = f" [{cfg.UDP_PERMANENT[port]}]" if port in cfg.UDP_PERMANENT else ""
+                if self._ok(self.udp_map.set(port, 1, dry_run)):
+                    log.debug("UDP +%d%s", port, tag)
+                    changed = True
 
         if self.last_apply_failures and not dry_run:
             log.warning(
