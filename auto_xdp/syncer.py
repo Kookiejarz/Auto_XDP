@@ -11,7 +11,7 @@ import time
 from auto_xdp import config as cfg
 from auto_xdp.backends import NftablesBackend, PortBackend, XdpBackend
 from auto_xdp.config import apply_toml_config, load_toml_config
-from auto_xdp.discovery import get_listening_ports
+from auto_xdp.discovery import DiscoveryError, get_listening_ports
 from auto_xdp.policy import resolve_desired_state
 from auto_xdp.proc_events import drain_proc_events, open_proc_connector
 
@@ -36,6 +36,16 @@ EVENT_SOURCE_RETRY_INTERVAL_SECONDS = 5.0
 
 def observe_system_state():
     return get_listening_ports()
+
+
+def _reload_config(config_path: str) -> bool:
+    """Reload config without disturbing the last known-good configuration."""
+    try:
+        apply_toml_config(load_toml_config(config_path, strict=True))
+    except Exception as exc:
+        log.error("Configuration reload failed; retaining previous configuration: %s", exc)
+        return False
+    return True
 
 
 def sync_once(backend: PortBackend, dry_run: bool) -> None:
@@ -169,6 +179,10 @@ def watch(
                     last_reconcile_t = time.monotonic()
                     last_event_t = 0.0
                     first_event_t = 0.0
+                except DiscoveryError as exc:
+                    log.error("Initial discovery failed; keeping existing policy: %s", exc)
+                    last_reconcile_t = time.monotonic()
+                    continue
                 except (OSError, RuntimeError) as exc:
                     log.error("Failed to open backend: %s. Retrying in 5s...", exc)
                     time.sleep(5)
@@ -234,6 +248,11 @@ def watch(
                                 last_reconcile_t = time.monotonic()
                                 last_event_t = 0.0
                                 first_event_t = 0.0
+                            except DiscoveryError as exc:
+                                log.error("Discovery failed; keeping existing policy: %s", exc)
+                                last_event_t = time.monotonic()
+                                first_event_t = last_event_t
+                                continue
                             except (OSError, RuntimeError) as exc:
                                 log.error("Sync error (port_change): %s", exc)
                                 backend.close()
@@ -258,7 +277,8 @@ def watch(
                 _old_nft_family = cfg.NFT_FAMILY
                 _old_nft_table = cfg.NFT_TABLE
                 _old_preferred = cfg.PREFERRED_BACKEND
-                apply_toml_config(load_toml_config(config_path))
+                if not _reload_config(config_path):
+                    continue
                 if cli_trusted_ips:
                     TRUSTED_SRC_IPS.update(cli_trusted_ips)
                 if cli_log_level is None:
@@ -296,6 +316,11 @@ def watch(
                 try:
                     sync_once(backend, dry_run)
                     last_reconcile_t = time.monotonic()
+                except DiscoveryError as exc:
+                    log.error("Discovery failed; keeping existing policy: %s", exc)
+                    last_event_t = time.monotonic()
+                    first_event_t = last_event_t
+                    continue
                 except (OSError, RuntimeError) as exc:
                     log.error("Sync error: %s", exc)
                     log.warning("Backend may be broken; will attempt to re-initialize.")
@@ -329,6 +354,9 @@ def watch(
                     # pending event-triggered reconcile.
                     last_event_t = 0.0
                     first_event_t = 0.0
+                except DiscoveryError as exc:
+                    log.error("Periodic discovery failed; keeping existing policy: %s", exc)
+                    last_reconcile_t = time.monotonic()
                 except (OSError, RuntimeError) as exc:
                     log.error("Periodic sync error: %s", exc)
                     log.warning("Backend may be broken; will attempt to re-initialize.")

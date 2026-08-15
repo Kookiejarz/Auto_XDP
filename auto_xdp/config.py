@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ipaddress
 import logging
 import os
@@ -271,18 +272,27 @@ def normalize_cidr(cidr_str: str) -> str:
     return f"{net.network_address}/{net.prefixlen}"
 
 
-def load_toml_config(path: str = TOML_CONFIG_PATH) -> dict:
+def load_toml_config(path: str = TOML_CONFIG_PATH, *, strict: bool = False) -> dict:
     if tomllib is None:
         log.debug("tomllib not available; skipping TOML config load.")
+        if strict:
+            raise RuntimeError("TOML support is unavailable")
         return {}
     try:
         with open(path, "rb") as f:
             return tomllib.load(f)
     except FileNotFoundError:
+        if strict:
+            raise
         return {}
     except OSError as exc:
         log.warning("Failed to load %s: %s", path, exc)
+        if strict:
+            raise
         return {}
+    except ValueError as exc:
+        log.warning("Invalid TOML in %s: %s", path, exc)
+        raise
 
 
 
@@ -353,7 +363,7 @@ def _coerce_prefix_len(value: object, path: str, default: int, maximum: int) -> 
     return parsed
 
 
-def apply_toml_config(cfg: dict) -> None:
+def _apply_toml_config_in_place(cfg: dict) -> None:
     global BOGON_FILTER_ENABLED, ISATTACK_MODE, DROP_EVENTS_ENABLED
     global LOG_LEVEL, DEBOUNCE_SECONDS
     global DISCOVERY_EXCLUDE_LOOPBACK
@@ -610,3 +620,31 @@ def apply_toml_config(cfg: dict) -> None:
         "abuseipdb.refresh_seconds",
         3600.0,
     )
+
+
+def apply_toml_config(cfg: dict) -> None:
+    """Apply a configuration atomically from the daemon's perspective.
+
+    The parser below updates module-level policy tables for compatibility with
+    existing callers. If any field fails validation, restore every config
+    global so a failed SIGHUP cannot leave a partially applied policy.
+    """
+    snapshot = {
+        name: (value, copy.deepcopy(value))
+        for name, value in globals().items()
+        if name.isupper()
+    }
+    try:
+        _apply_toml_config_in_place(cfg)
+    except Exception:
+        for name, (original, saved) in snapshot.items():
+            if isinstance(original, dict):
+                original.clear()
+                original.update(saved)
+            elif isinstance(original, list):
+                original[:] = saved
+            elif isinstance(original, set):
+                original.clear()
+                original.update(saved)
+            globals()[name] = original
+        raise

@@ -105,6 +105,24 @@ def _configured_ifaces(env: dict[str, str]) -> list[str]:
     return []
 
 
+def _preferred_backend(env: dict[str, str]) -> str:
+    default = env.get("PREFERRED_BACKEND", "auto")
+    path = Path(env.get("TOML_CONFIG", "/etc/auto_xdp/config.toml"))
+    if not path.exists():
+        return default
+    try:
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+
+        with path.open("rb") as handle:
+            value = str(tomllib.load(handle).get("daemon", {}).get("preferred_backend", default)).lower()
+    except (ImportError, OSError, ValueError):
+        return default
+    return value if value in {"auto", "xdp", "nftables"} else default
+
+
 def detect_backend(ctx: RuntimeContext, interfaces: list[str]) -> str:
     return _detect_backend_impl(
         ctx.bpf_pin_dir, ctx.run_state_dir, interfaces, ctx.nft_family, ctx.nft_table
