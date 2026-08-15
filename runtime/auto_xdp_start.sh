@@ -184,6 +184,12 @@ ensure_xdp_loaded() {
             fi
         done
         [[ -f "$BPF_PIN_DIR/sock_state_link" ]] || load_sock_state_tracker || true
+        if ! _auto_xdp_restore_tc_egress; then
+            echo "[auto_xdp] warning: could not restore tc egress tracker after XDP re-attach" >&2
+            # XDP is still attached; do not let select_backend tear it down
+            # and replace it with nftables without a verified tc rollback.
+            return 2
+        fi
         load_port_handlers || true
         auto_tune_interface_parallelism || true
         [[ $_any_missing -eq 1 ]] && echo "[auto_xdp] re-attached XDP to missing interfaces" >&2

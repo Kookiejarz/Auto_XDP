@@ -1,11 +1,13 @@
 """
 Tests for the UDP global rate limiter algorithm (udp_global_rate_check).
 
-Uses a Python simulation of the BPF C function to verify algorithmic
-correctness without requiring kernel infrastructure.
+Uses a Python simulation of the current BPF C function in
+bpf/include/rate_limit.h to verify algorithmic correctness without
+requiring kernel infrastructure.
 """
 import threading
 import unittest
+from pathlib import Path
 
 XDP_PASS = 0
 XDP_DROP = 2
@@ -19,66 +21,7 @@ RATE_MAX_SMALL = BATCH - 1
 
 
 # ---------------------------------------------------------------------------
-# Python simulation of the CURRENT (unfixed) C behavior.
-# The flush-trigger packet is dropped; subsequent small packets pass.
-# ---------------------------------------------------------------------------
-
-def make_global_state():
-    return {
-        "lock": threading.Lock(),
-        "byte_rate_max": 0,
-        "window_start_ns": 0,
-        "prev_bytes": 0,
-        "curr_bytes": 0,
-    }
-
-
-def make_percpu_local():
-    return {"local_bytes": 0}
-
-
-def _current(g, local, now, pkt_bytes):
-    """Simulation of the current (unfixed) udp_global_rate_check()."""
-    if g["byte_rate_max"] == 0:
-        return XDP_PASS
-
-    local["local_bytes"] += pkt_bytes
-    if local["local_bytes"] < UDP_GLOBAL_BATCH_BYTES:
-        return XDP_PASS
-
-    to_flush = local["local_bytes"]
-    local["local_bytes"] = 0
-
-    ret = XDP_PASS
-    with g["lock"]:
-        if g["window_start_ns"] == 0:
-            g["window_start_ns"] = now
-            g["prev_bytes"] = 0
-            g["curr_bytes"] = to_flush
-        else:
-            elapsed = now - g["window_start_ns"]
-            if elapsed >= 2 * WINDOW_NS:
-                g["window_start_ns"] = now
-                g["prev_bytes"] = 0
-                g["curr_bytes"] = to_flush
-            else:
-                if elapsed >= WINDOW_NS:
-                    g["prev_bytes"] = g["curr_bytes"]
-                    g["curr_bytes"] = 0
-                    g["window_start_ns"] += WINDOW_NS
-                    elapsed -= WINDOW_NS
-                weighted = (g["prev_bytes"] * (WINDOW_NS - elapsed)
-                            + g["curr_bytes"] * WINDOW_NS)
-                threshold = g["byte_rate_max"] * WINDOW_NS
-                if weighted + to_flush * WINDOW_NS > threshold:
-                    ret = XDP_DROP
-                else:
-                    g["curr_bytes"] += to_flush
-    return ret
-
-
-# ---------------------------------------------------------------------------
-# Desired (fixed) simulation — blocked_until_ns fast path.
+# Simulation of the current C behavior — blocked_until_ns fast path.
 # ---------------------------------------------------------------------------
 
 def make_global_state_v2(byte_rate_max=0):
@@ -100,7 +43,7 @@ def make_percpu_local_v2():
 
 
 def _v2(g, local, now, pkt_bytes):
-    """Simulation of the desired (fixed) udp_global_rate_check()."""
+    """Simulation of the current udp_global_rate_check() in rate_limit.h."""
     if g["byte_rate_max"] == 0:
         return XDP_PASS
 
@@ -180,50 +123,17 @@ def _trigger_block(g, local, now):
     assert result == XDP_DROP, "Expected block to be triggered"
 
 
-# ---------------------------------------------------------------------------
-# Tests of the CURRENT (unfixed) simulation — all must pass as a baseline.
-# ---------------------------------------------------------------------------
+class TestCurrentCMatchesBlockedUntilFastPath(unittest.TestCase):
+    def test_c_implementation_uses_blocked_until_fast_path(self):
+        source = (
+            Path(__file__).resolve().parents[2] / "bpf" / "include" / "rate_limit.h"
+        ).read_text()
+        self.assertIn("udp_global_block_fast_path", source)
+        self.assertIn("blocked_until_ns", source)
+        self.assertIn("local->local_bytes = 0", source)
+
 
 class TestCurrentBehavior(unittest.TestCase):
-    def setUp(self):
-        self.g = make_global_state()
-        self.g["byte_rate_max"] = RATE_MAX_SMALL
-        self.local = make_percpu_local()
-
-    def test_disabled_limiter_always_passes(self):
-        self.g["byte_rate_max"] = 0
-        for _ in range(100):
-            self.assertEqual(_current(self.g, self.local, 1_000_000_000, BATCH), XDP_PASS)
-
-    def test_below_limit_passes(self):
-        # One batch at rate_max > BATCH → under the limit on first flush.
-        self.g["byte_rate_max"] = 200 * 1024
-        result = _current(self.g, self.local, 500_000_000, BATCH)
-        self.assertEqual(result, XDP_PASS)
-
-    def test_second_batch_drops_when_over_limit(self):
-        now = 500_000_000
-        _current(self.g, self.local, now, BATCH)   # initialises window
-        result = _current(self.g, self.local, now, BATCH)
-        self.assertEqual(result, XDP_DROP)
-
-    def test_current_only_drops_flush_trigger(self):
-        """After the flush trigger is dropped, small packets pass because
-        local_bytes was cleared and the next batch hasn't filled yet."""
-        now = 500_000_000
-        _current(self.g, self.local, now, BATCH)
-        _current(self.g, self.local, now, BATCH)   # trigger block
-
-        # Small subsequent packet — PASSES (the known limitation).
-        result = _current(self.g, self.local, now + 1, 1)
-        self.assertEqual(result, XDP_PASS)
-
-
-# ---------------------------------------------------------------------------
-# Tests for the DESIRED (v2) behavior.
-# ---------------------------------------------------------------------------
-
-class TestDesiredBehavior(unittest.TestCase):
     def test_disabled_limiter_always_passes(self):
         g = make_global_state_v2(byte_rate_max=0)
         local = make_percpu_local_v2()

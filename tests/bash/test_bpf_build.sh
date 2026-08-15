@@ -30,9 +30,15 @@ fetch_local_or_remote() {
 set +e
 compile_xdp_program
 status=$?
+compile_sock_state_program
+sock_status=$?
 set -e
 if [[ $status -ne 0 ]]; then
     echo "compile_xdp_program failed"
+    exit 1
+fi
+if [[ $sock_status -ne 0 ]]; then
+    echo "compile_sock_state_program failed"
     exit 1
 fi
 
@@ -48,18 +54,26 @@ TC_OBJ_INSTALLED="$BUILD_STAGING_DIR/$TC_OBJ"
     exit 1
 }
 
+[[ -s "$BUILD_STAGING_DIR/xdp_map_abi.txt" ]] || {
+    echo "missing staged XDP map ABI manifest"
+    exit 1
+}
+
+[[ -s "$BUILD_STAGING_DIR/$SOCK_STATE_OBJ" ]] || {
+    echo "missing staged sock_state object: $BUILD_STAGING_DIR/$SOCK_STATE_OBJ"
+    exit 1
+}
+
 resolve_bpf_build_env || {
     echo "failed to resolve native BPF build environment"
     exit 1
 }
 
-make -C handlers clean >/dev/null 2>&1 || true
-make -C handlers -f Makefile --no-print-directory \
-    CLANG="clang" \
-    ASM_INC="$ASM_INC" \
-    ARCH_FLAGS="-D__TARGET_ARCH_${TARGET_ARCH} ${HOST_ARCH_FLAG}"
-
-for handler_obj in handlers/gre_handler.o handlers/esp_handler.o handlers/sctp_handler.o; do
+for handler_obj in \
+    "$BUILD_STAGING_DIR/handlers/gre_handler.o" \
+    "$BUILD_STAGING_DIR/handlers/esp_handler.o" \
+    "$BUILD_STAGING_DIR/handlers/sctp_handler.o" \
+    "$BUILD_STAGING_DIR/handlers/minecraft_handler.o"; do
     [[ -s "$handler_obj" ]] || {
         echo "missing compiled handler object: $handler_obj"
         exit 1

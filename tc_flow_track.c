@@ -43,10 +43,48 @@ struct vlan_hdr {
 // ingress program via bpf/include/common.h — single source of truth for the
 // bit encoding used in the tcp_ct4/tcp_ct6 maps.
 #include "ct_flags.h"
+#include "map_sizes.h"
 
 // Conntrack timeouts and refresh intervals (must match XDP)
-#define TCP_TIMEOUT_NS       (300ULL * 1000000000ULL)
-#define CT_REFRESH_INTERVAL  (30ULL  * 1000000000ULL)
+#define NS_PER_SEC 1000000000ULL
+
+struct xdp_runtime_cfg {
+    __u64 tcp_timeout_ns;
+    __u64 udp_timeout_ns;
+    __u64 ct_refresh_ns;
+    __u64 icmp_token_max;
+    __u64 icmp_ns_per_token;
+    __u64 udp_global_window_ns;
+    __u64 rate_window_ns;
+    __u64 syn_timeout_ns;
+    __u32 cfg_flags;
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct xdp_runtime_cfg);
+} xdp_runtime_cfg SEC(".maps");
+
+static __always_inline struct xdp_runtime_cfg *tc_runtime_cfg(void)
+{
+    __u32 key = 0;
+    return bpf_map_lookup_elem(&xdp_runtime_cfg, &key);
+}
+
+static __always_inline __u64 tc_tcp_timeout_ns(void)
+{
+    struct xdp_runtime_cfg *cfg = tc_runtime_cfg();
+    return cfg && cfg->tcp_timeout_ns ? cfg->tcp_timeout_ns : 300ULL * NS_PER_SEC;
+}
+
+static __always_inline __u64 tc_refresh_ns(void)
+{
+    struct xdp_runtime_cfg *cfg = tc_runtime_cfg();
+    return cfg && cfg->ct_refresh_ns ? cfg->ct_refresh_ns : 30ULL * NS_PER_SEC;
+}
 
 struct flow_key {
     __u8 family;
@@ -73,28 +111,28 @@ struct ct_key_v6 {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 196608);
+    __uint(max_entries, CT_MAP_MAX_ENTRIES_V4);
     __type(key, struct ct_key_v4);
     __type(value, __u64);
 } tcp_ct4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, CT_MAP_MAX_ENTRIES_V6);
     __type(key, struct ct_key_v6);
     __type(value, __u64);
 } tcp_ct6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 196608);
+    __uint(max_entries, CT_MAP_MAX_ENTRIES_V4);
     __type(key, struct ct_key_v4);
     __type(value, __u64);
 } udp_ct4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, CT_MAP_MAX_ENTRIES_V6);
     __type(key, struct ct_key_v6);
     __type(value, __u64);
 } udp_ct6 SEC(".maps");
@@ -271,9 +309,9 @@ int tc_egress_track(struct __sk_buff *skb)
                     if (last_seen) {
                         __u64 ts = *last_seen & ~CT_SYN_PENDING;
                         if ((tcp_flags & TCP_FLAG_RST) ||
-                            now - ts > TCP_TIMEOUT_NS) {
+                            now - ts > tc_tcp_timeout_ns()) {
                             bpf_map_delete_elem(&tcp_ct4, &map_key);
-                        } else if (now - ts > CT_REFRESH_INTERVAL) {
+                        } else if (now - ts > tc_refresh_ns()) {
                             __u64 new_val = (*last_seen & CT_SYN_PENDING) | now;
                             bpf_map_update_elem(&tcp_ct4, &map_key, &new_val, BPF_EXIST);
                         }
@@ -295,7 +333,7 @@ int tc_egress_track(struct __sk_buff *skb)
                 __u64 *last_seen_udp;
                 fill_ct_key_v4_map(&map_key, &key);
                 last_seen_udp = bpf_map_lookup_elem(&udp_ct4, &map_key);
-                if (!last_seen_udp || (now - *last_seen_udp > CT_REFRESH_INTERVAL))
+                if (!last_seen_udp || (now - *last_seen_udp > tc_refresh_ns()))
                     bpf_map_update_elem(&udp_ct4, &map_key, &now, BPF_ANY);
             }
             return TC_ACT_OK;
@@ -307,7 +345,7 @@ int tc_egress_track(struct __sk_buff *skb)
             now = bpf_ktime_get_ns();
             {
                 __u64 *last_seen_sctp = bpf_map_lookup_elem(&sctp_conntrack, &key);
-                if (!last_seen_sctp || (now - *last_seen_sctp > CT_REFRESH_INTERVAL))
+                if (!last_seen_sctp || (now - *last_seen_sctp > tc_refresh_ns()))
                     bpf_map_update_elem(&sctp_conntrack, &key, &now, BPF_ANY);
             }
             return TC_ACT_OK;
@@ -348,9 +386,9 @@ int tc_egress_track(struct __sk_buff *skb)
                 if (last_seen) {
                     __u64 ts = *last_seen & ~CT_SYN_PENDING;
                     if ((tcp_flags & TCP_FLAG_RST) ||
-                        now - ts > TCP_TIMEOUT_NS) {
+                        now - ts > tc_tcp_timeout_ns()) {
                         bpf_map_delete_elem(&tcp_ct6, &map_key);
-                    } else if (now - ts > CT_REFRESH_INTERVAL) {
+                    } else if (now - ts > tc_refresh_ns()) {
                         __u64 new_val = (*last_seen & CT_SYN_PENDING) | now;
                         bpf_map_update_elem(&tcp_ct6, &map_key, &new_val, BPF_EXIST);
                     }
@@ -370,7 +408,7 @@ int tc_egress_track(struct __sk_buff *skb)
             __u64 *last_seen_v6_udp;
             fill_ct_key_v6_map(&map_key, &key);
             last_seen_v6_udp = bpf_map_lookup_elem(&udp_ct6, &map_key);
-            if (!last_seen_v6_udp || (now - *last_seen_v6_udp > CT_REFRESH_INTERVAL))
+            if (!last_seen_v6_udp || (now - *last_seen_v6_udp > tc_refresh_ns()))
                 bpf_map_update_elem(&udp_ct6, &map_key, &now, BPF_ANY);
         }
         return TC_ACT_OK;
@@ -382,7 +420,7 @@ int tc_egress_track(struct __sk_buff *skb)
         fill_flow_key_v6(&key, &ipv6->daddr, &ipv6->saddr, sctp->dport, sctp->sport);
         {
             __u64 *last_seen_sctp6 = bpf_map_lookup_elem(&sctp_conntrack, &key);
-            if (!last_seen_sctp6 || (now - *last_seen_sctp6 > CT_REFRESH_INTERVAL))
+            if (!last_seen_sctp6 || (now - *last_seen_sctp6 > tc_refresh_ns()))
                 bpf_map_update_elem(&sctp_conntrack, &key, &now, BPF_ANY);
         }
         return TC_ACT_OK;

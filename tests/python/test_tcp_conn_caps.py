@@ -265,12 +265,71 @@ class PortPolicyStructLayoutTests(unittest.TestCase):
         )
 
 
-class CounterTimingTests(unittest.TestCase):
-    """Bug 2 foundational: counter increments iff ESTABLISHED transition seen.
+CONN_STATE_COUNT_MASK = 0xFFFFFFFF
+CONN_STATE_TICK_NS = 100_000_000
+XDP_PASS = 0
+XDP_DROP = 2
 
-    Python ports of new BPF helpers — we verify the algorithm contract.
-    Same pattern as test_udp_global_rl.py.
-    """
+
+def _conn_state_tick(now):
+    return now // CONN_STATE_TICK_NS
+
+
+def _conn_state_pack(tick, count_value):
+    return ((tick & CONN_STATE_COUNT_MASK) << 32) | (count_value & CONN_STATE_COUNT_MASK)
+
+
+def _conn_state_unpack(state):
+    return state >> 32, state & CONN_STATE_COUNT_MASK
+
+
+def _conn_state_timeout_ticks(timeout_ns):
+    ticks = timeout_ns // CONN_STATE_TICK_NS
+    if timeout_ns % CONN_STATE_TICK_NS:
+        ticks += 1
+    if ticks == 0:
+        return 1
+    return ticks
+
+
+def _shared_conn_count_record(state, now, timeout_ns):
+    now_tick = _conn_state_tick(now)
+    timeout_ticks = _conn_state_timeout_ticks(timeout_ns)
+    last_tick, count_value = _conn_state_unpack(state)
+    if count_value == 0 or (now_tick - last_tick) > timeout_ticks:
+        count_value = 1
+    elif count_value < CONN_STATE_COUNT_MASK:
+        count_value += 1
+    return _conn_state_pack(now_tick, count_value)
+
+
+def _shared_conn_count_activity(state, now):
+    now_tick = _conn_state_tick(now)
+    _, count_value = _conn_state_unpack(state)
+    if count_value == 0:
+        count_value = 1
+    return _conn_state_pack(now_tick, count_value)
+
+
+def _shared_conn_count_close(state, now):
+    now_tick = _conn_state_tick(now)
+    _, count_value = _conn_state_unpack(state)
+    if count_value > 0:
+        count_value -= 1
+    return _conn_state_pack(now_tick, count_value)
+
+
+def _shared_conn_count_check(state, now, timeout_ns, limit):
+    last_tick, count_value = _conn_state_unpack(state)
+    if count_value == 0:
+        return XDP_PASS
+    if (_conn_state_tick(now) - last_tick) > _conn_state_timeout_ticks(timeout_ns):
+        return XDP_PASS
+    return XDP_DROP if count_value >= limit else XDP_PASS
+
+
+class CounterTimingTests(unittest.TestCase):
+    """Python port of the packed atomic connection-counter helpers."""
 
     def setUp(self):
         self.tsc = {}
@@ -278,35 +337,37 @@ class CounterTimingTests(unittest.TestCase):
 
     def _record_established(self, key, now, dest_port):
         k = (key, dest_port)
-        v = self.tsc.get(k)
-        if v is None:
-            self.tsc[k] = {"count": 1, "last_seen_ns": now}
+        self.tsc[k] = _shared_conn_count_record(
+            self.tsc.get(k, 0), now, self.tcp_timeout_ns
+        )
+
+    def _record_activity(self, key, now, dest_port):
+        k = (key, dest_port)
+        if k not in self.tsc:
             return
-        if now - v["last_seen_ns"] > self.tcp_timeout_ns:
-            v["count"] = 1
-        else:
-            v["count"] += 1
-        v["last_seen_ns"] = now
+        self.tsc[k] = _shared_conn_count_activity(self.tsc[k], now)
 
     def _record_close(self, key, now, dest_port, was_established):
         if not was_established:
             return
         k = (key, dest_port)
-        v = self.tsc.get(k)
-        if v is None:
+        if k not in self.tsc:
             return
-        if v["count"] <= 1:
+        next_state = _shared_conn_count_close(self.tsc[k], now)
+        if (next_state & CONN_STATE_COUNT_MASK) == 0:
             del self.tsc[k]
             return
-        v["count"] -= 1
-        v["last_seen_ns"] = now
+        self.tsc[k] = next_state
+
+    def _count(self, key, dest_port):
+        return _conn_state_unpack(self.tsc[(key, dest_port)])[1]
 
     def test_syn_arrival_does_not_increment(self):
         self.assertEqual(len(self.tsc), 0)
 
     def test_full_handshake_increments_once(self):
         self._record_established(("10.0.0.1", 0), 1_000_000_000, 22)
-        self.assertEqual(self.tsc[(("10.0.0.1", 0), 22)]["count"], 1)
+        self.assertEqual(self._count(("10.0.0.1", 0), 22), 1)
 
     def test_full_cycle_returns_to_zero(self):
         self._record_established(("10.0.0.1", 0), 1_000, 22)
@@ -316,13 +377,24 @@ class CounterTimingTests(unittest.TestCase):
     def test_half_open_close_does_not_decrement(self):
         self._record_established(("10.0.0.1", 0), 1_000, 22)
         self._record_close(("10.0.0.1", 0), 2_000, 22, was_established=False)
-        self.assertEqual(self.tsc[(("10.0.0.1", 0), 22)]["count"], 1)
+        self.assertEqual(self._count(("10.0.0.1", 0), 22), 1)
 
     def test_ttl_self_heal_resets_stale_count(self):
         k = ((1, 2, 3, 4), 22)
-        self.tsc[k] = {"count": 999, "last_seen_ns": 0}
+        self.tsc[k] = _conn_state_pack(0, 999)
         self._record_established((1, 2, 3, 4), 2 * self.tcp_timeout_ns, 22)
-        self.assertEqual(self.tsc[k]["count"], 1)
+        self.assertEqual(self._count((1, 2, 3, 4), 22), 1)
+
+    def test_activity_refresh_keeps_count_from_expiring(self):
+        key = ("10.0.0.1", 0)
+        self._record_established(key, 1_000, 22)
+        later = self.tcp_timeout_ns + 1_000
+        self._record_activity(key, later, 22)
+        self.assertEqual(self._count(key, 22), 1)
+        self.assertEqual(
+            _shared_conn_count_check(self.tsc[(key, 22)], later, self.tcp_timeout_ns, 1),
+            XDP_DROP,
+        )
 
 
 class PerPrefixCapTests(unittest.TestCase):
@@ -334,25 +406,15 @@ class PerPrefixCapTests(unittest.TestCase):
 
     def _record(self, prefix, port, now):
         k = (prefix, port)
-        v = self.tsc_pfx.get(k)
-        if v is None:
-            self.tsc_pfx[k] = {"count": 1, "last_seen_ns": now}
-            return
-        if now - v["last_seen_ns"] > self.tcp_timeout_ns:
-            v["count"] = 1
-        else:
-            v["count"] += 1
-        v["last_seen_ns"] = now
+        self.tsc_pfx[k] = _shared_conn_count_record(
+            self.tsc_pfx.get(k, 0), now, self.tcp_timeout_ns
+        )
 
     def _check(self, prefix, port, now, cap):
         if cap == 0:
             return "pass"
-        v = self.tsc_pfx.get((prefix, port))
-        if v is None:
-            return "pass"
-        if now - v["last_seen_ns"] > self.tcp_timeout_ns:
-            return "pass"
-        return "drop" if v["count"] >= cap else "pass"
+        state = self.tsc_pfx.get((prefix, port), 0)
+        return "drop" if _shared_conn_count_check(state, now, self.tcp_timeout_ns, cap) == XDP_DROP else "pass"
 
     def test_below_cap_passes(self):
         for _ in range(4):
@@ -367,7 +429,7 @@ class PerPrefixCapTests(unittest.TestCase):
     def test_distributed_sources_share_one_counter(self):
         self._record("10.0.0.0/24", 80, 1_000)
         self._record("10.0.0.0/24", 80, 1_001)
-        self.assertEqual(self.tsc_pfx[("10.0.0.0/24", 80)]["count"], 2)
+        self.assertEqual(_conn_state_unpack(self.tsc_pfx[("10.0.0.0/24", 80)])[1], 2)
 
 
 class PerPortCapTests(unittest.TestCase):
@@ -378,25 +440,15 @@ class PerPortCapTests(unittest.TestCase):
         self.tcp_timeout_ns = 300_000_000_000
 
     def _record(self, port, now):
-        v = self.tsc_port.get(port)
-        if v is None:
-            self.tsc_port[port] = {"count": 1, "last_seen_ns": now}
-            return
-        if now - v["last_seen_ns"] > self.tcp_timeout_ns:
-            v["count"] = 1
-        else:
-            v["count"] += 1
-        v["last_seen_ns"] = now
+        self.tsc_port[port] = _shared_conn_count_record(
+            self.tsc_port.get(port, 0), now, self.tcp_timeout_ns
+        )
 
     def _check(self, port, now, cap):
         if cap == 0:
             return "pass"
-        v = self.tsc_port.get(port)
-        if v is None:
-            return "pass"
-        if now - v["last_seen_ns"] > self.tcp_timeout_ns:
-            return "pass"
-        return "drop" if v["count"] >= cap else "pass"
+        state = self.tsc_port.get(port, 0)
+        return "drop" if _shared_conn_count_check(state, now, self.tcp_timeout_ns, cap) == XDP_DROP else "pass"
 
     def test_below_port_cap_passes(self):
         for _ in range(199):

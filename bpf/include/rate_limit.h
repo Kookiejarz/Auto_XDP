@@ -511,7 +511,7 @@ prefix_done:
 }
 
 static __always_inline void tcp_src_conn_record_activity(struct flow_key *key, __u64 now,
-                                                         __u32 dest_port)
+                                                          __u32 dest_port)
 {
     if (key->family == CT_FAMILY_IPV4) {
         struct tcp_src_conn_key_v4 skey;
@@ -522,10 +522,7 @@ static __always_inline void tcp_src_conn_record_activity(struct flow_key *key, _
         if (!sv)
             return;
         shared_conn_count_activity(&sv->state, now);
-        return;
-    }
-
-    {
+    } else {
         struct tcp_src_conn_key_v6 skey;
         struct tcp_src_conn_val *sv;
 
@@ -534,6 +531,37 @@ static __always_inline void tcp_src_conn_record_activity(struct flow_key *key, _
         if (!sv)
             return;
         shared_conn_count_activity(&sv->state, now);
+    }
+
+    /* Keep the aggregate counters alive for long-lived connections too. */
+    {
+        struct tcp_port_policy_cfg *policy =
+            bpf_map_lookup_elem(&tcp_port_policies, &dest_port);
+        __u32 prefix_v4 = policy ? policy->source_prefix_v4 : 32;
+        __u32 prefix_v6 = policy ? policy->source_prefix_v6 : 128;
+
+        if (key->family == CT_FAMILY_IPV4) {
+            struct prefix_rate_key_v4 pkey;
+            struct tcp_pfx_conn_val *pv;
+            fill_prefix_rate_key_v4(&pkey, key, dest_port, prefix_v4);
+            pv = bpf_map_lookup_elem(&tsc_pfx4, &pkey);
+            if (pv)
+                shared_conn_count_activity(&pv->state, now);
+        } else {
+            struct prefix_rate_key_v6 pkey;
+            struct tcp_pfx_conn_val *pv;
+            fill_prefix_rate_key_v6(&pkey, key, dest_port, prefix_v6);
+            pv = bpf_map_lookup_elem(&tsc_pfx6, &pkey);
+            if (pv)
+                shared_conn_count_activity(&pv->state, now);
+        }
+    }
+
+    {
+        struct tcp_port_conn_val *pv =
+            bpf_map_lookup_elem(&tsc_port, &dest_port);
+        if (pv)
+            shared_conn_count_activity(&pv->state, now);
     }
 }
 

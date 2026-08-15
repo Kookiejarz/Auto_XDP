@@ -1359,6 +1359,38 @@ test_install_runtime_service_step_warns_without_init_system() (
     assert_contains "$output" "start manually: $RUNNER_SCRIPT"
 )
 
+test_cleanup_existing_xdp_ignores_xdp_in_interface_name() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/bin"
+    cat >"$tmpdir/bin/ls" <<'EOF_LS'
+#!/bin/sh
+printf 'axdp0\naxdp0p\n'
+EOF_LS
+    cat >"$tmpdir/bin/ip" <<'EOF_IP'
+#!/bin/sh
+printf '2: %s: <BROADCAST,MULTICAST,UP>\n    link/ether 00:00:00:00:00:01\n' "$4"
+EOF_IP
+    chmod +x "$tmpdir/bin/ls" "$tmpdir/bin/ip"
+    PATH="$tmpdir/bin:$PATH"
+
+    cleanup_existing_xdp >/dev/null 2>&1 || return 1
+    assert_eq "${#XDP_PREVIOUS_IFACES[@]}" "0"
+)
+
+test_relay_service_security_directives() (
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RELAY_GROUP="${RELAY_GROUP:-auto-xdp}"' || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RuntimeDirectoryMode=0750' || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'UMask=0007' || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RuntimeDirectory=auto_xdp' || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'PartOf=${SERVICE_NAME}.service' || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" '.relay-group-created' || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'command_user="root:${RELAY_GROUP}"' || return 1
+)
+
 test_load_configured_slot_handlers_step_only_runs_for_xdp() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -2041,6 +2073,8 @@ run_test "setup_xdp backend step falls back to nftables" test_deploy_backend_ste
 run_test "setup_xdp refuses nftables fallback while XDP remains attached" test_deploy_backend_step_refuses_fallback_with_active_xdp
 run_test "setup_xdp removes tc filter from removed interface" test_deploy_xdp_removes_tc_filter_from_removed_interface
 run_test "setup_xdp service step warns when no init system exists" test_install_runtime_service_step_warns_without_init_system
+run_test "setup_xdp ignores xdp text in interface names" test_cleanup_existing_xdp_ignores_xdp_in_interface_name
+run_test "relay service emits secure runtime directives" test_relay_service_security_directives
 run_test "setup_xdp loads configured slot handlers only for xdp backend" test_load_configured_slot_handlers_step_only_runs_for_xdp
 run_test "setup_xdp cleanup step preserves local sources" test_cleanup_build_artifacts_step_preserves_local_sources
 run_test "setup_xdp restores compiled builtin slot handlers after runtime install" test_restore_compiled_slot_handlers_reinstalls_builtin_objects

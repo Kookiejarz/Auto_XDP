@@ -50,6 +50,42 @@ compile_bpf_object() {
     return 0
 }
 
+generate_xdp_map_abi() {
+    local source_root="$1"
+    local header="${source_root}/bpf/include/map_sizes.h"
+    local ct4 ct6 rate4 rate6
+
+    [[ -f "$header" ]] || return 1
+    ct4=$(awk '$2 == "CT_MAP_MAX_ENTRIES_V4" { print $3; exit }' "$header")
+    ct6=$(awk '$2 == "CT_MAP_MAX_ENTRIES_V6" { print $3; exit }' "$header")
+    rate4=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V4" { print $3; exit }' "$header")
+    rate6=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V6" { print $3; exit }' "$header")
+    [[ "$ct4" =~ ^[0-9]+$ && "$ct6" =~ ^[0-9]+$ \
+        && "$rate4" =~ ^[0-9]+$ && "$rate6" =~ ^[0-9]+$ ]] || return 1
+
+    cat >"${BUILD_STAGING_DIR}/xdp_map_abi.txt" <<EOF
+# Map capacities derived from bpf/include/map_sizes.h.
+tcp_ct4 ${ct4}
+tcp_ct6 ${ct6}
+udp_ct4 ${ct4}
+udp_ct6 ${ct6}
+tcp_pd4 ${rate4}
+tcp_pd6 ${rate6}
+hblk4 ${rate4}
+hblk6 ${rate6}
+udp_hv4 ${rate4}
+udp_hv6 ${rate6}
+synag4 ${rate4}
+synag6 ${rate6}
+udpag4 ${rate4}
+udpag6 ${rate6}
+tsc4 ${rate4}
+tsc6 ${rate6}
+tsc_pfx4 ${rate4}
+tsc_pfx6 ${rate6}
+EOF
+}
+
 resolve_bpf_target_arch() {
     local arch
     arch=$(uname -m)
@@ -232,10 +268,14 @@ compile_xdp_program() {
     else
         # curl | bash: build.sh itself was fetched from GitHub, so this list
         # matches the remote repo's bpf/include/ at the same commit.
-        local _bpf_headers=(ct_flags.h common.h keys.h maps.h trust_acl.h rate_limit.h port_dispatch.h conntrack.h parse.h slots.h)
+        local _bpf_headers=(ct_flags.h common.h keys.h map_sizes.h maps.h trust_acl.h rate_limit.h port_dispatch.h conntrack.h parse.h slots.h)
         for _hdr in "${_bpf_headers[@]}"; do
             stage_build_source "bpf/include/${_hdr}" "bpf/include/${_hdr}" "bpf/include/${_hdr}" || true
         done
+    fi
+    if ! generate_xdp_map_abi "$_source_root"; then
+        warn "Unable to derive the BPF map ABI manifest; XDP backend will be skipped."
+        return 1
     fi
     local _handlers_ready=0
     if prepare_slot_handler_sources; then

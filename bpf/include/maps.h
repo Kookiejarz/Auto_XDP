@@ -1,10 +1,6 @@
 #pragma once
 #include "keys.h"
-
-#define CT_MAP_MAX_ENTRIES_V4 196608
-#define CT_MAP_MAX_ENTRIES_V6 196608
-#define RATE_MAP_MAX_ENTRIES_V4 49152
-#define RATE_MAP_MAX_ENTRIES_V6 16384
+#include "map_sizes.h"
 
 /* Note: pkt_counters (PERCPU_ARRAY) and pkt_ringbuf (RINGBUF) are declared
  * in common.h alongside the count() and emit_drop() helpers that use them.
