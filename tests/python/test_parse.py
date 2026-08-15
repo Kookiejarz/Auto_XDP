@@ -1,100 +1,41 @@
-import json
-import sys
+"""Tests for the production XDP counter dump parser."""
 
-names = [
-    "TCP_NEW_ALLOW",
-    "TCP_ESTABLISHED",
-    "TCP_DROP",
-    "UDP_PASS",
-    "UDP_DROP",
-    "IPv4_OTHER",
-    "IPv6_ICMP",
-    "FRAG_DROP",
-    "ARP_NON_IP",
-    "TCP_CT_MISS",
-    "ICMP_DROP",
-    "SYN_RATE_DROP",
-    "UDP_RATE_DROP",
-    "UDP_GBL_DROP",
-    "TCP_NULL",
-    "TCP_XMAS",
-    "TCP_SYN_FIN",
-    "TCP_SYN_RST",
-    "TCP_RST_FIN",
-    "TCP_BAD_DOFF",
-    "TCP_PORT0",
-    "VLAN_DROP",
-    "SLOT_CALL",
-    "SLOT_PASS",
-    "SLOT_DROP",
-    "UDP_PORT0",
-    "UDP_BAD_LEN",
-    "BOGON_DROP",
-]
+from unittest import mock
 
-def norm(values):
-    if isinstance(values, int):
-        return values
-    if isinstance(values, str):
-        try:
-            return int(values, 0)
-        except ValueError:
-            return 0
-    if isinstance(values, list):
-        return sum(norm(item) for item in values)
-    if isinstance(values, dict):
-        if "value" in values:
-            return norm(values["value"])
-        if "values" in values:
-            return norm(values["values"])
-        total = 0
-        for key, item in values.items():
-            if key in {"cpu", "index", "key"}:
-                continue
-            total += norm(item)
-        return total
-    return 0
+import auto_xdp.admin_cli as admin_cli
 
-def parse_key(key):
-    if isinstance(key, int):
-        return key
-    if isinstance(key, str):
-        try:
-            return int(key, 0)
-        except ValueError:
-            return 0
-    if isinstance(key, list):
-        val = 0
-        for i, b in enumerate(key):
-            try:
-                v = int(b, 0) if isinstance(b, str) else int(b)
-                val |= (v & 0xFF) << (i * 8)
-            except ValueError:
-                pass
-        return val
-    return -1
 
-rows = json.loads('[{"key":["0x01","0x00","0x00","0x00"],"values":[{"cpu":0,"value":5}]},{"key":28,"values":[{"cpu":0,"value":10}]}]')
+def test_counter_names_cover_current_drop_reasons():
+    names = admin_cli._XDP_COUNTER_NAMES
+    assert names[0] == "TCP_NEW_ALLOW"
+    assert names[27] == "BOGON_DROP"
+    assert "TCP_CONN_LIMIT_DROP" in names
+    assert "TCP_CONN_PREFIX_LIMIT_DROP" in names
+    assert "TCP_CONN_PORT_LIMIT_DROP" in names
+    assert "ABUSEIPDB_DROP" in names
+    assert len(names) == 35
 
-key_packets = {}
-for row in rows:
-    values = row.get("values")
-    if values is None:
-        values = row.get("value")
-    packets = norm(values)
-    k = parse_key(row.get("key"))
-    if k >= 0:
-        key_packets[k] = packets
 
-total = 0
-for idx in range(32):
-    packets = key_packets.get(idx, 0)
-    total += packets
-    name = names[idx] if idx < len(names) else f"COUNTER_{idx}"
-    print(f"{name}|{packets}|-1")
+def test_read_xdp_rows_uses_named_counters_and_byte_totals(tmp_path):
+    pin = tmp_path / "xdp_fw"
+    pin.mkdir()
+    (pin / "pkt_counters").write_bytes(b"")
 
-for idx in sorted(key_packets.keys()):
-    if idx >= 32:
-        print(f"COUNTER_{idx}|{key_packets[idx]}|-1")
+    dump = [
+        {"key": ["0x01", "0x00", "0x00", "0x00"], "values": [{"cpu": 0, "value": 5}]},
+        {"key": 28, "values": [{"cpu": 0, "value": 10}]},
+        {"key": 34, "values": [{"cpu": 0, "value": 2}]},
+    ]
 
-print(f"XDP_TOTAL|{total}|-1")
+    with mock.patch.object(admin_cli.shutil, "which", return_value="/usr/sbin/bpftool"), \
+         mock.patch.object(admin_cli.subprocess, "check_output", return_value=b"[]"), \
+         mock.patch.object(admin_cli.json, "loads", return_value=dump), \
+         mock.patch.object(admin_cli, "_read_byte_counters", return_value=(100, 20, 17, 12)):
+        rows = admin_cli._read_xdp_rows(str(pin))
+
+    by_name = {name: (packets, nbytes) for name, packets, nbytes in rows}
+    assert by_name["TCP_ESTABLISHED"] == (5, -1)
+    assert by_name["TCP_CONN_LIMIT_DROP"] == (10, -1)
+    assert by_name["ABUSEIPDB_DROP"] == (2, -1)
+    assert by_name["XDP_TOTAL"] == (17, 100)
+    assert by_name["XDP_DROP_TOTAL"] == (12, 20)

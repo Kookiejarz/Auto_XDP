@@ -26,7 +26,7 @@ PY
 
 bash ./tests/bash/test_setup_xdp.sh
 bash ./tests/bash/test_axdp.sh
-python3 -m unittest discover -s tests/python -v
+python3 -m pytest tests/python -v
 
 if [[ "$(uname -s)" == "Linux" ]]; then
     bash ./setup_xdp.sh --check-env | tee /tmp/setup_xdp_check_env.log
