@@ -5,6 +5,7 @@ import logging
 import re
 import shutil
 import subprocess
+from typing import cast
 
 from auto_xdp import config as cfg
 from auto_xdp.backends.base import BackendStatus, PortBackend
@@ -16,6 +17,87 @@ from auto_xdp.bpf.maps import (
 from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcilePlan
 
 log = logging.getLogger(__name__)
+
+_NFT_SCHEMA_MARKER = "policy_schema_v2"
+_BOGON_V4 = (
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+)
+_BOGON_V6 = (
+    "::/128",
+    "::1/128",
+    "::ffff:0:0/96",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+)
+
+
+def _set_block(name: str, value_type: str, elements: list[str], *, interval: bool = False) -> str:
+    lines = [f"    set {name} {{", f"        type {value_type}"]
+    if interval:
+        lines.append("        flags interval")
+    if elements:
+        lines.append(f"        elements = {{ {', '.join(elements)} }}")
+    lines.append("    }")
+    return "\n".join(lines)
+
+
+def _rate(value: int | float) -> int:
+    return max(1, int(math.ceil(value)))
+
+
+def _prefix_mask(family: int, prefix: int) -> str:
+    bits = 32 if family == 4 else 128
+    prefix = max(0, min(bits, prefix))
+    network = ipaddress.ip_network(f"0.0.0.0/{prefix}" if family == 4 else f"::/{prefix}")
+    return str(network.netmask)
+
+
+def _collapse_cidrs(cidrs: list[str]) -> list[str]:
+    networks = [ipaddress.ip_network(cidr) for cidr in cidrs]
+    v4 = [network for network in networks if isinstance(network, ipaddress.IPv4Network)]
+    v6 = [network for network in networks if isinstance(network, ipaddress.IPv6Network)]
+    collapsed = list(ipaddress.collapse_addresses(v4))
+    # Typeshed exposes only the IPv4 overload here; both families are valid at
+    # runtime, and the v4/v6 split above keeps them from being mixed.
+    collapsed.extend(
+        ipaddress.collapse_addresses(cast(list[ipaddress.IPv4Network], v6))
+    )
+    return [str(network) for network in collapsed]
+
+
+def _policy_signature(desired: DesiredState) -> tuple[object, ...]:
+    return (
+        frozenset(desired.tcp_ports),
+        frozenset(desired.udp_ports),
+        frozenset(desired.sctp_ports),
+        frozenset(desired.trusted_cidrs),
+        tuple(sorted(desired.tcp_syn_rate_limits.items())),
+        tuple(sorted(desired.tcp_syn_agg_rate_limits.items())),
+        tuple(sorted(desired.tcp_conn_limits.items())),
+        tuple(sorted(desired.tcp_conn_prefix_limits.items())),
+        tuple(sorted(desired.tcp_conn_port_limits.items())),
+        tuple(sorted(desired.udp_rate_limits.items())),
+        tuple(sorted(desired.udp_agg_rate_limits.items())),
+        tuple(sorted((proto, cidr, tuple(sorted(ports))) for (proto, cidr), ports in desired.acl_rules.items())),
+        desired.bogon_filter_enabled,
+        desired.drop_events_enabled,
+        desired.rate_limit_source_prefix_v4,
+        desired.rate_limit_source_prefix_v6,
+        desired.udp_global_byte_rate,
+        tuple(cfg.SIT4_ENDPOINTS),
+        cfg.SLOT_DEFAULT_ACTION,
+        cfg.NFT_FAMILY,
+        cfg.NFT_TABLE,
+    )
 
 
 class NftablesBackend(PortBackend):

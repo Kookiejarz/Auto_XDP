@@ -57,6 +57,10 @@ _ZERO16 = bytes(16)
 _RECV_BUFSZ = 1 << 16  # 64 KB
 
 
+class DiscoveryError(RuntimeError):
+    """The socket dump did not produce a complete, trustworthy snapshot."""
+
+
 # low-level netlink helpers
 
 def _nldiag_dump(family: int, proto: int, states: int):
@@ -84,19 +88,24 @@ def _nldiag_dump(family: int, proto: int, states: int):
         while True:
             n = nl.recv_into(buf)
             if n == 0:
-                break
+                raise DiscoveryError("SOCK_DIAG closed before NLMSG_DONE")
             offset = 0
             done = False
             while offset + _NLMSGHDR_SZ <= n:
                 msg_len, msg_type, _fl, _seq, _pid = _NLMSGHDR.unpack_from(buf, offset)
                 if msg_len < _NLMSGHDR_SZ:
-                    break
+                    raise DiscoveryError("SOCK_DIAG returned an invalid netlink message")
+                if offset + msg_len > n:
+                    raise DiscoveryError("SOCK_DIAG returned a truncated netlink message")
                 if msg_type == _NLMSG_DONE:
                     done = True
                     break
                 if msg_type == _NLMSG_ERROR:
-                    done = True
-                    break
+                    if msg_len < _NLMSGHDR_SZ + 4:
+                        raise DiscoveryError("SOCK_DIAG returned a truncated NLMSG_ERROR")
+                    (error,) = struct.unpack_from("=i", buf, offset + _NLMSGHDR_SZ)
+                    if error:
+                        raise DiscoveryError(f"SOCK_DIAG dump failed with errno {-error}")
                 if (
                     msg_type == _SOCK_DIAG_BY_FAMILY
                     and offset + _NLMSGHDR_SZ + _DIAG_MSG_SZ <= n
@@ -113,6 +122,8 @@ def _nldiag_dump(family: int, proto: int, states: int):
                         src, dst, inode, rqueue,
                     )
                 offset += (msg_len + 3) & ~3
+            if offset != n and not done:
+                raise DiscoveryError("SOCK_DIAG returned trailing incomplete data")
             if done:
                 break
 

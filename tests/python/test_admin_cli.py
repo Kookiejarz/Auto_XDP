@@ -274,6 +274,23 @@ class AdminCliTests(unittest.TestCase):
             self.assertIn('"interfaces": ["eth9"]', output)
             self.assertIn('"conntrack": {"tcp": 2, "udp": 1}', output)
 
+    def test_exclude_port_commands_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text("[discovery]\nexclude_ports = []\n")
+
+            rc = admin_cli.main(
+                ["--config", str(config_path), "exclude", "port", "add", "8080", "9090"]
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("exclude_ports = [8080, 9090]", config_path.read_text())
+
+            rc = admin_cli.main(
+                ["--config", str(config_path), "exclude", "port", "del", "8080"]
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("exclude_ports = [9090]", config_path.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()
