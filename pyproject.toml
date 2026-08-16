@@ -32,7 +32,7 @@ include-package-data = true
 include = ["auto_xdp*"]
 
 [tool.setuptools.package-data]
-auto_xdp = ["xdp_required_maps.txt"]
+auto_xdp = ["default_config.toml", "xdp_required_maps.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+from importlib import resources
 import json
 import math
 import os
 import re
+import secrets
 import struct
 import shutil
 import subprocess
@@ -65,221 +67,13 @@ _PORT_HANDLER_MARKERS = (
     "hblk4",
     "hblk6",
 )
-_DEFAULT_CONFIG_TEMPLATE = """\
-# Auto XDP configuration — /etc/auto_xdp/config.toml
-# Manage via: axdp trust / axdp acl / axdp permanent
-# The daemon reloads this file on SIGHUP (no restart needed).
-# To apply changes immediately: axdp restart
-
-[firewall]
-# Drop packets with obviously invalid or reserved source addresses.
-# Set to false only on environments where private/internal source ranges are expected.
-# Set to false on private/internal networks where RFC1918 source addresses are legitimate.
-bogon_filter = false
-
-[under_attack]
-# under_attack mode favors survivability under high packet rates.
-# When enabled, drop telemetry is disabled in the XDP data path to avoid
-# per-drop ringbuf writes and reduce hot-path CPU cost.
-enabled = false
-
-[daemon]
-# Log verbosity for the Python sync daemon: debug, info, warning, error.
-log_level = "warning"
-
-# Event debounce window before reconciling after proc connector activity.
-# Larger values reduce churn during bursty process/socket changes.
-debounce_seconds = 0.4
-
-# Preferred runtime backend: auto, xdp, nftables.
-# auto = choose the best available backend at runtime.
-# xdp  = require XDP mode when possible.
-# nftables = force nftables fallback mode.
-preferred_backend = "auto"
-
-[ringbuf]
-# Unix socket used by pkt_relay.py and axdp tui.
-socket_path = "/var/run/auto_xdp/pkt_events.sock"
-
-# Relay-side history retention. The relay keeps recent events for clients
-# that connect after drops/new connections already happened.
-retention_seconds = 300
-max_events = 100000
-max_history_send = 5000
-
-# TUI-side event scrollback kept in the local client process.
-tui_max_events = 500
-
-[discovery]
-# Exclude loopback-only listeners from exposure discovery.
-# When true, listeners bound only to 127.0.0.0/8 or ::1 are ignored.
-exclude_loopback = true
-
-# Exclude listeners bound to these addresses/CIDRs from automatic exposure.
-# Useful for admin sockets, VPN-only services, or addresses handled elsewhere.
-exclude_bind_cidrs = []
-
-[permanent_ports]
-# Ports always kept open regardless of which services are running.
-# SCTP is config-managed only; it is not auto-discovered from listening sockets.
-# Use these when a port must stay allowed even if the owning process is temporarily absent.
-tcp = []
-udp = []
-sctp = []
-
-[trusted_ips]
-# Source IPs/CIDRs with elevated handling.
-# XDP TCP: trusted sources may pass pure SYN packets even when the port was not
-# auto-discovered, and they bypass SYN rate limits.
-# XDP UDP: trusted sources do NOT open closed UDP ports; the destination UDP
-# port must already be whitelisted. Once whitelisted, trusted sources bypass
-# UDP rate limits and port handlers.
-# nftables fallback: trusted sources are accepted before port checks.
-# Format:  "CIDR" = "label"
-# "10.0.0.0/8" = "internal network"
-
-# SYN rate limits (new connections per second per source IP).
-# Lookup order: syn_by_proc (process name) → syn_by_service (IANA name).
-# Ports absent from both tables are not rate-limited (e.g. HTTP/HTTPS).
-# These limits apply only to new inbound TCP SYN traffic.
-
-[rate_limits]
-# Source grouping for per-source rate limits.
-# Defaults preserve per-IP behavior: IPv4 /32 and IPv6 /128.
-# Set to 24/64, for example, to make all sources in each CIDR share one bucket.
-source_cidr_v4 = 32
-source_cidr_v6 = 128
-
-[rate_limits.syn_by_proc]
-# Key: process name as seen on the local host.
-# Value: allowed new SYN packets per second per source IP for ports owned by that process.
-sshd           = 2
-vsftpd         = 10
-proftpd        = 10
-"pure-ftpd"    = 10
-postfix        = 20
-sendmail       = 20
-dovecot        = 15
-mysqld         = 2
-mariadbd       = 2
-postgres       = 2
-"redis-server" = 2
-mongod         = 2
-xrdp           = 2
-telnetd        = 2
-
-[rate_limits.syn_by_service]
-# Key: service name from /etc/services when no per-process override exists.
-# Value: allowed new SYN packets per second per source IP.
-ssh             = 2
-ftp             = 10
-"ftp-data"      = 10
-smtp            = 20
-smtps           = 20
-submission      = 20
-pop3            = 15
-pop3s           = 15
-imap            = 15
-imaps           = 15
-mysql           = 2
-postgresql      = 2
-redis           = 2
-mongodb         = 2
-"ms-wbt-server" = 2
-vnc             = 2
-telnet          = 2
-
-[rate_limits.syn_agg_by_proc]
-# Optional per-process aggregate SYN rate limits.
-# These apply across source prefixes, not just a single IP.
-
-[rate_limits.syn_agg_by_service]
-# Optional service-name fallback for aggregate SYN rate limits.
-
-[rate_limits.tcp_conn_by_proc]
-# Optional per-process cap on concurrent tracked TCP connections per source.
-
-[rate_limits.tcp_conn_by_service]
-# Optional service-name fallback for TCP concurrent connection caps.
 
 
-# UDP rate limits (packets per second per source IP).
-# UDP is stateless at the protocol level, so these controls help bound abuse.
-
-[rate_limits.udp_by_proc]
-# Key: process name.
-# Value: allowed UDP packets per second per source IP for ports owned by that process.
-named   = 5000
-unbound = 5000
-dnsmasq = 5000
-openvpn = 200
-
-[rate_limits.udp_by_service]
-# Service-name fallback for UDP per-source packet rate limits.
-domain  = 5000
-ntp     = 500
-isakmp  = 100
-openvpn = 200
-
-[rate_limits.udp_agg_bytes_by_proc]
-# Optional per-process aggregate UDP byte-rate caps across source prefixes.
-
-[rate_limits.udp_agg_bytes_by_service]
-# Service-name fallback for aggregate UDP byte-rate caps.
-
-# Per-CIDR port ACL rules.
-# XDP TCP ACL entries explicitly allow matching source CIDRs to reach listed
-# TCP ports even when those ports were not auto-discovered, and bypass TCP SYN
-# rate limits.
-# XDP UDP ACL entries do not open closed UDP ports; the destination UDP port
-# must already be whitelisted. Once whitelisted, matching ACL entries bypass
-# UDP rate limits and port handlers.
-# Use ACL when a service should be reachable only from specific source ranges.
-
-# [[acl]]
-# proto = "tcp"
-# cidr  = "10.0.0.0/8"
-# ports = [5432, 6379]  # destination ports covered by this ACL
-
-
-# Protocol slot handlers (bpf_tail_call dispatch for non-TCP/UDP/ICMP traffic).
-
-[slots]
-# Action for protocols with no handler loaded.
-# "pass" preserves existing behaviour; "drop" enforces an explicit allow-list.
-# This affects non-TCP/UDP/ICMP traffic dispatched through the slot table.
-default_action = "drop"
-
-# Built-in handlers to load at startup: "gre" (proto 47), "esp" (proto 50),
-# "sctp" (proto 132).  Custom handlers: { proto = N, path = "/path/to.o" }
-# Use built-ins by name, or point custom entries at compiled BPF object files.
-# enabled = ["sctp", "gre", "esp"]
-enabled = []
-
-[port_handlers.tcp]
-# Per-port TCP handlers: "PORT" = "/path/to/handler.o" or ".c".
-# Example:
-# "25565" = "/usr/local/lib/auto_xdp/handlers/minecraft_handler.o"
-
-[port_handlers.udp]
-# Per-port UDP handlers: "PORT" = "/path/to/handler.o" or ".c".
-
-[xdp]
-# Remove stale conntrack entries after N consecutive reconcile rounds miss them.
-# Only affects userspace-managed TCP conntrack seeding/cleanup logic.
-conntrack_stale_reconciles = 2
-
-[xdp.runtime]
-# Hot-updated XDP data-path tunables. Set a duration to 0 to let the BPF
-# program use its compiled default.
-tcp_timeout_seconds = 300
-udp_timeout_seconds = 60
-conntrack_refresh_seconds = 30
-icmp_burst_packets = 100
-icmp_rate_pps = 100
-udp_global_window_seconds = 1
-rate_window_seconds = 1
-"""
+def _default_config_template() -> str:
+    try:
+        return resources.files("auto_xdp").joinpath("default_config.toml").read_text()
+    except (FileNotFoundError, ModuleNotFoundError):
+        return (Path(__file__).resolve().parents[1] / "config.toml").read_text()
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -501,6 +295,10 @@ def _slot_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     return bpf_pin_dir, install_dir, handlers_dir
 
 
+def _builtin_handlers_dir(args: argparse.Namespace) -> Path:
+    return Path(args.install_dir) / "handlers"
+
+
 def _run_checked(cmd: list[str], fail_msg: str) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -509,6 +307,211 @@ def _run_checked(cmd: list[str], fail_msg: str) -> subprocess.CompletedProcess[s
             print(detail, file=sys.stderr)
         raise RuntimeError(fail_msg)
     return result
+
+
+def _bpf_key_u32(value: int) -> list[str]:
+    return [str((value >> shift) & 0xFF) for shift in (0, 8, 16, 24)]
+
+
+def _json_u32(value: object) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, list) and len(value) >= 4:
+        raw = bytes(int(item, 0) if isinstance(item, str) else int(item) for item in value[:4])
+        return int.from_bytes(raw, byteorder="little")
+    if isinstance(value, dict):
+        for key in ("id", "value"):
+            if key in value:
+                return _json_u32(value[key])
+    if isinstance(value, str):
+        return int(value, 0)
+    raise ValueError(f"cannot decode BPF u32 value: {value!r}")
+
+
+def _pinned_program_id(pin_path: Path) -> int:
+    result = _run_checked(
+        ["bpftool", "-j", "prog", "show", "pinned", str(pin_path)],
+        f"Failed to inspect candidate program pin {pin_path}",
+    )
+    try:
+        payload = json.loads(result.stdout)
+        if isinstance(payload, list):
+            payload = payload[0]
+        if not isinstance(payload, dict):
+            raise ValueError("program JSON is not an object")
+        return int(payload["id"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not read program ID from {pin_path}") from exc
+
+
+def _prog_array_entry_id(map_path: Path, key: int) -> int | None:
+    result = subprocess.run(
+        [
+            "bpftool",
+            "-j",
+            "map",
+            "lookup",
+            "pinned",
+            str(map_path),
+            "key",
+            *_bpf_key_u32(key),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict):
+            return None
+        return _json_u32(payload["value"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _prog_array_update(map_path: Path, key: int, prog_pin: Path) -> None:
+    _run_checked(
+        [
+            "bpftool",
+            "map",
+            "update",
+            "pinned",
+            str(map_path),
+            "key",
+            *_bpf_key_u32(key),
+            "value",
+            "pinned",
+            str(prog_pin),
+        ],
+        f"Failed to update program-array entry {key}",
+    )
+
+
+def _prog_array_delete(map_path: Path, key: int) -> bool:
+    result = subprocess.run(
+        [
+            "bpftool",
+            "map",
+            "delete",
+            "pinned",
+            str(map_path),
+            "key",
+            *_bpf_key_u32(key),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def _verify_prog_array_entry(map_path: Path, key: int, expected_id: int) -> None:
+    actual_id = _prog_array_entry_id(map_path, key)
+    if actual_id != expected_id:
+        raise RuntimeError(
+            f"Program-array verification failed for entry {key}: "
+            f"expected program ID {expected_id}, got {actual_id!r}"
+        )
+
+
+def _rollback_prog_array_entry(
+    map_path: Path,
+    key: int,
+    old_pin: Path | None,
+    old_id: int | None,
+) -> None:
+    if old_pin is None or old_id is None:
+        if not _prog_array_delete(map_path, key) and _prog_array_entry_id(map_path, key) is not None:
+            raise RuntimeError(f"Failed to remove candidate program-array entry {key}")
+        return
+    _prog_array_update(map_path, key, old_pin)
+    _verify_prog_array_entry(map_path, key, old_id)
+
+
+def _transactional_file_prog_swap(
+    map_path: Path,
+    key: int,
+    candidate_pin: Path,
+    live_pin: Path,
+) -> None:
+    """Atomically switch a PROG_ARRAY entry, then commit its canonical pin.
+
+    The old program remains pinned until the kernel lookup confirms the new
+    program ID.  Any failure before the final cleanup restores the old entry
+    and pin name.
+    """
+    try:
+        candidate_id = _pinned_program_id(candidate_pin)
+        old_exists = live_pin.exists()
+        old_id = _pinned_program_id(live_pin) if old_exists else None
+        active_id = _prog_array_entry_id(map_path, key)
+        if old_id is None and active_id is not None:
+            raise RuntimeError(
+                f"Program-array entry {key} is active but its rollback pin {live_pin} is missing"
+            )
+        if old_id is not None and active_id not in {None, old_id}:
+            raise RuntimeError(
+                f"Program-array entry {key} does not match its rollback pin {live_pin}"
+            )
+    except (OSError, RuntimeError):
+        if candidate_pin.exists():
+            try:
+                candidate_pin.unlink()
+            except OSError:
+                pass
+        raise
+    backup_pin = live_pin.with_name(f"{live_pin.name}_rollback_{secrets.token_hex(4)}")
+    old_pin_for_rollback: Path | None = live_pin if old_exists else None
+    switched = False
+    moved_old = False
+    moved_candidate = False
+    try:
+        _prog_array_update(map_path, key, candidate_pin)
+        switched = True
+        _verify_prog_array_entry(map_path, key, candidate_id)
+
+        if old_exists:
+            live_pin.rename(backup_pin)
+            moved_old = True
+            old_pin_for_rollback = backup_pin
+        candidate_pin.rename(live_pin)
+        moved_candidate = True
+        _verify_prog_array_entry(map_path, key, candidate_id)
+        if _pinned_program_id(live_pin) != candidate_id:
+            raise RuntimeError(f"Committed pin {live_pin} does not reference the candidate program")
+
+        if moved_old:
+            backup_pin.unlink()
+    except (OSError, RuntimeError) as exc:
+        rollback_error: Exception | None = None
+        if switched:
+            try:
+                _rollback_prog_array_entry(map_path, key, old_pin_for_rollback, old_id)
+            except (OSError, RuntimeError) as rollback_exc:
+                rollback_error = rollback_exc
+
+        if moved_candidate and live_pin.exists():
+            try:
+                live_pin.rename(candidate_pin)
+            except OSError:
+                pass
+        if moved_old and backup_pin.exists() and not live_pin.exists():
+            try:
+                backup_pin.rename(live_pin)
+            except OSError:
+                pass
+
+        if rollback_error is not None:
+            raise RuntimeError(
+                f"Handler switch failed ({exc}); rollback also failed ({rollback_error}). "
+                "Candidate and rollback pins were retained."
+            ) from exc
+        if candidate_pin.exists():
+            try:
+                candidate_pin.unlink()
+            except OSError:
+                pass
+        raise RuntimeError(f"Handler switch failed; previous program restored: {exc}") from exc
 
 
 def _slot_prog_name(pin_path: Path) -> str:
@@ -527,7 +530,7 @@ def _ensure_config_exists(path: Path) -> None:
     if path.exists():
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_DEFAULT_CONFIG_TEMPLATE)
+    path.write_text(_default_config_template())
 
 
 def _resolve_target_arch() -> tuple[str, str]:
@@ -568,7 +571,12 @@ def _resolve_asm_include(target_arch: str) -> str | None:
 
 
 def _compile_handler_source(
-    source_path: Path, proto: int | str, handlers_dir: Path, port: int | None = None
+    source_path: Path,
+    proto: int | str,
+    handlers_dir: Path,
+    port: int | None = None,
+    *,
+    sdk_dir: Path | None = None,
 ) -> Path:
     if not source_path.is_file():
         raise RuntimeError(f"Handler source not found: {source_path}")
@@ -603,6 +611,7 @@ def _compile_handler_source(
             f"-I{asm_inc}",
             "-I/usr/include/bpf",
             f"-I{handlers_dir}",
+            *([f"-I{sdk_dir}"] if sdk_dir is not None else []),
             f"-I{source_path.parent}",
             "-c",
             str(source_path),
@@ -626,6 +635,87 @@ def _port_handler_map_path(bpf_pin_dir: Path, proto: str) -> Path:
 
 def _port_handler_dir(bpf_pin_dir: Path, proto: str, port: int) -> Path:
     return bpf_pin_dir / "port_handlers" / proto / str(port)
+
+
+def _transactional_dir_prog_swap(
+    map_path: Path,
+    key: int,
+    candidate_dir: Path,
+    live_dir: Path,
+) -> None:
+    candidate_pin = candidate_dir / "prog"
+    live_pin = live_dir / "prog"
+    try:
+        candidate_id = _pinned_program_id(candidate_pin)
+        old_exists = live_pin.exists()
+        old_id = _pinned_program_id(live_pin) if old_exists else None
+        active_id = _prog_array_entry_id(map_path, key)
+        if old_id is None and active_id is not None:
+            raise RuntimeError(
+                f"Program-array entry {key} is active but its rollback pin {live_pin} is missing"
+            )
+        if old_id is not None and active_id not in {None, old_id}:
+            raise RuntimeError(
+                f"Program-array entry {key} does not match its rollback pin {live_pin}"
+            )
+    except (OSError, RuntimeError):
+        shutil.rmtree(candidate_dir, ignore_errors=True)
+        raise
+
+    backup_dir = live_dir.with_name(f"{live_dir.name}_rollback_{secrets.token_hex(4)}")
+    old_pin_for_rollback: Path | None = live_pin if old_exists else None
+    switched = False
+    moved_old = False
+    moved_candidate = False
+    try:
+        _prog_array_update(map_path, key, candidate_pin)
+        switched = True
+        _verify_prog_array_entry(map_path, key, candidate_id)
+
+        if live_dir.exists():
+            live_dir.rename(backup_dir)
+            moved_old = True
+            old_pin_for_rollback = backup_dir / "prog" if old_exists else None
+        candidate_dir.rename(live_dir)
+        moved_candidate = True
+        _verify_prog_array_entry(map_path, key, candidate_id)
+        if _pinned_program_id(live_dir / "prog") != candidate_id:
+            raise RuntimeError(f"Committed pin {live_dir / 'prog'} does not reference the candidate program")
+    except (OSError, RuntimeError) as exc:
+        rollback_error: Exception | None = None
+        if switched:
+            try:
+                _rollback_prog_array_entry(map_path, key, old_pin_for_rollback, old_id)
+            except (OSError, RuntimeError) as rollback_exc:
+                rollback_error = rollback_exc
+
+        if moved_candidate and live_dir.exists():
+            try:
+                live_dir.rename(candidate_dir)
+            except OSError:
+                pass
+        if moved_old and backup_dir.exists() and not live_dir.exists():
+            try:
+                backup_dir.rename(live_dir)
+            except OSError:
+                pass
+
+        if rollback_error is not None:
+            raise RuntimeError(
+                f"Handler switch failed ({exc}); rollback also failed ({rollback_error}). "
+                "Candidate and rollback generations were retained."
+            ) from exc
+        if candidate_dir.exists():
+            shutil.rmtree(candidate_dir, ignore_errors=True)
+        raise RuntimeError(f"Handler switch failed; previous program restored: {exc}") from exc
+
+    if moved_old:
+        try:
+            shutil.rmtree(backup_dir)
+        except OSError as exc:
+            # Traffic already uses the verified candidate. Retaining the old
+            # generation is safer than treating cleanup as a failed switch.
+            print(f"Warning: old handler generation retained at {backup_dir}: {exc}", file=sys.stderr)
 
 
 class _BpfPendingConntrackMap:
@@ -802,7 +892,7 @@ def _cmd_config_init(args: argparse.Namespace) -> int:
         print(f"Config already exists: {path}  (use 'axdp config show' to view)")
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_DEFAULT_CONFIG_TEMPLATE)
+    path.write_text(_default_config_template())
     print(f"Created: {path}")
     return 0
 
@@ -1047,7 +1137,8 @@ def _iter_available_port_handler_files(handlers_dir: Path) -> list[Path]:
 
 
 def _cmd_slot_list(args: argparse.Namespace) -> int:
-    bpf_pin_dir, _, handlers_dir = _slot_paths(args)
+    bpf_pin_dir, _, _ = _slot_paths(args)
+    handlers_dir = _builtin_handlers_dir(args)
     slot_pin_dir = bpf_pin_dir / "handlers"
     proto_handlers = bpf_pin_dir / "proto_handlers"
 
@@ -1084,6 +1175,7 @@ def _cmd_slot_list(args: argparse.Namespace) -> int:
 def _cmd_slot_load(args: argparse.Namespace) -> int:
     path = Path(args.config)
     bpf_pin_dir, _, handlers_dir = _slot_paths(args)
+    builtin_handlers_dir = _builtin_handlers_dir(args)
     slot_ctx_map = bpf_pin_dir / "slot_ctx_map"
     proto_handlers = bpf_pin_dir / "proto_handlers"
     slot_pin_dir = bpf_pin_dir / "handlers"
@@ -1092,7 +1184,7 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
     if args.name_or_proto in _BUILTIN_SLOT_INFO:
         builtin_name = args.name_or_proto
         proto, obj_name = _BUILTIN_SLOT_INFO[builtin_name]
-        obj_path = handlers_dir / obj_name
+        obj_path = builtin_handlers_dir / obj_name
     elif args.name_or_proto.isdigit():
         proto = int(args.name_or_proto)
         if not args.path:
@@ -1101,7 +1193,9 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
         custom_path = Path(args.path)
         if custom_path.suffix == ".c":
             try:
-                obj_path = _compile_handler_source(custom_path, proto, handlers_dir)
+                obj_path = _compile_handler_source(
+                    custom_path, proto, handlers_dir, sdk_dir=builtin_handlers_dir
+                )
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -1123,25 +1217,14 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
 
     slot_pin_dir.mkdir(parents=True, exist_ok=True)
     pin_path = slot_pin_dir / f"proto_{proto}"
-
-    # If this proto is already loaded, unload it cleanly first:
-    # 1. remove the proto_handlers map entry (drops the map's ref to the old prog)
-    # 2. unlink the pin (drops the pin's ref) → old prog refcount hits 0 → freed
-    if pin_path.exists():
-        subprocess.run(
-            ["bpftool", "map", "delete", "pinned", str(proto_handlers),
-             "key", str(proto), "0", "0", "0"],
-            capture_output=True,
-            text=True,
-        )
-        pin_path.unlink()
+    candidate_pin = slot_pin_dir / f"proto_{proto}_next_{secrets.token_hex(4)}"
 
     load_cmd = [
         "bpftool",
         "prog",
         "load",
         str(obj_path),
-        str(pin_path),
+        str(candidate_pin),
         "type",
         "xdp",
         "map",
@@ -1177,27 +1260,15 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
 
     try:
         _run_checked(load_cmd, f"Failed to load {obj_path}")
-        _run_checked(
-            [
-                "bpftool",
-                "map",
-                "update",
-                "pinned",
-                str(proto_handlers),
-                "key",
-                str(proto),
-                "0",
-                "0",
-                "0",
-                "value",
-                "pinned",
-                str(pin_path),
-            ],
-            f"Failed to register handler for proto {proto}",
-        )
     except RuntimeError as exc:
-        if pin_path.exists():
-            pin_path.unlink()
+        if candidate_pin.exists():
+            candidate_pin.unlink()
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    try:
+        _transactional_file_prog_swap(proto_handlers, proto, candidate_pin, pin_path)
+    except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -1264,7 +1335,12 @@ def _cmd_port_handler_list(args: argparse.Namespace) -> int:
     bpf_pin_dir, _, handlers_dir = _slot_paths(args)
     base_dir = bpf_pin_dir / "port_handlers"
     configured = _iter_configured_port_handlers(Path(args.config))
-    available = _iter_available_port_handler_files(handlers_dir)
+    available_by_path = {
+        str(path): path
+        for directory in (_builtin_handlers_dir(args), handlers_dir)
+        for path in _iter_available_port_handler_files(directory)
+    }
+    available = [available_by_path[key] for key in sorted(available_by_path)]
 
     print("Loaded per-port handlers:")
     found = False
@@ -1314,7 +1390,13 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
     source_path = Path(args.path)
     if source_path.suffix == ".c":
         try:
-            obj_path = _compile_handler_source(source_path, proto, handlers_dir, port=port)
+            obj_path = _compile_handler_source(
+                source_path,
+                proto,
+                handlers_dir,
+                port=port,
+                sdk_dir=_builtin_handlers_dir(args),
+            )
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -1360,10 +1442,9 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
         return 1
 
     pin_dir = _port_handler_dir(bpf_pin_dir, proto, port)
-    prog_pin = pin_dir / "prog"
-    pin_dir.mkdir(parents=True, exist_ok=True)
-    _cleanup_existing_port_handler(bpf_pin_dir, proto, port)
-    pin_dir.mkdir(parents=True, exist_ok=True)
+    pin_dir.parent.mkdir(parents=True, exist_ok=True)
+    candidate_dir = Path(tempfile.mkdtemp(prefix=f"{port}_next_", dir=str(pin_dir.parent)))
+    prog_pin = candidate_dir / "prog"
 
     load_cmd = [
         "bpftool",
@@ -1374,35 +1455,31 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
         "type",
         "xdp",
         "pinmaps",
-        str(pin_dir),
+        str(candidate_dir),
     ]
     for name, map_path in shared_maps:
         load_cmd.extend(["map", "name", name, "pinned", str(map_path)])
 
     try:
         _run_checked(load_cmd, f"Failed to load {obj_path}")
-        _run_checked(
-            [
-                "bpftool",
-                "map",
-                "update",
-                "pinned",
-                str(handler_map),
-                "key",
-                str(port),
-                "0",
-                "0",
-                "0",
-                "value",
-                "pinned",
-                str(prog_pin),
-            ],
-            f"Failed to register {proto} handler for port {port}",
-        )
     except RuntimeError as exc:
-        shutil.rmtree(pin_dir, ignore_errors=True)
+        shutil.rmtree(candidate_dir, ignore_errors=True)
         print(str(exc), file=sys.stderr)
         return 1
+
+    try:
+        _transactional_dir_prog_swap(handler_map, port, candidate_dir, pin_dir)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    # Handler-specific validation caches must not survive a successful handler
+    # replacement. Flush only after the new program is committed so a failed
+    # candidate never mutates the active handler's state.
+    if proto == "tcp":
+        _flush_tcp_pending_for_port(bpf_pin_dir, port)
+    else:
+        _flush_udp_validated_for_port(bpf_pin_dir, port)
 
     if not args.no_config_update:
         _ensure_config_exists(path)
@@ -2165,8 +2242,6 @@ def _read_xdp_rows(bpf_pin_dir: str) -> list[tuple[str, int, int]]:
                 return int(v, 0)
             except ValueError:
                 return 0
-        if isinstance(v, list):
-            return _bytelist_to_int(v)
         return 0
 
     def _parse_key(key: Any) -> int:
@@ -2629,8 +2704,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin_cli")
     parser.add_argument("--config", required=True)
     parser.add_argument("--bpf-pin-dir", default="/sys/fs/bpf/xdp_fw")
-    parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp")
-    parser.add_argument("--handlers-dir")
+    parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp/current")
+    parser.add_argument("--handlers-dir", default="/etc/auto_xdp/handlers")
     parser.add_argument("--run-state-dir", default="/run/auto_xdp")
     parser.add_argument("--nft-family", default="inet")
     parser.add_argument("--nft-table", default="auto_xdp")

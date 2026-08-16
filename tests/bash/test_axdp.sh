@@ -237,71 +237,6 @@ EOF_CFG
     assert_file_contains "$TOML_CONFIG" "sctp = [3868]"
 )
 
-test_detect_backend_prefers_xdp_runtime_state() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    RUN_STATE_DIR="$tmpdir/run"
-    BPF_PIN_DIR="$tmpdir/bpf"
-    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR"
-    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
-    touch "$BPF_PIN_DIR/pkt_counters"
-
-    BACKEND=""
-    IFACE="eth0"
-    detect_backend || return 1
-    assert_eq "$BACKEND" "xdp"
-)
-
-test_detect_backend_falls_back_to_nftables() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    RUN_STATE_DIR="$tmpdir/run"
-    BPF_PIN_DIR="$tmpdir/bpf"
-    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
-    printf 'nftables\n' > "$RUN_STATE_DIR/backend"
-
-    cat >"$tmpdir/bin/nft" <<'EOF_NFT'
-#!/bin/sh
-exit 0
-EOF_NFT
-    chmod +x "$tmpdir/bin/nft"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-    BACKEND=""
-    IFACE="eth0"
-    detect_backend || return 1
-    assert_eq "$BACKEND" "nftables"
-)
-
-test_detect_backend_reports_missing_state() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    RUN_STATE_DIR="$tmpdir/run"
-    BPF_PIN_DIR="$tmpdir/bpf"
-    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
-    # Point at a table that never exists so a live auto_xdp nftables install on
-    # the host cannot make detection succeed.
-    NFT_TABLE="axdp_test_absent"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-    IFACE="eth0"
-
-    local output status
-    output=$(detect_backend 2>&1)
-    status=$?
-    assert_eq "$status" "1" || return 1
-    assert_contains "$output" "No active Auto XDP backend detected."
-)
-
 _setup_reattach_test_env() {
     local tmpdir="$1"
     BPF_PIN_DIR="$tmpdir/bpf"
@@ -511,70 +446,6 @@ test_select_backend_refuses_nftables_while_xdp_remains_attached() (
     local status=$?
     assert_eq "$status" "1" || return 1
     [[ ! -e "$RUN_STATE_DIR/backend" ]]
-)
-
-test_detect_backend_multi_iface_second_only() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    RUN_STATE_DIR="$tmpdir/run"
-    BPF_PIN_DIR="$tmpdir/bpf"
-    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
-    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
-    touch "$BPF_PIN_DIR/pkt_counters"
-
-    # stub ip: eth0 has no xdp, eth1 has xdp (native)
-    cat >"$tmpdir/bin/ip" <<'EOF_IP'
-#!/bin/sh
-if echo "$@" | grep -q eth1; then
-    echo "    link/ether xdp"
-else
-    echo "    link/ether"
-fi
-exit 0
-EOF_IP
-    chmod +x "$tmpdir/bin/ip"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-    IFACES="eth0 eth1"
-    IFACE="eth0"
-    BACKEND=""
-    detect_backend || return 1
-    assert_eq "$BACKEND" "xdp"
-)
-
-test_detect_backend_multi_iface_mixed_modes() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    RUN_STATE_DIR="$tmpdir/run"
-    BPF_PIN_DIR="$tmpdir/bpf"
-    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
-    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
-    touch "$BPF_PIN_DIR/pkt_counters"
-
-    # stub ip: eth0 has native xdp, eth1 has generic xdp (no native support)
-    cat >"$tmpdir/bin/ip" <<'EOF_IP'
-#!/bin/sh
-if echo "$@" | grep -q eth1; then
-    echo "    link/ether xdpgeneric"
-else
-    echo "    link/ether xdp"
-fi
-exit 0
-EOF_IP
-    chmod +x "$tmpdir/bin/ip"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-    IFACES="eth0 eth1"
-    IFACE="eth0"
-    BACKEND=""
-    detect_backend || return 1
-    assert_eq "$BACKEND" "xdp"
 )
 
 test_run_backend_reports_runtime_state_and_conntrack_counts() (
@@ -1049,11 +920,6 @@ run_test "axdp loads configured interfaces for tui" test_main_loads_configured_i
 run_test "axdp reports stale admin_cli for tui" test_main_reports_stale_admin_cli_for_tui
 run_test "axdp preserves unrelated TOML sections on config update" test_config_updates_preserve_unrelated_sections
 run_test "axdp permanent supports SCTP ports" test_run_permanent_supports_sctp_ports
-run_test "axdp detects active xdp backend from runtime state" test_detect_backend_prefers_xdp_runtime_state
-run_test "axdp detects nftables fallback backend" test_detect_backend_falls_back_to_nftables
-run_test "axdp reports when no backend is active" test_detect_backend_reports_missing_state
-run_test "axdp detects xdp backend when only second iface has xdp attached" test_detect_backend_multi_iface_second_only
-run_test "axdp detects xdp backend with mixed native and generic ifaces" test_detect_backend_multi_iface_mixed_modes
 run_test "auto_xdp_start records generic xdp_mode when re-attach falls back to generic" test_ensure_xdp_reattach_records_generic_mode_on_fallback
 run_test "auto_xdp_start records native xdp_mode when re-attach succeeds natively" test_ensure_xdp_reattach_records_native_mode_when_all_native
 run_test "auto_xdp_start records generic xdp_mode when existing iface already in generic mode" test_ensure_xdp_reattach_records_generic_when_existing_iface_is_generic

@@ -125,7 +125,15 @@ run_service_cmd() {
     fi
 
     echo "No supported init system detected for service control." >&2
-    exit 1
+    return 2
+}
+
+run_status() {
+    local service_status=0 backend_status=0
+    run_service_cmd status || service_status=$?
+    printf '\nAuto XDP protection health\n'
+    run_backend "$@" || backend_status=$?
+    [[ $backend_status -eq 0 && ( $service_status -eq 0 || $service_status -eq 2 ) ]]
 }
 
 _remove_owned_tree() {
@@ -336,10 +344,7 @@ run_uninstall() {
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
 
-    _remove_owned_file "$SYNC_SCRIPT" "xdp_port_sync.py" || failures=1
-    _remove_owned_file "$RELAY_SCRIPT" "pkt_relay.py" || failures=1
-    _remove_owned_file "$RUNNER_SCRIPT" "auto_xdp_start.sh" || failures=1
-    _remove_owned_tree "$INSTALL_DIR" "auto_xdp" || failures=1
+    _remove_owned_tree "$INSTALL_ROOT" "auto_xdp" || failures=1
     _remove_owned_tree "$RUN_STATE_DIR" "auto_xdp" || failures=1
     _remove_owned_relay_group || failures=1
     _remove_owned_tree "$CONFIG_DIR" "auto_xdp" || failures=1
@@ -430,6 +435,7 @@ run_admin_config() {
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
+        --handlers-dir "$HANDLERS_DIR" \
         "$@"
 }
 
@@ -471,209 +477,6 @@ run_under_attack() {
     run_admin_config under-attack "$mode"
     reload_daemon
     return 0
-}
-
-autodetect_iface() {
-    if [[ -n "$IFACE" ]]; then
-        return 0
-    fi
-
-    IFACE="${IFACE:-}"
-    if [[ -z "$IFACE" ]]; then
-        IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-    fi
-
-    [[ -n "$IFACE" ]] || {
-        echo "Could not detect interface. Use --interface IFACE." >&2
-        exit 1
-    }
-}
-
-_any_iface_has_xdp() {
-    local _iface
-    for _iface in ${IFACES:-${IFACE:-}}; do
-        ip -d link show dev "$_iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload' && return 0
-    done
-    return 1
-}
-
-detect_backend() {
-    local candidate=""
-
-    if [[ -f "${RUN_STATE_DIR}/backend" ]]; then
-        candidate=$(<"${RUN_STATE_DIR}/backend")
-    fi
-
-    case "$candidate" in
-        xdp)
-            if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]] || _any_iface_has_xdp; then
-                BACKEND="xdp"
-                return 0
-            fi
-            ;;
-        nftables)
-            if command -v nft &>/dev/null && nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
-                BACKEND="nftables"
-                return 0
-            fi
-            ;;
-    esac
-
-    if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]] && _any_iface_has_xdp; then
-        BACKEND="xdp"
-        return 0
-    fi
-
-    if command -v nft &>/dev/null && nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
-        BACKEND="nftables"
-        return 0
-    fi
-
-    if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]]; then
-        BACKEND="xdp"
-        return 0
-    fi
-
-    echo "No active Auto XDP backend detected." >&2
-    exit 1
-}
-
-configured_ifaces() {
-    if [[ -n "${IFACES:-}" ]]; then
-        printf '%s\n' "$IFACES"
-        return 0
-    fi
-    if [[ -n "${IFACE:-}" ]]; then
-        printf '%s\n' "$IFACE"
-        return 0
-    fi
-    return 1
-}
-
-iface_xdp_state() {
-    local iface="$1"
-    local info=""
-    info=$(ip -d link show dev "$iface" 2>/dev/null || true)
-    [[ -n "$info" ]] || {
-        printf 'missing'
-        return 0
-    }
-    if grep -q 'xdpgeneric' <<<"$info"; then
-        printf 'generic'
-        return 0
-    fi
-    if grep -Eq 'xdp|xdpoffload' <<<"$info"; then
-        printf 'native'
-        return 0
-    fi
-    printf 'off'
-}
-
-iface_tc_egress_state() {
-    local iface="$1"
-    command -v tc >/dev/null 2>&1 || {
-        printf 'unavailable'
-        return 0
-    }
-    if tc filter show dev "$iface" egress pref 49152 2>/dev/null | grep -q .; then
-        printf 'attached'
-        return 0
-    fi
-    printf 'off'
-}
-
-conntrack_entry_count() {
-    local map_path="$1"
-    if [[ ! -e "$map_path" ]] || ! command -v bpftool >/dev/null 2>&1; then
-        printf '0'
-        return 0
-    fi
-    { bpftool -j map dump pinned "$map_path" 2>/dev/null || printf '[]\n'; } | python3 -c '
-import json, sys
-try:
-    rows = json.load(sys.stdin)
-except Exception:
-    rows = []
-print(len(rows) if isinstance(rows, list) else 0)
-'
-}
-
-summarize_conntrack_map() {
-    local map_path="$1"
-    local limit="${2:-10}"
-    local script
-    if [[ ! -e "$map_path" ]] || ! command -v bpftool >/dev/null 2>&1; then
-        echo "TOTAL|0"
-        return 0
-    fi
-    script=$(cat <<'PY'
-import json
-import sys
-
-limit = int(sys.argv[1])
-
-try:
-    rows = json.load(sys.stdin)
-except Exception:
-    rows = []
-
-if not isinstance(rows, list):
-    rows = []
-
-stats = {}
-
-for row in rows:
-    key = row.get("key", [])
-    if not isinstance(key, list) or len(key) < 8:
-        continue
-    try:
-        family = int(key[0], 0) if isinstance(key[0], str) else int(key[0])
-        dport = ((int(key[6], 0) if isinstance(key[6], str) else int(key[6])) << 8) | (
-            int(key[7], 0) if isinstance(key[7], str) else int(key[7])
-        )
-    except Exception:
-        continue
-    entry = stats.setdefault(dport, {"total": 0, "v4": 0, "v6": 0})
-    entry["total"] += 1
-    if family == 2:
-        entry["v4"] += 1
-    elif family == 10:
-        entry["v6"] += 1
-
-print(f"TOTAL|{len(rows)}")
-for dport, entry in sorted(stats.items(), key=lambda item: (-item[1]["total"], item[0]))[:limit]:
-    print(f"PORT|{dport}|{entry['total']}|{entry['v4']}|{entry['v6']}")
-PY
-)
-    { bpftool -j map dump pinned "$map_path" 2>/dev/null || printf '[]\n'; } | python3 -c "$script" "$limit"
-}
-
-render_conntrack_summary() {
-    local label="$1"
-    local map_path="$2"
-    local limit="${3:-10}"
-    local line total=0 dport count v4 v6
-
-    printf '%s conntrack:\n' "$label"
-    while IFS='|' read -r kind a b c d; do
-        case "$kind" in
-            TOTAL)
-                total="$a"
-                ;;
-            PORT)
-                dport="$a"
-                count="$b"
-                v4="$c"
-                v6="$d"
-                printf '  dport %-5s total=%-4s ipv4=%-4s ipv6=%s\n' "$dport" "$count" "$v4" "$v6"
-                ;;
-        esac
-    done < <(summarize_conntrack_map "$map_path" "$limit")
-
-    if [[ "$total" == "0" ]]; then
-        printf '  (none)\n'
-    fi
-    printf '  total=%s\n' "$total"
 }
 
 run_backend() {
@@ -1043,9 +846,13 @@ main() {
             shift || true
             run_exclude "$@"
             ;;
-        start|stop|restart|status)
+        status)
             shift || true
-            [[ "$cmd" != "status" ]] && require_root "$cmd"
+            run_status "$@"
+            ;;
+        start|stop|restart)
+            shift || true
+            require_root "$cmd"
             run_service_cmd "$cmd"
             ;;
         uninstall)

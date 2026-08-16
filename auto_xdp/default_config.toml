@@ -1,0 +1,227 @@
+# Auto XDP configuration — /etc/auto_xdp/config.toml
+# Manage via: axdp trust / axdp acl / axdp permanent
+# The daemon reloads this file on SIGHUP (no restart needed).
+# To apply changes immediately: axdp restart
+
+[firewall]
+# Drop packets with obviously invalid or reserved source addresses.
+# Set to false only on environments where private/internal source ranges are expected.
+# Set to false on private/internal networks where RFC1918 source addresses are legitimate.
+bogon_filter = false
+
+[under_attack]
+# under_attack mode favors survivability under high packet rates.
+# When enabled, drop telemetry is disabled in the XDP data path to avoid
+# per-drop ringbuf writes and reduce hot-path CPU cost.
+enabled = false
+
+[daemon]
+# Log verbosity for the Python sync daemon: debug, info, warning, error.
+log_level = "warning"
+
+# Event debounce window before reconciling after proc connector activity.
+# Larger values reduce churn during bursty process/socket changes.
+debounce_seconds = 0.4
+
+# Preferred runtime backend: auto, xdp, nftables.
+# auto = choose the best available backend at runtime.
+# xdp  = require XDP mode when possible.
+# nftables = force nftables fallback mode.
+preferred_backend = "auto"
+
+[interfaces]
+# Auto discovery excludes loopback and common Docker/CNI plumbing. Use include
+# for a stable explicit list, and exclude for host interfaces managed elsewhere.
+mode = "auto"
+include = []
+exclude = []
+allow_container = false
+
+# auto restores each interface's last verified mode first, then tries the
+# other XDP mode. native/generic make that mode strict on every interface.
+xdp_mode = "auto"
+
+[ringbuf]
+# Unix socket used by pkt_relay.py and axdp tui.
+socket_path = "/var/run/auto_xdp/pkt_events.sock"
+
+# Relay-side history retention. The relay keeps recent events for clients
+# that connect after drops/new connections already happened.
+retention_seconds = 300
+max_events = 100000
+max_history_send = 5000
+
+# TUI-side event scrollback kept in the local client process.
+tui_max_events = 500
+
+[discovery]
+# Exclude loopback-only listeners from exposure discovery.
+# When true, listeners bound only to 127.0.0.0/8 or ::1 are ignored.
+exclude_loopback = true
+
+# Exclude listeners bound to these addresses/CIDRs from automatic exposure.
+# Useful for admin sockets, VPN-only services, or addresses handled elsewhere.
+exclude_bind_cidrs = []
+
+[permanent_ports]
+# Ports always kept open regardless of which services are running.
+# SCTP is config-managed only; it is not auto-discovered from listening sockets.
+# Use these when a port must stay allowed even if the owning process is temporarily absent.
+tcp = []
+udp = []
+sctp = []
+
+[trusted_ips]
+# Source IPs/CIDRs with elevated handling.
+# XDP TCP: trusted sources may pass pure SYN packets even when the port was not
+# auto-discovered, and they bypass SYN rate limits.
+# XDP UDP: trusted sources do NOT open closed UDP ports; the destination UDP
+# port must already be whitelisted. Once whitelisted, trusted sources bypass
+# UDP rate limits and port handlers.
+# nftables fallback mirrors the XDP distinction: trusted TCP sources may open
+# a SYN to an otherwise closed port, while trusted UDP sources still require
+# the destination port to be open; both bypass fallback rate limits.
+# Format:  "CIDR" = "label"
+# "10.0.0.0/8" = "internal network"
+
+# SYN rate limits (new connections per second per source IP).
+# Lookup order: syn_by_proc (process name) → syn_by_service (IANA name).
+# Ports absent from both tables are not rate-limited (e.g. HTTP/HTTPS).
+# These limits apply only to new inbound TCP SYN traffic.
+
+[rate_limits]
+# Source grouping for per-source rate limits.
+# Defaults preserve per-IP behavior: IPv4 /32 and IPv6 /128.
+# Set to 24/64, for example, to make all sources in each CIDR share one bucket.
+source_cidr_v4 = 32
+source_cidr_v6 = 128
+
+[rate_limits.syn_by_proc]
+# Key: process name as seen on the local host.
+# Value: allowed new SYN packets per second per source IP for ports owned by that process.
+sshd           = 2
+vsftpd         = 10
+proftpd        = 10
+"pure-ftpd"    = 10
+postfix        = 20
+sendmail       = 20
+dovecot        = 15
+mysqld         = 2
+mariadbd       = 2
+postgres       = 2
+"redis-server" = 2
+mongod         = 2
+xrdp           = 2
+telnetd        = 2
+
+[rate_limits.syn_by_service]
+# Key: service name from /etc/services when no per-process override exists.
+# Value: allowed new SYN packets per second per source IP.
+ssh             = 2
+ftp             = 10
+"ftp-data"      = 10
+smtp            = 20
+smtps           = 20
+submission      = 20
+pop3            = 15
+pop3s           = 15
+imap            = 15
+imaps           = 15
+mysql           = 2
+postgresql      = 2
+redis           = 2
+mongodb         = 2
+"ms-wbt-server" = 2
+vnc             = 2
+telnet          = 2
+
+[rate_limits.syn_agg_by_proc]
+# Optional per-process aggregate SYN rate limits.
+# These apply across source prefixes, not just a single IP.
+
+[rate_limits.syn_agg_by_service]
+# Optional service-name fallback for aggregate SYN rate limits.
+
+[rate_limits.tcp_conn_by_proc]
+# Optional per-process cap on concurrent tracked TCP connections per source.
+
+[rate_limits.tcp_conn_by_service]
+# Optional service-name fallback for TCP concurrent connection caps.
+
+
+# UDP rate limits (packets per second per source IP).
+# UDP is stateless at the protocol level, so these controls help bound abuse.
+
+[rate_limits.udp_by_proc]
+# Key: process name.
+# Value: allowed UDP packets per second per source IP for ports owned by that process.
+named   = 5000
+unbound = 5000
+dnsmasq = 5000
+openvpn = 200
+
+[rate_limits.udp_by_service]
+# Service-name fallback for UDP per-source packet rate limits.
+domain  = 5000
+ntp     = 500
+isakmp  = 100
+openvpn = 200
+
+[rate_limits.udp_agg_bytes_by_proc]
+# Optional per-process aggregate UDP byte-rate caps across source prefixes.
+
+[rate_limits.udp_agg_bytes_by_service]
+# Service-name fallback for aggregate UDP byte-rate caps.
+
+# Per-CIDR port ACL rules.
+# XDP TCP ACL entries explicitly allow matching source CIDRs to reach listed
+# TCP ports even when those ports were not auto-discovered, and bypass TCP SYN
+# rate limits.
+# XDP UDP ACL entries do not open closed UDP ports; the destination UDP port
+# must already be whitelisted. Once whitelisted, matching ACL entries bypass
+# UDP rate limits and port handlers.
+# Use ACL when a service should be reachable only from specific source ranges.
+
+# [[acl]]
+# proto = "tcp"
+# cidr  = "10.0.0.0/8"
+# ports = [5432, 6379]  # destination ports covered by this ACL
+
+
+# Protocol slot handlers (bpf_tail_call dispatch for non-TCP/UDP/ICMP traffic).
+
+[slots]
+# Action for protocols with no handler loaded.
+# "pass" preserves existing behaviour; "drop" enforces an explicit allow-list.
+# This affects non-TCP/UDP/ICMP traffic dispatched through the slot table.
+default_action = "drop"
+
+# Built-in handlers to load at startup: "gre" (proto 47), "esp" (proto 50),
+# "sctp" (proto 132).  Custom handlers: { proto = N, path = "/path/to.o" }
+# Use built-ins by name, or point custom entries at compiled BPF object files.
+# enabled = ["sctp", "gre", "esp"]
+enabled = []
+
+[port_handlers.tcp]
+# Per-port TCP handlers: "PORT" = "/path/to/handler.o" or ".c".
+# Example:
+# "25565" = "/etc/auto_xdp/handlers/minecraft_handler.o"
+
+[port_handlers.udp]
+# Per-port UDP handlers: "PORT" = "/path/to/handler.o" or ".c".
+
+[xdp]
+# Remove stale conntrack entries after N consecutive reconcile rounds miss them.
+# Only affects userspace-managed TCP conntrack seeding/cleanup logic.
+conntrack_stale_reconciles = 2
+
+[xdp.runtime]
+# Hot-updated XDP data-path tunables. Set a duration to 0 to let the BPF
+# program use its compiled default.
+tcp_timeout_seconds = 300
+udp_timeout_seconds = 60
+conntrack_refresh_seconds = 30
+icmp_burst_packets = 100
+icmp_rate_pps = 100
+udp_global_window_seconds = 1
+rate_window_seconds = 1
