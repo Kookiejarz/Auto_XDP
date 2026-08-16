@@ -205,6 +205,10 @@ for e in tree:
         "auto_xdp/xdp_required_maps.txt" \
         "${pkg_root}/xdp_required_maps.txt" || return 1
 
+    fetch_local_or_remote \
+        "auto_xdp/default_config.toml" \
+        "auto_xdp/default_config.toml" \
+        "${pkg_root}/default_config.toml" || return 1
 }
 
 install_runner_script() {
@@ -285,8 +289,12 @@ import sys
 try:
     import auto_xdp.tui  # noqa: F401
     from auto_xdp import admin_cli
+    from importlib import resources
 except Exception as exc:
     raise SystemExit(f"failed to import installed auto_xdp TUI modules: {exc}")
+
+if not resources.files("auto_xdp").joinpath("default_config.toml").is_file():
+    raise SystemExit("installed auto_xdp package is missing default_config.toml")
 
 parser = admin_cli.build_parser()
 required_options = {"--run-state-dir", "--nft-family", "--nft-table", "--iface"}

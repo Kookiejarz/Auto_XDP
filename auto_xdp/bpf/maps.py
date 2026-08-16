@@ -40,10 +40,6 @@ def render_nft_ports(ports: set[int]) -> str:
     return "{ " + ", ".join(str(port) for port in sorted(ports)) + " }"
 
 
-def render_nft_addrs(addrs: set[str]) -> str:
-    return "{ " + ", ".join(sorted(addrs)) + " }"
-
-
 def run_nft(args: list[str], input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["nft", *args],

@@ -1483,6 +1483,7 @@ test_install_python_support_package_includes_state_module() (
 
     install_python_support_package || return 1
     assert_file_contains "$fetched" "auto_xdp/state.py -> ${AUTO_XDP_PACKAGE_DIR}/state.py"
+    assert_file_contains "$fetched" "auto_xdp/default_config.toml -> ${AUTO_XDP_PACKAGE_DIR}/default_config.toml"
     assert_file_contains "$fetched" "auto_xdp/xdp_required_maps.txt -> ${AUTO_XDP_PACKAGE_DIR}/xdp_required_maps.txt"
 )
 

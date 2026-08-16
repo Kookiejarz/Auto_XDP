@@ -47,6 +47,8 @@ class AdminCliTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue(config_path.exists())
             text = config_path.read_text()
+            expected = (Path(admin_cli.__file__).with_name("default_config.toml")).read_text()
+            self.assertEqual(text, expected)
             self.assertIn("[daemon]", text)
             self.assertIn("[slots]", text)
             self.assertIn('default_action = "drop"', text)
