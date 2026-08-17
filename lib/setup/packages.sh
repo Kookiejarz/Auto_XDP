@@ -62,20 +62,20 @@ package_list_for_manager() {
             if [[ "$(uname -m)" == "x86_64" ]]; then
                 multilib=" gcc-multilib"
             fi
-            echo "clang llvm libbpf-dev build-essential iproute2 curl python3 python3-pip nftables${multilib}"
+            echo "clang llvm libbpf-dev build-essential iproute2 curl tar python3 python3-pip nftables${multilib}"
             ;;
         dnf|yum)
             # tc lives in iproute-tc on Fedora/RHEL, not in iproute.
-            echo "clang llvm libbpf-devel bpftool iproute iproute-tc curl python3 python3-pip gcc make nftables"
+            echo "clang llvm libbpf-devel bpftool iproute iproute-tc curl tar python3 python3-pip gcc make nftables"
             ;;
         zypper)
-            echo "clang llvm libbpf-devel bpftool iproute2 curl python3 python3-pip gcc make nftables"
+            echo "clang llvm libbpf-devel bpftool iproute2 curl tar python3 python3-pip gcc make nftables"
             ;;
         pacman)
-            echo "clang llvm libbpf iproute2 curl python python-pip bpf base-devel nftables"
+            echo "clang llvm libbpf iproute2 curl tar python python-pip bpf base-devel nftables"
             ;;
         apk)
-            echo "clang llvm libbpf-dev bpftool iproute2 curl python3 py3-pip build-base nftables"
+            echo "clang llvm libbpf-dev bpftool iproute2 curl tar python3 py3-pip build-base nftables"
             ;;
         *)
             return 1
@@ -211,7 +211,7 @@ check_required_tools_step() {
     local cmd
 
     step_begin "Checking required tools"
-    for cmd in clang bpftool python3 curl ip tc nft; do
+    for cmd in clang bpftool python3 curl tar ip tc nft; do
         substep_run "$cmd" _tool_present "$cmd" || missing+=("$cmd")
     done
 
@@ -223,6 +223,9 @@ check_required_tools_step() {
                 case "$cmd" in
                     clang|bpftool)
                         warn "$cmd still missing — XDP backend may be unavailable"
+                        ;;
+                    tar)
+                        warn "$cmd still missing — remote source staging will be unavailable"
                         ;;
                     tc)
                         warn "tc still missing — TCP/UDP/SCTP egress reply tracking will be skipped"
@@ -237,6 +240,9 @@ check_required_tools_step() {
 
     _tool_present python3 || die_with_next "python3 not found after installation." "install Python 3.10 or newer, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
     _tool_present curl || die_with_next "curl not found after installation." "install curl, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
+    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]] && ! _tool_present tar; then
+        die_with_next "tar not found after installation." "install tar, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
+    fi
     _tool_present ip || die_with_next "ip command not found after installation." "install iproute2/iproute, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
     substep_run "python3 >= 3.10" ensure_python_runtime
     substep_run "python3 psutil module" ensure_psutil \
