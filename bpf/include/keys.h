@@ -95,9 +95,7 @@ struct syn_rate_key_v6 {
 };
 
 struct syn_rate_val {
-    __u64 window_start_ns;
-    __u32 count;
-    __u32 _pad;
+    __u64 state; /* upper 32 bits: window tick; lower 32 bits: count */
 };
 
 struct prefix_rate_key_v4 {
@@ -111,8 +109,7 @@ struct prefix_rate_key_v6 {
 };
 
 struct prefix_rate_val {
-    __u64 window_start_ns;
-    __u64 units;
+    __u64 state;
 };
 
 struct tcp_src_conn_key_v4 {
@@ -126,21 +123,15 @@ struct tcp_src_conn_key_v6 {
 };
 
 struct tcp_src_conn_val {
-    __u64 last_seen_ns;
-    __u32 count;
-    __u32 _pad;
+    __u64 state; /* upper 32 bits: activity tick; lower 32 bits: count */
 };
 
 struct tcp_pfx_conn_val {
-    __u64 last_seen_ns;
-    __u32 count;
-    __u32 _pad;
+    __u64 state;
 };
 
 struct tcp_port_conn_val {
-    __u64 last_seen_ns;
-    __u32 count;
-    __u32 _pad;
+    __u64 state;
 };
 
 // Per-CIDR port ACL: source CIDR → list of allowed destination ports.

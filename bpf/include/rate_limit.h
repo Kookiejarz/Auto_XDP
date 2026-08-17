@@ -104,29 +104,75 @@ static __always_inline void fill_tcp_src_conn_key_v6(
 }
 
 
-/* Sliding-window limiter: reset on expiry, drop if unit_field + increment > max.
- * `map` is a map pointer expression (e.g. &synag4 or an inner map from
- * a per-port ARRAY_OF_MAPS lookup). */
-#define WINDOW_RATE_CHECK(map, rkey, val_type, unit_field, now, window_ns, increment, max) \
-    do {                                                                                    \
-        val_type *_rv = bpf_map_lookup_elem((map), &(rkey));                              \
-        if (!_rv) {                                                                         \
-            val_type _new;                                                                  \
-            __builtin_memset(&_new, 0, sizeof(_new));                                      \
-            _new.window_start_ns = (now);                                                   \
-            _new.unit_field = (increment);                                                  \
-            bpf_map_update_elem((map), &(rkey), &_new, BPF_ANY);                          \
-            return XDP_PASS;                                                                \
-        }                                                                                   \
-        if ((now) - _rv->window_start_ns >= (window_ns)) {                                 \
-            _rv->window_start_ns = (now);                                                   \
-            _rv->unit_field = (increment);                                                  \
-            return XDP_PASS;                                                                \
-        }                                                                                   \
-        if ((__u64)_rv->unit_field + (__u64)(increment) > (__u64)(max))                    \
-            return XDP_DROP;                                                                \
-        _rv->unit_field += (increment);                                                     \
-        return XDP_PASS;                                                                    \
+/* Rate-map values are shared across CPUs.  Pack the window timestamp and the
+ * count into one 64-bit state word so rollover and increment happen in one
+ * cmpxchg.  This avoids the otherwise unavoidable race between resetting one
+ * field and incrementing the other.  A 1 ms tick keeps normal rate windows
+ * precise; clamping below half the 32-bit range keeps wraparound comparisons
+ * unambiguous (about 24.8 days maximum).
+ */
+#define RATE_STATE_COUNT_MASK 0xFFFFFFFFULL
+#define RATE_STATE_TICK_NS 1000000ULL
+#define RATE_STATE_RETRIES 64
+
+static __always_inline __u32 rate_state_tick(__u64 now)
+{
+    return (__u32)(now / RATE_STATE_TICK_NS);
+}
+
+static __always_inline __u32 rate_state_window_ticks(__u64 window_ns)
+{
+    __u64 ticks = window_ns / RATE_STATE_TICK_NS;
+    if (window_ns % RATE_STATE_TICK_NS)
+        ticks++;
+    if (ticks == 0)
+        return 1;
+    if (ticks > 0x7FFFFFFFULL)
+        return 0x7FFFFFFFU;
+    return (__u32)ticks;
+}
+
+static __always_inline __u64 rate_state_pack(__u32 tick, __u32 count_value)
+{
+    return ((__u64)tick << 32) | (__u64)count_value;
+}
+
+#define WINDOW_RATE_CHECK(map, rkey, val_type, now, window_ns, increment, max)       \
+    do {                                                                              \
+        __u64 _inc64 = (__u64)(increment);                                            \
+        __u64 _limit64 = (__u64)(max);                                                \
+        if (_inc64 > _limit64 || _inc64 > 0xFFFFFFFFULL)                             \
+            return XDP_DROP;                                                         \
+        __u32 _inc = (__u32)_inc64;                                                   \
+        __u32 _limit = (__u32)_limit64;                                               \
+        __u32 _now_tick = rate_state_tick(now);                                       \
+        __u32 _window_ticks = rate_state_window_ticks(window_ns);                     \
+        for (int _attempt = 0; _attempt < RATE_STATE_RETRIES; _attempt++) {           \
+            val_type *_rv = bpf_map_lookup_elem((map), &(rkey));                     \
+            if (!_rv) {                                                               \
+                val_type _new = { .state = rate_state_pack(_now_tick, _inc) };         \
+                if (bpf_map_update_elem((map), &(rkey), &_new, BPF_NOEXIST) == 0)    \
+                    return XDP_PASS;                                                  \
+                continue;                                                             \
+            }                                                                         \
+            __u64 _current = __sync_fetch_and_add(&_rv->state, 0);                    \
+            __u32 _start_tick = (__u32)(_current >> 32);                              \
+            __u32 _old_count = (__u32)(_current & RATE_STATE_COUNT_MASK);             \
+            __u32 _next_tick = _now_tick;                                            \
+            __u32 _next_count;                                                       \
+            if ((__u32)(_now_tick - _start_tick) >= _window_ticks) {                 \
+                _next_count = _inc;                                                   \
+            } else {                                                                  \
+                if (_old_count > _limit || _inc > _limit - _old_count)               \
+                    return XDP_DROP;                                                  \
+                _next_count = _old_count + _inc;                                      \
+                _next_tick = _start_tick;                                             \
+            }                                                                         \
+            __u64 _next = rate_state_pack(_next_tick, _next_count);                   \
+            if (__sync_val_compare_and_swap(&_rv->state, _current, _next) == _current) \
+                return XDP_PASS;                                                      \
+        }                                                                             \
+        return XDP_DROP;                                                              \
     } while (0)
 
 static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
@@ -145,7 +191,7 @@ static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
             return XDP_PASS; /* no per-port map yet: pass, syncer will create it */
         struct syn_rate_key_v4 rkey;
         fill_source_rate_key_v4(&rkey, key, prefix_v4);
-        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, now, window_ns, 1U, rate_max);
     }
 
     {
@@ -154,7 +200,7 @@ static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
             return XDP_PASS;
         struct syn_rate_key_v6 rkey;
         fill_source_rate_key_v6(&rkey, key, prefix_v6);
-        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, now, window_ns, 1U, rate_max);
     }
 }
 
@@ -171,12 +217,12 @@ static __always_inline int syn_agg_rate_check(struct flow_key *key, __u64 now,
     if (key->family == CT_FAMILY_IPV4) {
         struct prefix_rate_key_v4 rkey;
         fill_prefix_rate_key_v4(&rkey, key, dest_port, prefix_v4);
-        WINDOW_RATE_CHECK(&synag4, rkey, struct prefix_rate_val, units, now, window_ns, 1ULL, rate_max);
+        WINDOW_RATE_CHECK(&synag4, rkey, struct prefix_rate_val, now, window_ns, 1ULL, rate_max);
     }
 
     struct prefix_rate_key_v6 rkey;
     fill_prefix_rate_key_v6(&rkey, key, dest_port, prefix_v6);
-    WINDOW_RATE_CHECK(&synag6, rkey, struct prefix_rate_val, units, now, window_ns, 1ULL, rate_max);
+    WINDOW_RATE_CHECK(&synag6, rkey, struct prefix_rate_val, now, window_ns, 1ULL, rate_max);
 }
 
 static __always_inline int udp_rate_check(struct flow_key *key, __u64 now,
@@ -195,7 +241,7 @@ static __always_inline int udp_rate_check(struct flow_key *key, __u64 now,
             return XDP_PASS; /* no per-port map yet: pass, syncer will create it */
         struct syn_rate_key_v4 rkey;
         fill_source_rate_key_v4(&rkey, key, prefix_v4);
-        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, now, window_ns, 1U, rate_max);
     }
 
     {
@@ -204,7 +250,7 @@ static __always_inline int udp_rate_check(struct flow_key *key, __u64 now,
             return XDP_PASS;
         struct syn_rate_key_v6 rkey;
         fill_source_rate_key_v6(&rkey, key, prefix_v6);
-        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, count, now, window_ns, 1U, rate_max);
+        WINDOW_RATE_CHECK(inner, rkey, struct syn_rate_val, now, window_ns, 1U, rate_max);
     }
 }
 
@@ -222,13 +268,124 @@ static __always_inline int udp_agg_rate_check(struct flow_key *key, __u64 now,
     if (key->family == CT_FAMILY_IPV4) {
         struct prefix_rate_key_v4 rkey;
         fill_prefix_rate_key_v4(&rkey, key, dest_port, prefix_v4);
-        WINDOW_RATE_CHECK(&udpag4, rkey, struct prefix_rate_val, units, now, window_ns, pkt_bytes, (__u64)rate_max);
+        WINDOW_RATE_CHECK(&udpag4, rkey, struct prefix_rate_val, now, window_ns, pkt_bytes, (__u64)rate_max);
     }
 
     struct prefix_rate_key_v6 rkey;
     fill_prefix_rate_key_v6(&rkey, key, dest_port, prefix_v6);
-    WINDOW_RATE_CHECK(&udpag6, rkey, struct prefix_rate_val, units, now, window_ns, pkt_bytes, (__u64)rate_max);
+    WINDOW_RATE_CHECK(&udpag6, rkey, struct prefix_rate_val, now, window_ns, pkt_bytes, (__u64)rate_max);
 }
+
+/* Connection counters need the timestamp and count to change as one unit.
+ * LRU_HASH values cannot portably embed bpf_spin_lock, so pack both fields
+ * into one 64-bit word and update it with cmpxchg.  One tick is 100 ms; the
+ * unsigned 32-bit tick delta remains wrap-safe for any practical TCP timeout.
+ */
+#define CONN_STATE_COUNT_MASK 0xFFFFFFFFULL
+#define CONN_STATE_TICK_NS 100000000ULL
+#define CONN_STATE_RETRIES 64
+
+static __always_inline __u32 conn_state_tick(__u64 now)
+{
+    return (__u32)(now / CONN_STATE_TICK_NS);
+}
+
+static __always_inline __u32 conn_state_timeout_ticks(__u64 timeout_ns)
+{
+    __u64 ticks = timeout_ns / CONN_STATE_TICK_NS;
+    if (timeout_ns % CONN_STATE_TICK_NS)
+        ticks++;
+    if (ticks == 0)
+        return 1;
+    if (ticks > 0x7FFFFFFFULL)
+        return 0x7FFFFFFFU;
+    return (__u32)ticks;
+}
+
+static __always_inline __u64 conn_state_pack(__u32 tick, __u32 count_value)
+{
+    return ((__u64)tick << 32) | (__u64)count_value;
+}
+
+static __always_inline bool conn_state_expired(
+    __u32 now_tick, __u32 last_tick, __u32 timeout_ticks)
+{
+    return (__u32)(now_tick - last_tick) > timeout_ticks;
+}
+
+static __always_inline int shared_conn_count_check(
+    __u64 *state, __u64 now, __u64 timeout_ns, __u32 limit)
+{
+    __u64 current = __sync_fetch_and_add(state, 0);
+    __u32 count_value = (__u32)(current & CONN_STATE_COUNT_MASK);
+    if (count_value == 0)
+        return XDP_PASS;
+
+    __u32 now_tick = conn_state_tick(now);
+    __u32 last_tick = (__u32)(current >> 32);
+    if (conn_state_expired(
+            now_tick, last_tick, conn_state_timeout_ticks(timeout_ns)))
+        return XDP_PASS;
+    return count_value >= limit ? XDP_DROP : XDP_PASS;
+}
+
+static __always_inline void shared_conn_count_fail_closed(
+    __u64 *state, __u32 now_tick)
+{
+    __sync_lock_test_and_set(state, conn_state_pack(now_tick, 0xFFFFFFFFU));
+}
+
+enum shared_conn_count_op {
+    CONN_COUNT_RECORD,
+    CONN_COUNT_ACTIVITY,
+    CONN_COUNT_CLOSE,
+};
+
+static __always_inline void shared_conn_count_update(
+    __u64 *state, __u64 now, __u64 timeout_ns,
+    enum shared_conn_count_op op)
+{
+    __u32 now_tick = conn_state_tick(now);
+    __u32 timeout_ticks = op == CONN_COUNT_RECORD ? conn_state_timeout_ticks(timeout_ns) : 0;
+#pragma clang loop unroll(disable)
+    for (int attempt = 0; attempt < CONN_STATE_RETRIES; attempt++) {
+        __u64 current = __sync_fetch_and_add(state, 0);
+        __u32 count_value = (__u32)(current & CONN_STATE_COUNT_MASK);
+
+        if (op == CONN_COUNT_RECORD) {
+            __u32 last_tick = (__u32)(current >> 32);
+            if (count_value == 0 ||
+                conn_state_expired(now_tick, last_tick, timeout_ticks))
+                count_value = 1;
+            else if (count_value < 0xFFFFFFFFU)
+                count_value++;
+        } else if (op == CONN_COUNT_ACTIVITY) {
+            if (count_value == 0)
+                count_value = 1;
+        } else if (count_value > 0) {
+            count_value--;
+        }
+
+        __u64 next = conn_state_pack(now_tick, count_value);
+        if (__sync_val_compare_and_swap(state, current, next) == current)
+            return;
+    }
+
+    /* Sustained contention must not turn an accounting failure into a
+     * connection-limit bypass.  Saturate until the normal timeout rolls the
+     * value into a fresh state. */
+    shared_conn_count_fail_closed(state, now_tick);
+}
+
+static __always_inline void shared_conn_count_record(
+    __u64 *state, __u64 now, __u64 timeout_ns)
+{ shared_conn_count_update(state, now, timeout_ns, CONN_COUNT_RECORD); }
+
+static __always_inline void shared_conn_count_activity(__u64 *state, __u64 now)
+{ shared_conn_count_update(state, now, 0, CONN_COUNT_ACTIVITY); }
+
+static __always_inline void shared_conn_count_close(__u64 *state, __u64 now)
+{ shared_conn_count_update(state, now, 0, CONN_COUNT_CLOSE); }
 
 static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
                                                 __u32 dest_port, __u32 conn_max,
@@ -236,6 +393,8 @@ static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
 {
     if (conn_max == 0)
         return XDP_PASS;
+
+    __u64 timeout_ns = cfg_tcp_timeout_ns(cfg);
 
     if (key->family == CT_FAMILY_IPV4) {
         struct tcp_src_conn_key_v4 skey;
@@ -245,17 +404,7 @@ static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
         sv = bpf_map_lookup_elem(&tsc4, &skey);
         if (!sv)
             return XDP_PASS;
-
-        if (now - sv->last_seen_ns > cfg_tcp_timeout_ns(cfg)) {
-            sv->count = 0;
-            sv->last_seen_ns = now;
-            return XDP_PASS;
-        }
-
-        if (sv->count >= conn_max)
-            return XDP_DROP;
-
-        return XDP_PASS;
+        return shared_conn_count_check(&sv->state, now, timeout_ns, conn_max);
     }
 
     {
@@ -266,17 +415,7 @@ static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
         sv = bpf_map_lookup_elem(&tsc6, &skey);
         if (!sv)
             return XDP_PASS;
-
-        if (now - sv->last_seen_ns > cfg_tcp_timeout_ns(cfg)) {
-            sv->count = 0;
-            sv->last_seen_ns = now;
-            return XDP_PASS;
-        }
-
-        if (sv->count >= conn_max)
-            return XDP_DROP;
-
-        return XDP_PASS;
+        return shared_conn_count_check(&sv->state, now, timeout_ns, conn_max);
     }
 }
 
@@ -295,16 +434,13 @@ static __always_inline void tcp_src_conn_record_established(
         if (!sv) {
             struct tcp_src_conn_val new_sv;
             __builtin_memset(&new_sv, 0, sizeof(new_sv));
-            new_sv.last_seen_ns = now;
-            new_sv.count = 1;
-            bpf_map_update_elem(&tsc4, &skey, &new_sv, BPF_ANY);
-        } else {
-            if (now - sv->last_seen_ns > tcp_timeout_ns)
-                sv->count = 0;
-            if (sv->count < 0xFFFFFFFF)
-                sv->count++;
-            sv->last_seen_ns = now;
+            new_sv.state = conn_state_pack(conn_state_tick(now), 1);
+            if (bpf_map_update_elem(&tsc4, &skey, &new_sv, BPF_NOEXIST) == 0)
+                goto source_done;
+            sv = bpf_map_lookup_elem(&tsc4, &skey);
         }
+        if (sv)
+            shared_conn_count_record(&sv->state, now, tcp_timeout_ns);
     } else {
         struct tcp_src_conn_key_v6 skey;
         struct tcp_src_conn_val *sv;
@@ -313,17 +449,15 @@ static __always_inline void tcp_src_conn_record_established(
         if (!sv) {
             struct tcp_src_conn_val new_sv;
             __builtin_memset(&new_sv, 0, sizeof(new_sv));
-            new_sv.last_seen_ns = now;
-            new_sv.count = 1;
-            bpf_map_update_elem(&tsc6, &skey, &new_sv, BPF_ANY);
-        } else {
-            if (now - sv->last_seen_ns > tcp_timeout_ns)
-                sv->count = 0;
-            if (sv->count < 0xFFFFFFFF)
-                sv->count++;
-            sv->last_seen_ns = now;
+            new_sv.state = conn_state_pack(conn_state_tick(now), 1);
+            if (bpf_map_update_elem(&tsc6, &skey, &new_sv, BPF_NOEXIST) == 0)
+                goto source_done;
+            sv = bpf_map_lookup_elem(&tsc6, &skey);
         }
+        if (sv)
+            shared_conn_count_record(&sv->state, now, tcp_timeout_ns);
     }
+source_done:
 
     /* L4 — per-prefix counter (tsc_pfx4/tsc_pfx6). */
     {
@@ -340,16 +474,13 @@ static __always_inline void tcp_src_conn_record_established(
             if (!pv) {
                 struct tcp_pfx_conn_val new_pv;
                 __builtin_memset(&new_pv, 0, sizeof(new_pv));
-                new_pv.last_seen_ns = now;
-                new_pv.count = 1;
-                bpf_map_update_elem(&tsc_pfx4, &pkey, &new_pv, BPF_ANY);
-            } else {
-                if (now - pv->last_seen_ns > tcp_timeout_ns)
-                    pv->count = 0;
-                if (pv->count < 0xFFFFFFFF)
-                    pv->count++;
-                pv->last_seen_ns = now;
+                new_pv.state = conn_state_pack(conn_state_tick(now), 1);
+                if (bpf_map_update_elem(&tsc_pfx4, &pkey, &new_pv, BPF_NOEXIST) == 0)
+                    goto prefix_done;
+                pv = bpf_map_lookup_elem(&tsc_pfx4, &pkey);
             }
+            if (pv)
+                shared_conn_count_record(&pv->state, now, tcp_timeout_ns);
         } else {
             struct prefix_rate_key_v6 pkey;
             struct tcp_pfx_conn_val *pv;
@@ -358,30 +489,24 @@ static __always_inline void tcp_src_conn_record_established(
             if (!pv) {
                 struct tcp_pfx_conn_val new_pv;
                 __builtin_memset(&new_pv, 0, sizeof(new_pv));
-                new_pv.last_seen_ns = now;
-                new_pv.count = 1;
-                bpf_map_update_elem(&tsc_pfx6, &pkey, &new_pv, BPF_ANY);
-            } else {
-                if (now - pv->last_seen_ns > tcp_timeout_ns)
-                    pv->count = 0;
-                if (pv->count < 0xFFFFFFFF)
-                    pv->count++;
-                pv->last_seen_ns = now;
+                new_pv.state = conn_state_pack(conn_state_tick(now), 1);
+                if (bpf_map_update_elem(&tsc_pfx6, &pkey, &new_pv, BPF_NOEXIST) == 0)
+                    goto prefix_done;
+                pv = bpf_map_lookup_elem(&tsc_pfx6, &pkey);
             }
+            if (pv)
+                shared_conn_count_record(&pv->state, now, tcp_timeout_ns);
         }
+prefix_done:
+        ;
     }
 
     /* L5 — per-port total counter (tsc_port ARRAY). */
     {
         struct tcp_port_conn_val *pv =
             bpf_map_lookup_elem(&tsc_port, &dest_port);
-        if (pv) {
-            if (now - pv->last_seen_ns > tcp_timeout_ns)
-                pv->count = 0;
-            if (pv->count < 0xFFFFFFFF)
-                pv->count++;
-            pv->last_seen_ns = now;
-        }
+        if (pv)
+            shared_conn_count_record(&pv->state, now, tcp_timeout_ns);
     }
 }
 
@@ -396,9 +521,7 @@ static __always_inline void tcp_src_conn_record_activity(struct flow_key *key, _
         sv = bpf_map_lookup_elem(&tsc4, &skey);
         if (!sv)
             return;
-        if (sv->count == 0)
-            sv->count = 1;
-        sv->last_seen_ns = now;
+        shared_conn_count_activity(&sv->state, now);
         return;
     }
 
@@ -410,9 +533,7 @@ static __always_inline void tcp_src_conn_record_activity(struct flow_key *key, _
         sv = bpf_map_lookup_elem(&tsc6, &skey);
         if (!sv)
             return;
-        if (sv->count == 0)
-            sv->count = 1;
-        sv->last_seen_ns = now;
+        shared_conn_count_activity(&sv->state, now);
     }
 }
 
@@ -426,28 +547,16 @@ static __always_inline void tcp_src_conn_record_close(struct flow_key *key, __u6
 
         fill_tcp_src_conn_key_v4(&skey, key, dest_port);
         sv = bpf_map_lookup_elem(&tsc4, &skey);
-        if (sv) {
-            if (sv->count <= 1) {
-                bpf_map_delete_elem(&tsc4, &skey);
-            } else {
-                sv->count--;
-                sv->last_seen_ns = now;
-            }
-        }
+        if (sv)
+            shared_conn_count_close(&sv->state, now);
     } else {
         struct tcp_src_conn_key_v6 skey;
         struct tcp_src_conn_val *sv;
 
         fill_tcp_src_conn_key_v6(&skey, key, dest_port);
         sv = bpf_map_lookup_elem(&tsc6, &skey);
-        if (sv) {
-            if (sv->count <= 1) {
-                bpf_map_delete_elem(&tsc6, &skey);
-            } else {
-                sv->count--;
-                sv->last_seen_ns = now;
-            }
-        }
+        if (sv)
+            shared_conn_count_close(&sv->state, now);
     }
 
     /* L4 — per-prefix decrement. */
@@ -462,27 +571,15 @@ static __always_inline void tcp_src_conn_record_close(struct flow_key *key, __u6
             struct tcp_pfx_conn_val *pv;
             fill_prefix_rate_key_v4(&pkey, key, dest_port, prefix_v4);
             pv = bpf_map_lookup_elem(&tsc_pfx4, &pkey);
-            if (pv) {
-                if (pv->count <= 1) {
-                    bpf_map_delete_elem(&tsc_pfx4, &pkey);
-                } else {
-                    pv->count--;
-                    pv->last_seen_ns = now;
-                }
-            }
+            if (pv)
+                shared_conn_count_close(&pv->state, now);
         } else {
             struct prefix_rate_key_v6 pkey;
             struct tcp_pfx_conn_val *pv;
             fill_prefix_rate_key_v6(&pkey, key, dest_port, prefix_v6);
             pv = bpf_map_lookup_elem(&tsc_pfx6, &pkey);
-            if (pv) {
-                if (pv->count <= 1) {
-                    bpf_map_delete_elem(&tsc_pfx6, &pkey);
-                } else {
-                    pv->count--;
-                    pv->last_seen_ns = now;
-                }
-            }
+            if (pv)
+                shared_conn_count_close(&pv->state, now);
         }
     }
 
@@ -490,10 +587,8 @@ static __always_inline void tcp_src_conn_record_close(struct flow_key *key, __u6
     {
         struct tcp_port_conn_val *pv =
             bpf_map_lookup_elem(&tsc_port, &dest_port);
-        if (pv && pv->count > 0) {
-            pv->count--;
-            pv->last_seen_ns = now;
-        }
+        if (pv)
+            shared_conn_count_close(&pv->state, now);
     }
 }
 
@@ -505,6 +600,8 @@ static __always_inline int tcp_conn_prefix_limit_check(
     if (conn_max == 0)
         return XDP_PASS;
 
+    __u64 timeout_ns = cfg_tcp_timeout_ns(cfg);
+
     if (key->family == CT_FAMILY_IPV4) {
         struct prefix_rate_key_v4 pkey;
         struct tcp_pfx_conn_val *pv;
@@ -512,11 +609,7 @@ static __always_inline int tcp_conn_prefix_limit_check(
         pv = bpf_map_lookup_elem(&tsc_pfx4, &pkey);
         if (!pv)
             return XDP_PASS;
-        if (now - pv->last_seen_ns > cfg_tcp_timeout_ns(cfg))
-            return XDP_PASS;
-        if (pv->count >= conn_max)
-            return XDP_DROP;
-        return XDP_PASS;
+        return shared_conn_count_check(&pv->state, now, timeout_ns, conn_max);
     }
     {
         struct prefix_rate_key_v6 pkey;
@@ -525,11 +618,7 @@ static __always_inline int tcp_conn_prefix_limit_check(
         pv = bpf_map_lookup_elem(&tsc_pfx6, &pkey);
         if (!pv)
             return XDP_PASS;
-        if (now - pv->last_seen_ns > cfg_tcp_timeout_ns(cfg))
-            return XDP_PASS;
-        if (pv->count >= conn_max)
-            return XDP_DROP;
-        return XDP_PASS;
+        return shared_conn_count_check(&pv->state, now, timeout_ns, conn_max);
     }
 }
 
@@ -543,11 +632,7 @@ static __always_inline int tcp_conn_port_limit_check(
         bpf_map_lookup_elem(&tsc_port, &dest_port);
     if (!pv)
         return XDP_PASS;
-    if (now - pv->last_seen_ns > cfg_tcp_timeout_ns(cfg))
-        return XDP_PASS;
-    if (pv->count >= conn_max)
-        return XDP_DROP;
-    return XDP_PASS;
+    return shared_conn_count_check(&pv->state, now, cfg_tcp_timeout_ns(cfg), conn_max);
 }
 
 static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest_port,
