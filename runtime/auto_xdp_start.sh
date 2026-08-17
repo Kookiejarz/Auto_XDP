@@ -144,9 +144,14 @@ ensure_xdp_loaded() {
     ensure_bpffs
 
     # A killed loader can leave a staged or rollback generation behind. Resume
-    # or verify it before the healthy fast path accepts existing attachments.
+    # it when possible. If the staged generation is no longer usable, verify
+    # and restore the last committed generation before accepting the healthy
+    # fast path below.
     if [[ -e "${BPF_PIN_DIR}_next" || -e "${BPF_PIN_DIR}_rollback" ]]; then
-        _auto_xdp_finish_interrupted_reload || return 1
+        if ! _auto_xdp_finish_interrupted_reload; then
+            _auto_xdp_warn "Interrupted candidate could not be committed; restoring the last committed generation."
+            _auto_xdp_restore_interrupted_reload || return 1
+        fi
     fi
 
     # If the prog is already pinned and maps are intact, just re-attach any
@@ -154,15 +159,15 @@ ensure_xdp_loaded() {
     if [[ -f "$BPF_PIN_DIR/prog" ]] && xdp_maps_ready; then
         local _iface _any_missing=0 _xdp_mode="native"
         for _iface in "${_IFACES[@]}"; do
-            if ! ip link show "$_iface" 2>/dev/null | grep -q "xdp"; then
+            if ! _auto_xdp_verify_iface_program "$_iface" "$BPF_PIN_DIR/prog"; then
                 _any_missing=1
-                if ip link set dev "$_iface" xdp pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
-                    echo "[auto_xdp] re-attached XDP (native) on $_iface" >&2
-                elif ip link set dev "$_iface" xdpgeneric pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
-                    echo "[auto_xdp] re-attached XDP (generic) on $_iface" >&2
-                    _xdp_mode="generic"
+                if _auto_xdp_attach_candidate "$_iface" "$BPF_PIN_DIR/prog" \
+                        && _auto_xdp_verify_iface_program "$_iface" "$BPF_PIN_DIR/prog"; then
+                    echo "[auto_xdp] re-attached XDP (${AUTO_XDP_LAST_ATTACH_MODE}) on $_iface" >&2
+                    [[ "$AUTO_XDP_LAST_ATTACH_MODE" == "generic" ]] && _xdp_mode="generic"
                 else
                     echo "[auto_xdp] warning: could not re-attach XDP to $_iface" >&2
+                    return 1
                 fi
             elif ip -d link show dev "$_iface" 2>/dev/null | grep -q "xdpgeneric"; then
                 _xdp_mode="generic"

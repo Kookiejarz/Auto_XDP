@@ -679,8 +679,16 @@ run_check_update() {
     done
 
     command -v curl >/dev/null 2>&1 || { printf 'curl is required for check-update\n' >&2; exit 1; }
+    command -v python3 >/dev/null 2>&1 || { printf 'python3 is required for check-update\n' >&2; exit 1; }
 
-    local setup_url="https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/heads/main/setup_xdp.sh"
+    local ref_url="https://api.github.com/repos/Kookiejarz/Auto_XDP/commits/main"
+    local source_ref
+    source_ref=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL "$ref_url" \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["sha"])') \
+        || { printf 'Failed to resolve the main branch commit\n' >&2; exit 1; }
+    [[ "$source_ref" =~ ^[0-9a-fA-F]{40}$ ]] \
+        || { printf 'GitHub returned an invalid commit SHA\n' >&2; exit 1; }
+    local setup_url="https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/${source_ref}/setup_xdp.sh"
     local tmp_setup
     tmp_setup=$(mktemp)
     trap 'rm -f "$tmp_setup"' EXIT
@@ -692,9 +700,11 @@ run_check_update() {
     fi
 
     if [[ $force -eq 1 ]]; then
-        bash "$tmp_setup" --check-update --force
+        AUTO_XDP_SOURCE_REF="$source_ref" AUTO_XDP_FORCE_REMOTE=1 \
+            bash "$tmp_setup" --check-update --force
     else
-        bash "$tmp_setup" --check-update
+        AUTO_XDP_SOURCE_REF="$source_ref" AUTO_XDP_FORCE_REMOTE=1 \
+            bash "$tmp_setup" --check-update
     fi
 }
 

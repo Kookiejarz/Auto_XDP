@@ -108,7 +108,9 @@ BUILD_STAGING_DIR=""
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 SERVICE_NAME="xdp-port-sync"
 RELAY_SERVICE_NAME="auto-xdp-relay"
-RAW_URL="https://raw.githubusercontent.com/Kookiejarz/auto_xdp/main"
+RAW_BASE_URL="https://raw.githubusercontent.com/Kookiejarz/Auto_XDP"
+AUTO_XDP_SOURCE_REF="${AUTO_XDP_SOURCE_REF:-}"
+RAW_URL=""
 TC_FILTER_PREF=49152
 PREFER_REMOTE_SOURCES=0
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
@@ -128,6 +130,32 @@ if [[ $PREFER_REMOTE_SOURCES -eq 0 ]]; then
         PREFER_REMOTE_SOURCES=1
     fi
 fi
+
+case "${AUTO_XDP_FORCE_REMOTE:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+        PREFER_REMOTE_SOURCES=1
+        ;;
+esac
+
+valid_source_ref() {
+    local ref="$1"
+
+    if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        return 0
+    fi
+    [[ "$ref" =~ ^refs/(heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || return 1
+    [[ "$ref" != *".."* && "$ref" != *"//"* && "$ref" != */ ]]
+}
+
+if [[ -z "$AUTO_XDP_SOURCE_REF" ]]; then
+    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
+        die "Remote installation requires AUTO_XDP_SOURCE_REF (for example refs/tags/v26.7.7a); use the release archive command from README.md."
+    fi
+    AUTO_XDP_SOURCE_REF="refs/heads/main"
+fi
+valid_source_ref "$AUTO_XDP_SOURCE_REF" \
+    || die "Invalid AUTO_XDP_SOURCE_REF: $AUTO_XDP_SOURCE_REF"
+RAW_URL="${RAW_BASE_URL}/${AUTO_XDP_SOURCE_REF}"
 
 PKG_MANAGER=""
 INIT_SYSTEM="none"
@@ -266,9 +294,18 @@ run_backend_phase_dispatch() {
     local -a force_arg=()
     [[ $FORCE -eq 1 ]] && force_arg=(--force)
 
-    as_root bash "$self" --internal-phase2 --result-file "$rf" \
-        "${force_arg[@]}" "${IFACES[@]}" \
-        || die "Backend bring-up failed under sudo."
+    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
+        as_root env \
+            "AUTO_XDP_SOURCE_REF=${AUTO_XDP_SOURCE_REF}" \
+            "AUTO_XDP_FORCE_REMOTE=1" \
+            bash "$self" --internal-phase2 --result-file "$rf" \
+            "${force_arg[@]}" "${IFACES[@]}" \
+            || die "Backend bring-up failed under sudo."
+    else
+        as_root bash "$self" --internal-phase2 --result-file "$rf" \
+            "${force_arg[@]}" "${IFACES[@]}" \
+            || die "Backend bring-up failed under sudo."
+    fi
 
     # shellcheck disable=SC1090
     [[ -s "$rf" ]] && source "$rf"

@@ -210,18 +210,38 @@ Incoming Packet
 ## Quick Start
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/v26.7.7a/setup_xdp.sh | sudo bash
+(
+  set -e
+  AUTO_XDP_VERSION=v26.7.7a
+  auto_xdp_tmp=$(mktemp -d)
+  trap 'rm -rf "$auto_xdp_tmp"' EXIT
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL \
+    "https://github.com/Kookiejarz/Auto_XDP/archive/refs/tags/${AUTO_XDP_VERSION}.tar.gz" \
+    | tar -xz -C "$auto_xdp_tmp" --strip-components=1
+  cd "$auto_xdp_tmp"
+  sudo bash setup_xdp.sh
+)
 ```
 
 ### Install a Specific Release
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/<version_here>/setup_xdp.sh | bash
+(
+  set -e
+  AUTO_XDP_VERSION=<version_here>
+  auto_xdp_tmp=$(mktemp -d)
+  trap 'rm -rf "$auto_xdp_tmp"' EXIT
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL \
+    "https://github.com/Kookiejarz/Auto_XDP/archive/refs/tags/${AUTO_XDP_VERSION}.tar.gz" \
+    | tar -xz -C "$auto_xdp_tmp" --strip-components=1
+  cd "$auto_xdp_tmp"
+  bash setup_xdp.sh
+)
 ```
 
-Using a tag gives you a reproducible installer version instead of tracking the latest `main` branch.
+The release archive keeps the installer, build inputs, Python runtime, and handlers on the same tag instead of mixing a tagged entry script with files from `main`.
 
-When the installer is executed from `stdin` (`curl | bash`), it prefers the matching GitHub source files instead of stale local files from the current working directory.
+Direct `curl | bash` execution is rejected unless `AUTO_XDP_SOURCE_REF` explicitly identifies a tag, branch, or full commit SHA. The release archive flow above is preferred because every source file is already present locally before privilege escalation.
 
 ## Install From Source
 
