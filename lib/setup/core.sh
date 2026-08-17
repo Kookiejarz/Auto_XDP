@@ -38,6 +38,19 @@ step_fail() {
     printf "${_STEP_INDENT}${RED}[ERROR]${NC}  %s\n" "${1:-Failed}" >&2
 }
 
+step_error() {
+    if [[ $IN_STEP -eq 1 && $_STEP_NEWLINED -eq 0 ]]; then
+        printf "\n"
+        _STEP_NEWLINED=1
+    fi
+    if [[ $_PENDING_NL -eq 1 ]]; then
+        printf "\n"
+        _PENDING_NL=0
+    fi
+    printf "${_STEP_INDENT}${RED}[ERROR]${NC}  %s\n" "${1:-Error}" >&2
+    _STEP_NEWLINED=1
+}
+
 step_warn() {
     local nl=$_STEP_NEWLINED
     local pending=$_PENDING_NL
@@ -177,22 +190,22 @@ priv_mkdir() {
 # Write stdin to DEST, escalating only when DEST is not user-writable.
 write_file() {
     local dest="$1"
-    priv_mkdir "$(dirname "$dest")"
-    if _can_write_path "$dest"; then
-        cat > "$dest"
-    else
-        as_root tee "$dest" >/dev/null
-    fi
+    local tmp
+    tmp=$(mktemp)
+    _SETUP_TMPFILES+=("$tmp")
+    cat > "$tmp"
+    place_file "$tmp" "$dest"
 }
 
-# Copy SRC to DEST, escalating only when DEST is not user-writable.
+# Copy SRC to DEST through a same-directory temporary and atomically rename it.
 place_file() {
     local src="$1" dest="$2"
+    local tmp="${dest}.auto-xdp-tmp-${BASHPID:-$$}"
     priv_mkdir "$(dirname "$dest")"
     if _can_write_path "$dest"; then
-        cp "$src" "$dest"
+        cp "$src" "$tmp" && mv -f "$tmp" "$dest"
     else
-        as_root cp "$src" "$dest"
+        as_root cp "$src" "$tmp" && as_root mv -f "$tmp" "$dest"
     fi
 }
 
@@ -210,6 +223,8 @@ Options:
   --check-env        Print detected package manager and init system, then exit
   --dry-run          Report planned actions without changing the system
   --all-interfaces   Deploy to all active non-loopback interfaces automatically
+  --allow-container-interfaces
+                     Allow explicitly included veth/container interfaces
   -h, --help         Show this help
 
 Examples:
@@ -251,6 +266,10 @@ parse_args() {
                 ALL_IFACES=1
                 shift
                 ;;
+            --allow-container-interfaces)
+                AUTO_XDP_ALLOW_CONTAINER=1
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -276,6 +295,43 @@ parse_args() {
 
 # Basic-info block printed before any install step. Detection (privileges,
 # distro, package manager, interfaces, existing install) must already be done.
+load_interface_policy() {
+    [[ -f "$TOML_CONFIG" ]] || return 0
+    local line key value
+    while IFS= read -r line; do
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            present) INTERFACE_POLICY_PRESENT="$value" ;;
+            mode) INTERFACE_CONFIG_MODE="$value" ;;
+            include) INTERFACE_CONFIG_INCLUDE+=("$value") ;;
+            exclude) INTERFACE_CONFIG_EXCLUDE+=("$value") ;;
+            allow_container) INTERFACE_ALLOW_CONTAINER="$value" ;;
+            xdp_mode) INTERFACE_XDP_MODE="$value" ;;
+        esac
+    done < <("${PYTHON3_BIN:-python3}" - "$TOML_CONFIG" <<'PY'
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+try:
+    with open(sys.argv[1], "rb") as handle:
+        table = tomllib.load(handle).get("interfaces", {})
+except Exception:
+    table = {}
+print(f"present={1 if table else 0}")
+print(f"mode={table.get('mode', 'auto')}")
+for name in table.get("include", []):
+    print(f"include={name}")
+for name in table.get("exclude", []):
+    print(f"exclude={name}")
+print(f"allow_container={1 if table.get('allow_container', False) else 0}")
+print(f"xdp_mode={table.get('xdp_mode', 'auto')}")
+PY
+)
+}
+
 print_basic_info() {
     echo -e "\n${BOLD}${CYAN}Auto XDP Installer${NC}\n"
     echo -e "${BOLD}Basic information${NC}"
@@ -305,22 +361,71 @@ print_basic_info() {
 }
 
 get_active_interfaces() {
+    local source_root="${SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+    local state_json=""
+    local -a exclude_args=()
+    local excluded_iface
+    for excluded_iface in "${INTERFACE_CONFIG_EXCLUDE[@]:-}"; do
+        [[ -n "$excluded_iface" ]] && exclude_args+=(--exclude "$excluded_iface")
+    done
+    state_json=$(ip -j -d link show up 2>/dev/null \
+        | PYTHONPATH="$source_root" "${PYTHON3_BIN:-python3}" \
+            -m auto_xdp.install_state select --input - "${exclude_args[@]}" 2>/dev/null) || state_json=""
+    if [[ -n "$state_json" ]]; then
+        "${PYTHON3_BIN:-python3}" -c '
+import json, sys
+for name in json.load(sys.stdin).get("interfaces", {}):
+    print(name)
+' <<< "$state_json"
+        return 0
+    fi
+
+    # Compatibility fallback for older iproute2 without JSON output.
     ip -o link show up 2>/dev/null \
         | awk -F': ' '{print $2}' \
         | awk '{print $1}' \
         | grep -v '^lo$' \
         | grep -v '@' \
-        | grep -v '^dummy' \
-        | grep -v '^virbr' \
-        | grep -v '^docker' \
-        | grep -v '^veth' \
-        | grep -v '^br-' \
-        | grep -v '^tun' \
-        | grep -v '^tap' \
-        | grep -v '^wg' \
-        | grep -v '^bond' \
-        | grep -v '^team' \
+        | grep -Ev '^(dummy|virbr|docker|veth|cni|flannel|cali|kube-ipvs)' \
         || true
+}
+
+_stage_machine_interface_state() {
+    local source_root="${SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+    local link_json="" state_file=""
+    link_json=$(ip -j -d link show 2>/dev/null) || return 0
+    state_file=$(mktemp)
+    _SETUP_TMPFILES+=("$state_file")
+
+    local -a explicit_args=()
+    if [[ "$IFACE_SOURCE" == "arguments" || "$IFACE_SOURCE" == "config.toml interfaces.include" ]]; then
+        local iface
+        for iface in "${IFACES[@]}"; do
+            explicit_args+=(--interface "$iface")
+        done
+    fi
+    local -a previous_args=()
+    [[ -f "$MACHINE_STATE" ]] && previous_args=(--machine-state "$MACHINE_STATE")
+    local -a container_args=()
+    case "${AUTO_XDP_ALLOW_CONTAINER:-${INTERFACE_ALLOW_CONTAINER:-0}}" in
+        1|true|TRUE|yes|YES) container_args=(--allow-container) ;;
+    esac
+    local -a exclude_args=()
+    local excluded_iface
+    for excluded_iface in "${INTERFACE_CONFIG_EXCLUDE[@]:-}"; do
+        [[ -n "$excluded_iface" ]] && exclude_args+=(--exclude "$excluded_iface")
+    done
+
+    if printf '%s\n' "$link_json" \
+        | PYTHONPATH="$source_root" "${PYTHON3_BIN:-python3}" \
+            -m auto_xdp.install_state select --input - \
+            "${explicit_args[@]}" "${previous_args[@]}" "${container_args[@]}" \
+            "${exclude_args[@]}" --default-xdp-mode "${INTERFACE_XDP_MODE:-auto}" \
+            --write "$state_file" >/dev/null; then
+        MACHINE_STATE_CANDIDATE="$state_file"
+    elif [[ ${#explicit_args[@]} -gt 0 ]]; then
+        return 1
+    fi
 }
 
 # How the target interfaces were chosen; shown in the basic-info block and the
@@ -371,12 +476,25 @@ _detect_default_route_iface() {
 # Silent: resolves IFACES/IFACE only; the result is reported in the basic-info
 # block printed at the top of the run.
 resolve_target_interfaces() {
+    if [[ ${#IFACES[@]} -eq 0 && ${#INTERFACE_CONFIG_INCLUDE[@]} -gt 0 ]]; then
+        IFACES=("${INTERFACE_CONFIG_INCLUDE[@]}")
+        IFACE_SOURCE="config.toml interfaces.include"
+    fi
     if [[ $ALL_IFACES -eq 1 ]]; then
         mapfile -t IFACES < <(get_active_interfaces)
         [[ ${#IFACES[@]} -gt 0 ]] || die "No active non-loopback interfaces found."
         IFACE_SOURCE="all active interfaces"
     elif [[ ${#IFACES[@]} -eq 0 ]]; then
-        _reuse_installed_ifaces || _detect_default_route_iface
+        if [[ ${INTERFACE_POLICY_PRESENT:-0} -eq 0 ]] && _reuse_installed_ifaces; then
+            :
+        else
+            mapfile -t IFACES < <(get_active_interfaces)
+            if [[ ${#IFACES[@]} -gt 0 ]]; then
+                IFACE_SOURCE="host auto-discovery"
+            else
+                _detect_default_route_iface
+            fi
+        fi
     fi
 
     local _iface
@@ -385,12 +503,7 @@ resolve_target_interfaces() {
     done
 
     IFACE="${IFACES[0]}"
-}
-
-# Backward-compatible alias; the up-front root requirement is gone. Privilege
-# is resolved by detect_privilege_mode and acquired lazily via priv_init.
-check_root_privileges() {
-    detect_privilege_mode
+    _stage_machine_interface_state
 }
 
 print_deployment_summary() {
@@ -408,6 +521,7 @@ EOF
     echo ""
     echo -e "${GREEN}Deployment summary${NC}"
     echo -e "  Status         : ${OK_MARK} complete"
+    echo "  Source         : ${SOURCE_REVISION:-local}"
     if [[ ${#IFACES[@]} -eq 1 ]]; then
         echo "  Interface      : ${IFACES[0]}  [${IFACE_SOURCE:-arguments}]"
     else
@@ -415,12 +529,15 @@ EOF
     fi
     if [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
         echo "  Backend        : XDP ($ACTIVE_XDP_MODE mode)"
+        echo "  Verification   : every interface program ID + tc egress"
         echo "  BPF maps       : $BPF_PIN_DIR/"
         echo "  TC egress obj  : $TC_OBJ_INSTALLED"
     else
         echo "  Backend        : nftables fallback"
         echo "  Fallback reason: ${XDP_FALLBACK_REASON:-XDP unavailable}"
-        echo "  nftables table : inet auto_xdp"
+        echo "  nftables table : ${NFT_FAMILY:-inet} ${NFT_TABLE:-auto_xdp}"
+        echo "  Coverage       : ports, ACL, trust, malformed/bogon, rates and conn caps"
+        echo "  XDP-only       : BPF handlers, ring-buffer telemetry, pre-stack throughput"
     fi
     echo "  Init system    : $INIT_SYSTEM"
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -434,6 +551,8 @@ EOF
         echo "  Relay service  : not installed"
     fi
     echo "  Config         : $TOML_CONFIG"
+    echo "  Machine state  : $MACHINE_STATE"
+    echo "  Runtime state  : $RUNTIME_STATE"
     echo "  Launcher       : $RUNNER_SCRIPT"
     echo "  Command        : $AXDP_CMD"
     echo ""
@@ -468,7 +587,7 @@ dry_run_report() {
     echo "package_manager=$PKG_MANAGER"
     echo "init_system=$INIT_SYSTEM"
     echo "interfaces=${detected_ifaces:-undetected}"
-    echo "missing_commands=$(for cmd in clang bpftool python3 curl ip tc nft; do command -v "$cmd" >/dev/null 2>&1 || printf '%s ' "$cmd"; done | sed 's/[[:space:]]*$//')"
+    echo "missing_commands=$(for cmd in clang bpftool python3 curl tar ip tc nft; do command -v "$cmd" >/dev/null 2>&1 || printf '%s ' "$cmd"; done | sed 's/[[:space:]]*$//')"
     echo "planned_packages=$(package_list_for_manager; optional_package_list_for_manager; printf ' python3-psutil python3-tomli-if-python310')"
     echo "planned_actions=check-dependencies,compile-xdp,deploy-backend,install-runtime,initial-sync,install-service"
     echo "note=dry-run performs no installs, no downloads, and no system changes"

@@ -31,7 +31,6 @@ info()  {
         echo -e "${CYAN}[INFO]${NC}  $*"
     fi
 }
-ok()    { if [[ $IN_STEP -eq 0 ]]; then echo -e "${GREEN}[OK]${NC}    $*"; fi; }
 warn()  {
     if [[ $IN_STEP -eq 1 ]]; then
         if [[ $_STEP_NEWLINED -eq 0 ]]; then printf "\n"; _STEP_NEWLINED=1; fi
@@ -82,16 +81,28 @@ XDP_OBJ="xdp_firewall.o"
 TC_SRC="tc_flow_track.c"
 TC_OBJ="tc_flow_track.o"
 
-INSTALL_DIR="/usr/local/lib/auto_xdp"
+INSTALL_ROOT="/usr/local/lib/auto_xdp"
+RELEASES_DIR="${INSTALL_ROOT}/releases"
+CURRENT_LINK="${INSTALL_ROOT}/current"
+INSTALL_DIR="$CURRENT_LINK"
+INSTALL_LOCK_DIR="/run/auto_xdp/install.lock"
+RELEASE_NAME="${AUTO_XDP_RELEASE_NAME:-}"
+RELEASE_CANDIDATE_DIR=""
+PREVIOUS_RELEASE=""
+INSTALL_TRANSACTION_ID=""
+INSTALL_TRANSACTION_ACTIVE=0
+INSTALL_TRANSACTION_COMMITTED=0
+INSTALL_LOCK_HELD=0
 PYTHON_LIB_DIR="${INSTALL_DIR}/python"
 AUTO_XDP_PACKAGE_DIR="${PYTHON_LIB_DIR}/auto_xdp"
 CONFIG_DIR="/etc/auto_xdp"
+INSTALL_TRANSACTION_FILE="${CONFIG_DIR}/install-transaction.json"
 CONFIG_FILE="${CONFIG_DIR}/auto_xdp.env"
 TOML_CONFIG="${CONFIG_DIR}/config.toml"
-SYNC_SCRIPT="/usr/local/bin/xdp_port_sync.py"
-RELAY_SCRIPT="/usr/local/bin/pkt_relay.py"
+SYNC_SCRIPT="${CURRENT_LINK}/xdp_port_sync.py"
+RELAY_SCRIPT="${CURRENT_LINK}/pkt_relay.py"
 AXDP_CMD="/usr/local/bin/axdp"
-RUNNER_SCRIPT="/usr/local/bin/auto_xdp_start.sh"
+RUNNER_SCRIPT="${CURRENT_LINK}/auto_xdp_start.sh"
 RUNNER_SRC="runtime/auto_xdp_start.sh"
 RUNTIME_COMMON_SRC="runtime/auto_xdp_runtime_common.sh"
 XDP_OBJ_INSTALLED="${INSTALL_DIR}/xdp_firewall.o"
@@ -99,11 +110,25 @@ TC_OBJ_INSTALLED="${INSTALL_DIR}/tc_flow_track.o"
 SOCK_STATE_SRC="bpf/sock_state_track.c"
 SOCK_STATE_OBJ="sock_state_track.o"
 SOCK_STATE_OBJ_INSTALLED="${INSTALL_DIR}/sock_state_track.o"
-BPF_RUNTIME_COMMON_INSTALLED="${INSTALL_DIR}/auto_xdp_runtime_common.sh"
 BPF_HELPER_SRC="auto_xdp_bpf_helpers.py"
 BPF_HELPER_INSTALLED="${INSTALL_DIR}/auto_xdp_bpf_helpers.py"
 BPF_HELPER_BOOTSTRAP=""
 BUILD_STAGING_DIR=""
+SOURCE_ROOT="${AUTO_XDP_PRESTAGED_SOURCE_ROOT:-}"
+BOOTSTRAP_LOCAL_ROOT=""
+SOURCE_REVISION=""
+SOURCE_VERSION=""
+MACHINE_STATE="${CONFIG_DIR}/machine-state.json"
+RUNTIME_STATE="${CONFIG_DIR}/runtime-state.json"
+MACHINE_STATE_CANDIDATE=""
+CANDIDATE_TOML_CONFIG=""
+INTERFACE_CONFIG_MODE="auto"
+INTERFACE_CONFIG_INCLUDE=()
+INTERFACE_CONFIG_EXCLUDE=()
+INTERFACE_ALLOW_CONTAINER=0
+INTERFACE_XDP_MODE="auto"
+INTERFACE_POLICY_PRESENT=0
+AUTO_XDP_ALLOW_CONTAINER=0
 
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 SERVICE_NAME="xdp-port-sync"
@@ -129,6 +154,9 @@ if [[ $PREFER_REMOTE_SOURCES -eq 0 ]]; then
     if [[ "${BASH_SOURCE[0]:-}" == "bash" || ! -r "${BASH_SOURCE[0]:-}" ]]; then
         PREFER_REMOTE_SOURCES=1
     fi
+fi
+if [[ $PREFER_REMOTE_SOURCES -eq 0 && -r "${BASH_SOURCE[0]:-}" ]]; then
+    BOOTSTRAP_LOCAL_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 fi
 
 case "${AUTO_XDP_FORCE_REMOTE:-0}" in
@@ -164,6 +192,8 @@ OPENRC_AVAILABLE=0
 ACTIVE_BACKEND="nftables"
 ACTIVE_XDP_MODE="none"
 XDP_FALLBACK_REASON=""
+REQUESTED_BACKEND="auto"
+PENDING_NFT_CUTOVER=0
 PYTHON3_BIN=""
 CHECK_UPDATES=0
 FORCE=0
@@ -186,17 +216,45 @@ _cleanup_setup_tmpfiles() {
     return 0
 }
 _cleanup_on_exit() {
+    local exit_status=$?
+    if [[ $exit_status -ne 0 && ${INSTALL_TRANSACTION_ACTIVE:-0} -eq 1 \
+            && ${INSTALL_TRANSACTION_COMMITTED:-0} -eq 0 ]] \
+            && declare -F rollback_install_transaction >/dev/null 2>&1; then
+        rollback_install_transaction || true
+    fi
+    if [[ ${INSTALL_LOCK_HELD:-0} -eq 1 ]] \
+            && declare -F release_install_lock >/dev/null 2>&1; then
+        release_install_lock || true
+    fi
+    if [[ -n "${RELEASE_CANDIDATE_DIR:-}" \
+            && "$(basename "$RELEASE_CANDIDATE_DIR")" == .staging-* \
+            && -d "$RELEASE_CANDIDATE_DIR" ]]; then
+        if declare -F as_root >/dev/null 2>&1 && [[ -n "${PRIV_MODE:-}" ]]; then
+            as_root rm -rf "$RELEASE_CANDIDATE_DIR" 2>/dev/null || true
+        else
+            rm -rf "$RELEASE_CANDIDATE_DIR" 2>/dev/null || true
+        fi
+    fi
     _cleanup_setup_tmpfiles
+    if [[ -n "${BUILD_STAGING_DIR:-}" && -d "$BUILD_STAGING_DIR" ]]; then
+        rm -rf "$BUILD_STAGING_DIR"
+    fi
     if declare -F _stop_priv_keepalive >/dev/null 2>&1; then
         _stop_priv_keepalive
     fi
+    return "$exit_status"
 }
 trap '_cleanup_on_exit' EXIT
 
 source_setup_lib() {
     local relative_path="$1"
     local source_path="$relative_path"
-    if [[ $PREFER_REMOTE_SOURCES -eq 1 || ! -r "$source_path" ]]; then
+    if [[ -n "${SOURCE_ROOT:-}" && -r "${SOURCE_ROOT}/${relative_path}" ]]; then
+        source_path="${SOURCE_ROOT}/${relative_path}"
+    elif [[ -n "${BOOTSTRAP_LOCAL_ROOT:-}" \
+            && -r "${BOOTSTRAP_LOCAL_ROOT}/${relative_path}" ]]; then
+        source_path="${BOOTSTRAP_LOCAL_ROOT}/${relative_path}"
+    elif [[ $PREFER_REMOTE_SOURCES -eq 1 || ! -r "$source_path" ]]; then
         source_path=$(mktemp)
         _SETUP_TMPFILES+=("$source_path")
         curl -fsSL "${RAW_URL}/${relative_path}" -o "$source_path" \
@@ -224,7 +282,12 @@ auto_xdp_shared_warn() {
 
 load_runtime_common_lib() {
     local lib_path="$RUNTIME_COMMON_SRC"
-    if [[ $PREFER_REMOTE_SOURCES -eq 1 || ! -r "$lib_path" ]]; then
+    if [[ -n "${SOURCE_ROOT:-}" && -r "${SOURCE_ROOT}/${RUNTIME_COMMON_SRC}" ]]; then
+        lib_path="${SOURCE_ROOT}/${RUNTIME_COMMON_SRC}"
+    elif [[ -n "${BOOTSTRAP_LOCAL_ROOT:-}" \
+            && -r "${BOOTSTRAP_LOCAL_ROOT}/${RUNTIME_COMMON_SRC}" ]]; then
+        lib_path="${BOOTSTRAP_LOCAL_ROOT}/${RUNTIME_COMMON_SRC}"
+    elif [[ $PREFER_REMOTE_SOURCES -eq 1 || ! -r "$lib_path" ]]; then
         lib_path=$(mktemp)
         _SETUP_TMPFILES+=("$lib_path")
         if ! fetch_local_or_remote "$RUNTIME_COMMON_SRC" "$RUNTIME_COMMON_SRC" "$lib_path"; then
@@ -237,6 +300,7 @@ load_runtime_common_lib() {
 
 load_runtime_common_lib
 source_setup_lib "lib/setup/install.sh"
+source_setup_lib "lib/setup/release.sh"
 
 # The backend bring-up: load the XDP/nftables backend, register handlers, seed
 # conntrack, and install + start the system service. These steps run the shared
@@ -258,6 +322,7 @@ _emit_backend_results() {
         printf 'ACTIVE_BACKEND=%q\n' "$ACTIVE_BACKEND"
         printf 'ACTIVE_XDP_MODE=%q\n' "$ACTIVE_XDP_MODE"
         printf 'XDP_FALLBACK_REASON=%q\n' "$XDP_FALLBACK_REASON"
+        printf 'REQUESTED_BACKEND=%q\n' "$REQUESTED_BACKEND"
     } > "$rf"
 }
 
@@ -265,6 +330,15 @@ _emit_backend_results() {
 # installer is being piped from curl there is no file on disk, so materialize a
 # copy from GitHub.
 _resolve_self_path() {
+    if [[ -n "${SOURCE_ROOT:-}" && -r "${SOURCE_ROOT}/setup_xdp.sh" ]]; then
+        printf '%s' "${SOURCE_ROOT}/setup_xdp.sh"
+        return 0
+    fi
+    if [[ -n "${BOOTSTRAP_LOCAL_ROOT:-}" \
+            && -r "${BOOTSTRAP_LOCAL_ROOT}/setup_xdp.sh" ]]; then
+        printf '%s' "${BOOTSTRAP_LOCAL_ROOT}/setup_xdp.sh"
+        return 0
+    fi
     if [[ $PREFER_REMOTE_SOURCES -eq 0 && -r "${BASH_SOURCE[0]:-}" ]]; then
         printf '%s' "${BASH_SOURCE[0]}"
         return 0
@@ -298,11 +372,14 @@ run_backend_phase_dispatch() {
         as_root env \
             "AUTO_XDP_SOURCE_REF=${AUTO_XDP_SOURCE_REF}" \
             "AUTO_XDP_FORCE_REMOTE=1" \
+            "AUTO_XDP_PRESTAGED_SOURCE_ROOT=${SOURCE_ROOT}" \
+            "AUTO_XDP_RELEASE_NAME=${RELEASE_NAME}" \
             bash "$self" --internal-phase2 --result-file "$rf" \
             "${force_arg[@]}" "${IFACES[@]}" \
             || die "Backend bring-up failed under sudo."
     else
-        as_root bash "$self" --internal-phase2 --result-file "$rf" \
+        as_root env "AUTO_XDP_RELEASE_NAME=${RELEASE_NAME}" \
+            bash "$self" --internal-phase2 --result-file "$rf" \
             "${force_arg[@]}" "${IFACES[@]}" \
             || die "Backend bring-up failed under sudo."
     fi
@@ -357,24 +434,31 @@ main() {
     # come last.
     detect_privilege_mode
     detect_environment
+    # Interface discovery itself depends on iproute2. Minimal hosts therefore
+    # bootstrap runtime tools under the install lock before resolving NICs.
+    priv_init
+    acquire_install_lock_step
+    recover_interrupted_install_step
+    check_required_tools_step
+    load_interface_policy
     resolve_target_interfaces
     if existing_install_detected; then
         EXISTING_INSTALL=1
     fi
     print_basic_info
     check_github_updates_once
-    # First system-mutating step ahead: acquire sudo once (no-op when root).
-    priv_init
-    check_required_tools_step
+    prepare_source_tree_step
     bootstrap_bpf_helper_step
-    replace_existing_install_step
+    prepare_candidate_config_step
     compile_bpf_objects_step
-    install_xdp_required_maps_step
-    install_runtime_files_step
-    restore_compiled_slot_handlers_step
+    stage_runtime_release_step
+    replace_existing_install_step
+    begin_install_transaction_step
+    activate_candidate_release_step
     # Backend bring-up runs as a single privileged unit (root in-process, or one
     # sudo re-exec when started as a normal user).
     run_backend_phase_dispatch
+    commit_install_transaction_step
     cleanup_build_artifacts_step
     print_deployment_summary
 }

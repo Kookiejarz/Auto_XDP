@@ -247,24 +247,19 @@ compile_xdp_program() {
         return 1
     fi
 
-    if ! compile_bpf_object "${_source_root}/${XDP_SRC}" "$XDP_OBJ" "$_source_root"; then
+    if ! compile_bpf_object "${_source_root}/${XDP_SRC}" "${BUILD_STAGING_DIR}/${XDP_OBJ}" "$_source_root"; then
         warn "Failed to compile ${XDP_SRC}; XDP backend will be skipped."
         return 1
     fi
-
-    priv_mkdir "$INSTALL_DIR"
-    place_file "$XDP_OBJ" "$XDP_OBJ_INSTALLED"
 
     if ! stage_build_source "$TC_SRC" "$TC_SRC" "$TC_SRC"; then
         warn "Unable to fetch ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
         return 0
     fi
-    if ! compile_bpf_object "${_source_root}/${TC_SRC}" "$TC_OBJ" "$_source_root"; then
+    if ! compile_bpf_object "${_source_root}/${TC_SRC}" "${BUILD_STAGING_DIR}/${TC_OBJ}" "$_source_root"; then
         warn "Failed to compile ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
         return 0
     fi
-    place_file "$TC_OBJ" "$TC_OBJ_INSTALLED"
-
     if [[ $_handlers_ready -eq 1 && -d "$_handlers_dir" ]] && command -v make &>/dev/null; then
         if ! bpf_header_exists "linux/bpf.h" "/usr/include" "$ASM_INC"; then
             warn "Slot handlers skipped: missing linux/bpf.h in /usr/include or ${ASM_INC}"
@@ -278,12 +273,7 @@ compile_xdp_program() {
                     ASM_INC="$ASM_INC" \
                     ARCH_FLAGS="-D__TARGET_ARCH_${TARGET_ARCH} ${HOST_ARCH_FLAG}" \
                     >"$handler_log" 2>&1; then
-                priv_mkdir "${INSTALL_DIR}/handlers"
-                local _ho
-                for _ho in "${_handlers_dir}"/*.o; do
-                    [[ -e "$_ho" ]] || continue
-                    place_file "$_ho" "${INSTALL_DIR}/handlers/$(basename "$_ho")"
-                done
+                : # compiled handler objects remain in staging until install
             else
                 warn "Slot handler compilation failed; handlers will be unavailable"
                 warn_from_log_file "$handler_log" "handler build: "
@@ -311,14 +301,12 @@ compile_sock_state_program() {
 
     if ! compile_bpf_object \
             "${BUILD_STAGING_DIR}/${SOCK_STATE_SRC}" \
-            "$SOCK_STATE_OBJ" \
+            "${BUILD_STAGING_DIR}/${SOCK_STATE_OBJ}" \
             "$BUILD_STAGING_DIR"; then
         warn "Failed to compile ${SOCK_STATE_SRC}; sock_state tracker will be skipped."
         return 1
     fi
 
-    priv_mkdir "$INSTALL_DIR"
-    place_file "$SOCK_STATE_OBJ" "$SOCK_STATE_OBJ_INSTALLED"
     return 0
 }
 
@@ -352,15 +340,6 @@ restore_compiled_slot_handlers() {
         [[ -e "$_ho" ]] || continue
         place_file "$_ho" "${INSTALL_DIR}/handlers/$(basename "$_ho")"
     done
-}
-
-restore_compiled_slot_handlers_step() {
-    step_begin "Restoring compiled slot handlers"
-    if restore_compiled_slot_handlers; then
-        step_ok
-    else
-        step_warn "restore failed"
-    fi
 }
 
 cleanup_build_artifacts_step() {

@@ -2,6 +2,90 @@ sha256_of_file() {
     python3 -c "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())" "$1"
 }
 
+prepare_source_tree() {
+    if [[ -n "${SOURCE_ROOT:-}" && -d "$SOURCE_ROOT" ]]; then
+        local existing_path
+        for existing_path in setup_xdp.sh config.toml auto_xdp bpf lib runtime; do
+            [[ -e "${SOURCE_ROOT}/${existing_path}" ]] || return 1
+        done
+        return 0
+    fi
+
+    ensure_build_staging_dir || return 1
+    SOURCE_ROOT="${BUILD_STAGING_DIR}/source"
+    mkdir -p "$SOURCE_ROOT"
+
+    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
+        local archive extract_root
+        if [[ "$AUTO_XDP_SOURCE_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            SOURCE_REVISION="${AUTO_XDP_SOURCE_REF,,}"
+        else
+            local encoded_ref response
+            encoded_ref=$("${PYTHON3_BIN:-python3}" -c \
+                'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+                "$AUTO_XDP_SOURCE_REF")
+            response=$(curl -fsSL \
+                "https://api.github.com/repos/Kookiejarz/Auto_XDP/commits/${encoded_ref}") \
+                || return 1
+            SOURCE_REVISION=$(printf '%s' "$response" | "${PYTHON3_BIN:-python3}" -c '
+import json, re, sys
+value = json.load(sys.stdin).get("sha", "")
+if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+    raise SystemExit(1)
+print(value.lower())
+') || return 1
+        fi
+        archive="${BUILD_STAGING_DIR}/source.tar.gz"
+        extract_root="${BUILD_STAGING_DIR}/archive"
+        mkdir -p "$extract_root"
+        info "Downloading one source archive for ${AUTO_XDP_SOURCE_REF}..."
+        curl -fsSL \
+            "https://codeload.github.com/Kookiejarz/Auto_XDP/tar.gz/${SOURCE_REVISION}" \
+            -o "$archive" || return 1
+        tar -xzf "$archive" -C "$extract_root" || return 1
+        local unpacked=""
+        unpacked=$(find "$extract_root" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+        [[ -n "$unpacked" ]] || return 1
+        cp -R "$unpacked"/. "$SOURCE_ROOT"/ || return 1
+    else
+        local repo_root
+        repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+        SOURCE_REVISION=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)
+        [[ "$SOURCE_REVISION" =~ ^[0-9a-fA-F]{40}$ ]] || SOURCE_REVISION="local"
+        local path
+        local required=(
+            setup_xdp.sh axdp config.toml xdp_port_sync.py pkt_relay.py
+            auto_xdp_bpf_helpers.py tc_flow_track.c auto_xdp bpf handlers
+            lib runtime
+        )
+        for path in "${required[@]}"; do
+            [[ -e "${repo_root}/${path}" ]] || {
+                warn "Source snapshot is missing required path: $path"
+                return 1
+            }
+            cp -R "${repo_root}/${path}" "$SOURCE_ROOT"/ || return 1
+        done
+    fi
+
+    for path in setup_xdp.sh config.toml auto_xdp bpf lib runtime; do
+        [[ -e "${SOURCE_ROOT}/${path}" ]] || {
+            warn "Source archive failed manifest validation: $path missing"
+            return 1
+        }
+    done
+    SOURCE_VERSION="${SOURCE_REVISION:0:12}"
+    return 0
+}
+
+prepare_source_tree_step() {
+    step_begin "Staging one complete source tree"
+    if prepare_source_tree; then
+        step_ok "${AUTO_XDP_SOURCE_REF}"
+    else
+        die "Could not stage a complete source tree. Current installation was not changed."
+    fi
+}
+
 # Download URL into TARGET, escalating only when TARGET is a system path. The
 # download itself runs unprivileged into a user temp, then place_file installs
 # it (with sudo if needed).
@@ -159,6 +243,14 @@ fetch_local_or_remote() {
     local tmp_file=""
     local local_hash=""
     local remote_hash=""
+
+    if [[ -n "${SOURCE_ROOT:-}" && -f "${SOURCE_ROOT}/${local_path}" ]]; then
+        if [[ "${SOURCE_ROOT}/${local_path}" != "$target_path" ]]; then
+            place_file "${SOURCE_ROOT}/${local_path}" "$target_path"
+        fi
+        info "Using staged ${remote_name}"
+        return 0
+    fi
 
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
         info "Installer is running from stdin; fetching ${remote_name} from GitHub..."
