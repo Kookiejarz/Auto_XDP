@@ -81,8 +81,7 @@ struct mc_rate_key_v6 {
 };
 
 struct mc_rate_val {
-    __u64 window_start_ns;
-    __u32 count;
+    __u64 state; /* upper 32 bits: window tick; lower 32 bits: count */
 };
 
 struct mc_pending_val {
@@ -222,21 +221,51 @@ static __always_inline void fill_rate_key_v6(struct mc_rate_key_v6 *key, const s
     key->prefix[1] = ct->saddr[1];
 }
 
-#define MC_RATE_CHECK(map, key, now, window_ns, max_count, over_limit)            \
-    do {                                                                          \
-        struct mc_rate_val *_v = bpf_map_lookup_elem((map), (key));              \
-        if (!_v) {                                                                \
-            struct mc_rate_val _init = { .window_start_ns = (now), .count = 1 }; \
-            bpf_map_update_elem((map), (key), &_init, BPF_ANY);                  \
-            (over_limit) = false;                                                \
-        } else if ((now) - _v->window_start_ns > (window_ns)) {                  \
-            _v->window_start_ns = (now);                                         \
-            _v->count = 1;                                                       \
-            (over_limit) = false;                                                \
-        } else {                                                                  \
-            _v->count++;                                                         \
-            (over_limit) = _v->count > (max_count);                              \
-        }                                                                         \
+#define MC_RATE_TICK_NS 1000000ULL
+#define MC_RATE_RETRIES 64
+
+#define MC_RATE_CHECK(map, key, now, window_ns, max_count, over_limit)               \
+    do {                                                                             \
+        (over_limit) = true;                                                         \
+        __u32 _now_tick = (__u32)((now) / MC_RATE_TICK_NS);                         \
+        __u64 _ticks64 = (window_ns) / MC_RATE_TICK_NS;                            \
+        if ((window_ns) % MC_RATE_TICK_NS)                                          \
+            _ticks64++;                                                             \
+        __u32 _window_ticks = _ticks64 > 0x7FFFFFFFULL ? 0x7FFFFFFFU                \
+                                                       : (__u32)_ticks64;            \
+        if (_window_ticks == 0)                                                      \
+            _window_ticks = 1;                                                      \
+        for (int _attempt = 0; _attempt < MC_RATE_RETRIES; _attempt++) {             \
+            struct mc_rate_val *_v = bpf_map_lookup_elem((map), (key));             \
+            if (!_v) {                                                               \
+                struct mc_rate_val _init = {                                         \
+                    .state = ((__u64)_now_tick << 32) | 1ULL,                        \
+                };                                                                   \
+                if (bpf_map_update_elem((map), (key), &_init, BPF_NOEXIST) == 0) {  \
+                    (over_limit) = false;                                            \
+                    break;                                                           \
+                }                                                                    \
+                continue;                                                            \
+            }                                                                        \
+            __u64 _current = __sync_fetch_and_add(&_v->state, 0);                   \
+            __u32 _start_tick = (__u32)(_current >> 32);                            \
+            __u32 _count = (__u32)_current;                                          \
+            __u32 _next_tick = _now_tick;                                            \
+            __u32 _next_count;                                                       \
+            if ((__u32)(_now_tick - _start_tick) >= _window_ticks) {                \
+                _next_count = 1;                                                     \
+            } else {                                                                 \
+                if (_count >= (__u32)(max_count))                                    \
+                    break;                                                           \
+                _next_count = _count + 1;                                            \
+                _next_tick = _start_tick;                                            \
+            }                                                                        \
+            __u64 _next = ((__u64)_next_tick << 32) | _next_count;                  \
+            if (__sync_val_compare_and_swap(&_v->state, _current, _next) == _current) { \
+                (over_limit) = false;                                                \
+                break;                                                               \
+            }                                                                        \
+        }                                                                            \
     } while (0)
 
 static __always_inline bool mc_handshake_rate_exceeded(
