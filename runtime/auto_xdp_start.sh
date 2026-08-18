@@ -3,7 +3,43 @@ set -euo pipefail
 
 CONFIG_FILE="${CONFIG_FILE:-/etc/auto_xdp/auto_xdp.env}"
 RUN_STATE_DIR="${RUN_STATE_DIR:-/run/auto_xdp}"
-RUNTIME_COMMON_SCRIPT="${RUNTIME_COMMON_SCRIPT:-/usr/local/lib/auto_xdp/auto_xdp_runtime_common.sh}"
+AUTO_XDP_LAUNCHER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+RUNTIME_COMMON_SCRIPT="${RUNTIME_COMMON_SCRIPT:-${AUTO_XDP_LAUNCHER_DIR}/auto_xdp_runtime_common.sh}"
+
+recover_interrupted_release_switch() {
+    local install_root="${AUTO_XDP_INSTALL_ROOT:-/usr/local/lib/auto_xdp}"
+    local current_link="${AUTO_XDP_CURRENT_LINK:-${install_root}/current}"
+    local transaction_file="${INSTALL_TRANSACTION_FILE:-/etc/auto_xdp/install-transaction.json}"
+    [[ -f "$transaction_file" ]] || return 0
+    local phase previous fields script_dir
+    local -a _recovery_fields=()
+    fields=$(python3 - "$transaction_file" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as handle:
+        value = json.load(handle)
+except Exception:
+    raise SystemExit(0)
+if value.get("status") != "active":
+    raise SystemExit(0)
+print(value.get("phase", ""))
+print(value.get("previous", ""))
+PY
+) || return 0
+    mapfile -t _recovery_fields <<<"$fields"
+    phase="${_recovery_fields[0]:-}"
+    previous="${_recovery_fields[1]:-}"
+    [[ "$phase" == "switching" && -n "$previous" \
+        && -d "${install_root}/${previous}" ]] || return 0
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+    echo "[auto_xdp] interrupted install switch detected; restoring ${previous}" >&2
+    PYTHONPATH="${script_dir}/python" python3 -m auto_xdp.install_state link \
+        --target "$previous" --link "$current_link" || return 1
+    PYTHONPATH="${script_dir}/python" python3 -m auto_xdp.install_state transition \
+        --path "$transaction_file" --status recovered --phase rolled_back || return 1
+    exec "${current_link}/auto_xdp_start.sh" "$@"
+}
 
 append_pythonpath_once() {
     local path="$1"
@@ -18,19 +54,16 @@ append_pythonpath_once() {
 }
 
 discover_python_lib_dir() {
-    local script_dir candidate
+    local candidate
     local -a candidates=()
 
     if [[ -n "${PYTHON_LIB_DIR:-}" ]]; then
         candidates+=("${PYTHON_LIB_DIR}")
     fi
-    if [[ -n "${INSTALL_DIR:-}" ]]; then
-        candidates+=("${INSTALL_DIR}/python" "${INSTALL_DIR}")
-    fi
-
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-    script_dir="$(cd "${script_dir}/.." && pwd)"
-    candidates+=("${script_dir}" "${script_dir}/python")
+    candidates+=(
+        "${AUTO_XDP_LAUNCHER_DIR}/python"
+        "$(cd "${AUTO_XDP_LAUNCHER_DIR}/.." && pwd)"
+    )
 
     for candidate in "${candidates[@]}"; do
         [[ -f "${candidate}/auto_xdp/__init__.py" ]] || continue
@@ -40,8 +73,8 @@ discover_python_lib_dir() {
 
     if [[ -n "${PYTHON_LIB_DIR:-}" ]]; then
         printf '%s\n' "${PYTHON_LIB_DIR}"
-    elif [[ -n "${INSTALL_DIR:-}" ]]; then
-        printf '%s\n' "${INSTALL_DIR}/python"
+    else
+        printf '%s\n' "${AUTO_XDP_LAUNCHER_DIR}/python"
     fi
 }
 
@@ -54,6 +87,7 @@ auto_xdp_shared_warn() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    recover_interrupted_release_switch "$@"
     [[ -f "$CONFIG_FILE" ]] || {
         echo "[auto_xdp] missing config: $CONFIG_FILE" >&2
         exit 1
@@ -73,56 +107,32 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     # shellcheck disable=SC1091
     source "$RUNTIME_COMMON_SCRIPT"
 
-    # Normalize _IFACES array — supports both new IFACES= and legacy IFACE= configs.
-    IFS=' ' read -ra _IFACES <<< "${IFACES:-${IFACE:-}}"
+    IFS=' ' read -ra _IFACES <<< "${IFACES:-}"
     [[ ${#_IFACES[@]} -gt 0 ]] || {
-        echo "[auto_xdp] no interfaces configured (IFACES or IFACE missing from config)" >&2
+        echo "[auto_xdp] no interfaces configured (IFACES missing from config)" >&2
         exit 1
     }
 fi
 
 resolve_preferred_backend() {
-    local preferred="${PREFERRED_BACKEND:-auto}"
+    _auto_xdp_resolve_preferred_backend "${TOML_CONFIG:-}" "${PREFERRED_BACKEND:-auto}"
+}
 
-    [[ -f "${TOML_CONFIG:-}" ]] || {
-        printf '%s\n' "$preferred"
-        return 0
-    }
-
-    preferred=$("$PYTHON3_BIN" - "$TOML_CONFIG" "$preferred" <<'PY'
-import os
-import sys
-
-path, default = sys.argv[1], sys.argv[2]
-
+resolve_committed_backend() {
+    local state_path="${RUNTIME_STATE:-/etc/auto_xdp/runtime-state.json}"
+    [[ -f "$state_path" ]] || return 1
+    "$PYTHON3_BIN" - "$state_path" <<'PY'
+import json, sys
 try:
-    import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib  # type: ignore[no-redef]
-    except ImportError:
-        print(default)
-        raise SystemExit(0)
-
-if not os.path.exists(path):
-    print(default)
-    raise SystemExit(0)
-
-try:
-    with open(path, "rb") as f:
-        cfg = tomllib.load(f)
+    with open(sys.argv[1]) as handle:
+        state = json.load(handle)
+    value = state.get("active_backend") if state.get("healthy") else None
 except Exception:
-    print(default)
-    raise SystemExit(0)
-
-preferred = str(cfg.get("daemon", {}).get("preferred_backend", default)).lower()
-if preferred not in {"auto", "xdp", "nftables"}:
-    preferred = default
-print(preferred)
+    value = None
+if value not in {"xdp", "nftables"}:
+    raise SystemExit(1)
+print(value)
 PY
-) || preferred="${PREFERRED_BACKEND:-auto}"
-
-    printf '%s\n' "$preferred"
 }
 
 run_sync_script() {
@@ -178,6 +188,10 @@ ensure_xdp_loaded() {
         auto_tune_interface_parallelism || true
         [[ $_any_missing -eq 1 ]] && echo "[auto_xdp] re-attached XDP to missing interfaces" >&2
         echo "$_xdp_mode" > "${RUN_STATE_DIR}/xdp_mode"
+        _auto_xdp_record_xdp_state "$BPF_PIN_DIR/prog" || {
+            echo "[auto_xdp] warning: could not persist verified per-interface XDP state" >&2
+            return 1
+        }
         return 0
     fi
 
@@ -201,12 +215,88 @@ ensure_xdp_loaded() {
     return 0
 }
 
+activate_nftables_backend() {
+    command -v nft &>/dev/null || {
+        echo "[auto_xdp] nft not found and nftables backend was selected" >&2
+        return 1
+    }
+
+    local needs_cutover=0 iface mode index detached=0 rollback_ok=1
+    local nft_family="${NFT_FAMILY:-inet}" nft_table="${NFT_TABLE:-auto_xdp}"
+    local -a old_modes=()
+    _auto_xdp_any_target_has_xdp && needs_cutover=1
+    if [[ $needs_cutover -eq 0 ]] \
+            && nft list table "$nft_family" "$nft_table" 2>/dev/null \
+                | grep -F 'set policy_schema_v2' >/dev/null; then
+        echo "nftables" > "${RUN_STATE_DIR}/backend"
+        _auto_xdp_record_nft_state
+        return
+    fi
+
+    # Build and validate the full nftables policy while XDP still protects the
+    # interfaces. nft commits the generated table atomically.
+    if ! PYTHONPATH="${PYTHON_LIB_DIR}${PYTHONPATH:+:$PYTHONPATH}" \
+            "$PYTHON3_BIN" "$SYNC_SCRIPT" \
+            --config "$TOML_CONFIG" --backend nftables; then
+        echo "[auto_xdp] nftables candidate sync failed; retaining current XDP backend" >&2
+        return 1
+    fi
+    nft list table "$nft_family" "$nft_table" 2>/dev/null \
+        | grep -F 'set policy_schema_v2' >/dev/null || {
+        echo "[auto_xdp] nftables candidate schema verification failed; retaining current XDP backend" >&2
+        return 1
+    }
+
+    if [[ $needs_cutover -eq 1 ]]; then
+        for iface in "${_IFACES[@]}"; do
+            old_modes+=("$(_auto_xdp_iface_xdp_mode "$iface")")
+        done
+        for iface in "${_IFACES[@]}"; do
+            _auto_xdp_detach_mode "$iface" native
+            _auto_xdp_detach_mode "$iface" generic
+            if [[ "$(_auto_xdp_iface_xdp_mode "$iface")" != "none" ]]; then
+                echo "[auto_xdp] failed to remove XDP from $iface after nftables verification" >&2
+                for ((index = 0; index < detached; index++)); do
+                    _auto_xdp_attach_mode "${_IFACES[$index]}" "$BPF_PIN_DIR/prog" \
+                        "${old_modes[$index]}" >/dev/null 2>&1 \
+                        && _auto_xdp_verify_iface_program "${_IFACES[$index]}" "$BPF_PIN_DIR/prog" \
+                        || rollback_ok=0
+                done
+                [[ $rollback_ok -eq 1 ]] \
+                    || echo "[auto_xdp] warning: XDP rollback was incomplete; retaining all pin generations" >&2
+                return 1
+            fi
+            detached=$((detached + 1))
+        done
+        cleanup_tc_egress_filter
+    fi
+
+    echo "nftables" > "${RUN_STATE_DIR}/backend"
+    _auto_xdp_record_nft_state
+}
+
+_auto_xdp_record_nft_state() {
+    local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+    local generation
+    generation=$(_auto_xdp_runtime_generation)
+    PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON3_BIN" -m auto_xdp.install_state record \
+        --machine-state "${MACHINE_STATE:-/etc/auto_xdp/machine-state.json}" \
+        --runtime-state "${RUNTIME_STATE:-/etc/auto_xdp/runtime-state.json}" \
+        --requested-backend "${preferred_backend:-nftables}" \
+        --active-backend nftables \
+        --generation "$generation" >/dev/null
+}
+
 select_backend() {
     mkdir -p "$RUN_STATE_DIR"
-    local preferred_backend xdp_status=1
+    local preferred_backend committed_backend="" xdp_status=1
     preferred_backend=$(resolve_preferred_backend)
+    if [[ "$preferred_backend" == "auto" ]]; then
+        committed_backend=$(resolve_committed_backend 2>/dev/null || true)
+    fi
 
-    if [[ "$preferred_backend" != "nftables" ]]; then
+    if [[ "$preferred_backend" != "nftables" && "$committed_backend" != "nftables" ]]; then
         if ensure_xdp_loaded; then
             xdp_status=0
         else
@@ -214,9 +304,12 @@ select_backend() {
         fi
         if [[ $xdp_status -eq 0 ]]; then
             echo "xdp" > "${RUN_STATE_DIR}/backend"
-            if command -v nft &>/dev/null && nft list table inet auto_xdp &>/dev/null 2>&1; then
-                if nft delete table inet auto_xdp 2>/dev/null; then
-                    echo "[auto_xdp] nftables inet auto_xdp table removed (replaced by XDP)"
+            if command -v nft &>/dev/null \
+                    && nft list table "${NFT_FAMILY:-inet}" "${NFT_TABLE:-auto_xdp}" \
+                        &>/dev/null 2>&1; then
+                if nft delete table "${NFT_FAMILY:-inet}" "${NFT_TABLE:-auto_xdp}" \
+                        2>/dev/null; then
+                    echo "[auto_xdp] nftables ${NFT_FAMILY:-inet} ${NFT_TABLE:-auto_xdp} table removed (replaced by XDP)"
                 fi
             fi
             return 0
@@ -227,11 +320,7 @@ select_backend() {
         fi
     fi
 
-    command -v nft &>/dev/null || {
-        echo "[auto_xdp] nft not found and XDP unavailable" >&2
-        exit 1
-    }
-    echo "nftables" > "${RUN_STATE_DIR}/backend"
+    activate_nftables_backend
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
