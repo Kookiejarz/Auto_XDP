@@ -106,7 +106,19 @@ static __always_inline void fill_tcp_src_conn_key_v6(
 
 /* Sliding-window limiter: reset on expiry, drop if unit_field + increment > max.
  * `map` is a map pointer expression (e.g. &synag4 or an inner map from
- * a per-port ARRAY_OF_MAPS lookup). */
+ * a per-port ARRAY_OF_MAPS lookup).
+ *
+ * These value structs live in shared (non-percpu) LRU_HASH maps and are hit
+ * from every RX CPU concurrently. The whole "check window expiry -> maybe
+ * reset -> compare against max -> increment" sequence has to execute as one
+ * atomic unit, or two CPUs landing in the same window both read the old
+ * unit_field, both pass the max check, and both write back their own
+ * increment - the last writer's value wins and the other CPU's increment is
+ * silently lost (undercounting the rate under load). A single atomic add on
+ * unit_field is not sufficient by itself because the reset-on-expiry branch
+ * still needs to be race-free against the increment branch. bpf_spin_lock
+ * protects the full sequence, matching the pattern already used by
+ * struct udp_global_state's lock. */
 #define WINDOW_RATE_CHECK(map, rkey, val_type, unit_field, now, window_ns, increment, max) \
     do {                                                                                    \
         val_type *_rv = bpf_map_lookup_elem((map), &(rkey));                              \
@@ -118,15 +130,20 @@ static __always_inline void fill_tcp_src_conn_key_v6(
             bpf_map_update_elem((map), &(rkey), &_new, BPF_ANY);                          \
             return XDP_PASS;                                                                \
         }                                                                                   \
+        int _verdict;                                                                       \
+        bpf_spin_lock(&_rv->lock);                                                          \
         if ((now) - _rv->window_start_ns >= (window_ns)) {                                 \
             _rv->window_start_ns = (now);                                                   \
             _rv->unit_field = (increment);                                                  \
-            return XDP_PASS;                                                                \
-        }                                                                                   \
-        if ((__u64)_rv->unit_field + (__u64)(increment) > (__u64)(max))                    \
-            return XDP_DROP;                                                                \
-        _rv->unit_field += (increment);                                                     \
-        return XDP_PASS;                                                                    \
+            _verdict = XDP_PASS;                                                            \
+        } else if ((__u64)_rv->unit_field + (__u64)(increment) > (__u64)(max)) {           \
+            _verdict = XDP_DROP;                                                            \
+        } else {                                                                            \
+            _rv->unit_field += (increment);                                                 \
+            _verdict = XDP_PASS;                                                            \
+        }                                                                                    \
+        bpf_spin_unlock(&_rv->lock);                                                        \
+        return _verdict;                                                                    \
     } while (0)
 
 static __always_inline int syn_rate_check(struct flow_key *key, __u64 now,
@@ -246,16 +263,17 @@ static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
         if (!sv)
             return XDP_PASS;
 
+        int verdict;
+        bpf_spin_lock(&sv->lock);
         if (now - sv->last_seen_ns > cfg_tcp_timeout_ns(cfg)) {
             sv->count = 0;
             sv->last_seen_ns = now;
-            return XDP_PASS;
+            verdict = XDP_PASS;
+        } else {
+            verdict = (sv->count >= conn_max) ? XDP_DROP : XDP_PASS;
         }
-
-        if (sv->count >= conn_max)
-            return XDP_DROP;
-
-        return XDP_PASS;
+        bpf_spin_unlock(&sv->lock);
+        return verdict;
     }
 
     {
@@ -267,16 +285,17 @@ static __always_inline int tcp_conn_limit_check(struct flow_key *key, __u64 now,
         if (!sv)
             return XDP_PASS;
 
+        int verdict;
+        bpf_spin_lock(&sv->lock);
         if (now - sv->last_seen_ns > cfg_tcp_timeout_ns(cfg)) {
             sv->count = 0;
             sv->last_seen_ns = now;
-            return XDP_PASS;
+            verdict = XDP_PASS;
+        } else {
+            verdict = (sv->count >= conn_max) ? XDP_DROP : XDP_PASS;
         }
-
-        if (sv->count >= conn_max)
-            return XDP_DROP;
-
-        return XDP_PASS;
+        bpf_spin_unlock(&sv->lock);
+        return verdict;
     }
 }
 
@@ -299,11 +318,13 @@ static __always_inline void tcp_src_conn_record_established(
             new_sv.count = 1;
             bpf_map_update_elem(&tsc4, &skey, &new_sv, BPF_ANY);
         } else {
+            bpf_spin_lock(&sv->lock);
             if (now - sv->last_seen_ns > tcp_timeout_ns)
                 sv->count = 0;
             if (sv->count < 0xFFFFFFFF)
                 sv->count++;
             sv->last_seen_ns = now;
+            bpf_spin_unlock(&sv->lock);
         }
     } else {
         struct tcp_src_conn_key_v6 skey;
@@ -317,11 +338,13 @@ static __always_inline void tcp_src_conn_record_established(
             new_sv.count = 1;
             bpf_map_update_elem(&tsc6, &skey, &new_sv, BPF_ANY);
         } else {
+            bpf_spin_lock(&sv->lock);
             if (now - sv->last_seen_ns > tcp_timeout_ns)
                 sv->count = 0;
             if (sv->count < 0xFFFFFFFF)
                 sv->count++;
             sv->last_seen_ns = now;
+            bpf_spin_unlock(&sv->lock);
         }
     }
 
@@ -344,11 +367,13 @@ static __always_inline void tcp_src_conn_record_established(
                 new_pv.count = 1;
                 bpf_map_update_elem(&tsc_pfx4, &pkey, &new_pv, BPF_ANY);
             } else {
+                bpf_spin_lock(&pv->lock);
                 if (now - pv->last_seen_ns > tcp_timeout_ns)
                     pv->count = 0;
                 if (pv->count < 0xFFFFFFFF)
                     pv->count++;
                 pv->last_seen_ns = now;
+                bpf_spin_unlock(&pv->lock);
             }
         } else {
             struct prefix_rate_key_v6 pkey;
@@ -362,25 +387,31 @@ static __always_inline void tcp_src_conn_record_established(
                 new_pv.count = 1;
                 bpf_map_update_elem(&tsc_pfx6, &pkey, &new_pv, BPF_ANY);
             } else {
+                bpf_spin_lock(&pv->lock);
                 if (now - pv->last_seen_ns > tcp_timeout_ns)
                     pv->count = 0;
                 if (pv->count < 0xFFFFFFFF)
                     pv->count++;
                 pv->last_seen_ns = now;
+                bpf_spin_unlock(&pv->lock);
             }
         }
     }
 
-    /* L5 — per-port total counter (tsc_port ARRAY). */
+    /* L5 — per-port total counter (tsc_port ARRAY). Shared across every RX
+     * CPU (ARRAY maps have no per-cpu variant selected here), so this needs
+     * the same lock as the LRU-backed counters above. */
     {
         struct tcp_port_conn_val *pv =
             bpf_map_lookup_elem(&tsc_port, &dest_port);
         if (pv) {
+            bpf_spin_lock(&pv->lock);
             if (now - pv->last_seen_ns > tcp_timeout_ns)
                 pv->count = 0;
             if (pv->count < 0xFFFFFFFF)
                 pv->count++;
             pv->last_seen_ns = now;
+            bpf_spin_unlock(&pv->lock);
         }
     }
 }
@@ -396,9 +427,11 @@ static __always_inline void tcp_src_conn_record_activity(struct flow_key *key, _
         sv = bpf_map_lookup_elem(&tsc4, &skey);
         if (!sv)
             return;
+        bpf_spin_lock(&sv->lock);
         if (sv->count == 0)
             sv->count = 1;
         sv->last_seen_ns = now;
+        bpf_spin_unlock(&sv->lock);
         return;
     }
 
@@ -410,9 +443,11 @@ static __always_inline void tcp_src_conn_record_activity(struct flow_key *key, _
         sv = bpf_map_lookup_elem(&tsc6, &skey);
         if (!sv)
             return;
+        bpf_spin_lock(&sv->lock);
         if (sv->count == 0)
             sv->count = 1;
         sv->last_seen_ns = now;
+        bpf_spin_unlock(&sv->lock);
     }
 }
 
@@ -427,12 +462,19 @@ static __always_inline void tcp_src_conn_record_close(struct flow_key *key, __u6
         fill_tcp_src_conn_key_v4(&skey, key, dest_port);
         sv = bpf_map_lookup_elem(&tsc4, &skey);
         if (sv) {
-            if (sv->count <= 1) {
-                bpf_map_delete_elem(&tsc4, &skey);
-            } else {
+            bool should_delete;
+            bpf_spin_lock(&sv->lock);
+            should_delete = sv->count <= 1;
+            if (!should_delete) {
                 sv->count--;
                 sv->last_seen_ns = now;
             }
+            bpf_spin_unlock(&sv->lock);
+            /* Delete only after unlocking: the lock lives inside the map
+             * value, so unlocking a slot bpf_map_delete_elem() has already
+             * freed would touch released memory. */
+            if (should_delete)
+                bpf_map_delete_elem(&tsc4, &skey);
         }
     } else {
         struct tcp_src_conn_key_v6 skey;
@@ -441,12 +483,16 @@ static __always_inline void tcp_src_conn_record_close(struct flow_key *key, __u6
         fill_tcp_src_conn_key_v6(&skey, key, dest_port);
         sv = bpf_map_lookup_elem(&tsc6, &skey);
         if (sv) {
-            if (sv->count <= 1) {
-                bpf_map_delete_elem(&tsc6, &skey);
-            } else {
+            bool should_delete;
+            bpf_spin_lock(&sv->lock);
+            should_delete = sv->count <= 1;
+            if (!should_delete) {
                 sv->count--;
                 sv->last_seen_ns = now;
             }
+            bpf_spin_unlock(&sv->lock);
+            if (should_delete)
+                bpf_map_delete_elem(&tsc6, &skey);
         }
     }
 
@@ -463,12 +509,16 @@ static __always_inline void tcp_src_conn_record_close(struct flow_key *key, __u6
             fill_prefix_rate_key_v4(&pkey, key, dest_port, prefix_v4);
             pv = bpf_map_lookup_elem(&tsc_pfx4, &pkey);
             if (pv) {
-                if (pv->count <= 1) {
-                    bpf_map_delete_elem(&tsc_pfx4, &pkey);
-                } else {
+                bool should_delete;
+                bpf_spin_lock(&pv->lock);
+                should_delete = pv->count <= 1;
+                if (!should_delete) {
                     pv->count--;
                     pv->last_seen_ns = now;
                 }
+                bpf_spin_unlock(&pv->lock);
+                if (should_delete)
+                    bpf_map_delete_elem(&tsc_pfx4, &pkey);
             }
         } else {
             struct prefix_rate_key_v6 pkey;
@@ -476,12 +526,16 @@ static __always_inline void tcp_src_conn_record_close(struct flow_key *key, __u6
             fill_prefix_rate_key_v6(&pkey, key, dest_port, prefix_v6);
             pv = bpf_map_lookup_elem(&tsc_pfx6, &pkey);
             if (pv) {
-                if (pv->count <= 1) {
-                    bpf_map_delete_elem(&tsc_pfx6, &pkey);
-                } else {
+                bool should_delete;
+                bpf_spin_lock(&pv->lock);
+                should_delete = pv->count <= 1;
+                if (!should_delete) {
                     pv->count--;
                     pv->last_seen_ns = now;
                 }
+                bpf_spin_unlock(&pv->lock);
+                if (should_delete)
+                    bpf_map_delete_elem(&tsc_pfx6, &pkey);
             }
         }
     }
@@ -490,9 +544,13 @@ static __always_inline void tcp_src_conn_record_close(struct flow_key *key, __u6
     {
         struct tcp_port_conn_val *pv =
             bpf_map_lookup_elem(&tsc_port, &dest_port);
-        if (pv && pv->count > 0) {
-            pv->count--;
-            pv->last_seen_ns = now;
+        if (pv) {
+            bpf_spin_lock(&pv->lock);
+            if (pv->count > 0) {
+                pv->count--;
+                pv->last_seen_ns = now;
+            }
+            bpf_spin_unlock(&pv->lock);
         }
     }
 }

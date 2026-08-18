@@ -94,7 +94,16 @@ struct syn_rate_key_v6 {
     __u32 addr[4];
 };
 
+/* NOTE on locking: these *_val structs live in shared (non-percpu) LRU_HASH /
+ * ARRAY map slots that are read-modify-written from every RX CPU concurrently
+ * (window-expiry check + reset + increment/decrement is not a single atomic
+ * op). Each carries its own struct bpf_spin_lock so rate_limit.h can protect
+ * the whole critical section, the same pattern already used by
+ * struct udp_global_state above. Do not remove the lock field or read/modify
+ * `count`/`units` outside of bpf_spin_lock()/bpf_spin_unlock(). */
+
 struct syn_rate_val {
+    struct bpf_spin_lock lock;
     __u64 window_start_ns;
     __u32 count;
     __u32 _pad;
@@ -111,6 +120,8 @@ struct prefix_rate_key_v6 {
 };
 
 struct prefix_rate_val {
+    struct bpf_spin_lock lock;
+    __u32 _pad;
     __u64 window_start_ns;
     __u64 units;
 };
@@ -126,18 +137,21 @@ struct tcp_src_conn_key_v6 {
 };
 
 struct tcp_src_conn_val {
+    struct bpf_spin_lock lock;
     __u64 last_seen_ns;
     __u32 count;
     __u32 _pad;
 };
 
 struct tcp_pfx_conn_val {
+    struct bpf_spin_lock lock;
     __u64 last_seen_ns;
     __u32 count;
     __u32 _pad;
 };
 
 struct tcp_port_conn_val {
+    struct bpf_spin_lock lock;
     __u64 last_seen_ns;
     __u32 count;
     __u32 _pad;

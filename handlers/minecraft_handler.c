@@ -81,6 +81,10 @@ struct mc_rate_key_v6 {
 };
 
 struct mc_rate_val {
+    /* Shared LRU_HASH map value hit from every RX CPU for a given source
+     * prefix concurrently — needs a lock around the whole check-reset-
+     * increment sequence in MC_RATE_CHECK below, same as rate_limit.h. */
+    struct bpf_spin_lock lock;
     __u64 window_start_ns;
     __u32 count;
 };
@@ -226,16 +230,23 @@ static __always_inline void fill_rate_key_v6(struct mc_rate_key_v6 *key, const s
     do {                                                                          \
         struct mc_rate_val *_v = bpf_map_lookup_elem((map), (key));              \
         if (!_v) {                                                                \
-            struct mc_rate_val _init = { .window_start_ns = (now), .count = 1 }; \
+            struct mc_rate_val _init;                                            \
+            __builtin_memset(&_init, 0, sizeof(_init));                         \
+            _init.window_start_ns = (now);                                       \
+            _init.count = 1;                                                     \
             bpf_map_update_elem((map), (key), &_init, BPF_ANY);                  \
             (over_limit) = false;                                                \
-        } else if ((now) - _v->window_start_ns > (window_ns)) {                  \
-            _v->window_start_ns = (now);                                         \
-            _v->count = 1;                                                       \
-            (over_limit) = false;                                                \
         } else {                                                                  \
-            _v->count++;                                                         \
-            (over_limit) = _v->count > (max_count);                              \
+            bpf_spin_lock(&_v->lock);                                            \
+            if ((now) - _v->window_start_ns > (window_ns)) {                     \
+                _v->window_start_ns = (now);                                     \
+                _v->count = 1;                                                   \
+                (over_limit) = false;                                            \
+            } else {                                                              \
+                _v->count++;                                                     \
+                (over_limit) = _v->count > (max_count);                          \
+            }                                                                     \
+            bpf_spin_unlock(&_v->lock);                                          \
         }                                                                         \
     } while (0)
 
