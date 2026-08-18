@@ -23,15 +23,8 @@ stop_existing_service() {
 existing_install_detected() {
     local runtime_paths=(
         "$CONFIG_FILE"
-        "$SYNC_SCRIPT"
         "$AXDP_CMD"
-        "$RUNNER_SCRIPT"
-        "$BPF_RUNTIME_COMMON_INSTALLED"
-        "${INSTALL_DIR}/xdp_required_maps.txt"
-        "$BPF_HELPER_INSTALLED"
-        "$XDP_OBJ_INSTALLED"
-        "$TC_OBJ_INSTALLED"
-        "${INSTALL_DIR}/handlers"
+        "$CURRENT_LINK"
         "${CONFIG_DIR}/config.toml"
     )
     local path=""
@@ -54,15 +47,56 @@ existing_install_detected() {
     return 1
 }
 
-# Existing installs are replaced in place, without prompting: runtime files are
-# repo-managed and safe to overwrite. User-edited config.toml is still guarded
-# separately by install_toml_config. Stray services/processes are always
-# stopped so the new deployment starts clean.
+prepare_candidate_config() {
+    local source_config="${CONFIG_DIR}/config.toml"
+    if [[ ! -f "$source_config" ]]; then
+        source_config="${SOURCE_ROOT}/config.toml"
+    fi
+    [[ -f "$source_config" ]] || return 1
+    local candidate
+    candidate=$(mktemp)
+    _SETUP_TMPFILES+=("$candidate")
+    cp "$source_config" "$candidate" || return 1
+    "${PYTHON3_BIN:-python3}" - "$candidate" <<'PY'
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], "rb") as handle:
+    value = tomllib.load(handle)
+backend = str(value.get("daemon", {}).get("preferred_backend", "auto")).lower()
+if backend not in {"auto", "xdp", "nftables"}:
+    raise SystemExit(f"invalid daemon.preferred_backend: {backend}")
+interfaces = value.get("interfaces", {})
+mode = str(interfaces.get("mode", "auto"))
+if mode not in {"auto", "explicit"}:
+    raise SystemExit(f"invalid interfaces.mode: {mode}")
+if mode == "explicit" and not interfaces.get("include", []):
+    raise SystemExit("interfaces.mode=explicit requires a non-empty interfaces.include")
+xdp_mode = str(interfaces.get("xdp_mode", "auto"))
+if xdp_mode not in {"auto", "native", "generic"}:
+    raise SystemExit(f"invalid interfaces.xdp_mode: {xdp_mode}")
+PY
+    CANDIDATE_TOML_CONFIG="$candidate"
+}
+
+prepare_candidate_config_step() {
+    step_begin "Validating candidate configuration"
+    if prepare_candidate_config; then
+        step_ok "local config preserved"
+    else
+        die "Candidate config validation failed. Current installation was not changed."
+    fi
+}
+
+# The complete candidate release is already staged and validated when this
+# runs. Stop old processes only for the short atomic current-link transaction.
 replace_existing_install_step() {
     if existing_install_detected; then
         step_begin "Replacing existing installation"
         stop_existing_service
-        step_ok "services stopped; runtime files will be overwritten"
+        step_ok "services stopped; candidate release is ready"
     else
         step_begin "Checking existing installation"
         stop_existing_service
@@ -71,135 +105,51 @@ replace_existing_install_step() {
 }
 
 write_config() {
+    REQUESTED_BACKEND=$(_auto_xdp_resolve_preferred_backend "$TOML_CONFIG" "auto")
     priv_mkdir "$CONFIG_DIR"
     write_file "$CONFIG_FILE" <<EOF_CFG
 IFACES="${IFACES[*]}"
-IFACE="${IFACES[0]}"
-SYNC_SCRIPT="${SYNC_SCRIPT}"
+SYNC_SCRIPT="${CURRENT_LINK}/xdp_port_sync.py"
 PYTHON3_BIN="${PYTHON3_BIN}"
 BPF_PIN_DIR="${BPF_PIN_DIR}"
-XDP_OBJ_PATH="${XDP_OBJ_INSTALLED}"
-TC_OBJ_PATH="${TC_OBJ_INSTALLED}"
-SOCK_STATE_OBJ_PATH="${SOCK_STATE_OBJ_INSTALLED}"
-PREFERRED_BACKEND="auto"
+XDP_OBJ_PATH="${CURRENT_LINK}/${XDP_OBJ}"
+TC_OBJ_PATH="${CURRENT_LINK}/${TC_OBJ}"
+SOCK_STATE_OBJ_PATH="${CURRENT_LINK}/${SOCK_STATE_OBJ}"
+PREFERRED_BACKEND="${REQUESTED_BACKEND}"
+MACHINE_STATE="${MACHINE_STATE}"
+RUNTIME_STATE="${RUNTIME_STATE}"
+INSTALL_TRANSACTION_FILE="${INSTALL_TRANSACTION_FILE}"
+RUNTIME_GENERATION="${RELEASE_NAME:-unknown}"
 AUTO_TUNE_QUEUES="1"
-BPF_HELPER_SCRIPT="${BPF_HELPER_INSTALLED}"
+BPF_HELPER_SCRIPT="${CURRENT_LINK}/auto_xdp_bpf_helpers.py"
 TOML_CONFIG="${CONFIG_DIR}/config.toml"
-INSTALL_DIR="${INSTALL_DIR}"
-HANDLERS_DIR="${INSTALL_DIR}/handlers"
-PYTHON_LIB_DIR="${PYTHON_LIB_DIR}"
-PYTHONPATH="${PYTHON_LIB_DIR}"
+INSTALL_DIR="${CURRENT_LINK}"
+HANDLERS_DIR="${CONFIG_DIR}/handlers"
+PYTHON_LIB_DIR="${CURRENT_LINK}/python"
+PYTHONPATH="${CURRENT_LINK}/python"
 export BPF_PIN_DIR
 EOF_CFG
 }
 
-cleanup_installed_python_support_package() {
-    local pkg_root="${AUTO_XDP_PACKAGE_DIR}"
-
-    [[ -n "$pkg_root" ]] || return 0
-    if [[ -d "$pkg_root" ]]; then
-        as_root rm -rf "$pkg_root"
-    fi
-    priv_mkdir "$pkg_root"
-}
-
-cleanup_installed_handler_sdk() {
-    local handlers_root="${INSTALL_DIR}/handlers"
-    local config_path="${CONFIG_DIR}/config.toml"
-    local installed_file=""
-    local base_name=""
-    local resolved_file=""
-    local keep_file=0
-    local preserved_path=""
-    local -a preserve_paths=()
-
-    priv_mkdir "$handlers_root"
-
-    if command -v "${PYTHON3_BIN:-python3}" >/dev/null 2>&1 && [[ -f "$config_path" ]]; then
-        mapfile -t preserve_paths < <("${PYTHON3_BIN:-python3}" - "$config_path" "$handlers_root" <<'PY'
-import os
-import sys
-from pathlib import Path
-
-config_path = Path(sys.argv[1])
-handlers_root = Path(sys.argv[2]).resolve()
-preserved = set()
-
-try:
-    import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib  # type: ignore[no-redef]
-    except ImportError:
-        raise SystemExit(0)
-
-try:
-    with config_path.open("rb") as fh:
-        cfg = tomllib.load(fh)
-except Exception:
-    raise SystemExit(0)
-
-for entry in cfg.get("slots", {}).get("enabled", []):
-    if isinstance(entry, dict):
-        raw_path = entry.get("path")
-        if raw_path:
-            try:
-                path = Path(str(raw_path)).resolve()
-            except OSError:
-                continue
-            if path.parent == handlers_root:
-                preserved.add(str(path))
-
-for proto in ("tcp", "udp"):
-    table = cfg.get("port_handlers", {}).get(proto, {})
-    if not isinstance(table, dict):
-        continue
-    for raw_path in table.values():
-        if not raw_path:
-            continue
-        try:
-            path = Path(str(raw_path)).resolve()
-        except OSError:
-            continue
-        if path.parent == handlers_root:
-            preserved.add(str(path))
-
-for path in sorted(preserved):
-    print(path)
-PY
-)
-    fi
-
-    while IFS= read -r installed_file; do
-        base_name="$(basename "$installed_file")"
-        resolved_file="$(cd "$(dirname "$installed_file")" && pwd -P)/${base_name}"
-        keep_file=0
-
-        case "$base_name" in
-            custom_*)
-                continue
-                ;;
-        esac
-
-        for preserved_path in "${preserve_paths[@]}"; do
-            if [[ "$resolved_file" == "$preserved_path" ]]; then
-                keep_file=1
-                break
-            fi
-        done
-        [[ $keep_file -eq 1 ]] && continue
-
-        as_root rm -f "$installed_file"
-    done < <(find "$handlers_root" -maxdepth 1 -type f)
+install_machine_state() {
+    [[ -n "${MACHINE_STATE_CANDIDATE:-}" && -f "$MACHINE_STATE_CANDIDATE" ]] || return 0
+    place_file "$MACHINE_STATE_CANDIDATE" "$MACHINE_STATE"
+    as_root chmod 0644 "$MACHINE_STATE"
 }
 
 install_python_support_package() {
     local pkg_root="${AUTO_XDP_PACKAGE_DIR}"
     local files rel target
 
-    cleanup_installed_python_support_package
+    priv_mkdir "$pkg_root"
 
-    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
+    if [[ -n "${SOURCE_ROOT:-}" && -d "${SOURCE_ROOT}/auto_xdp" ]]; then
+        mapfile -t files < <(
+            find "${SOURCE_ROOT}/auto_xdp" -name "*.py" -type f \
+                | sed "s|^${SOURCE_ROOT}/||" \
+                | sort
+        )
+    elif [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
         local api_url
         api_url="$(sed \
             -e 's|https://raw\.githubusercontent\.com/|https://api.github.com/repos/|' \
@@ -240,10 +190,11 @@ for e in tree:
 }
 
 install_runner_script() {
-    if ! fetch_local_or_remote "$RUNNER_SRC" "$RUNNER_SRC" "$RUNNER_SCRIPT"; then
+    local target="${INSTALL_DIR}/auto_xdp_start.sh"
+    if ! fetch_local_or_remote "$RUNNER_SRC" "$RUNNER_SRC" "$target"; then
         die "Failed to install ${RUNNER_SRC}"
     fi
-    as_root chmod +x "$RUNNER_SCRIPT"
+    as_root chmod +x "$target"
 }
 
 install_xdp_required_maps() {
@@ -256,45 +207,44 @@ install_xdp_required_maps() {
     fi
 }
 
-install_xdp_required_maps_step() {
-    step_begin "Installing XDP required maps list"
-    install_xdp_required_maps
-    step_ok
-}
-
 install_runtime_common_script() {
-    if ! fetch_local_or_remote "$RUNTIME_COMMON_SRC" "$RUNTIME_COMMON_SRC" "$BPF_RUNTIME_COMMON_INSTALLED"; then
+    local target="${INSTALL_DIR}/auto_xdp_runtime_common.sh"
+    if ! fetch_local_or_remote "$RUNTIME_COMMON_SRC" "$RUNTIME_COMMON_SRC" "$target"; then
         die "Failed to install ${RUNTIME_COMMON_SRC}"
     fi
-    as_root chmod +x "$BPF_RUNTIME_COMMON_INSTALLED"
+    as_root chmod +x "$target"
 }
 
 install_sync_script() {
-    if ! fetch_local_or_remote "xdp_port_sync.py" "xdp_port_sync.py" "$SYNC_SCRIPT"; then
+    local target="${INSTALL_DIR}/xdp_port_sync.py"
+    if ! fetch_local_or_remote "xdp_port_sync.py" "xdp_port_sync.py" "$target"; then
         die "Failed to install xdp_port_sync.py"
     fi
-    as_root chmod +x "$SYNC_SCRIPT"
+    as_root chmod +x "$target"
 }
 
 install_relay_script() {
-    if ! fetch_local_or_remote "pkt_relay.py" "pkt_relay.py" "$RELAY_SCRIPT"; then
+    local target="${INSTALL_DIR}/pkt_relay.py"
+    if ! fetch_local_or_remote "pkt_relay.py" "pkt_relay.py" "$target"; then
         die "Failed to install pkt_relay.py"
     fi
-    as_root chmod +x "$RELAY_SCRIPT"
+    as_root chmod +x "$target"
 }
 
 install_bpf_helper() {
-    if ! fetch_local_or_remote "$BPF_HELPER_SRC" "$BPF_HELPER_SRC" "$BPF_HELPER_INSTALLED"; then
+    local target="${INSTALL_DIR}/auto_xdp_bpf_helpers.py"
+    if ! fetch_local_or_remote "$BPF_HELPER_SRC" "$BPF_HELPER_SRC" "$target"; then
         die "Failed to install ${BPF_HELPER_SRC}"
     fi
-    as_root chmod +x "$BPF_HELPER_INSTALLED"
+    as_root chmod +x "$target"
 }
 
 install_axdp_command() {
-    if ! fetch_local_or_remote "axdp" "axdp" "$AXDP_CMD"; then
+    local target="${INSTALL_DIR}/axdp"
+    if ! fetch_local_or_remote "axdp" "axdp" "$target"; then
         die "Failed to install axdp"
     fi
-    as_root chmod +x "$AXDP_CMD"
+    as_root chmod +x "$target"
 }
 
 validate_installed_python_support_package() {
@@ -330,7 +280,7 @@ install_slot_handler_sdk() {
     local -a handler_files=()
     local rel=""
 
-    cleanup_installed_handler_sdk
+    priv_mkdir "$handlers_root"
 
     if [[ -n "${BUILD_STAGING_DIR:-}" && -d "${BUILD_STAGING_DIR}/handlers" ]]; then
         local _staged=()
@@ -365,16 +315,17 @@ for e in json.load(sys.stdin).get('tree', []):
 " | sort
         )
     else
+        local handler_root="${SOURCE_ROOT:-${BOOTSTRAP_LOCAL_ROOT:-.}}/handlers"
         mapfile -t handler_files < <(
-            find handlers -maxdepth 1 -type f \
+            find "$handler_root" -maxdepth 1 -type f \
                 \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) \
                 | sort
         )
     fi
 
     if [[ ${#handler_files[@]} -eq 0 ]]; then
-        warn "Handler SDK files not found (GitHub API unavailable or repo empty); skipping SDK install"
-        return 1
+        warn "Handler SDK files not found (GitHub API unavailable or repo empty); continuing without optional handlers"
+        return 0
     fi
 
     for rel in "${handler_files[@]}"; do
@@ -387,48 +338,55 @@ for e in json.load(sys.stdin).get('tree', []):
 install_toml_config() {
     local toml_target="${CONFIG_DIR}/config.toml"
     priv_mkdir "$CONFIG_DIR"
+    priv_mkdir "${CONFIG_DIR}/handlers"
+    as_root chmod 0755 "${CONFIG_DIR}/handlers"
 
     if [[ -f "$toml_target" ]]; then
-        if ! confirm_yes_no "config.toml already exists at ${toml_target}. Replace with repo default? [y/N] "; then
-            return 0
-        fi
-        # User-edited config is about to be replaced (interactive yes or
-        # --force); keep a copy so the settings are recoverable.
-        place_file "$toml_target" "${toml_target}.bak"
-        info "Backed up existing config to ${toml_target}.bak"
+        local backup_dir="${CONFIG_DIR}/backups"
+        local stamp
+        stamp=$(date -u +%Y%m%d-%H%M%S)
+        priv_mkdir "$backup_dir"
+        place_file "$toml_target" "${backup_dir}/config.toml.${stamp}"
+        as_root chmod 0700 "$backup_dir"
+        info "Preserving existing config.toml (backup: ${backup_dir}/config.toml.${stamp})"
+        return 0
     fi
 
-    if ! fetch_local_or_remote "config.toml" "config.toml" "$toml_target"; then
+    if [[ -n "${CANDIDATE_TOML_CONFIG:-}" && -f "$CANDIDATE_TOML_CONFIG" ]]; then
+        place_file "$CANDIDATE_TOML_CONFIG" "$toml_target"
+    elif ! fetch_local_or_remote "config.toml" "config.toml" "$toml_target"; then
         die "Failed to install config.toml"
     fi
 }
 
-install_runtime_files() {
+build_release_payload() {
     priv_mkdir "$INSTALL_DIR"
 
-    _install_runtime_common_assets() {
-        install_runtime_common_script
-        write_config
+    install_compiled_bpf_objects() {
+        local object source
+        for object in "$XDP_OBJ" "$TC_OBJ" "$SOCK_STATE_OBJ"; do
+            source="${BUILD_STAGING_DIR}/${object}"
+            [[ -f "$source" ]] || continue
+            place_file "$source" "${INSTALL_DIR}/${object}" || return 1
+        done
+        return 0
     }
 
-    substep_run "Installing sync daemon" install_sync_script
-    substep_run "Installing Python support package" install_python_support_package
-    substep_run "Installing relay helper" install_relay_script
-    substep_run "Installing BPF helper script" install_bpf_helper
-    substep_run "Installing axdp command" install_axdp_command
-    substep_run "Validating Python support package" validate_installed_python_support_package
-    substep_run "Installing slot handler SDK" install_slot_handler_sdk
-    substep_run "Installing shared runtime library" _install_runtime_common_assets
-    substep_run "Installing default TOML config" install_toml_config
-    substep_run "Installing launcher script" install_runner_script
+    local rc=0
+    substep_run "Installing staged BPF objects" install_compiled_bpf_objects || rc=1
+    substep_run "Installing XDP required maps list" install_xdp_required_maps || rc=1
+    substep_run "Installing sync daemon" install_sync_script || rc=1
+    substep_run "Installing Python support package" install_python_support_package || rc=1
+    substep_run "Installing relay helper" install_relay_script || rc=1
+    substep_run "Installing BPF helper script" install_bpf_helper || rc=1
+    substep_run "Installing axdp command" install_axdp_command || rc=1
+    substep_run "Validating Python support package" validate_installed_python_support_package || rc=1
+    substep_run "Installing slot handler SDK" install_slot_handler_sdk || rc=1
+    substep_run "Installing shared runtime library" install_runtime_common_script || rc=1
+    substep_run "Installing launcher script" install_runner_script || rc=1
 
-    unset -f _install_runtime_common_assets
-}
-
-install_runtime_files_step() {
-    step_begin "Installing runtime files"
-    install_runtime_files
-    IN_STEP=0; _STEP_NEWLINED=0
+    unset -f install_compiled_bpf_objects
+    return "$rc"
 }
 
 load_configured_slot_handlers_step() {
@@ -464,7 +422,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${RUNNER_SCRIPT}
+ExecStart=${CURRENT_LINK}/auto_xdp_start.sh
 Restart=on-failure
 RestartSec=5
 User=root
@@ -481,8 +439,8 @@ Wants=${SERVICE_NAME}.service
 
 [Service]
 Type=simple
-Environment=PYTHONPATH=${PYTHON_LIB_DIR}
-ExecStart=${RELAY_SCRIPT} --config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf
+Environment=PYTHONPATH=${CURRENT_LINK}/python
+ExecStart=${CURRENT_LINK}/pkt_relay.py --config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf
 Restart=on-failure
 RestartSec=2
 User=root
@@ -502,7 +460,7 @@ install_openrc_service() {
     write_file "/etc/init.d/${SERVICE_NAME}" <<EOF_OPENRC
 #!/sbin/openrc-run
 description="Auto XDP loader + port whitelist auto-sync"
-command="${RUNNER_SCRIPT}"
+command="${CURRENT_LINK}/auto_xdp_start.sh"
 command_background=true
 pidfile="/run/\${RC_SVCNAME}.pid"
 
@@ -514,7 +472,7 @@ EOF_OPENRC
     write_file "/etc/init.d/${RELAY_SERVICE_NAME}" <<EOF_RELAY_OPENRC
 #!/sbin/openrc-run
 description="Auto XDP packet event relay"
-command="${RELAY_SCRIPT}"
+command="${CURRENT_LINK}/pkt_relay.py"
 command_args="--config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf"
 command_background=true
 pidfile="/run/\${RC_SVCNAME}.pid"
@@ -535,13 +493,48 @@ EOF_RELAY_OPENRC
 
 run_initial_sync() {
     info "Running initial sync..."
-    as_root "$RUNNER_SCRIPT" --sync-once
+    as_root env \
+        "PYTHONPATH=${PYTHON_LIB_DIR}" \
+        "$PYTHON3_BIN" "$SYNC_SCRIPT" \
+        --config "$TOML_CONFIG" \
+        --backend "$ACTIVE_BACKEND"
 }
 
 run_initial_sync_step() {
-    step_begin "Pre-seeding IPv4/IPv6 established TCP sessions"
-    run_initial_sync >/dev/null 2>&1 || true
-    step_ok
+    step_begin "Applying and verifying initial policy"
+    local sync_log
+    sync_log=$(mktemp)
+    _SETUP_TMPFILES+=("$sync_log")
+    if ! run_initial_sync >"$sync_log" 2>&1; then
+        warn_from_log_file "$sync_log" "initial sync: " 20
+        if [[ "${REQUESTED_BACKEND:-auto}" == "auto" && "$ACTIVE_BACKEND" == "xdp" ]]; then
+            warn "XDP initial policy verification failed; attempting nftables fallback."
+            if ! ensure_nftables_available; then
+                step_fail "initial policy sync failed and nftables is unavailable"
+                return 1
+            fi
+            ACTIVE_BACKEND="nftables"
+            ACTIVE_XDP_MODE="none"
+            PENDING_NFT_CUTOVER=1
+            XDP_FALLBACK_REASON="XDP initial policy sync failed"
+            : >"$sync_log"
+            if ! run_initial_sync >"$sync_log" 2>&1; then
+                warn_from_log_file "$sync_log" "nftables sync: " 20
+                step_fail "both XDP and nftables initial policy sync failed"
+                return 1
+            fi
+        else
+            step_fail "initial policy sync failed; refusing to report a healthy installation"
+            return 1
+        fi
+    fi
+    if [[ ${PENDING_NFT_CUTOVER:-0} -eq 1 ]]; then
+        if ! finalize_nftables_cutover; then
+            step_fail "nftables candidate loaded, but XDP/tc cutover could not be verified"
+            return 1
+        fi
+    fi
+    step_ok "$ACTIVE_BACKEND policy verified"
 }
 
 install_runtime_service_step() {
@@ -549,10 +542,18 @@ install_runtime_service_step() {
     case "$INIT_SYSTEM" in
         systemd)
             install_systemd_service
+            if ! as_root systemctl is-active --quiet "$SERVICE_NAME"; then
+                step_fail "systemd service did not remain active after restart"
+                return 1
+            fi
             step_ok "systemd: $SERVICE_NAME"
             ;;
         openrc)
             install_openrc_service
+            if ! as_root rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
+                step_fail "OpenRC service did not remain active after restart"
+                return 1
+            fi
             step_ok "openrc: $SERVICE_NAME"
             ;;
         *)
