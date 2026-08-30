@@ -62,6 +62,27 @@ def _run_text(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def _load_json_file(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _nft_policy_schema(family: str, table: str) -> str:
+    if not _command_exists("nft"):
+        return "unavailable"
+    result = _run_text(["nft", "list", "table", family, table])
+    if result.returncode != 0:
+        return "missing"
+    if "set tcp_ports" in result.stdout and "chain input" in result.stdout:
+        return "policy_schema_v2"
+    return "legacy"
+
+
 def _ip_default_iface() -> str:
     result = _run_text(["ip", "route", "show", "default"])
     if result.returncode != 0:

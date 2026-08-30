@@ -38,6 +38,19 @@ step_fail() {
     printf "${_STEP_INDENT}${RED}[ERROR]${NC}  %s\n" "${1:-Failed}" >&2
 }
 
+step_error() {
+    if [[ $IN_STEP -eq 1 && $_STEP_NEWLINED -eq 0 ]]; then
+        printf "\n"
+        _STEP_NEWLINED=1
+    fi
+    if [[ $_PENDING_NL -eq 1 ]]; then
+        printf "\n"
+        _PENDING_NL=0
+    fi
+    printf "${_STEP_INDENT}${RED}[ERROR]${NC}  %s\n" "${1:-Error}" >&2
+    _STEP_NEWLINED=1
+}
+
 step_warn() {
     local nl=$_STEP_NEWLINED
     local pending=$_PENDING_NL
@@ -542,6 +555,12 @@ EOF
     echo "  Runtime state  : $RUNTIME_STATE"
     echo "  Launcher       : $RUNNER_SCRIPT"
     echo "  Command        : $AXDP_CMD"
+    if [[ ${EXISTING_INSTALL:-0} -eq 1 ]]; then
+        echo "install_status=replace"
+    else
+        echo "install_status=fresh"
+    fi
+    echo "install_result=complete"
     echo ""
     echo "Next commands"
     echo "  status         : sudo axdp status"
@@ -574,7 +593,7 @@ dry_run_report() {
     echo "package_manager=$PKG_MANAGER"
     echo "init_system=$INIT_SYSTEM"
     echo "interfaces=${detected_ifaces:-undetected}"
-    echo "missing_commands=$(for cmd in clang bpftool python3 curl ip tc nft; do command -v "$cmd" >/dev/null 2>&1 || printf '%s ' "$cmd"; done | sed 's/[[:space:]]*$//')"
+    echo "missing_commands=$(for cmd in clang bpftool python3 curl tar ip tc nft; do command -v "$cmd" >/dev/null 2>&1 || printf '%s ' "$cmd"; done | sed 's/[[:space:]]*$//')"
     echo "planned_packages=$(package_list_for_manager; optional_package_list_for_manager; printf ' python3-psutil python3-tomli-if-python310')"
     echo "planned_actions=check-dependencies,compile-xdp,deploy-backend,install-runtime,initial-sync,install-service"
     echo "note=dry-run performs no installs, no downloads, and no system changes"

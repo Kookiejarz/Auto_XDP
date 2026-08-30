@@ -31,7 +31,6 @@ info()  {
         echo -e "${CYAN}[INFO]${NC}  $*"
     fi
 }
-ok()    { if [[ $IN_STEP -eq 0 ]]; then echo -e "${GREEN}[OK]${NC}    $*"; fi; }
 warn()  {
     if [[ $IN_STEP -eq 1 ]]; then
         if [[ $_STEP_NEWLINED -eq 0 ]]; then printf "\n"; _STEP_NEWLINED=1; fi
@@ -90,6 +89,7 @@ INSTALL_LOCK_DIR="/run/auto_xdp/install.lock"
 RELEASE_NAME="${AUTO_XDP_RELEASE_NAME:-}"
 RELEASE_CANDIDATE_DIR=""
 PREVIOUS_RELEASE=""
+PREVIOUS_ENV_CONFIG=""
 INSTALL_TRANSACTION_ID=""
 INSTALL_TRANSACTION_ACTIVE=0
 INSTALL_TRANSACTION_COMMITTED=0
@@ -141,6 +141,8 @@ TC_FILTER_PREF=49152
 PREFER_REMOTE_SOURCES=0
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 SYSTEMD_RUN_DIR="${SYSTEMD_RUN_DIR:-/run/systemd/system}"
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+OPENRC_INIT_DIR="${OPENRC_INIT_DIR:-/etc/init.d}"
 
 case "${BASH_SOURCE[0]:-}" in
     stdin|/dev/stdin|/dev/fd/*|/proc/self/fd/*)
@@ -256,7 +258,7 @@ bootstrap_remote_source_tree() {
     BUILD_STAGING_DIR=$(mktemp -d)
     local encoded_ref response archive extract_root unpacked
     if [[ "$AUTO_XDP_SOURCE_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
-        SOURCE_REVISION="$AUTO_XDP_SOURCE_REF"
+        SOURCE_REVISION="${AUTO_XDP_SOURCE_REF,,}"
     else
         encoded_ref=$(python3 -c \
             'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \

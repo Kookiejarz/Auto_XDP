@@ -10,6 +10,9 @@ pkg_update() {
             as_root zypper --non-interactive refresh
             ;;
         pacman)
+            if [[ -w /etc/pacman.conf ]] && ! grep -qx 'DisableSandbox' /etc/pacman.conf; then
+                printf '\nDisableSandbox\n' >> /etc/pacman.conf
+            fi
             as_root pacman -Sy --noconfirm
             ;;
         apk)
@@ -36,7 +39,7 @@ pkg_install() {
             as_root zypper --non-interactive install -y "$@"
             ;;
         pacman)
-            as_root pacman -S --noconfirm --needed "$@"
+            as_root pacman -S --disable-sandbox --noconfirm --needed "$@"
             ;;
         apk)
             as_root apk add --no-cache "$@"
@@ -111,10 +114,24 @@ install_bpftool_apt() {
     pkg_install_optional "linux-tools-$(uname -r)" linux-tools-common
 }
 
+enable_rpm_build_repos() {
+    [[ "$PKG_MANAGER" == "dnf" || "$PKG_MANAGER" == "yum" ]] || return 0
+    case " ${DISTRO_ID:-} ${DISTRO_LIKE:-} " in
+        *" rocky "*|*" alma "*|*" rhel "*|*" centos "*) ;;
+        *) return 0 ;;
+    esac
+    command -v dnf >/dev/null 2>&1 || return 0
+    as_root dnf -y install dnf-plugins-core >/dev/null 2>&1 || true
+    as_root dnf config-manager --enable crb >/dev/null 2>&1 \
+        || as_root dnf config-manager --enable powertools >/dev/null 2>&1 \
+        || true
+}
+
 install_packages() {
     local package_list=()
     local optional_list=()
 
+    enable_rpm_build_repos
     mapfile -t package_list < <(package_list_for_manager | tr ' ' '\n')
     mapfile -t optional_list < <(optional_package_list_for_manager | tr ' ' '\n')
 
@@ -215,7 +232,17 @@ check_required_tools_step() {
         substep_run "$cmd" _tool_present "$cmd" || missing+=("$cmd")
     done
 
-    if [[ ${#missing[@]} -gt 0 ]]; then
+    local missing_bpf_headers=0
+    if declare -F bpf_header_exists >/dev/null 2>&1; then
+        if ! substep_run "BPF development headers" bpf_header_exists \
+                "bpf/bpf_helpers.h" "/usr/include" "/usr/local/include"; then
+            missing_bpf_headers=1
+        fi
+    elif [[ ! -f /usr/include/bpf/bpf_helpers.h && ! -f /usr/local/include/bpf/bpf_helpers.h ]]; then
+        missing_bpf_headers=1
+    fi
+
+    if [[ ${#missing[@]} -gt 0 || $missing_bpf_headers -eq 1 ]]; then
         substep_run "Installing via $PKG_MANAGER: ${missing[*]}" install_packages \
             || die_with_next "Package installation failed." "install the missing packages manually, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
         for cmd in "${missing[@]}"; do
@@ -236,6 +263,13 @@ check_required_tools_step() {
                 esac
             fi
         done
+        if [[ $missing_bpf_headers -eq 1 ]]; then
+            if declare -F bpf_header_exists >/dev/null 2>&1 \
+                    && ! substep_run "BPF development headers (after install)" bpf_header_exists \
+                        "bpf/bpf_helpers.h" "/usr/include" "/usr/local/include"; then
+                warn "BPF development headers still missing — XDP backend may be unavailable"
+            fi
+        fi
     fi
 
     if declare -F bpf_header_exists >/dev/null 2>&1 \

@@ -233,7 +233,9 @@ activate_nftables_backend() {
     _auto_xdp_any_target_has_xdp && needs_cutover=1
     if [[ $needs_cutover -eq 0 ]] \
             && nft list table "$nft_family" "$nft_table" 2>/dev/null \
-                | grep -F 'set policy_schema_v2' >/dev/null; then
+                | grep -Fq 'set tcp_ports' \
+            && nft list table "$nft_family" "$nft_table" 2>/dev/null \
+                | grep -Fq 'chain input'; then
         echo "nftables" > "${RUN_STATE_DIR}/backend"
         _auto_xdp_record_nft_state
         return
@@ -248,7 +250,9 @@ activate_nftables_backend() {
         return 1
     fi
     nft list table "$nft_family" "$nft_table" 2>/dev/null \
-        | grep -F 'set policy_schema_v2' >/dev/null || {
+        | grep -Fq 'set tcp_ports' \
+        && nft list table "$nft_family" "$nft_table" 2>/dev/null \
+            | grep -Fq 'chain input' || {
         echo "[auto_xdp] nftables candidate schema verification failed; retaining current XDP backend" >&2
         return 1
     }

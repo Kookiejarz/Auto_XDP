@@ -52,12 +52,12 @@ existing_install_detected() {
 
     case "$INIT_SYSTEM" in
         systemd)
-            [[ -e "/etc/systemd/system/${SERVICE_NAME}.service" ]] && return 0
-            [[ -e "/etc/systemd/system/${RELAY_SERVICE_NAME:-auto-xdp-relay}.service" ]] && return 0
+            [[ -e "${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service" ]] && return 0
+            [[ -e "${SYSTEMD_UNIT_DIR}/${RELAY_SERVICE_NAME:-auto-xdp-relay}.service" ]] && return 0
             ;;
         openrc)
-            [[ -e "/etc/init.d/${SERVICE_NAME}" ]] && return 0
-            [[ -e "/etc/init.d/${RELAY_SERVICE_NAME:-auto-xdp-relay}" ]] && return 0
+            [[ -e "${OPENRC_INIT_DIR}/${SERVICE_NAME}" ]] && return 0
+            [[ -e "${OPENRC_INIT_DIR}/${RELAY_SERVICE_NAME:-auto-xdp-relay}" ]] && return 0
             ;;
     esac
 
@@ -456,7 +456,7 @@ load_configured_port_handlers_step() {
 install_systemd_service() {
     ensure_relay_group
     as_root install -d -m 0750 -o root -g "$RELAY_GROUP" /run/auto_xdp
-    write_file "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF_UNIT
+    write_file "${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service" <<EOF_UNIT
 [Unit]
 Description=Auto XDP Loader + Port Whitelist Auto-Sync
 After=network-online.target
@@ -476,7 +476,7 @@ RuntimeDirectoryMode=0750
 WantedBy=multi-user.target
 EOF_UNIT
 
-    write_file "/etc/systemd/system/${RELAY_SERVICE_NAME}.service" <<EOF_RELAY_UNIT
+    write_file "${SYSTEMD_UNIT_DIR}/${RELAY_SERVICE_NAME}.service" <<EOF_RELAY_UNIT
 [Unit]
 Description=Auto XDP packet event relay
 After=${SERVICE_NAME}.service
@@ -507,7 +507,7 @@ EOF_RELAY_UNIT
 install_openrc_service() {
     ensure_relay_group
     as_root install -d -m 0750 -o root -g "$RELAY_GROUP" /run/auto_xdp
-    write_file "/etc/init.d/${SERVICE_NAME}" <<EOF_OPENRC
+    write_file "${OPENRC_INIT_DIR}/${SERVICE_NAME}" <<EOF_OPENRC
 #!/sbin/openrc-run
 description="Auto XDP loader + port whitelist auto-sync"
 command="${CURRENT_LINK}/auto_xdp_start.sh"
@@ -524,7 +524,7 @@ depend() {
 }
 EOF_OPENRC
 
-    write_file "/etc/init.d/${RELAY_SERVICE_NAME}" <<EOF_RELAY_OPENRC
+    write_file "${OPENRC_INIT_DIR}/${RELAY_SERVICE_NAME}" <<EOF_RELAY_OPENRC
 #!/sbin/openrc-run
 description="Auto XDP packet event relay"
 command="${CURRENT_LINK}/pkt_relay.py"
@@ -543,8 +543,8 @@ depend() {
 }
 EOF_RELAY_OPENRC
 
-    as_root chmod +x "/etc/init.d/${SERVICE_NAME}"
-    as_root chmod +x "/etc/init.d/${RELAY_SERVICE_NAME}"
+    as_root chmod +x "${OPENRC_INIT_DIR}/${SERVICE_NAME}"
+    as_root chmod +x "${OPENRC_INIT_DIR}/${RELAY_SERVICE_NAME}"
     as_root rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
     as_root rc-update add "$RELAY_SERVICE_NAME" default >/dev/null 2>&1 || true
     as_root rc-service "$SERVICE_NAME" restart

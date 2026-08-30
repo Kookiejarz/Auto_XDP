@@ -211,22 +211,29 @@ stage_build_source() {
 }
 
 prepare_slot_handler_sources() {
-    local _handler_artifacts=(
-        "handlers/Makefile"
-        "handlers/gre_handler.c"
-        "handlers/esp_handler.c"
-        "handlers/sctp_handler.c"
-        "handlers/minecraft_handler.c"
-        "handlers/xdp_slot_ctx.h"
-    )
     local _handler_file=""
     local _missing=()
+    local _source_dir="${SOURCE_ROOT:-${BOOTSTRAP_LOCAL_ROOT:-.}}"
 
-    for _handler_file in "${_handler_artifacts[@]}"; do
-        if ! stage_build_source "${_handler_file}" "${_handler_file}" "${_handler_file}"; then
-            _missing+=("${_handler_file}")
-        fi
-    done
+    if [[ -d "${_source_dir}/handlers" ]]; then
+        while IFS= read -r _handler_file; do
+            _handler_file="${_handler_file#./}"
+            if ! stage_build_source "${_handler_file}" "${_handler_file}" "${_handler_file}"; then
+                _missing+=("${_handler_file}")
+            fi
+        done < <(
+            find "${_source_dir}/handlers" -maxdepth 1 -type f \
+                \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) \
+                | sed "s|^${_source_dir}/||" | sort
+        )
+    else
+        for _handler_file in handlers/Makefile handlers/xdp_slot_ctx.h handlers/*_handler.c; do
+            [[ -e "${_source_dir}/${_handler_file}" || $PREFER_REMOTE_SOURCES -eq 1 ]] || continue
+            if ! stage_build_source "${_handler_file}" "${_handler_file}" "${_handler_file}"; then
+                _missing+=("${_handler_file}")
+            fi
+        done
+    fi
 
     if [[ ${#_missing[@]} -gt 0 ]]; then
         warn "Slot handlers skipped: failed to prepare sources: ${_missing[*]}"
@@ -244,6 +251,7 @@ prepare_slot_handler_sources() {
 compile_xdp_program() {
     local _source_root=""
     local _handlers_dir=""
+    HANDLER_BUILD_FAILED=0
 
     if ! command -v clang &>/dev/null || ! command -v bpftool &>/dev/null; then
         warn "clang or bpftool missing; XDP backend will be skipped."
@@ -257,20 +265,17 @@ compile_xdp_program() {
     _source_root="$BUILD_STAGING_DIR"
     _handlers_dir="${_source_root}/handlers"
 
-    local _hdr
-    if [[ $PREFER_REMOTE_SOURCES -eq 0 ]] && [[ -d "bpf/include" ]]; then
-        # Local checkout: stage every header present on disk so new files are
-        # picked up automatically without touching this list.
-        for _hdr in bpf/include/*.h; do
+    local _hdr _header_root="${SOURCE_ROOT:-.}"
+    if [[ -d "${_header_root}/bpf/include" ]]; then
+        for _hdr in "${_header_root}"/bpf/include/*.h; do
             [[ -f "$_hdr" ]] || continue
+            _hdr="bpf/include/$(basename "$_hdr")"
             stage_build_source "$_hdr" "$_hdr" "$_hdr" || true
         done
     else
-        # curl | bash: build.sh itself was fetched from GitHub, so this list
-        # matches the remote repo's bpf/include/ at the same commit.
-        local _bpf_headers=(ct_flags.h common.h keys.h map_sizes.h maps.h trust_acl.h rate_limit.h port_dispatch.h conntrack.h parse.h slots.h)
-        for _hdr in "${_bpf_headers[@]}"; do
-            stage_build_source "bpf/include/${_hdr}" "bpf/include/${_hdr}" "bpf/include/${_hdr}" || true
+        for _hdr in bpf/include/*.h; do
+            [[ -e "$_hdr" || $PREFER_REMOTE_SOURCES -eq 1 ]] || continue
+            stage_build_source "$_hdr" "$_hdr" "$_hdr" || true
         done
     fi
     if ! generate_xdp_map_abi "$_source_root"; then
@@ -315,10 +320,11 @@ compile_xdp_program() {
                     >"$handler_log" 2>&1; then
                 : # compiled handler objects remain in staging until install
             else
-                warn "Slot handler compilation failed; handlers will be unavailable"
+                step_error "Slot handler compilation failed; continuing with the XDP main program without handlers."
                 warn_from_log_file "$handler_log" "handler build: "
                 rm -f "$handler_log"
-                return 1
+                rm -f "${_handlers_dir}"/*.o
+                HANDLER_BUILD_FAILED=1
             fi
             rm -f "$handler_log"
         fi
@@ -358,7 +364,11 @@ compile_bpf_objects_step() {
     compile_xdp_program || ok=0
     compile_sock_state_program || true
     if [[ $ok -eq 1 ]]; then
-        step_ok
+        if [[ ${HANDLER_BUILD_FAILED:-0} -eq 1 ]]; then
+            step_ok "XDP/tc compiled; slot handlers unavailable"
+        else
+            step_ok
+        fi
     else
         XDP_FALLBACK_REASON="BPF object compilation failed"
         step_warn "XDP unavailable, continuing with nftables backend"
