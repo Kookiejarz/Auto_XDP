@@ -327,6 +327,25 @@ _setup_reattach_test_env() {
     xdp_maps_ready() { return 0; }
     load_port_handlers() { return 0; }
     auto_tune_interface_parallelism() { return 0; }
+    _TEST_XDP_ATTACHED=""
+    _auto_xdp_verify_iface_program() {
+        [[ " $_TEST_XDP_ATTACHED " == *" $1 "* ]] && return 0
+        ip -d link show dev "$1" 2>/dev/null | grep -Eq 'xdp|xdpgeneric'
+    }
+    _auto_xdp_attach_candidate() {
+        if ip link set dev "$1" xdp pinned "$2" 2>/dev/null; then
+            AUTO_XDP_LAST_ATTACH_MODE="native"
+            _TEST_XDP_ATTACHED="$_TEST_XDP_ATTACHED $1"
+            return 0
+        fi
+        if ip link set dev "$1" xdpgeneric pinned "$2" 2>/dev/null; then
+            AUTO_XDP_LAST_ATTACH_MODE="generic"
+            _TEST_XDP_ATTACHED="$_TEST_XDP_ATTACHED $1"
+            return 0
+        fi
+        return 1
+    }
+    _auto_xdp_record_xdp_state() { return 0; }
 }
 
 test_ensure_xdp_reattach_records_generic_mode_on_fallback() (

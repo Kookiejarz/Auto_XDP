@@ -370,19 +370,21 @@ print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIIIII', $rate_max, 0, 0, 32,
     bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
         key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1
 
-    # syn_rate_val: window_start_ns(__u64 LE) + count(__u32 LE) + _pad(__u32)
+    # syn_rate_val.state packs window tick (upper 32) and count (lower 32).
     local now_ns rate_val_hex
     now_ns=$(_ktime_ns)
     rate_val_hex=$(python3 -c "
 import struct
-print(' '.join(f'{b:02x}' for b in struct.pack('<QII', $now_ns, $rate_max, 0)))
+tick = $now_ns // 1000000
+state = (tick << 32) | $rate_max
+print(' '.join(f'{b:02x}' for b in struct.pack('<Q', state)))
 ")
     # Create a per-port inner LRU and install it into the syn4 outer slot for
     # $port, then pre-fill the source's counter with count=rate_max inside the
     # current window so the next SYN overflows. BPF_F_INNER_MAP is valid for
     # array inner maps, not LRU hash maps; the latter are created with flags 0.
     local inner_pin="$_PIN_DIR/it_syn4_$port"
-    bpftool map create "$inner_pin" type lru_hash key 4 value 16 \
+    bpftool map create "$inner_pin" type lru_hash key 4 value 8 \
         entries 1024 name "s4_$port" flags 0 >/dev/null 2>&1 || {
         echo "inner map create failed"; return 1; }
     bpftool map update pinned "$_PIN_DIR/syn4" \
