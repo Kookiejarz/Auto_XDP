@@ -14,8 +14,6 @@ source "$REPO_ROOT/setup_xdp.sh"
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
-XDP_OBJ_INSTALLED="$BUILD_STAGING_DIR/$XDP_OBJ"
-TC_OBJ_INSTALLED="$BUILD_STAGING_DIR/$TC_OBJ"
 PREFER_REMOTE_SOURCES=0
 CHECK_UPDATES=0
 
@@ -38,6 +36,8 @@ if [[ $status -ne 0 ]]; then
     exit 1
 fi
 
+XDP_OBJ_INSTALLED="$BUILD_STAGING_DIR/$XDP_OBJ"
+TC_OBJ_INSTALLED="$BUILD_STAGING_DIR/$TC_OBJ"
 [[ -s "$XDP_OBJ_INSTALLED" ]] || {
     echo "missing compiled XDP object: $XDP_OBJ_INSTALLED"
     exit 1

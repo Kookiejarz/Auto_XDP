@@ -391,6 +391,7 @@ test_write_config_enables_queue_auto_tuning() (
     TC_OBJ_INSTALLED="/tmp/tc_flow_track.o"
     BPF_HELPER_INSTALLED="/tmp/auto_xdp_bpf_helpers.py"
     INSTALL_DIR="/tmp/auto_xdp"
+    CURRENT_LINK="/tmp/auto_xdp"
     PYTHON_LIB_DIR="/tmp/auto_xdp/python"
 
     write_config || return 1
@@ -804,6 +805,7 @@ test_transaction_retains_candidate_after_incomplete_tc_rollback() (
     preseed_xdp_candidate_policy() { return 0; }
     preseed_xdp_candidate_handlers() { return 0; }
     _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE="native"; return 0; }
+    _auto_xdp_verify_iface_program() { return 0; }
     _auto_xdp_attach_mode() { return 0; }
     load_tc_egress_program() {
         AUTO_XDP_TC_ROLLBACK_COMPLETE=0
@@ -981,6 +983,7 @@ test_transactional_xdp_attach_failure_restores_switched_interfaces() (
         AUTO_XDP_LAST_ATTACH_MODE="native"
         return 0
     }
+    _auto_xdp_verify_iface_program() { return 0; }
     _auto_xdp_detach_mode() {
         printf 'detach %s %s\n' "$1" "$2" >> "$tmpdir/ops.log"
     }
@@ -1033,6 +1036,7 @@ test_transactional_tc_failure_restores_xdp_generation() (
         AUTO_XDP_LAST_ATTACH_MODE="native"
         return 0
     }
+    _auto_xdp_verify_iface_program() { return 0; }
     _auto_xdp_detach_mode() {
         printf 'detach %s %s\n' "$1" "$2" >> "$tmpdir/ops.log"
     }
@@ -1078,6 +1082,8 @@ test_transactional_xdp_success_commits_candidate_generation() (
     preseed_xdp_candidate_policy() { return 0; }
     preseed_xdp_candidate_handlers() { return 0; }
     _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE="native"; return 0; }
+    _auto_xdp_verify_iface_program() { return 0; }
+    _auto_xdp_record_xdp_state() { return 0; }
     load_tc_egress_program() { return 0; }
 
     transactional_reload_xdp >/dev/null 2>&1 || return 1
@@ -1107,6 +1113,8 @@ test_interrupted_xdp_reload_resumes_candidate_generation() (
         AUTO_XDP_LAST_ATTACH_MODE="native"
         return 0
     }
+    _auto_xdp_verify_iface_program() { return 0; }
+    _auto_xdp_record_xdp_state() { return 0; }
     load_tc_egress_program() {
         printf 'tc %s %s\n' "$BPF_PIN_DIR" "$TC_ROLLBACK_PROG_PATH" >> "$tmpdir/ops.log"
         return 0
@@ -1226,7 +1234,7 @@ test_resolve_target_interfaces_detects_when_saved_ifaces_all_gone() (
     assert_eq "$IFACE_SOURCE" "default route auto-detect"
 )
 
-test_install_toml_config_backs_up_before_replace() (
+test_install_toml_config_preserves_existing_local_config() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
@@ -1240,8 +1248,12 @@ test_install_toml_config_backs_up_before_replace() (
     fetch_local_or_remote() { printf 'repo_default = 1\n' >"$3"; }
 
     install_toml_config >/dev/null || return 1
-    assert_file_contains "$CONFIG_DIR/config.toml.bak" "user_setting = 1" || return 1
-    assert_file_contains "$CONFIG_DIR/config.toml" "repo_default = 1"
+    assert_file_contains "$CONFIG_DIR/config.toml" "user_setting = 1" || return 1
+    ! grep -q 'repo_default' "$CONFIG_DIR/config.toml" || return 1
+    local backup
+    backup=$(find "$CONFIG_DIR/backups" -type f -name 'config.toml.*' | head -n 1)
+    [[ -n "$backup" ]] || return 1
+    assert_file_contains "$backup" "user_setting = 1"
 )
 
 test_check_required_tools_step_only_requires_runtime_commands() (
@@ -1397,7 +1409,7 @@ test_cleanup_build_artifacts_step_preserves_local_sources() (
     }
 )
 
-test_restore_compiled_slot_handlers_step_reinstalls_builtin_objects() (
+test_restore_compiled_slot_handlers_reinstalls_builtin_objects() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
@@ -1410,7 +1422,7 @@ test_restore_compiled_slot_handlers_step_reinstalls_builtin_objects() (
     printf 'gre' >"$BUILD_STAGING_DIR/handlers/gre_handler.o"
     printf 'esp' >"$BUILD_STAGING_DIR/handlers/esp_handler.o"
 
-    restore_compiled_slot_handlers_step >/dev/null || return 1
+    restore_compiled_slot_handlers >/dev/null || return 1
 
     [[ -s "$INSTALL_DIR/handlers/gre_handler.o" ]] || {
         printf 'expected gre handler object to be restored after SDK install\n'
@@ -1949,15 +1961,20 @@ test_main_orders_basic_info_checks_then_summary() (
     local -a ordered=(
         detect_privilege_mode
         detect_environment
+        priv_init
+        acquire_install_lock_step
+        recover_interrupted_install_step
+        check_required_tools_step
         resolve_target_interfaces
         existing_install_detected
         print_basic_info
-        priv_init
-        check_required_tools_step
-        replace_existing_install_step
         compile_bpf_objects_step
-        install_runtime_files_step
+        stage_runtime_release_step
+        replace_existing_install_step
+        begin_install_transaction_step
+        activate_candidate_release_step
         run_backend_phase_dispatch
+        commit_install_transaction_step
         print_deployment_summary
     )
     local prev_pos=-1 name pos
@@ -2018,7 +2035,7 @@ run_test "setup_xdp resolves default route interface for step helper" test_resol
 run_test "setup_xdp reuses installed env interfaces on reinstall" test_resolve_target_interfaces_reuses_installed_env_ifaces
 run_test "setup_xdp drops missing saved interfaces with note" test_resolve_target_interfaces_drops_missing_saved_ifaces
 run_test "setup_xdp re-detects when all saved interfaces are gone" test_resolve_target_interfaces_detects_when_saved_ifaces_all_gone
-run_test "setup_xdp backs up config.toml before forced replace" test_install_toml_config_backs_up_before_replace
+run_test "setup_xdp preserves existing config.toml on reinstall" test_install_toml_config_preserves_existing_local_config
 run_test "setup_xdp keeps clang and bpftool optional for runtime tool checks" test_check_required_tools_step_only_requires_runtime_commands
 run_test "setup_xdp backend step falls back to nftables" test_deploy_backend_step_falls_back_to_nftables
 run_test "setup_xdp refuses nftables fallback while XDP remains attached" test_deploy_backend_step_refuses_fallback_with_active_xdp
@@ -2026,10 +2043,8 @@ run_test "setup_xdp removes tc filter from removed interface" test_deploy_xdp_re
 run_test "setup_xdp service step warns when no init system exists" test_install_runtime_service_step_warns_without_init_system
 run_test "setup_xdp loads configured slot handlers only for xdp backend" test_load_configured_slot_handlers_step_only_runs_for_xdp
 run_test "setup_xdp cleanup step preserves local sources" test_cleanup_build_artifacts_step_preserves_local_sources
-run_test "setup_xdp restores compiled builtin slot handlers after runtime install" test_restore_compiled_slot_handlers_step_reinstalls_builtin_objects
+run_test "setup_xdp restores compiled builtin slot handlers after runtime install" test_restore_compiled_slot_handlers_reinstalls_builtin_objects
 run_test "setup_xdp installs auto_xdp state module into runtime package" test_install_python_support_package_includes_state_module
-run_test "setup_xdp removes stale installed python package files" test_install_python_support_package_removes_stale_files
-run_test "setup_xdp cleans stale handler artifacts but preserves configured custom handlers" test_install_slot_handler_sdk_cleans_stale_files_and_preserves_configured_custom_handlers
 run_test "setup_xdp selects sudo mode when not root" test_detect_privilege_mode_uses_sudo_when_not_root
 run_test "setup_xdp fails when neither root nor sudo is available" test_detect_privilege_mode_fails_without_root_or_sudo
 run_test "setup_xdp as_root runs directly in root mode" test_as_root_runs_directly_when_root
