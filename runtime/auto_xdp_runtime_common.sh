@@ -457,12 +457,12 @@ seed_existing_tcp_conntrack() {
 
     helper_script=$(_auto_xdp_first_value BPF_HELPER_BOOTSTRAP BPF_HELPER_SCRIPT) || {
         _auto_xdp_warn "BPF helper is not available for conntrack seeding."
-        return 0
+        return 1
     }
 
     if ! seeded=$("${PYTHON3_BIN:-python3}" "$helper_script" seed-tcp-conntrack --map-path-v4 "$map_path_v4" --map-path-v6 "$map_path_v6"); then
         _auto_xdp_warn "Failed to pre-seed tcp_ct4/tcp_ct6; established sessions may reconnect."
-        return 0
+        return 1
     fi
 
     if [[ "$seeded" != "0" ]]; then
@@ -921,6 +921,11 @@ _auto_xdp_finish_interrupted_reload() {
             _auto_xdp_warn "Could not validate candidate handlers; retaining both generations."
             return 1
         fi
+        if ! seed_existing_tcp_conntrack; then
+            BPF_PIN_DIR="$saved_pin_dir"
+            _auto_xdp_warn "Could not pre-seed candidate conntrack; retaining both generations."
+            return 1
+        fi
         BPF_PIN_DIR="$saved_pin_dir"
         AUTO_XDP_SWITCH_MODE=""
         for iface in "${recovery_ifaces[@]}"; do
@@ -969,6 +974,7 @@ _auto_xdp_finish_interrupted_reload() {
     [[ -e "$live_dir/prog" && -e "$rollback_dir/prog" ]] || return 1
     _auto_xdp_warn "Interrupted XDP commit detected; verifying the live generation before cleanup."
     preseed_xdp_candidate_handlers || return 1
+    seed_existing_tcp_conntrack || return 1
     AUTO_XDP_SWITCH_MODE=""
     for iface in "${recovery_ifaces[@]}"; do
         if ! _auto_xdp_attach_candidate "$iface" "$live_dir/prog" \
@@ -1145,7 +1151,8 @@ transactional_reload_xdp() {
             pinmaps "$candidate_dir" >/dev/null 2>&1 \
             || ! xdp_maps_ready \
             || ! preseed_xdp_candidate_policy "$candidate_dir" \
-            || ! preseed_xdp_candidate_handlers; then
+            || ! preseed_xdp_candidate_handlers \
+            || ! seed_existing_tcp_conntrack; then
         BPF_PIN_DIR="$saved_pin_dir"
         _auto_xdp_warn "Candidate XDP program failed validation or policy pre-seeding; current protection was not changed."
         rm -rf "$candidate_dir"

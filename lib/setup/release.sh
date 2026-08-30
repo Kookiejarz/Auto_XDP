@@ -219,6 +219,12 @@ _resolve_previous_release() {
 
 begin_install_transaction() {
     _resolve_previous_release
+    PREVIOUS_ENV_CONFIG=""
+    if [[ -n "$PREVIOUS_RELEASE" && -f "$CONFIG_FILE" ]]; then
+        PREVIOUS_ENV_CONFIG=$(mktemp)
+        _SETUP_TMPFILES+=("$PREVIOUS_ENV_CONFIG")
+        as_root cp "$CONFIG_FILE" "$PREVIOUS_ENV_CONFIG" || return 1
+    fi
     INSTALL_TRANSACTION_ID="${RELEASE_NAME}"
     INSTALL_TRANSACTION_ACTIVE=1
     INSTALL_TRANSACTION_COMMITTED=0
@@ -294,6 +300,9 @@ rollback_install_transaction() {
     if [[ -n "${PREVIOUS_RELEASE:-}" && -d "${INSTALL_ROOT}/${PREVIOUS_RELEASE}" ]]; then
         warn "Installation failed; atomically restoring ${PREVIOUS_RELEASE}."
         _atomic_runtime_link "$PREVIOUS_RELEASE" "$CURRENT_LINK" || return 1
+        if [[ -n "${PREVIOUS_ENV_CONFIG:-}" && -f "$PREVIOUS_ENV_CONFIG" ]]; then
+            place_file "$PREVIOUS_ENV_CONFIG" "$CONFIG_FILE" || return 1
+        fi
         _transition_update --status rolled_back --phase rolled_back || true
         _restart_previous_service
     else
