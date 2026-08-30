@@ -14,9 +14,8 @@ source "$REPO_ROOT/setup_xdp.sh"
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
-INSTALL_DIR="$tmpdir/install"
-XDP_OBJ_INSTALLED="$INSTALL_DIR/xdp_firewall.o"
-TC_OBJ_INSTALLED="$INSTALL_DIR/tc_flow_track.o"
+XDP_OBJ_INSTALLED="$BUILD_STAGING_DIR/$XDP_OBJ"
+TC_OBJ_INSTALLED="$BUILD_STAGING_DIR/$TC_OBJ"
 PREFER_REMOTE_SOURCES=0
 CHECK_UPDATES=0
 
