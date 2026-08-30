@@ -9,7 +9,8 @@ cleanup_existing_xdp() {
     local iface any_xdp=0
     XDP_PREVIOUS_IFACES=()
     for iface in $(ls /sys/class/net/ 2>/dev/null); do
-        if ip -d link show dev "$iface" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
+        if ip -d link show dev "$iface" 2>/dev/null \
+                | grep -Eq '(^|[[:space:]])prog/xdp([[:space:]]|$)|(^|[[:space:]])xdpgeneric([[:space:]]|$)|(^|[[:space:]])xdpoffload([[:space:]]|$)'; then
             XDP_PREVIOUS_IFACES+=("$iface")
             any_xdp=1
         fi

@@ -3,6 +3,23 @@
 # lib/setup/install.sh — runtime file installation and system service setup
 # Sourced by setup_xdp.sh after backend_xdp.sh and backend_nft.sh.
 
+RELAY_GROUP="${RELAY_GROUP:-auto-xdp}"
+
+ensure_relay_group() {
+    if getent group "$RELAY_GROUP" >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v groupadd >/dev/null 2>&1; then
+        as_root groupadd --system "$RELAY_GROUP"
+    elif command -v addgroup >/dev/null 2>&1; then
+        as_root addgroup -S "$RELAY_GROUP"
+    else
+        die "groupadd or addgroup is required to create the ${RELAY_GROUP} service group"
+    fi
+    priv_mkdir "$CONFIG_DIR"
+    as_root install -m 0600 /dev/null "${CONFIG_DIR}/.relay-group-created"
+}
+
 stop_existing_service() {
     case "$INIT_SYSTEM" in
         systemd)
@@ -187,6 +204,7 @@ for e in tree:
         "auto_xdp/xdp_required_maps.txt" \
         "auto_xdp/xdp_required_maps.txt" \
         "${pkg_root}/xdp_required_maps.txt" || return 1
+
 }
 
 install_runner_script() {
@@ -414,6 +432,8 @@ load_configured_port_handlers_step() {
 }
 
 install_systemd_service() {
+    ensure_relay_group
+    as_root install -d -m 0750 -o root -g "$RELAY_GROUP" /run/auto_xdp
     write_file "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF_UNIT
 [Unit]
 Description=Auto XDP Loader + Port Whitelist Auto-Sync
@@ -426,6 +446,9 @@ ExecStart=${CURRENT_LINK}/auto_xdp_start.sh
 Restart=on-failure
 RestartSec=5
 User=root
+Group=${RELAY_GROUP}
+RuntimeDirectory=auto_xdp
+RuntimeDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target
@@ -436,6 +459,7 @@ EOF_UNIT
 Description=Auto XDP packet event relay
 After=${SERVICE_NAME}.service
 Wants=${SERVICE_NAME}.service
+PartOf=${SERVICE_NAME}.service
 
 [Service]
 Type=simple
@@ -444,6 +468,8 @@ ExecStart=${CURRENT_LINK}/pkt_relay.py --config ${TOML_CONFIG} --pin-path ${BPF_
 Restart=on-failure
 RestartSec=2
 User=root
+Group=${RELAY_GROUP}
+UMask=0007
 
 [Install]
 WantedBy=multi-user.target
@@ -457,12 +483,19 @@ EOF_RELAY_UNIT
 }
 
 install_openrc_service() {
+    ensure_relay_group
+    as_root install -d -m 0750 -o root -g "$RELAY_GROUP" /run/auto_xdp
     write_file "/etc/init.d/${SERVICE_NAME}" <<EOF_OPENRC
 #!/sbin/openrc-run
 description="Auto XDP loader + port whitelist auto-sync"
 command="${CURRENT_LINK}/auto_xdp_start.sh"
 command_background=true
+command_user="root:${RELAY_GROUP}"
 pidfile="/run/\${RC_SVCNAME}.pid"
+
+start_pre() {
+    install -d -m 0750 -o root -g ${RELAY_GROUP} /run/auto_xdp
+}
 
 depend() {
     need net
@@ -475,7 +508,12 @@ description="Auto XDP packet event relay"
 command="${CURRENT_LINK}/pkt_relay.py"
 command_args="--config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf"
 command_background=true
+command_user="root:${RELAY_GROUP}"
 pidfile="/run/\${RC_SVCNAME}.pid"
+
+start_pre() {
+    install -d -m 0750 -o root -g ${RELAY_GROUP} /run/auto_xdp
+}
 
 depend() {
     need net

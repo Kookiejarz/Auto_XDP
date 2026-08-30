@@ -31,6 +31,7 @@ info()  {
         echo -e "${CYAN}[INFO]${NC}  $*"
     fi
 }
+ok()    { if [[ $IN_STEP -eq 0 ]]; then echo -e "${GREEN}[OK]${NC}    $*"; fi; }
 warn()  {
     if [[ $IN_STEP -eq 1 ]]; then
         if [[ $_STEP_NEWLINED -eq 0 ]]; then printf "\n"; _STEP_NEWLINED=1; fi
@@ -245,6 +246,53 @@ _cleanup_on_exit() {
     return "$exit_status"
 }
 trap '_cleanup_on_exit' EXIT
+
+bootstrap_remote_source_tree() {
+    [[ $PREFER_REMOTE_SOURCES -eq 1 ]] || return 0
+    [[ -n "${SOURCE_ROOT:-}" && -d "$SOURCE_ROOT" ]] && return 0
+    command -v curl >/dev/null 2>&1 || die "Remote installation requires curl."
+    command -v tar >/dev/null 2>&1 || die "Remote installation requires tar."
+
+    BUILD_STAGING_DIR=$(mktemp -d)
+    local encoded_ref response archive extract_root unpacked
+    if [[ "$AUTO_XDP_SOURCE_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        SOURCE_REVISION="$AUTO_XDP_SOURCE_REF"
+    else
+        encoded_ref=$(python3 -c \
+            'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+            "$AUTO_XDP_SOURCE_REF")
+        response=$(curl -fsSL \
+            "https://api.github.com/repos/Kookiejarz/Auto_XDP/commits/${encoded_ref}") \
+            || die "Could not resolve ${AUTO_XDP_SOURCE_REF} to an immutable commit."
+        SOURCE_REVISION=$(printf '%s' "$response" | python3 -c '
+import json, re, sys
+sha = json.load(sys.stdin).get("sha", "")
+if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+    raise SystemExit(1)
+print(sha.lower())
+') || die "GitHub returned an invalid source commit."
+    fi
+    archive="${BUILD_STAGING_DIR}/source.tar.gz"
+    extract_root="${BUILD_STAGING_DIR}/archive"
+    mkdir -p "$extract_root"
+    curl -fsSL \
+        "https://codeload.github.com/Kookiejarz/Auto_XDP/tar.gz/${SOURCE_REVISION}" \
+        -o "$archive" || die "Could not download the source archive."
+    tar -xzf "$archive" -C "$extract_root" || die "Could not unpack the source archive."
+    unpacked=$(find "$extract_root" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+    [[ -n "$unpacked" ]] || die "Source archive is empty."
+    SOURCE_ROOT="${BUILD_STAGING_DIR}/source"
+    mkdir -p "$SOURCE_ROOT"
+    cp -R "$unpacked"/. "$SOURCE_ROOT"/
+    local required_path
+    for required_path in setup_xdp.sh config.toml auto_xdp bpf handlers lib runtime; do
+        [[ -e "${SOURCE_ROOT}/${required_path}" ]] \
+            || die "Source archive failed manifest validation: ${required_path} missing."
+    done
+    SOURCE_VERSION="${SOURCE_REVISION:0:12}"
+}
+
+bootstrap_remote_source_tree
 
 source_setup_lib() {
     local relative_path="$1"

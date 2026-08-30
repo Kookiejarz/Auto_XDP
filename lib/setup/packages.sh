@@ -238,6 +238,11 @@ check_required_tools_step() {
         done
     fi
 
+    if declare -F bpf_header_exists >/dev/null 2>&1 \
+            && ! bpf_header_exists "bpf/bpf_helpers.h" "/usr/include" "/usr/local/include"; then
+        substep_run "Installing BPF headers via $PKG_MANAGER" install_packages || true
+    fi
+
     _tool_present python3 || die_with_next "python3 not found after installation." "install Python 3.10 or newer, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
     _tool_present curl || die_with_next "curl not found after installation." "install curl, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]] && ! _tool_present tar; then

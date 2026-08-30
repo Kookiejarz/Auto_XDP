@@ -277,6 +277,8 @@ compile_xdp_program() {
             else
                 warn "Slot handler compilation failed; handlers will be unavailable"
                 warn_from_log_file "$handler_log" "handler build: "
+                rm -f "$handler_log"
+                return 1
             fi
             rm -f "$handler_log"
         fi
