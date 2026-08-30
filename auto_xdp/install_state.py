@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -226,7 +227,7 @@ def runtime_state(
 
 def _cmd_select(args: argparse.Namespace) -> int:
     if args.input == "-":
-        links = json.load(os.sys.stdin)
+        links = json.load(sys.stdin)
     else:
         with open(args.input) as handle:
             links = json.load(handle)
@@ -364,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except (OSError, ValueError) as exc:
-        print(str(exc), file=os.sys.stderr)
+        print(str(exc), file=sys.stderr)
         return 1
 
 
