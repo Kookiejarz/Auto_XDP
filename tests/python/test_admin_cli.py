@@ -5,8 +5,13 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 import auto_xdp.admin.main as admin_main
 import auto_xdp.admin_cli as admin_cli
+
+
+pytestmark = pytest.mark.component
 
 
 class AdminCliTests(unittest.TestCase):

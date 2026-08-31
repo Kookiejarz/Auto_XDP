@@ -41,19 +41,43 @@ except ImportError:
 
 _BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _LOG_LEVELS = {"debug", "info", "warning", "error"}
-_BUILTIN_SLOT_PROTO = {47: "gre", 50: "esp", 132: "sctp"}
-_BUILTIN_SLOT_INFO = {
-    "gre": (47, "gre_handler.o"),
-    "esp": (50, "esp_handler.o"),
-    "sctp": (132, "sctp_handler.o"),
+_IPPROTO_BY_NAME = {
+    "gre": 47,
+    "esp": 50,
+    "sctp": 132,
 }
+
+
+def _slot_handler_name(path: Path) -> str:
+    return path.name.removesuffix("_handler.c")
+
+
+def _discover_builtin_slot_info() -> dict[str, tuple[int, str]]:
+    info: dict[str, tuple[int, str]] = {}
+    handlers_dir = Path(__file__).resolve().parents[1] / "handlers"
+    if not handlers_dir.is_dir():
+        return {
+            name: (proto, f"{name}_handler.o")
+            for name, proto in _IPPROTO_BY_NAME.items()
+        }
+    for source in sorted(handlers_dir.glob("*_handler.c")):
+        text = source.read_text(encoding="utf-8", errors="ignore")
+        if "SEC(\"xdp/" not in text or "tcp_ct4" in text or "udp_ct4" in text:
+            continue
+        name = _slot_handler_name(source)
+        proto = _IPPROTO_BY_NAME.get(name)
+        if proto is None:
+            continue
+        info[name] = (proto, f"{name}_handler.o")
+    return info
+
+
+_BUILTIN_SLOT_INFO = _discover_builtin_slot_info()
+_BUILTIN_SLOT_PROTO = {proto: name for name, (proto, _obj) in _BUILTIN_SLOT_INFO.items()}
 _BUILTIN_SLOT_ARTIFACTS = {
-    "gre_handler.c",
-    "gre_handler.o",
-    "esp_handler.c",
-    "esp_handler.o",
-    "sctp_handler.c",
-    "sctp_handler.o",
+    artifact
+    for name, (_proto, obj_name) in _BUILTIN_SLOT_INFO.items()
+    for artifact in (f"{name}_handler.c", obj_name)
 }
 _CUSTOM_SLOT_ARTIFACT_RE = re.compile(r"^custom_\d+_.+\.(?:c|o)$")
 _CUSTOM_PORT_ARTIFACT_RE = re.compile(r"^custom_(?:tcp|udp)_\d+_.+\.(?:c|o)$")
@@ -1158,7 +1182,7 @@ def _cmd_slot_list(args: argparse.Namespace) -> int:
             print("  (none)")
         print("")
     print("Available handlers:")
-    for name in ("gre", "esp", "sctp"):
+    for name in _BUILTIN_SLOT_INFO:
         proto_num, obj_name = _BUILTIN_SLOT_INFO[name]
         obj_path = handlers_dir / obj_name
         pin_path = slot_pin_dir / f"proto_{proto_num}"
@@ -2082,7 +2106,11 @@ _XDP_COUNTER_NAMES = [
     "ABUSEIPDB_DROP",
 ]
 
-_XDP_DROP_INDEXES = {2, 4, 7, 10, 11, 12, 13, 21, 24, 27, 28, 29, 30, 31, 32, 33, 34}
+_XDP_DROP_INDEXES = {
+    idx
+    for idx, name in enumerate(_XDP_COUNTER_NAMES)
+    if name.endswith("_DROP") or name.endswith("_GBL_DROP")
+}
 
 
 def _human_bytes(value: int) -> str:

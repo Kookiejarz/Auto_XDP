@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# auto-xdp-test-suite: component
 
 set -euo pipefail
 
@@ -241,6 +242,23 @@ test_fetch_local_or_remote_uses_local_copy_without_network() (
     assert_file_contains "$dst" "local copy"
 )
 
+test_prepare_source_tree_snapshots_local_repository_once() (
+    local caller_dir
+    caller_dir=$(mktemp -d)
+    cd "$caller_dir" || return 1
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    assert_eq "$BOOTSTRAP_LOCAL_ROOT" "$REPO_ROOT" || return 1
+    BUILD_STAGING_DIR=$(mktemp -d)
+    SOURCE_ROOT=""
+    PREFER_REMOTE_SOURCES=0
+    prepare_source_tree || return 1
+    [[ -f "$SOURCE_ROOT/setup_xdp.sh" ]] || return 1
+    [[ -f "$SOURCE_ROOT/auto_xdp/install_state.py" ]] || return 1
+    [[ -f "$SOURCE_ROOT/bpf/xdp_firewall.c" ]] || return 1
+)
+
 test_local_source_defaults_to_main_ref() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -393,11 +411,14 @@ test_write_config_enables_queue_auto_tuning() (
     INSTALL_DIR="/tmp/auto_xdp"
     CURRENT_LINK="/tmp/auto_xdp"
     PYTHON_LIB_DIR="/tmp/auto_xdp/python"
+    CURRENT_LINK="/tmp/auto_xdp/current"
+    RELEASE_NAME="test-release"
 
     write_config || return 1
 
     assert_file_contains "$CONFIG_FILE" 'AUTO_TUNE_QUEUES="1"'
-    assert_file_contains "$CONFIG_FILE" 'PYTHON_LIB_DIR="/tmp/auto_xdp/python"'
+    assert_file_contains "$CONFIG_FILE" 'PYTHON_LIB_DIR="/tmp/auto_xdp/current/python"'
+    assert_file_contains "$CONFIG_FILE" 'RUNTIME_GENERATION="test-release"'
 )
 
 test_auto_tune_interface_parallelism_sets_combined_channels() (
@@ -538,7 +559,9 @@ test_prepare_slot_handler_sources_uses_staging_dir() (
     cd "$tmpdir" || return 1
     prepare_slot_handler_sources || return 1
     assert_file_contains "$fetched" "handlers/Makefile -> $BUILD_STAGING_DIR/handlers/Makefile" || return 1
-    assert_file_contains "$fetched" "handlers/minecraft_handler.c -> $BUILD_STAGING_DIR/handlers/minecraft_handler.c" || return 1
+    local handler_src
+    handler_src=$(basename "$(printf '%s\n' "$REPO_ROOT"/handlers/*_handler.c | head -n 1)")
+    assert_file_contains "$fetched" "handlers/${handler_src} -> $BUILD_STAGING_DIR/handlers/${handler_src}" || return 1
     [[ ! -e "$tmpdir/handlers/Makefile" ]] || {
         printf 'expected handlers/Makefile to stay out of the current working directory\n'
         return 1
@@ -843,6 +866,65 @@ test_xdp_attach_mode_uses_atomic_bpftool_overwrite() (
         "net attach xdpoffload pinned /pins/prog dev eth2 overwrite"
 )
 
+test_xdp_iface_prog_id_reads_nested_iproute2_schema() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    ip() {
+        printf '%s\n' '[{"ifname":"eth0","xdp":{"mode":2,"prog":{"id":303,"btf_id":432},"attached":[{"mode":2,"prog":{"id":303}}]}}]'
+    }
+
+    assert_eq "$(_auto_xdp_iface_prog_id eth0)" "303"
+)
+
+test_xdp_attach_candidate_prefers_saved_per_interface_mode() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'generic\n'; }
+    _auto_xdp_attach_mode() {
+        printf '%s\n' "$3" >> "$tmpdir/modes"
+        [[ "$3" == "generic" ]]
+    }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "generic" || return 1
+    assert_eq "$(head -n 1 "$tmpdir/modes")" "generic"
+)
+
+test_xdp_switch_mode_reports_mixed_multi_interface_modes() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    AUTO_XDP_SWITCH_MODE=""
+    _auto_xdp_record_switch_mode native
+    _auto_xdp_record_switch_mode generic
+    assert_eq "$AUTO_XDP_SWITCH_MODE" "mixed"
+)
+
+test_xdp_attach_candidate_honors_strict_saved_mode() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'native:generic\n'; }
+    _auto_xdp_attach_mode() {
+        printf '%s\n' "$3" >> "$tmpdir/modes"
+        printf 'kernel rejected test candidate\n' >&2
+        return 1
+    }
+
+    local output status
+    output=$(_auto_xdp_attach_candidate eth1 /tmp/prog 2>&1)
+    status=$?
+    assert_eq "$status" "1" || return 1
+    assert_eq "$(cat "$tmpdir/modes")" "native" || return 1
+    assert_contains "$output" "XDP attach failed on eth1: kernel rejected test candidate"
+)
+
 test_transactional_xdp_validation_failure_keeps_current_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -1013,6 +1095,56 @@ test_transactional_xdp_attach_failure_restores_switched_interfaces() (
     fi
 )
 
+test_transactional_xdp_verification_failure_restores_current_interface() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=("eth0")
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' > "$BPF_PIN_DIR/prog"
+    touch "$XDP_OBJ_INSTALLED"
+
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
+    xdp_maps_ready() { return 0; }
+    preseed_xdp_candidate_policy() { return 0; }
+    preseed_xdp_candidate_handlers() { return 0; }
+    _auto_xdp_attach_candidate() {
+        printf 'candidate %s %s\n' "$1" "$2" >> "$tmpdir/ops.log"
+        AUTO_XDP_LAST_ATTACH_MODE="native"
+        return 0
+    }
+    _auto_xdp_verify_iface_program() {
+        printf 'verify %s %s\n' "$1" "$2" >> "$tmpdir/ops.log"
+        [[ "$2" == "$BPF_PIN_DIR/prog" ]]
+    }
+    _auto_xdp_attach_mode() {
+        printf 'restore %s %s %s\n' "$1" "$2" "$3" >> "$tmpdir/ops.log"
+        return 0
+    }
+    load_tc_egress_program() {
+        printf 'unexpected tc switch\n' >> "$tmpdir/ops.log"
+        return 0
+    }
+
+    transactional_reload_xdp >/dev/null 2>&1
+    local status=$?
+    assert_eq "$status" "1" || return 1
+    assert_eq "$AUTO_XDP_SWITCH_ROLLED_BACK" "1" || return 1
+    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
+    assert_file_contains "$tmpdir/ops.log" "verify eth0 ${BPF_PIN_DIR}_next/prog" || return 1
+    assert_file_contains "$tmpdir/ops.log" "restore eth0 ${BPF_PIN_DIR}/prog native" || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" ]] || return 1
+    if grep -q "unexpected tc switch" "$tmpdir/ops.log"; then
+        printf 'tc switch ran after XDP verification failure\n'
+        return 1
+    fi
+)
+
 test_transactional_tc_failure_restores_xdp_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -1083,16 +1215,46 @@ test_transactional_xdp_success_commits_candidate_generation() (
     preseed_xdp_candidate_handlers() { return 0; }
     _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE="native"; return 0; }
     _auto_xdp_verify_iface_program() { return 0; }
-    _auto_xdp_record_xdp_state() { return 0; }
     load_tc_egress_program() { return 0; }
+    _auto_xdp_record_xdp_state() { return 0; }
+    seed_existing_tcp_conntrack() { seed_called=$((seed_called + 1)); return 0; }
+    local seed_called=0
 
     transactional_reload_xdp >/dev/null 2>&1 || return 1
     assert_eq "$(cat "$BPF_PIN_DIR/prog")" "new" || return 1
     assert_eq "$AUTO_XDP_SWITCH_MODE" "native" || return 1
+    assert_eq "$seed_called" "1" || return 1
     [[ ! -e "${BPF_PIN_DIR}_rollback" ]] || {
         printf 'rollback generation remained after successful commit\n'
         return 1
     }
+)
+
+test_transactional_xdp_conntrack_seed_failure_keeps_current_generation() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=("eth0")
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' > "$BPF_PIN_DIR/prog"
+    touch "$XDP_OBJ_INSTALLED"
+
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
+    xdp_maps_ready() { return 0; }
+    preseed_xdp_candidate_policy() { return 0; }
+    preseed_xdp_candidate_handlers() { return 0; }
+    seed_existing_tcp_conntrack() { return 1; }
+
+    transactional_reload_xdp >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1" || return 1
+    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" ]]
 )
 
 test_interrupted_xdp_reload_resumes_candidate_generation() (
@@ -1127,6 +1289,98 @@ test_interrupted_xdp_reload_resumes_candidate_generation() (
     assert_file_contains "$tmpdir/ops.log" "candidate eth1 ${BPF_PIN_DIR}_next/prog" || return 1
     assert_file_contains "$tmpdir/ops.log" "tc ${BPF_PIN_DIR}_next ${BPF_PIN_DIR}/tc_egress_prog" || return 1
     [[ ! -e "${BPF_PIN_DIR}_next" && ! -e "${BPF_PIN_DIR}_rollback" ]]
+)
+
+test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    TEST_ACTUAL_XDP_ID=202
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=("eth0")
+    mkdir -p "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next"
+    printf 'old\n' > "$BPF_PIN_DIR/prog"
+    printf 'stale\n' > "${BPF_PIN_DIR}_next/prog"
+    touch "$BPF_PIN_DIR/tc_egress_prog" "$XDP_OBJ_INSTALLED"
+
+    _auto_xdp_finish_interrupted_reload() { return 1; }
+    _auto_xdp_pinned_prog_id() {
+        case "$1" in
+            "$BPF_PIN_DIR/prog") printf '101\n' ;;
+            "${BPF_PIN_DIR}_next/prog")
+                if [[ "$(cat "$1")" == "stale" ]]; then
+                    printf '202\n'
+                else
+                    printf '303\n'
+                fi
+                ;;
+            *) return 1 ;;
+        esac
+    }
+    _auto_xdp_iface_xdp_mode() { printf 'native\n'; }
+    _auto_xdp_iface_prog_id() { printf '%s\n' "$TEST_ACTUAL_XDP_ID"; }
+    _auto_xdp_attach_mode() {
+        printf 'restore %s %s %s\n' "$1" "$2" "$3" >> "$tmpdir/ops.log"
+        TEST_ACTUAL_XDP_ID=101
+        return 0
+    }
+    _auto_xdp_verify_iface_program() {
+        local expected
+        expected=$(_auto_xdp_pinned_prog_id "$2") || return 1
+        [[ "$TEST_ACTUAL_XDP_ID" == "$expected" ]]
+    }
+    tc() {
+        printf 'tc %s\n' "$*" >> "$tmpdir/ops.log"
+        return 0
+    }
+    bpftool() {
+        printf 'fresh\n' > "$BPF_PIN_DIR/prog"
+        return 0
+    }
+    xdp_maps_ready() { return 0; }
+    preseed_xdp_candidate_policy() { return 0; }
+    preseed_xdp_candidate_handlers() { return 0; }
+    _auto_xdp_attach_candidate() {
+        printf 'candidate %s %s\n' "$1" "$2" >> "$tmpdir/ops.log"
+        TEST_ACTUAL_XDP_ID=303
+        AUTO_XDP_LAST_ATTACH_MODE="native"
+        return 0
+    }
+    load_tc_egress_program() { return 0; }
+    _auto_xdp_record_xdp_state() { return 0; }
+
+    if ! transactional_reload_xdp >"$tmpdir/transaction.log" 2>&1; then
+        cat "$tmpdir/transaction.log"
+        return 1
+    fi
+    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "fresh" || return 1
+    assert_file_contains "$tmpdir/ops.log" \
+        "restore eth0 ${BPF_PIN_DIR}/prog native" || return 1
+    assert_file_contains "$tmpdir/ops.log" \
+        "candidate eth0 ${BPF_PIN_DIR}_next/prog" || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" && ! -e "${BPF_PIN_DIR}_rollback" ]]
+)
+
+test_ambiguous_interrupted_reload_retains_all_generations() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir output status
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    mkdir -p "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next" "${BPF_PIN_DIR}_rollback"
+    touch "$BPF_PIN_DIR/prog" "${BPF_PIN_DIR}_next/prog" \
+        "${BPF_PIN_DIR}_rollback/prog"
+
+    output=$(_auto_xdp_restore_interrupted_reload 2>&1)
+    status=$?
+    assert_eq "$status" "1" || return 1
+    assert_contains "$output" "refusing ambiguous recovery" || return 1
+    [[ -e "$BPF_PIN_DIR/prog" && -e "${BPF_PIN_DIR}_next/prog" \
+        && -e "${BPF_PIN_DIR}_rollback/prog" ]]
 )
 
 test_resolve_target_interfaces_uses_default_route_interface() (
@@ -1300,6 +1554,110 @@ test_deploy_backend_step_falls_back_to_nftables() (
     assert_eq "$ACTIVE_XDP_MODE" "none"
 )
 
+test_deploy_backend_step_strict_xdp_disables_fallback() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    IFACES=(eth0)
+    _auto_xdp_resolve_preferred_backend() { printf 'xdp\n'; }
+    deploy_xdp_backend() { return 1; }
+    ensure_nftables_available() { printf 'unexpected nft fallback\n'; return 0; }
+
+    local output status
+    output=$(deploy_backend_step 2>&1)
+    status=$?
+    [[ $status -ne 0 ]] || return 1
+    assert_contains "$output" "fallback disabled" || return 1
+    [[ "$output" != *"unexpected nft fallback"* ]]
+)
+
+test_deploy_backend_step_explicit_nft_defers_xdp_removal() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    IFACES=(eth0 eth1)
+    _auto_xdp_resolve_preferred_backend() { printf 'nftables\n'; }
+    ensure_nftables_available() { return 0; }
+    deploy_xdp_backend() { printf 'unexpected xdp deploy\n'; return 1; }
+
+    deploy_backend_step >/dev/null || return 1
+    assert_eq "$ACTIVE_BACKEND" "nftables" || return 1
+    assert_eq "$PENDING_NFT_CUTOVER" "1"
+)
+
+test_nftables_cutover_restores_detached_interfaces_on_partial_failure() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="${tmpdir}/xdp_fw"
+    IFACES=(eth0 eth1)
+    declare -A current_modes=([eth0]=native [eth1]=generic)
+
+    verify_nftables_policy() { return 0; }
+    _auto_xdp_iface_xdp_mode() { printf '%s\n' "${current_modes[$1]}"; }
+    _auto_xdp_iface_prog_id() {
+        [[ "$1" == "eth0" ]] && printf '101\n' || printf '202\n'
+    }
+    bpftool() {
+        [[ "$1 $2 $3 $4" == "prog pin id "* ]] || return 1
+        : >"$5"
+    }
+    _auto_xdp_detach_mode() {
+        [[ "$1" == "eth0" ]] && current_modes[$1]=none
+    }
+    _auto_xdp_attach_mode() {
+        current_modes[$1]="$3"
+        printf 'attach %s %s\n' "$1" "$3" >>"${tmpdir}/events"
+    }
+    _auto_xdp_verify_iface_program() { return 0; }
+    cleanup_tc_egress_filter() { printf 'unexpected tc cleanup\n'; return 1; }
+
+    local output status
+    output=$(finalize_nftables_cutover 2>&1)
+    status=$?
+    assert_eq "$status" "1" || return 1
+    assert_contains "$output" "restoring previous attachments" || return 1
+    assert_contains "$(<"${tmpdir}/events")" "attach eth0 native" || return 1
+    ! compgen -G "${BPF_PIN_DIR}_nft_cutover_*" >/dev/null
+)
+
+test_initial_sync_failure_is_not_suppressed() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    ACTIVE_BACKEND="xdp"
+    REQUESTED_BACKEND="xdp"
+    run_initial_sync() { printf 'kernel policy error\n' >&2; return 1; }
+    local output status
+    output=$(run_initial_sync_step 2>&1)
+    status=$?
+    [[ $status -ne 0 ]] || return 1
+    assert_contains "$output" "kernel policy error" || return 1
+    assert_contains "$output" "refusing to report a healthy installation"
+)
+
+test_initial_xdp_sync_failure_falls_back_to_nftables_in_auto_mode() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    ACTIVE_BACKEND="xdp"
+    ACTIVE_XDP_MODE="native"
+    REQUESTED_BACKEND="auto"
+    local attempts=0
+    run_initial_sync() {
+        attempts=$((attempts + 1))
+        [[ "$ACTIVE_BACKEND" == "nftables" ]]
+    }
+    ensure_nftables_available() { return 0; }
+    finalize_nftables_cutover() { PENDING_NFT_CUTOVER=0; return 0; }
+
+    run_initial_sync_step >/dev/null || return 1
+    assert_eq "$ACTIVE_BACKEND" "nftables" || return 1
+    assert_eq "$XDP_FALLBACK_REASON" "XDP initial policy sync failed"
+)
+
 test_deploy_backend_step_refuses_fallback_with_active_xdp() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -1357,6 +1715,133 @@ test_install_runtime_service_step_warns_without_init_system() (
     local output
     output=$(install_runtime_service_step)
     assert_contains "$output" "start manually: $RUNNER_SCRIPT"
+)
+
+test_existing_install_detected_finds_openrc_units() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    CONFIG_FILE="$tmpdir/missing.env"
+    AXDP_CMD="$tmpdir/missing-axdp"
+    CURRENT_LINK="$tmpdir/missing-current"
+    CONFIG_DIR="$tmpdir/etc/auto_xdp"
+    OPENRC_INIT_DIR="$tmpdir/etc/init.d"
+    SYSTEMD_UNIT_DIR="$tmpdir/etc/systemd/system"
+    SERVICE_NAME="xdp-port-sync"
+    RELAY_SERVICE_NAME="auto-xdp-relay"
+    mkdir -p "$OPENRC_INIT_DIR" "$SYSTEMD_UNIT_DIR"
+
+    INIT_SYSTEM="openrc"
+    existing_install_detected
+    assert_eq "$?" "1" || return 1
+
+    touch "$OPENRC_INIT_DIR/$SERVICE_NAME"
+    existing_install_detected
+    assert_eq "$?" "0"
+)
+
+test_stop_existing_service_uses_openrc_commands() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir ops_log
+    tmpdir=$(mktemp -d)
+    ops_log="$tmpdir/ops.log"
+    INIT_SYSTEM="openrc"
+    SERVICE_NAME="xdp-port-sync"
+    RELAY_SERVICE_NAME="auto-xdp-relay"
+    PRIV_MODE="root"
+    as_root() { printf 'as_root %s\n' "$*" >>"$ops_log"; return 0; }
+
+    stop_existing_service || return 1
+    assert_file_contains "$ops_log" "as_root rc-service xdp-port-sync stop" || return 1
+    assert_file_contains "$ops_log" "as_root rc-service auto-xdp-relay stop"
+)
+
+test_restart_previous_service_uses_openrc_commands() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir ops_log
+    tmpdir=$(mktemp -d)
+    ops_log="$tmpdir/ops.log"
+    INIT_SYSTEM="openrc"
+    SERVICE_NAME="xdp-port-sync"
+    RELAY_SERVICE_NAME="auto-xdp-relay"
+    PRIV_MODE="root"
+    as_root() { printf 'as_root %s\n' "$*" >>"$ops_log"; return 0; }
+
+    _restart_previous_service || return 1
+    assert_file_contains "$ops_log" "as_root rc-service xdp-port-sync restart" || return 1
+    assert_file_contains "$ops_log" "as_root rc-service auto-xdp-relay restart"
+)
+
+test_install_openrc_service_writes_units_and_enables() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir ops_log
+    tmpdir=$(mktemp -d)
+    ops_log="$tmpdir/ops.log"
+    OPENRC_INIT_DIR="$tmpdir/etc/init.d"
+    CONFIG_DIR="$tmpdir/etc/auto_xdp"
+    CURRENT_LINK="$tmpdir/usr/local/lib/auto_xdp/current"
+    TOML_CONFIG="$CONFIG_DIR/config.toml"
+    BPF_PIN_DIR="$tmpdir/sys/fs/bpf/xdp_fw"
+    RELAY_GROUP="auto-xdp"
+    SERVICE_NAME="xdp-port-sync"
+    RELAY_SERVICE_NAME="auto-xdp-relay"
+    PRIV_MODE="root"
+    mkdir -p "$OPENRC_INIT_DIR" "$CONFIG_DIR" "$CURRENT_LINK"
+    ensure_relay_group() { :; }
+    as_root() {
+        printf 'as_root %s\n' "$*" >>"$ops_log"
+        if [[ "$1" == chmod && "$2" == +x ]]; then
+            chmod +x "$3"
+        fi
+        return 0
+    }
+
+    install_openrc_service || return 1
+
+    [[ -x "$OPENRC_INIT_DIR/$SERVICE_NAME" ]] || {
+        printf 'OpenRC loader unit was not written executable\n'
+        return 1
+    }
+    [[ -x "$OPENRC_INIT_DIR/$RELAY_SERVICE_NAME" ]] || {
+        printf 'OpenRC relay unit was not written executable\n'
+        return 1
+    }
+    assert_file_contains "$OPENRC_INIT_DIR/$SERVICE_NAME" '#!/sbin/openrc-run' || return 1
+    assert_file_contains "$OPENRC_INIT_DIR/$SERVICE_NAME" "command=\"${CURRENT_LINK}/auto_xdp_start.sh\"" || return 1
+    assert_file_contains "$OPENRC_INIT_DIR/$SERVICE_NAME" 'command_user="root:auto-xdp"' || return 1
+    assert_file_contains "$OPENRC_INIT_DIR/$RELAY_SERVICE_NAME" "command=\"${CURRENT_LINK}/pkt_relay.py\"" || return 1
+    assert_file_contains "$OPENRC_INIT_DIR/$RELAY_SERVICE_NAME" "after ${SERVICE_NAME}" || return 1
+    assert_file_contains "$ops_log" "as_root rc-update add xdp-port-sync default" || return 1
+    assert_file_contains "$ops_log" "as_root rc-update add auto-xdp-relay default" || return 1
+    assert_file_contains "$ops_log" "as_root rc-service xdp-port-sync restart" || return 1
+    assert_file_contains "$ops_log" "as_root rc-service auto-xdp-relay restart"
+)
+
+test_install_runtime_service_step_reports_openrc() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    INIT_SYSTEM="openrc"
+    SERVICE_NAME="xdp-port-sync"
+    install_openrc_service() { :; }
+    as_root() {
+        if [[ "$1" == rc-service && "$2" == "$SERVICE_NAME" && "$3" == status ]]; then
+            return 0
+        fi
+        return 1
+    }
+
+    local output
+    output=$(install_runtime_service_step) || return 1
+    assert_contains "$output" "openrc: $SERVICE_NAME"
 )
 
 test_cleanup_existing_xdp_ignores_xdp_in_interface_name() (
@@ -1451,19 +1936,21 @@ test_restore_compiled_slot_handlers_reinstalls_builtin_objects() (
     INSTALL_DIR="$tmpdir/install"
 
     mkdir -p "$BUILD_STAGING_DIR/handlers" "$INSTALL_DIR/handlers"
-    printf 'gre' >"$BUILD_STAGING_DIR/handlers/gre_handler.o"
-    printf 'esp' >"$BUILD_STAGING_DIR/handlers/esp_handler.o"
+    local src obj
+    for src in "$REPO_ROOT"/handlers/*_handler.c; do
+        obj="$(basename "${src%.c}").o"
+        printf '%s' "$obj" >"$BUILD_STAGING_DIR/handlers/$obj"
+    done
 
     restore_compiled_slot_handlers >/dev/null || return 1
 
-    [[ -s "$INSTALL_DIR/handlers/gre_handler.o" ]] || {
-        printf 'expected gre handler object to be restored after SDK install\n'
-        return 1
-    }
-    [[ -s "$INSTALL_DIR/handlers/esp_handler.o" ]] || {
-        printf 'expected esp handler object to be restored after SDK install\n'
-        return 1
-    }
+    for src in "$REPO_ROOT"/handlers/*_handler.c; do
+        obj="$(basename "${src%.c}").o"
+        [[ -s "$INSTALL_DIR/handlers/$obj" ]] || {
+            printf 'expected %s to be restored after SDK install\n' "$obj"
+            return 1
+        }
+    done
 )
 
 test_install_python_support_package_includes_state_module() (
@@ -1485,90 +1972,6 @@ test_install_python_support_package_includes_state_module() (
     assert_file_contains "$fetched" "auto_xdp/state.py -> ${AUTO_XDP_PACKAGE_DIR}/state.py"
     assert_file_contains "$fetched" "auto_xdp/default_config.toml -> ${AUTO_XDP_PACKAGE_DIR}/default_config.toml"
     assert_file_contains "$fetched" "auto_xdp/xdp_required_maps.txt -> ${AUTO_XDP_PACKAGE_DIR}/xdp_required_maps.txt"
-)
-
-test_install_python_support_package_removes_stale_files() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir fetched
-    tmpdir=$(mktemp -d)
-    AUTO_XDP_PACKAGE_DIR="$tmpdir/auto_xdp"
-    fetched="$tmpdir/fetched.log"
-
-    mkdir -p "$AUTO_XDP_PACKAGE_DIR/obsolete"
-    : >"$AUTO_XDP_PACKAGE_DIR/stale.py"
-    : >"$AUTO_XDP_PACKAGE_DIR/obsolete/old.txt"
-
-    fetch_local_or_remote() {
-        printf '%s -> %s\n' "$1" "$3" >>"$fetched"
-        mkdir -p "$(dirname "$3")"
-        printf 'fresh\n' >"$3"
-    }
-
-    install_python_support_package || return 1
-    [[ ! -e "$AUTO_XDP_PACKAGE_DIR/stale.py" ]] || {
-        printf 'expected stale package file to be removed\n'
-        return 1
-    }
-    [[ ! -e "$AUTO_XDP_PACKAGE_DIR/obsolete/old.txt" ]] || {
-        printf 'expected stale package subdirectory to be removed\n'
-        return 1
-    }
-    assert_file_contains "$AUTO_XDP_PACKAGE_DIR/state.py" "fresh"
-)
-
-test_install_slot_handler_sdk_cleans_stale_files_and_preserves_configured_custom_handlers() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir fetched
-    tmpdir=$(mktemp -d)
-    INSTALL_DIR="$tmpdir/install"
-    CONFIG_DIR="$tmpdir/etc"
-    PYTHON3_BIN="${PYTHON3_BIN:-python3}"
-    fetched="$tmpdir/fetched.log"
-
-    mkdir -p "$INSTALL_DIR/handlers" "$CONFIG_DIR"
-    cat >"$CONFIG_DIR/config.toml" <<EOF_CFG
-[slots]
-enabled = [{ proto = 99, path = "${INSTALL_DIR}/handlers/custom_99_keep.o" }]
-
-[port_handlers.tcp]
-"25565" = "${INSTALL_DIR}/handlers/minecraft_handler.o"
-EOF_CFG
-
-    : >"$INSTALL_DIR/handlers/gre_handler.o"
-    : >"$INSTALL_DIR/handlers/old_removed_handler.o"
-    : >"$INSTALL_DIR/handlers/custom_99_keep.o"
-    : >"$INSTALL_DIR/handlers/minecraft_handler.o"
-    : >"$INSTALL_DIR/handlers/xdp_slot_ctx.h"
-    : >"$INSTALL_DIR/handlers/Makefile"
-
-    fetch_local_or_remote() {
-        printf '%s -> %s\n' "$1" "$3" >>"$fetched"
-        mkdir -p "$(dirname "$3")"
-        printf 'sdk\n' >"$3"
-    }
-
-    install_slot_handler_sdk || return 1
-    [[ ! -e "$INSTALL_DIR/handlers/gre_handler.o" ]] || {
-        printf 'expected old built-in handler object to be removed\n'
-        return 1
-    }
-    [[ ! -e "$INSTALL_DIR/handlers/old_removed_handler.o" ]] || {
-        printf 'expected stale unconfigured handler object to be removed\n'
-        return 1
-    }
-    [[ -e "$INSTALL_DIR/handlers/custom_99_keep.o" ]] || {
-        printf 'expected configured custom slot handler to be preserved\n'
-        return 1
-    }
-    [[ -e "$INSTALL_DIR/handlers/minecraft_handler.o" ]] || {
-        printf 'expected configured custom port handler to be preserved\n'
-        return 1
-    }
-    assert_file_contains "$INSTALL_DIR/handlers/Makefile" "sdk"
 )
 
 # Write a fake sudo onto PATH that logs its invocation and then runs the wrapped
@@ -1773,6 +2176,118 @@ test_backend_phase_dispatch_runs_inline_when_root() (
     [[ -f "$tmpdir/backend_ran" ]] || { printf 'backend phase did not run inline\n'; return 1; }
 )
 
+test_release_transaction_rolls_current_back_atomically() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    PRIV_MODE="root"
+    SOURCE_ROOT="$REPO_ROOT"
+    PYTHON3_BIN="$(command -v python3)"
+    INSTALL_ROOT="$tmpdir/runtime"
+    RELEASES_DIR="$INSTALL_ROOT/releases"
+    CURRENT_LINK="$INSTALL_ROOT/current"
+    CONFIG_FILE="$tmpdir/auto_xdp.env"
+    INSTALL_TRANSACTION_FILE="$tmpdir/install-transaction.json"
+    mkdir -p "$RELEASES_DIR/previous" "$RELEASES_DIR/candidate"
+    ln -s releases/previous "$CURRENT_LINK"
+    printf 'RUNTIME_GENERATION="previous"\n' > "$CONFIG_FILE"
+
+    RELEASE_NAME="candidate"
+    RELEASE_CANDIDATE_DIR="$RELEASES_DIR/candidate"
+    INIT_SYSTEM="none"
+    _restart_previous_service() { :; }
+
+    begin_install_transaction || return 1
+    _atomic_runtime_link releases/candidate "$CURRENT_LINK" || return 1
+    printf 'RUNTIME_GENERATION="candidate"\n' > "$CONFIG_FILE"
+    rollback_install_transaction || return 1
+
+    assert_eq "$(readlink "$CURRENT_LINK")" "releases/previous" || return 1
+    assert_file_contains "$CONFIG_FILE" 'RUNTIME_GENERATION="previous"' || return 1
+    assert_eq "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$INSTALL_TRANSACTION_FILE")" "rolled_back"
+)
+
+test_release_cleanup_removes_only_obsolete_entrypoints() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir path
+    tmpdir=$(mktemp -d)
+    PRIV_MODE="root"
+    INSTALL_ROOT="$tmpdir/runtime"
+    RELEASES_DIR="$INSTALL_ROOT/releases"
+    CURRENT_LINK="$INSTALL_ROOT/current"
+    AXDP_CMD="$tmpdir/bin/axdp"
+    mkdir -p "$RELEASES_DIR/active" "$INSTALL_ROOT/python" \
+        "$INSTALL_ROOT/handlers" "$(dirname "$AXDP_CMD")"
+    ln -s releases/active "$CURRENT_LINK"
+    touch "$INSTALL_ROOT/xdp_port_sync.py" \
+        "$tmpdir/bin/xdp_port_sync.py" "$tmpdir/bin/pkt_relay.py" \
+        "$tmpdir/bin/auto_xdp_start.sh"
+
+    _remove_obsolete_install_layout || return 1
+
+    [[ -L "$CURRENT_LINK" && -d "$RELEASES_DIR/active" ]] || {
+        printf 'versioned release layout was removed\n'
+        return 1
+    }
+    for path in "$INSTALL_ROOT/python" "$INSTALL_ROOT/handlers" \
+        "$INSTALL_ROOT/xdp_port_sync.py" "$tmpdir/bin/xdp_port_sync.py" \
+        "$tmpdir/bin/pkt_relay.py" "$tmpdir/bin/auto_xdp_start.sh"; do
+        [[ ! -e "$path" ]] || {
+            printf 'obsolete install artifact remains: %s\n' "$path"
+            return 1
+        }
+    done
+)
+
+test_runtime_launcher_recovers_interrupted_switch_before_config_load() (
+    set +e
+    local tmpdir candidate previous transaction
+    tmpdir=$(mktemp -d)
+    candidate="$tmpdir/releases/candidate"
+    previous="$tmpdir/releases/previous"
+    transaction="$tmpdir/transaction.json"
+    mkdir -p "$candidate" "$previous"
+    cp "$REPO_ROOT/runtime/auto_xdp_start.sh" "$candidate/auto_xdp_start.sh"
+    ln -s "$REPO_ROOT" "$candidate/python"
+    ln -s /usr/bin/true "$previous/auto_xdp_start.sh"
+    ln -s releases/candidate "$tmpdir/current"
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.install_state transition \
+        --path "$transaction" --transaction-id test --status active \
+        --phase switching --previous releases/previous \
+        --candidate releases/candidate --release candidate || return 1
+
+    AUTO_XDP_INSTALL_ROOT="$tmpdir" \
+    AUTO_XDP_CURRENT_LINK="$tmpdir/current" \
+    INSTALL_TRANSACTION_FILE="$transaction" \
+        bash "$candidate/auto_xdp_start.sh" --sync-once >/dev/null || return 1
+
+    assert_eq "$(readlink "$tmpdir/current")" "releases/previous" || return 1
+    assert_eq "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$transaction")" "recovered"
+)
+
+test_install_lock_rejects_live_owner_and_reclaims_stale_owner() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    PRIV_MODE="root"
+    INSTALL_LOCK_DIR="$tmpdir/install.lock"
+    mkdir "$INSTALL_LOCK_DIR"
+    printf '%s\n' "$$" >"$INSTALL_LOCK_DIR/pid"
+    acquire_install_lock >/dev/null 2>&1 && return 1
+
+    printf '99999999\n' >"$INSTALL_LOCK_DIR/pid"
+    acquire_install_lock || return 1
+    assert_eq "$INSTALL_LOCK_HELD" "1" || return 1
+    release_install_lock
+    [[ ! -e "$INSTALL_LOCK_DIR" ]]
+)
+
 test_package_list_gates_gcc_multilib_by_arch() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -1830,6 +2345,49 @@ test_install_packages_succeeds_on_non_apt_managers() (
     done
 )
 
+test_check_required_tools_step_requires_tar_for_remote_sources() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir output status cmd
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/bin"
+    for cmd in clang bpftool python3 curl ip tc nft; do
+        printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
+        chmod +x "$tmpdir/bin/$cmd"
+    done
+
+    PKG_MANAGER="apk"
+    PREFER_REMOTE_SOURCES=1
+    install_packages() { :; }
+    ensure_psutil() { :; }
+    ensure_tomli_for_python310() { :; }
+
+    output=$(PATH="$tmpdir/bin" check_required_tools_step 2>&1)
+    status=$?
+    [[ $status -ne 0 ]] || {
+        printf 'remote source staging must fail when tar remains unavailable\n'
+        return 1
+    }
+    assert_contains "$output" "tar not found after installation."
+)
+
+test_build_release_payload_propagates_substep_failure() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    BUILD_STAGING_DIR="$tmpdir/staging"
+    INSTALL_DIR="$tmpdir/install"
+    mkdir -p "$BUILD_STAGING_DIR"
+    substep_run() { return 1; }
+
+    build_release_payload >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1"
+)
+
 test_check_required_tools_step_dies_when_install_fails() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -1856,6 +2414,30 @@ test_check_required_tools_step_dies_when_install_fails() (
     }
     assert_contains "$output" "bpftool" || return 1
     assert_contains "$output" "Package installation failed."
+)
+
+test_check_required_tools_step_installs_when_bpf_headers_missing() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir output cmd
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/bin"
+    for cmd in clang bpftool python3 curl tar ip tc nft; do
+        printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
+        chmod +x "$tmpdir/bin/$cmd"
+    done
+
+    PKG_MANAGER="apk"
+    PYTHON3_BIN=""
+    install_packages() { printf 'install_packages_ran\n'; }
+    ensure_psutil() { :; }
+    ensure_tomli_for_python310() { :; }
+    bpf_header_exists() { return 1; }
+
+    output=$(PATH="$tmpdir/bin" check_required_tools_step 2>&1) || return 1
+    assert_contains "$output" "install_packages_ran" || return 1
+    assert_contains "$output" "BPF development headers"
 )
 
 test_check_required_tools_step_rechecks_missing_tools() (
@@ -1918,28 +2500,29 @@ test_print_basic_info_renders_required_fields() (
     assert_contains "$output" "none (fresh install)"
 )
 
-# Anti-drift: the hardcoded header list used by curl|bash installs must cover
-# every header in bpf/include/, or remote installs silently compile without
-# newly added headers.
-test_remote_bpf_header_list_matches_repo_headers() (
+test_print_deployment_summary_emits_machine_records() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
-    local listed hdr base
-    listed=$(grep -o '_bpf_headers=([^)]*)' "$REPO_ROOT/lib/setup/build.sh" \
-        | sed 's/_bpf_headers=(//; s/)//')
-    [[ -n "$listed" ]] || {
-        printf '_bpf_headers list not found in lib/setup/build.sh\n'
-        return 1
-    }
+    IFACES=(eth9)
+    ACTIVE_BACKEND="nftables"
+    INIT_SYSTEM="none"
+    TOML_CONFIG="/tmp/config.toml"
+    MACHINE_STATE="/tmp/machine.json"
+    RUNTIME_STATE="/tmp/runtime.json"
+    RUNNER_SCRIPT="/tmp/start.sh"
+    AXDP_CMD="/usr/local/bin/axdp"
 
-    for hdr in "$REPO_ROOT"/bpf/include/*.h; do
-        base=$(basename "$hdr")
-        [[ " $listed " == *" $base "* || "$listed" == "$base "* || "$listed" == *" $base" || "$listed" == "$base" ]] || {
-            printf 'bpf/include/%s missing from _bpf_headers curl|bash list in lib/setup/build.sh\n' "$base"
-            return 1
-        }
-    done
+    local output
+    EXISTING_INSTALL=0
+    output=$(print_deployment_summary)
+    assert_contains "$output" "install_status=fresh" || return 1
+    assert_contains "$output" "install_result=complete" || return 1
+
+    EXISTING_INSTALL=1
+    output=$(print_deployment_summary)
+    assert_contains "$output" "install_status=replace" || return 1
+    assert_contains "$output" "install_result=complete"
 )
 
 # Anti-drift: --check-update must keep covering every installed source tree;
@@ -1951,30 +2534,20 @@ test_check_update_candidates_cover_installed_sources() (
     cd "$REPO_ROOT" || return 1
     local list f
     list=$(_check_update_candidate_files)
-    for f in \
-        setup_xdp.sh \
-        axdp \
-        config.toml \
-        xdp_port_sync.py \
-        pkt_relay.py \
-        auto_xdp_bpf_helpers.py \
-        tc_flow_track.c \
-        lib/setup/install.sh \
-        lib/setup/packages.sh \
-        runtime/auto_xdp_start.sh \
-        runtime/auto_xdp_runtime_common.sh \
-        bpf/xdp_firewall.c \
-        bpf/include/maps.h \
-        handlers/Makefile \
-        auto_xdp/admin/main.py \
-        auto_xdp/backends/xdp.py \
-        auto_xdp/bpf/maps.py \
-        auto_xdp/xdp_required_maps.txt; do
-        [[ "$list" == *"$f"* ]] || {
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        [[ "$list" == *$'\n'"$f"$'\n'* || "$list" == "$f"$'\n'* || "$list" == *$'\n'"$f" || "$list" == "$f" ]] || {
             printf '%s missing from check-update candidate files\n' "$f"
             return 1
         }
-    done
+    done < <(
+        printf '%s\n' setup_xdp.sh axdp config.toml xdp_port_sync.py \
+            pkt_relay.py auto_xdp_bpf_helpers.py tc_flow_track.c
+        find lib/setup runtime bpf/include handlers auto_xdp \
+            \( -name '*.sh' -o -name '*.c' -o -name '*.h' -o -name '*.py' \
+               -o -name 'Makefile' -o -name '*.toml' -o -name '*.txt' \) \
+            -type f | sed 's|^\./||' | sort
+    )
 )
 
 # Anti-drift: installer output contract — basic info first, per-item checks and
@@ -1992,22 +2565,8 @@ test_main_orders_basic_info_checks_then_summary() (
     }
 
     local -a ordered=(
-        detect_privilege_mode
-        detect_environment
-        priv_init
-        acquire_install_lock_step
-        recover_interrupted_install_step
         check_required_tools_step
-        resolve_target_interfaces
-        existing_install_detected
         print_basic_info
-        compile_bpf_objects_step
-        stage_runtime_release_step
-        replace_existing_install_step
-        begin_install_transaction_step
-        activate_candidate_release_step
-        run_backend_phase_dispatch
-        commit_install_transaction_step
         print_deployment_summary
     )
     local prev_pos=-1 name pos
@@ -2026,80 +2585,5 @@ test_main_orders_basic_info_checks_then_summary() (
     done
 )
 
-run_test "setup_xdp detects distro families" test_detect_os_release_maps_supported_families
-run_test "setup_xdp prefers distro package-manager order" test_detect_pkg_manager_prefers_family_order
-run_test "setup_xdp reports missing package managers" test_detect_pkg_manager_fails_when_no_manager_exists
-run_test "setup_xdp detects systemd and openrc" test_detect_init_system_supports_systemd_and_openrc
-run_test "setup_xdp package lists cover supported managers" test_package_lists_cover_all_supported_managers
-run_test "setup_xdp dry-run report emits CI fields" test_dry_run_report_emits_ci_fields
-run_test "setup_xdp confirmation handles force and no-tty abort" test_confirm_yes_no_force_and_no_tty_abort_modes
-run_test "setup_xdp replaces existing install without prompting" test_replace_existing_install_step_replaces_without_prompt
-run_test "setup_xdp prefers local files when available" test_fetch_local_or_remote_uses_local_copy_without_network
-run_test "setup_xdp local source defaults to main ref" test_local_source_defaults_to_main_ref
-run_test "setup_xdp explicit ref selects matching remote tree" test_explicit_source_ref_selects_matching_remote_tree
-run_test "setup_xdp stdin install requires explicit ref" test_remote_stdin_install_requires_explicit_ref
-run_test "setup_xdp preserves remote ref across sudo" test_backend_phase_dispatch_preserves_remote_ref_across_sudo
-run_test "README release install uses one local archive tree" test_readme_release_install_uses_one_local_archive_tree
-run_test "setup_xdp check-update confirms all changed files once" test_check_github_updates_lists_and_confirms_once
-run_test "setup_xdp writes queue auto tuning into runtime config" test_write_config_enables_queue_auto_tuning
-run_test "setup_xdp sizes combined channels to available CPUs" test_auto_tune_interface_parallelism_sets_combined_channels
-run_test "setup_xdp balances interface irqs across CPUs" test_auto_tune_interface_parallelism_balances_irqs
-run_test "setup_xdp detects required BPF headers across include roots" test_bpf_header_exists_checks_multiple_include_roots
-run_test "setup_xdp surfaces truncated handler build logs" test_warn_from_log_file_prefixes_and_truncates_output
-run_test "setup_xdp stages handler sources outside the current directory" test_prepare_slot_handler_sources_uses_staging_dir
-run_test "setup_xdp prints info lines within active step output" test_info_prints_within_active_step
-run_test "setup_xdp prints substep success and failure markers" test_substep_run_prints_success_and_failure_markers
-run_test "setup_xdp validates pinned map set completeness" test_xdp_maps_ready_requires_all_expected_pins
-run_test "required map manifest matches the XDP program maps" test_xdp_required_map_manifest_matches_program_maps
-run_test "required map fallback matches the installed manifest" test_xdp_required_map_fallback_matches_manifest
-run_test "setup_xdp reuses SCTP conntrack map for tc egress" test_load_tc_egress_program_reuses_sctp_conntrack_map
-run_test "tc switch failure restores the previous filter" test_tc_switch_failure_restores_previous_filter
-run_test "tc rollback failure retains the candidate program" test_tc_rollback_failure_retains_candidate_program
-run_test "XDP transaction retains candidate after incomplete tc rollback" test_transaction_retains_candidate_after_incomplete_tc_rollback
-run_test "XDP attach uses atomic bpftool overwrite" test_xdp_attach_mode_uses_atomic_bpftool_overwrite
-run_test "XDP candidate validation failure keeps the current generation" test_transactional_xdp_validation_failure_keeps_current_generation
-run_test "XDP candidate handler failure keeps the current generation" test_transactional_handler_failure_keeps_current_generation
-run_test "XDP candidate pre-seed rejects map update failures" test_candidate_preseed_rejects_map_update_failures
-run_test "XDP attach failure restores switched interfaces" test_transactional_xdp_attach_failure_restores_switched_interfaces
-run_test "tc failure restores the previous XDP generation" test_transactional_tc_failure_restores_xdp_generation
-run_test "successful XDP switch commits the candidate generation" test_transactional_xdp_success_commits_candidate_generation
-run_test "interrupted XDP reload resumes the candidate generation" test_interrupted_xdp_reload_resumes_candidate_generation
-run_test "setup_xdp resolves default route interface for step helper" test_resolve_target_interfaces_uses_default_route_interface
-run_test "setup_xdp reuses installed env interfaces on reinstall" test_resolve_target_interfaces_reuses_installed_env_ifaces
-run_test "setup_xdp drops missing saved interfaces with note" test_resolve_target_interfaces_drops_missing_saved_ifaces
-run_test "setup_xdp re-detects when all saved interfaces are gone" test_resolve_target_interfaces_detects_when_saved_ifaces_all_gone
-run_test "setup_xdp preserves existing config.toml on reinstall" test_install_toml_config_preserves_existing_local_config
-run_test "setup_xdp keeps clang and bpftool optional for runtime tool checks" test_check_required_tools_step_only_requires_runtime_commands
-run_test "setup_xdp backend step falls back to nftables" test_deploy_backend_step_falls_back_to_nftables
-run_test "setup_xdp refuses nftables fallback while XDP remains attached" test_deploy_backend_step_refuses_fallback_with_active_xdp
-run_test "setup_xdp removes tc filter from removed interface" test_deploy_xdp_removes_tc_filter_from_removed_interface
-run_test "setup_xdp service step warns when no init system exists" test_install_runtime_service_step_warns_without_init_system
-run_test "setup_xdp ignores xdp text in interface names" test_cleanup_existing_xdp_ignores_xdp_in_interface_name
-run_test "relay service emits secure runtime directives" test_relay_service_security_directives
-run_test "setup_xdp loads configured slot handlers only for xdp backend" test_load_configured_slot_handlers_step_only_runs_for_xdp
-run_test "setup_xdp cleanup step preserves local sources" test_cleanup_build_artifacts_step_preserves_local_sources
-run_test "setup_xdp restores compiled builtin slot handlers after runtime install" test_restore_compiled_slot_handlers_reinstalls_builtin_objects
-run_test "setup_xdp installs auto_xdp state module into runtime package" test_install_python_support_package_includes_state_module
-run_test "setup_xdp selects sudo mode when not root" test_detect_privilege_mode_uses_sudo_when_not_root
-run_test "setup_xdp fails when neither root nor sudo is available" test_detect_privilege_mode_fails_without_root_or_sudo
-run_test "setup_xdp as_root runs directly in root mode" test_as_root_runs_directly_when_root
-run_test "setup_xdp as_root escalates with sudo in sudo mode" test_as_root_escalates_in_sudo_mode
-run_test "setup_xdp detects unwritable destinations" test_can_write_path_detects_unwritable_destinations
-run_test "setup_xdp write_file writes to writable paths without sudo" test_write_file_writes_content_without_escalation
-run_test "setup_xdp priv_init is a no-op when root" test_priv_init_is_noop_when_root
-run_test "setup_xdp priv_init primes sudo once" test_priv_init_primes_sudo_once
-run_test "setup_xdp gates gcc-multilib by architecture" test_package_list_gates_gcc_multilib_by_arch
-run_test "setup_xdp propagates required package install failures" test_install_packages_propagates_required_install_failure
-run_test "setup_xdp package install succeeds on non-apt managers" test_install_packages_succeeds_on_non_apt_managers
-run_test "setup_xdp dies when tool package install fails" test_check_required_tools_step_dies_when_install_fails
-run_test "setup_xdp rechecks missing tools after package install" test_check_required_tools_step_rechecks_missing_tools
-run_test "setup_xdp reports fresh install when nothing is installed" test_replace_existing_install_step_reports_fresh_install
-run_test "setup_xdp basic info block renders required fields" test_print_basic_info_renders_required_fields
-run_test "setup_xdp remote header list matches bpf/include" test_remote_bpf_header_list_matches_repo_headers
-run_test "setup_xdp check-update candidates cover installed sources" test_check_update_candidates_cover_installed_sources
-run_test "setup_xdp main keeps info-checks-summary output order" test_main_orders_basic_info_checks_then_summary
-run_test "setup_xdp parses internal phase2 flags" test_parse_args_accepts_internal_phase2_flags
-run_test "setup_xdp round-trips backend results" test_emit_backend_results_roundtrips_state
-run_test "setup_xdp runs backend phase inline when root" test_backend_phase_dispatch_runs_inline_when_root
-
+run_discovered_tests "${BASH_SOURCE[0]}" "setup_xdp"
 finish_tests

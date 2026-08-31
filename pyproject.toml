@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "mypy>=1.8",
+    "PyYAML>=6.0",
     "pytest>=7.0",
 ]
 
@@ -36,6 +37,13 @@ auto_xdp = ["default_config.toml", "xdp_required_maps.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+addopts = "--strict-markers -vv -ra --showlocals --tb=long --capture=tee-sys"
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "[%(levelname)s] %(name)s: %(message)s"
+markers = [
+    "component: filesystem, CLI, subprocess, or fake-adapter contract",
+]
 
 [tool.mypy]
 python_version = "3.10"

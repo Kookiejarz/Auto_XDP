@@ -7,10 +7,14 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import pytest
+
 import support
 
 
 helpers = support.load_module("auto_xdp_bpf_helpers_test", "auto_xdp_bpf_helpers.py")
+
+pytestmark = pytest.mark.component
 
 
 def make_addr(ip: str, port: int):

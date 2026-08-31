@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from auto_xdp.discovery import (
     DiscoveryError,
     _bind_ip_is_exposed,
@@ -1795,6 +1797,7 @@ def _failing_desired_state():
     )
 
 
+@pytest.mark.component
 class ApplyFailureCountingTests(unittest.TestCase):
     def _reconcile(self, backend, dry_run):
         desired = _failing_desired_state()
@@ -1919,6 +1922,7 @@ def _make_outer_backend():
     return backend
 
 
+@pytest.mark.component
 class RateOuterReconcileTests(unittest.TestCase):
     def _reconcile(self, backend, desired, dry_run=False):
         with mock.patch.object(cfg, "TCP_PERMANENT", {}), \
@@ -1955,6 +1959,7 @@ class RateOuterReconcileTests(unittest.TestCase):
             self.assertEqual(outer.active(), {})
 
 
+@pytest.mark.component
 class ProbeInnerMapSupportTests(unittest.TestCase):
     def test_probe_unavailable_without_inner_map_support(self):
         with mock.patch.object(xdp_backend_mod.shutil, "which", return_value="/usr/sbin/bpftool"), \
@@ -1967,6 +1972,7 @@ class ProbeInnerMapSupportTests(unittest.TestCase):
         self.assertIn("5.10", status.reason)
 
 
+@pytest.mark.component
 class VerifyKernelStateTests(unittest.TestCase):
     def _backend_with_verifiers(self, values):
         backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
@@ -2001,6 +2007,7 @@ class VerifyKernelStateTests(unittest.TestCase):
         warn.assert_not_called()
 
 
+@pytest.mark.component
 class MapVerifyTests(unittest.TestCase):
     def _make_map(self, cache):
         m = object.__new__(bpf_maps_mod.BpfSynRatePortsMap)
@@ -2024,6 +2031,7 @@ class MapVerifyTests(unittest.TestCase):
         self.assertTrue(any("drift" in line for line in logs.output), logs.output)
 
 
+@pytest.mark.component
 class SyncerVerifyTriggerTests(unittest.TestCase):
     def _run_watch(self, backend, select_effects):
         nl = mock.MagicMock()
@@ -2035,7 +2043,11 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
              mock.patch.object(syncer_mod.select, "select", side_effect=select_effects), \
              mock.patch.object(cfg, "DEBOUNCE_SECONDS", 0.0), \
              mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
-            syncer_mod.watch(dry_run=False, backend_name="xdp")
+            syncer_mod.watch(
+                dry_run=False,
+                backend_name="xdp",
+                monotonic=lambda: 100.0,
+            )
         return sync_once
 
     def test_failed_apply_triggers_verify_and_corrective_sync(self):
@@ -2059,7 +2071,24 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
         backend.is_stale.return_value = False
         backend.verify_kernel_state.return_value = 0
 
-        self._run_watch(backend, [([], [], []), KeyboardInterrupt()])
+        nl = mock.MagicMock()
+        with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
+             mock.patch.object(syncer_mod, "open_proc_connector", return_value=nl), \
+             mock.patch.object(syncer_mod, "_open_relay_client", return_value=None), \
+             mock.patch.object(syncer_mod, "drain_proc_events", return_value=True), \
+             mock.patch.object(syncer_mod, "sync_once"), \
+             mock.patch.object(
+                 syncer_mod.select,
+                 "select",
+                 side_effect=[([], [], []), KeyboardInterrupt()],
+             ), \
+             mock.patch.object(cfg, "DEBOUNCE_SECONDS", 0.0), \
+             mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
+            syncer_mod.watch(
+                dry_run=False,
+                backend_name="xdp",
+                monotonic=lambda: 100.0,
+            )
 
         backend.is_stale.assert_called_once()
         backend.verify_kernel_state.assert_called_once()
@@ -2130,6 +2159,7 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
         self.assertTrue(any("keeping existing policy" in line for line in logs.output), logs.output)
 
 
+@pytest.mark.component
 class ConfigReloadTests(unittest.TestCase):
     def test_invalid_sighup_config_keeps_last_known_good_state(self):
         old_ports = dict(cfg.TCP_PERMANENT)

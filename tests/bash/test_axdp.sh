@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# auto-xdp-test-suite: component
 
 set -euo pipefail
 
@@ -75,6 +76,20 @@ test_main_dispatches_under_attack_command() (
 
     main under-attack on || return 1
     assert_eq "$called" "yes:on"
+)
+
+test_status_combines_service_and_backend_health() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    run_service_cmd() { printf 'service active\n'; }
+    run_backend() { printf 'Backend   : xdp\nHealth    : healthy\n'; }
+
+    local output
+    output=$(run_status) || return 1
+    assert_contains "$output" "service active" || return 1
+    assert_contains "$output" "Auto XDP protection health" || return 1
+    assert_contains "$output" "Health    : healthy"
 )
 
 test_check_update_propagates_main_ref_to_downloaded_installer() (
@@ -155,7 +170,7 @@ def build_parser():
     parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin_cli")
     parser.add_argument("--config", required=True)
     parser.add_argument("--bpf-pin-dir", default="/sys/fs/bpf/xdp_fw")
-    parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp")
+    parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp/current")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("config")
     return parser
@@ -633,17 +648,17 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
     local ops_log="$tmpdir/ops.log"
 
     BPF_PIN_DIR="$tmpdir/sys/fs/bpf/xdp_fw"
-    INSTALL_DIR="$tmpdir/usr/local/lib/auto_xdp"
+    INSTALL_ROOT="$tmpdir/usr/local/lib/auto_xdp"
+    INSTALL_DIR="$INSTALL_ROOT/current"
     CONFIG_DIR="$tmpdir/etc/auto_xdp"
     CONFIG_FILE="$CONFIG_DIR/auto_xdp.env"
     TOML_CONFIG="$CONFIG_DIR/config.toml"
     RELAY_GROUP="auto-xdp"
     RELAY_GROUP_MARKER="$CONFIG_DIR/.relay-group-created"
     RUN_STATE_DIR="$tmpdir/run/auto_xdp"
-    RUN_STATE_COMPAT_DIR="$tmpdir/var/run/auto_xdp"
-    SYNC_SCRIPT="$tmpdir/usr/local/bin/xdp_port_sync.py"
-    RELAY_SCRIPT="$tmpdir/usr/local/bin/pkt_relay.py"
-    RUNNER_SCRIPT="$tmpdir/usr/local/bin/auto_xdp_start.sh"
+    SYNC_SCRIPT="$INSTALL_DIR/xdp_port_sync.py"
+    RELAY_SCRIPT="$INSTALL_DIR/pkt_relay.py"
+    RUNNER_SCRIPT="$INSTALL_DIR/auto_xdp_start.sh"
     AXDP_CMD="$tmpdir/usr/local/bin/axdp"
     SYSTEMD_UNIT_DIR="$tmpdir/etc/systemd/system"
     OPENRC_INIT_DIR="$tmpdir/etc/init.d"
@@ -654,8 +669,9 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
 
     mkdir -p \
         "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next" "${BPF_PIN_DIR}_rollback" \
-        "$INSTALL_DIR" "$CONFIG_DIR" "$RUN_STATE_DIR" "$RUN_STATE_COMPAT_DIR" \
-        "$(dirname "$SYNC_SCRIPT")" "$SYSTEMD_UNIT_DIR" "$OPENRC_INIT_DIR"
+        "$INSTALL_ROOT" "$CONFIG_DIR" "$RUN_STATE_DIR" \
+        "$(dirname "$SYNC_SCRIPT")" "$(dirname "$AXDP_CMD")" \
+        "$SYSTEMD_UNIT_DIR" "$OPENRC_INIT_DIR"
     touch \
         "$SYNC_SCRIPT" "$RELAY_SCRIPT" "$RUNNER_SCRIPT" "$AXDP_CMD" \
         "$SYSTEMD_UNIT_DIR/xdp-port-sync.service" \
@@ -703,7 +719,7 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
     local path
     for path in \
         "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next" "${BPF_PIN_DIR}_rollback" \
-        "$INSTALL_DIR" "$CONFIG_DIR" "$RUN_STATE_DIR" "$RUN_STATE_COMPAT_DIR" \
+        "$INSTALL_DIR" "$CONFIG_DIR" "$RUN_STATE_DIR" \
         "$SYNC_SCRIPT" "$RELAY_SCRIPT" "$RUNNER_SCRIPT" "$AXDP_CMD" \
         "$SYSTEMD_UNIT_DIR/xdp-port-sync.service" \
         "$SYSTEMD_UNIT_DIR/auto-xdp-relay.service" \
@@ -760,7 +776,8 @@ test_uninstall_keeps_runtime_when_xdp_detach_fails() (
     local tmpdir
     tmpdir=$(mktemp -d)
     BPF_PIN_DIR="$tmpdir/sys/fs/bpf/xdp_fw"
-    INSTALL_DIR="$tmpdir/usr/local/lib/auto_xdp"
+    INSTALL_ROOT="$tmpdir/usr/local/lib/auto_xdp"
+    INSTALL_DIR="$INSTALL_ROOT/current"
     AUTO_XDP_PROC_ROOT="$tmpdir/proc"
     IFACES="eth0"
     mkdir -p "$BPF_PIN_DIR" "$INSTALL_DIR"
@@ -793,11 +810,11 @@ test_uninstall_stops_only_exact_runtime_process_argv() (
     local tmpdir
     tmpdir=$(mktemp -d)
     AUTO_XDP_PROC_ROOT="$tmpdir/proc"
-    SYNC_SCRIPT="/usr/local/bin/xdp_port_sync.py"
+    SYNC_SCRIPT="/usr/local/lib/auto_xdp/current/xdp_port_sync.py"
     mkdir -p "$AUTO_XDP_PROC_ROOT/100" "$AUTO_XDP_PROC_ROOT/101"
-    printf 'bash\0-lc\0test /usr/local/bin/xdp_port_sync.py\0' \
+    printf 'bash\0-lc\0test /usr/local/lib/auto_xdp/current/xdp_port_sync.py\0' \
         >"$AUTO_XDP_PROC_ROOT/100/cmdline"
-    printf 'python3\0/usr/local/bin/xdp_port_sync.py\0--watch\0' \
+    printf 'python3\0/usr/local/lib/auto_xdp/current/xdp_port_sync.py\0--watch\0' \
         >"$AUTO_XDP_PROC_ROOT/101/cmdline"
 
     local killed="$tmpdir/killed"
@@ -826,10 +843,11 @@ test_slot_load_sctp_reuses_shared_maps() (
     tmpdir=$(mktemp -d)
     BPF_PIN_DIR="$tmpdir/bpf"
     INSTALL_DIR="$tmpdir/install"
+    HANDLERS_DIR="$tmpdir/etc/handlers"
     TOML_CONFIG="$tmpdir/config.toml"
     PYTHON_LIB_DIR="$REPO_ROOT"
     require_root() { :; }
-    mkdir -p "$BPF_PIN_DIR/handlers" "$INSTALL_DIR/handlers" "$tmpdir/bin"
+    mkdir -p "$BPF_PIN_DIR/handlers" "$INSTALL_DIR/handlers" "$HANDLERS_DIR" "$tmpdir/bin"
     touch \
         "$BPF_PIN_DIR/slot_ctx_map" \
         "$BPF_PIN_DIR/sctp_whitelist" \
@@ -844,6 +862,16 @@ EOF_CFG
     cat >"$tmpdir/bin/bpftool" <<EOF_BPFSH
 #!/bin/sh
 printf '%s\n' "\$*" >> "$tmpdir/bpftool.log"
+if [ "\$1 \$2" = "prog load" ]; then
+    : > "\$4"
+elif [ "\$1 \$2 \$3" = "-j prog show" ]; then
+    printf '%s\n' '{"id":132}'
+elif [ "\$1 \$2" = "map update" ]; then
+    printf '%s\n' 132 > "$tmpdir/active-id"
+elif [ "\$1 \$2 \$3" = "-j map lookup" ]; then
+    [ -f "$tmpdir/active-id" ] || exit 1
+    printf '%s\n' '{"key":[132,0,0,0],"value":[132,0,0,0]}'
+fi
 exit 0
 EOF_BPFSH
     chmod +x "$tmpdir/bin/bpftool"
@@ -864,10 +892,11 @@ test_slot_load_custom_c_compiles_and_persists_object_path() (
     tmpdir=$(mktemp -d)
     BPF_PIN_DIR="$tmpdir/bpf"
     INSTALL_DIR="$tmpdir/install"
+    HANDLERS_DIR="$tmpdir/etc/handlers"
     TOML_CONFIG="$tmpdir/config.toml"
     PYTHON_LIB_DIR="$REPO_ROOT"
     require_root() { :; }
-    mkdir -p "$BPF_PIN_DIR/handlers" "$INSTALL_DIR/handlers" "$tmpdir/bin"
+    mkdir -p "$BPF_PIN_DIR/handlers" "$INSTALL_DIR/handlers" "$HANDLERS_DIR" "$tmpdir/bin"
     touch \
         "$BPF_PIN_DIR/slot_ctx_map" \
         "$BPF_PIN_DIR/proto_handlers" \
@@ -898,6 +927,16 @@ EOF_CLANG
     cat >"$tmpdir/bin/bpftool" <<EOF_BPFSH
 #!/bin/sh
 printf '%s\n' "\$*" >> "$tmpdir/bpftool.log"
+if [ "\$1 \$2" = "prog load" ]; then
+    : > "\$4"
+elif [ "\$1 \$2 \$3" = "-j prog show" ]; then
+    printf '%s\n' '{"id":99}'
+elif [ "\$1 \$2" = "map update" ]; then
+    printf '%s\n' 99 > "$tmpdir/active-id"
+elif [ "\$1 \$2 \$3" = "-j map lookup" ]; then
+    [ -f "$tmpdir/active-id" ] || exit 1
+    printf '%s\n' '{"key":[99,0,0,0],"value":[99,0,0,0]}'
+fi
 exit 0
 EOF_BPFSH
     chmod +x "$tmpdir/bin/clang" "$tmpdir/bin/bpftool"
@@ -906,36 +945,11 @@ EOF_BPFSH
     run_slot load 99 "$tmpdir/custom_handler.c" >/dev/null || return 1
 
     assert_file_contains "$tmpdir/clang.log" "$tmpdir/custom_handler.c" || return 1
-    assert_file_contains "$tmpdir/bpftool.log" "$INSTALL_DIR/handlers/custom_99_custom_handler.o" || return 1
+    assert_file_contains "$tmpdir/bpftool.log" "$HANDLERS_DIR/custom_99_custom_handler.o" || return 1
     assert_file_contains "$TOML_CONFIG" "[[slots.enabled]]" || return 1
     assert_file_contains "$TOML_CONFIG" 'proto = 99' || return 1
-    assert_file_contains "$TOML_CONFIG" 'path = "'"$INSTALL_DIR"'/handlers/custom_99_custom_handler.o"'
+    assert_file_contains "$TOML_CONFIG" 'path = "'"$HANDLERS_DIR"'/custom_99_custom_handler.o"'
 )
 
-run_test "axdp reads and updates runtime log level" test_run_log_level_reads_and_updates_config
-run_test "axdp reads and updates under-attack mode" test_run_under_attack_reads_and_updates_config
-run_test "axdp dispatches under-attack command correctly" test_main_dispatches_under_attack_command
-run_test "axdp check-update propagates its source ref" test_check_update_propagates_main_ref_to_downloaded_installer
-run_test "axdp loads configured interfaces for tui" test_main_loads_configured_ifaces_for_tui
-run_test "axdp reports stale admin_cli for tui" test_main_reports_stale_admin_cli_for_tui
-run_test "axdp preserves unrelated TOML sections on config update" test_config_updates_preserve_unrelated_sections
-run_test "axdp permanent supports SCTP ports" test_run_permanent_supports_sctp_ports
-run_test "auto_xdp_start records generic xdp_mode when re-attach falls back to generic" test_ensure_xdp_reattach_records_generic_mode_on_fallback
-run_test "auto_xdp_start records native xdp_mode when re-attach succeeds natively" test_ensure_xdp_reattach_records_native_mode_when_all_native
-run_test "auto_xdp_start records generic xdp_mode when existing iface already in generic mode" test_ensure_xdp_reattach_records_generic_when_existing_iface_is_generic
-run_test "auto_xdp_start restores tc and blocks fallback after XDP re-attach failure" test_ensure_xdp_reattach_restores_tc_and_blocks_fallback_on_failure
-run_test "auto_xdp_start restores stable XDP after interrupted candidate failure" test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails
-run_test "auto_xdp_start refuses nftables while XDP remains attached" test_select_backend_refuses_nftables_while_xdp_remains_attached
-run_test "axdp backend reports runtime attach state and conntrack counts" test_run_backend_reports_runtime_state_and_conntrack_counts
-run_test "axdp backend json reports runtime attach state and conntrack counts" test_run_backend_json_reports_runtime_state_and_conntrack_counts
-run_test "axdp conntrack summarizes destination ports" test_run_conntrack_summarizes_destination_ports
-run_test "axdp help works without installation" test_cli_help_runs_without_runtime_state
-run_test "axdp uninstall removes all owned artifacts" test_uninstall_removes_all_auto_xdp_artifacts
-run_test "axdp uninstall preserves a used relay group" test_uninstall_preserves_used_relay_group
-run_test "axdp uninstall keeps retry assets after detach failure" test_uninstall_keeps_runtime_when_xdp_detach_fails
-run_test "axdp uninstall stops only exact runtime process argv" test_uninstall_stops_only_exact_runtime_process_argv
-run_test "axdp dispatches uninstall with explicit interfaces" test_main_dispatches_uninstall_command
-run_test "axdp slot load sctp reuses shared SCTP maps" test_slot_load_sctp_reuses_shared_maps
-run_test "axdp slot load custom c compiles and persists object path" test_slot_load_custom_c_compiles_and_persists_object_path
-
+run_discovered_tests "${BASH_SOURCE[0]}" "axdp"
 finish_tests
