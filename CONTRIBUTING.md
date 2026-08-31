@@ -31,15 +31,18 @@ Thanks for your interest in improving Auto XDP. >w<
 
 ## Local Validation
 
-Run the same baseline checks used in CI:
+`tests/run.sh` is the same entry point CI uses. After `python3 -m pip install -e ".[dev]"`:
 
 ```bash
-bash -n setup_xdp.sh
-bash -n axdp
-python3 -m py_compile xdp_port_sync.py
-bash ./setup_xdp.sh --dry-run
-bash ./setup_xdp.sh --help >/dev/null
+bash tests/run.sh check
+bash tests/run.sh unit
+bash tests/run.sh component
+bash tests/run.sh smoke
 ```
+
+`check` is static syntax plus mypy. `unit`, `component`, and `smoke` match the Quality job. `bash tests/run.sh distro` runs static + unit + component + smoke in one shot.
+
+Privileged Linux hosts can also run `sudo bash tests/run.sh kernel`. Do not add test programs to workflow YAML; register them with `# auto-xdp-test-suite: <suite>` as described in [tests/README.md](./tests/README.md).
 
 ## Coding Guidelines
 

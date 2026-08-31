@@ -1,6 +1,9 @@
 .DS_Store
 __pycache__/
 *.pyc
+*.egg-info/
+.superpowers/
+uv.lock
 XDP-eBPF-Anti-DDoS-Firewall/
 website/
 docs/
