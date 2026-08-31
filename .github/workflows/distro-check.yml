@@ -1,4 +1,4 @@
-name: CI / Native Distro Build
+name: CI / Full Validation
 
 on:
   push:
@@ -13,119 +13,214 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  native-build:
-    name: Native Build (${{ matrix.name }})
+  quality:
+    name: Static, Type, Unit, and Component
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install project dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Run static and type checks
+        run: bash tests/run.sh check
+
+      - name: Run unit, component, and installer smoke tests
+        run: |
+          bash tests/run.sh unit
+          bash tests/run.sh component
+          bash tests/run.sh smoke
+
+  distro-install:
+    name: Distro install + compile (${{ matrix.name }})
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: debian
             image: debian:12-slim
-            experimental: false
-            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib bpftool
+            preinstall: apt-get update && apt-get install -y bash ca-certificates curl git python3 procps iproute2
           - name: ubuntu
             image: ubuntu:24.04
-            experimental: false
-            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib linux-tools-common linux-tools-generic; bpftool_path="$(find /usr/lib/linux-tools -name bpftool -print -quit)"; test -x "$bpftool_path"; ln -sf "$bpftool_path" /usr/local/bin/bpftool; bpftool version
+            preinstall: apt-get update && apt-get install -y bash ca-certificates curl git python3 procps iproute2
           - name: fedora
             image: fedora:41
-            experimental: false
-            install: dnf -y install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
+            preinstall: dnf -y install bash ca-certificates curl git python3 procps-ng awk iproute
           - name: opensuse
             image: opensuse/tumbleweed
-            experimental: true
-            install: zypper --non-interactive refresh && zypper --non-interactive install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-devel bpftool gcc make
+            preinstall: zypper --non-interactive refresh && zypper --non-interactive install -y bash ca-certificates curl git python3 procps iproute2
           - name: arch
             image: archlinux:latest
-            experimental: true
-            install: "pacman -Sy --noconfirm --needed bash ca-certificates coreutils curl gawk git grep python sed iproute2 clang llvm libbpf base-devel bpf"
+            preinstall: pacman -Sy --disable-sandbox --noconfirm --needed bash ca-certificates curl git python procps-ng iproute2 && printf '\nDisableSandbox\n' >> /etc/pacman.conf
           - name: alpine
             image: alpine:3.20
-            experimental: false
-            install: apk add --no-cache bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev bpftool build-base linux-headers
+            preinstall: apk add --no-cache bash ca-certificates curl git python3 procps gawk grep sed coreutils iproute2
           - name: almalinux
             image: almalinux:10
-            experimental: false
-            install: dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
+            preinstall: dnf -y --allowerasing install bash ca-certificates curl git python3 procps-ng iproute
           - name: rockylinux
-            image: rockylinux:9
-            experimental: false
-            install: dnf -y install dnf-plugins-core && dnf config-manager --enable crb && dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
+            image: rockylinux/rockylinux:10
+            preinstall: dnf -y --allowerasing install bash ca-certificates curl git python3 procps-ng iproute
     container:
       image: ${{ matrix.image }}
-    steps:
-      - name: Install build dependencies
-        run: ${{ matrix.install }}
-
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Verify build dependencies
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          for command_name in bash clang llvm-strip bpftool ip python3; do
-            command -v "$command_name"
-          done
-          clang --version
-          bpftool version
-
-      - name: Build BPF objects natively on ${{ matrix.name }}
-        shell: bash
-        run: bash ./tests/bash/test_bpf_build.sh
-
-  kernel-integration:
-    name: Kernel Load + XDP Integration
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    container:
-      image: debian:12-slim
       options: --privileged
     steps:
-      - name: Install kernel test dependencies
-        run: |
-          apt-get update
-          apt-get install -y bash clang llvm libbpf-dev bpftool iproute2 python3 util-linux nftables
-          if [ "$(uname -m)" = "x86_64" ]; then
-            apt-get install -y gcc-multilib
-          fi
+      - name: Install bootstrap dependencies
+        shell: sh
+        run: ${{ matrix.preinstall }}
 
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Mount BPF filesystem
-        run: |
-          mkdir -p /sys/fs/bpf
-          mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
-
-      - name: Report kernel and BPF environment
+      - name: Run installer end to end
         shell: bash
         run: |
           set -Eeuo pipefail
-          uname -a
-          clang --version
-          bpftool version
-          ip -Version
-          mountpoint /sys/fs/bpf
-          ulimit -l
-          bpftool feature probe kernel 2>&1 || echo "warning: kernel feature probe failed"
+          for command_name in clang bpftool llvm-strip; do
+            if command -v "$command_name" >/dev/null 2>&1; then
+              echo "bootstrap must not preinstall $command_name" >&2
+              exit 1
+            fi
+          done
+          cd /tmp
+          bash "$GITHUB_WORKSPACE/setup_xdp.sh" 2>&1 | tee "$GITHUB_WORKSPACE/install.log"
 
-      - name: Load, attach, and exercise the XDP program
+      - name: Verify installed artifacts and compiled objects
+        shell: bash
+        run: bash tests/bash/assert_install_artifacts.sh install.log
+
+      - name: Rerun installer over the existing install
         shell: bash
         run: |
           set -Eeuo pipefail
-          integration_log="$GITHUB_WORKSPACE/kernel-integration.log"
-          bash ./tests/bash/test_integration.sh 2>&1 | tee "$integration_log"
-          grep -Eq '^all [1-9][0-9]* tests passed$' "$integration_log"
+          cd /tmp
+          bash "$GITHUB_WORKSPACE/setup_xdp.sh" 2>&1 | tee "$GITHUB_WORKSPACE/reinstall.log"
 
-      - name: Upload kernel verifier diagnostics
+      - name: Verify overwrite reinstall
+        shell: bash
+        run: bash tests/bash/assert_install_artifacts.sh install.log reinstall.log
+
+      - name: Upload installer diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-integration-debug-${{ github.run_id }}
-          path: kernel-integration.log
+          name: distro-install-${{ matrix.name }}-${{ github.run_id }}
+          path: |
+            install.log
+            reinstall.log
           if-no-files-found: warn
           retention-days: 7
+
+  ubuntu-e2e:
+    name: Full E2E + Kernel (Ubuntu own kernel)
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Verify Ubuntu VM runner
+        run: |
+          set -Eeuo pipefail
+          source /etc/os-release
+          test "${ID:-}" = ubuntu
+          if systemd-detect-virt --container --quiet; then
+            echo "runner must be a VM or bare-metal Ubuntu host, not a container" >&2
+            exit 1
+          fi
+          test -r /sys/kernel/btf/vmlinux
+          sudo -n true
+          uname -a
+
+      - name: Reset previous interrupted CI installation
+        run: |
+          if sudo test -x /usr/local/bin/axdp; then
+            sudo /usr/local/bin/axdp uninstall
+          fi
+          sudo ip link del axdpci0 2>/dev/null || true
+          sudo ip link add axdpci0 type veth peer name axdpci1
+          sudo ip link set axdpci0 up
+          sudo ip link set axdpci1 up
+
+      - name: Install without teardown
+        run: |
+          cd /tmp
+          sudo bash "$GITHUB_WORKSPACE/setup_xdp.sh" \
+            --allow-container-interfaces axdpci0 \
+            2>&1 | tee "$GITHUB_WORKSPACE/install.log"
+
+      - name: Verify installed artifacts and runtime
+        run: |
+          bash tests/bash/assert_install_artifacts.sh install.log
+          sudo env \
+            REQUIRE_SOCK_STATE_EVENT=1 \
+            RUNTIME_E2E_PEER_IFACE=axdpci1 \
+            bash tests/run.sh installed
+
+      - name: Run real kernel and packet-policy integration
+        run: |
+          set -Eeuo pipefail
+          sudo mkdir -p /sys/fs/bpf
+          mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+          sudo env REQUIRE_KERNEL_TESTS=1 bash tests/run.sh kernel 2>&1 | tee kernel-integration.log
+
+      - name: Verify in-place upgrade and failed-candidate rollback
+        run: sudo bash tests/bash/e2e_upgrade_rollback.sh 2>&1 | tee upgrade-rollback.log
+
+      - name: Uninstall and verify no residue
+        run: sudo bash tests/run.sh uninstall 2>&1 | tee uninstall.log
+
+      - name: Reinstall from a clean host
+        run: |
+          cd /tmp
+          sudo bash "$GITHUB_WORKSPACE/setup_xdp.sh" \
+            --allow-container-interfaces axdpci0 \
+            2>&1 | tee "$GITHUB_WORKSPACE/reinstall.log"
+
+      - name: Verify reinstall, uninstall again, and check final residue
+        run: |
+          bash tests/bash/assert_install_artifacts.sh reinstall.log --replace
+          sudo bash tests/run.sh uninstall 2>&1 | tee final-uninstall.log
+
+      - name: Install and exercise the nftables fallback
+        run: sudo bash tests/bash/e2e_nftables_fallback.sh 2>&1 | tee nftables-fallback.log
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-e2e-${{ github.run_id }}
+          path: |
+            install.log
+            kernel-integration.log
+            uninstall.log
+            reinstall.log
+            final-uninstall.log
+            upgrade-rollback.log
+            nftables-fallback.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Teardown
+        if: always()
+        run: |
+          if sudo test -x /usr/local/bin/axdp; then
+            sudo /usr/local/bin/axdp uninstall 2>/dev/null || true
+          fi
+          sudo systemctl stop xdp-port-sync auto-xdp-relay 2>/dev/null || true
+          sudo ip link set dev axdpci0 xdp off 2>/dev/null || true
+          sudo nft delete table inet auto_xdp 2>/dev/null || true
+          sudo ip link del axdpci0 2>/dev/null || true
