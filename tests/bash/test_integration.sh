@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# auto-xdp-test-suite: kernel
 # Real-environment XDP integration tests: kernel BPF, network namespaces, veth.
 # Requires root, clang, bpftool, iproute2 (with netns support), python3.
 
@@ -24,20 +25,27 @@ readonly _TC_OBJ="/tmp/axdp_integ_tc.o"
 # ---------------------------------------------------------------------------
 # Prerequisites
 # ---------------------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-    echo "skip: must run as root"
+_kernel_unavailable() {
+    if [[ "${REQUIRE_KERNEL_TESTS:-0}" == 1 ]]; then
+        test_log_error "kernel tests required: $*"
+        exit 1
+    fi
+    test_log_warning "SKIP $*"
     exit 0
+}
+
+if [[ $EUID -ne 0 ]]; then
+    _kernel_unavailable "must run as root"
 fi
 
 for _cmd in clang bpftool ip python3; do
-    command -v "$_cmd" &>/dev/null || { echo "skip: $_cmd not found"; exit 0; }
+    command -v "$_cmd" &>/dev/null || _kernel_unavailable "$_cmd not found"
 done
 
 ip netns add "${_NS}_chk" 2>/dev/null || true
 if ! ip netns exec "${_NS}_chk" true 2>/dev/null; then
     ip netns del "${_NS}_chk" 2>/dev/null || true
-    echo "skip: network namespaces not supported"
-    exit 0
+    _kernel_unavailable "network namespaces not supported"
 fi
 ip netns del "${_NS}_chk" 2>/dev/null || true
 
@@ -46,9 +54,9 @@ ip netns del "${_NS}_chk" 2>/dev/null || true
 # after the repository has changed.
 # ---------------------------------------------------------------------------
 _src="$REPO_ROOT/bpf/xdp_firewall.c"
-[[ -f "$_src" ]] || { echo "skip: $_src not found"; exit 0; }
+[[ -f "$_src" ]] || _kernel_unavailable "$_src not found"
 _asm_inc=$(clang -print-file-name=include 2>/dev/null) || {
-    echo "skip: clang include path not found"; exit 0
+    _kernel_unavailable "clang include path not found"
 }
 _include_args=(-I "$REPO_ROOT/bpf/include" -I "$_asm_inc")
 _multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
@@ -57,16 +65,16 @@ rm -f "$_XDP_OBJ"
 if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
     "${_include_args[@]}" \
     -c "$_src" -o "$_XDP_OBJ"; then
-    echo "error: XDP compile failed" >&2
+    test_log_error "XDP compile failed"
     exit 1
 fi
 _tc_src="$REPO_ROOT/tc_flow_track.c"
-[[ -f "$_tc_src" ]] || { echo "skip: $_tc_src not found"; exit 0; }
+[[ -f "$_tc_src" ]] || _kernel_unavailable "$_tc_src not found"
 rm -f "$_TC_OBJ"
 if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
     "${_include_args[@]}" \
     -c "$_tc_src" -o "$_TC_OBJ"; then
-    echo "error: tc egress compile failed" >&2
+    test_log_error "tc egress compile failed"
     exit 1
 fi
 
@@ -113,7 +121,8 @@ _load_xdp_program() {
 }
 
 _setup() {
-    rm -rf "$_PIN_DIR" "$_DEBUG_PIN_DIR" "$_RUN_DIR"
+    rm -rf "$_PIN_DIR" "${_PIN_DIR}_next" "${_PIN_DIR}_rollback" \
+        "$_DEBUG_PIN_DIR" "$_RUN_DIR"
     mkdir -p "$_PIN_DIR" "$_RUN_DIR"
 
     ip netns del "$_NS" 2>/dev/null || true
@@ -143,7 +152,8 @@ _teardown() {
     nft delete table inet axdp_integ 2>/dev/null || true
     ip netns del "$_NS" 2>/dev/null || true
     ip link del "$_VETH" 2>/dev/null || true
-    rm -rf "$_PIN_DIR" "$_DEBUG_PIN_DIR" "$_RUN_DIR"
+    rm -rf "$_PIN_DIR" "${_PIN_DIR}_next" "${_PIN_DIR}_rollback" \
+        "$_DEBUG_PIN_DIR" "$_RUN_DIR"
 }
 trap '_teardown' EXIT
 
@@ -162,6 +172,16 @@ _ip6be() { python3 -c "import socket; print(' '.join(f'{b:02x}' for b in socket.
 _u16be() { python3 -c "import struct; print(' '.join(f'{b:02x}' for b in struct.pack('>H', $1)))"; }
 # Current kernel monotonic time in ns (same epoch as bpf_ktime_get_ns)
 _ktime_ns() { python3 -c "import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))"; }
+
+_pinned_prog_id() {
+    bpftool -j prog show pinned "$1" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, list):
+    data = data[0]
+print(data["id"])
+'
+}
 
 # Read a little-endian __u32 from bpftool's JSON output. Depending on the
 # bpftool version, raw values are emitted as an array of hex-byte strings
@@ -183,16 +203,56 @@ else:
 '
 }
 
+# Assert the ABI exposed by the loaded kernel map, rather than duplicating C
+# declarations in a Python model. bpftool has used both bytes_key/bytes_value
+# and key_size/value_size field names across releases, so accept either JSON
+# spelling while keeping the contract itself exact.
+_assert_map_abi() {
+    local map_name="$1" expected_type="$2" expected_key="$3"
+    local expected_value="$4" expected_entries="$5"
+
+    bpftool -j map show pinned "$_PIN_DIR/$map_name" \
+        | python3 -c '
+import json, sys
+
+name, expected_type, expected_key, expected_value, expected_entries = sys.argv[1:]
+data = json.load(sys.stdin)
+if isinstance(data, list):
+    data = data[0]
+
+actual = (
+    data.get("type"),
+    data.get("bytes_key", data.get("key_size")),
+    data.get("bytes_value", data.get("value_size")),
+    data.get("max_entries"),
+)
+expected = (expected_type, int(expected_key), int(expected_value), int(expected_entries))
+if actual != expected:
+    raise SystemExit(f"{name} ABI {actual!r}, expected {expected!r}")
+' "$map_name" "$expected_type" "$expected_key" "$expected_value" "$expected_entries"
+}
+
 # Integration traffic uses an RFC1918 veth subnet. Production defaults treat
 # private source addresses as bogons, so disable that independent policy here;
 # otherwise whitelist, ACL, conntrack, and rate-limit assertions never reach
 # the code paths they claim to exercise.
 _configure_test_runtime() {
-    local value_hex
-    value_hex=$(python3 -c '
-import struct
-print(" ".join(f"{byte:02x}" for byte in struct.pack("<QQQQQQQQII", *([0] * 8), 1, 0)))
+    local value_hex value_bytes=72
+    value_bytes=$(bpftool -j map show pinned "$_PIN_DIR/xdp_runtime_cfg" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, list):
+    data = data[0]
+print(int(data.get("bytes_value", data.get("value_size", 72))))
 ')
+    value_hex=$(python3 -c '
+import struct, sys
+size = int(sys.argv[1])
+# cfg_flags sits after eight u64 fields; set XDP_CFG_FLAG_BOGON_DISABLED.
+payload = struct.pack("<QQQQQQQQI", *([0] * 8), 1)
+payload = payload.ljust(size, b"\x00")
+print(" ".join(f"{byte:02x}" for byte in payload[:size]))
+' "$value_bytes")
     bpftool map update pinned "$_PIN_DIR/xdp_runtime_cfg" \
         key hex 00 00 00 00 value hex $value_hex >/dev/null
 }
@@ -222,11 +282,13 @@ PYEOF
 # Listen for one UDP datagram on PORT and write it to stdout.
 _udp_listen_py() {
     local port="$1"
-    python3 - "$port" <<'PYEOF'
+    local family="${2:-inet}"
+    python3 - "$port" "$family" <<'PYEOF'
 import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+af = socket.AF_INET6 if sys.argv[2] == "inet6" else socket.AF_INET
+s = socket.socket(af, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('', int(sys.argv[1])))
+s.bind(('::' if af == socket.AF_INET6 else '', int(sys.argv[1])))
 s.settimeout(2)
 try:
     data, _ = s.recvfrom(1024)
@@ -235,6 +297,35 @@ try:
 except socket.timeout:
     pass
 PYEOF
+}
+
+_udp_send() {
+    local family="$1" src="$2" sport="$3" dest="$4" dport="$5"
+    local packets="$6" payload_bytes="$7"
+    ip netns exec "$_NS" python3 - "$family" "$src" "$sport" "$dest" "$dport" "$packets" "$payload_bytes" <<'PYEOF'
+import socket, sys
+
+family, source, sport, dest, dport, packets, payload_bytes = sys.argv[1:]
+af = socket.AF_INET6 if family == "inet6" else socket.AF_INET
+s = socket.socket(af, socket.SOCK_DGRAM)
+s.bind((source, int(sport)))
+payload = b"x" * int(payload_bytes)
+for _ in range(int(packets)):
+    s.sendto(payload, (dest, int(dport)))
+s.close()
+PYEOF
+}
+
+_map_lookup_u64_offset() {
+    local map_path="$1" key_hex="$2" offset="$3"
+    bpftool -j map lookup pinned "$map_path" key hex $key_hex \
+        | python3 -c '
+import json, struct, sys
+
+value = json.load(sys.stdin)["value"]
+raw = bytes(int(byte, 0) if isinstance(byte, str) else byte for byte in value)
+print(struct.unpack_from("<Q", raw, int(sys.argv[1]))[0])
+' "$offset"
 }
 
 # ---------------------------------------------------------------------------
@@ -257,6 +348,114 @@ test_attach() {
         echo "XDP not shown in ip link output for $_VETH"
         return 1
     }
+}
+
+_header_define() {
+    awk -v name="$2" '$1 == "#define" && $2 == name { print $3; exit }' "$1"
+}
+
+test_loaded_map_abi() {
+    local ct4 ct6 rate4 rate6
+    ct4=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" CT_MAP_MAX_ENTRIES_V4)
+    ct6=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" CT_MAP_MAX_ENTRIES_V6)
+    rate4=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" RATE_MAP_MAX_ENTRIES_V4)
+    rate6=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" RATE_MAP_MAX_ENTRIES_V6)
+
+    _assert_map_abi tcp_ct4 lru_hash 12 8 "$ct4" || return 1
+    _assert_map_abi tcp_ct6 lru_hash 36 8 "$ct6" || return 1
+    _assert_map_abi udp_ct4 lru_hash 12 8 "$ct4" || return 1
+    _assert_map_abi udp_ct6 lru_hash 36 8 "$ct6" || return 1
+    _assert_map_abi syn4 array_of_maps 4 4 65536 || return 1
+    _assert_map_abi syn6 array_of_maps 4 4 65536 || return 1
+
+    _assert_map_abi tsc4 lru_hash 8 8 "$rate4" || return 1
+    _assert_map_abi tsc6 lru_hash 20 8 "$rate6" || return 1
+    _assert_map_abi tsc_pfx4 lru_hash 8 8 "$rate4" || return 1
+    _assert_map_abi tsc_pfx6 lru_hash 20 8 "$rate6" || return 1
+    _assert_map_abi tsc_port array 4 8 65536 || return 1
+
+    _assert_map_abi tcp_port_policies hash 4 32 1024 || return 1
+    _assert_map_abi udp_global_rl array 4 40 1 || return 1
+    _assert_map_abi udp_percpu_acc percpu_array 4 16 1 || return 1
+}
+
+test_interrupted_candidate_restore() {
+    local candidate_dir="${_PIN_DIR}_next"
+    local stable_id candidate_id attached_id
+    local -a IFACES=("$_VETH")
+
+    mkdir -p "$candidate_dir" || return 1
+    bpftool prog load "$_XDP_OBJ" "$candidate_dir/prog" type xdp \
+        pinmaps "$candidate_dir" >/dev/null 2>&1 || {
+        echo "failed to load interrupted candidate generation"
+        return 1
+    }
+    stable_id=$(_pinned_prog_id "$_PIN_DIR/prog") || return 1
+    candidate_id=$(_pinned_prog_id "$candidate_dir/prog") || return 1
+    [[ "$candidate_id" != "$stable_id" ]] || {
+        echo "candidate generation reused the stable program id"
+        return 1
+    }
+
+    _auto_xdp_attach_mode "$_VETH" "$candidate_dir/prog" generic || return 1
+    attached_id=$(_auto_xdp_iface_prog_id "$_VETH") || {
+        echo "could not read candidate program id from the interface"
+        return 1
+    }
+    assert_eq "$attached_id" "$candidate_id" "candidate attached before recovery" || return 1
+
+    _auto_xdp_restore_interrupted_reload || return 1
+    attached_id=$(_auto_xdp_iface_prog_id "$_VETH") || return 1
+    assert_eq "$attached_id" "$stable_id" "stable program restored" || return 1
+    [[ -e "$_PIN_DIR/prog" && ! -e "$candidate_dir" ]] || {
+        echo "recovery did not retain stable pins and remove the failed candidate"
+        return 1
+    }
+}
+
+test_handler_transactional_hot_swap() {
+    local handler_obj="/tmp/axdp_integ_gre_handler.o"
+    local config_path="/tmp/axdp_integ_handler.toml"
+    local asm_inc multiarch_inc old_id new_id map_id
+    asm_inc=$(clang -print-file-name=include) || return 1
+    multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
+    local -a include_args=(-I "$REPO_ROOT/handlers" -I /usr/include -I /usr/include/bpf -I "$asm_inc")
+    [[ ! -d "$multiarch_inc" ]] || include_args+=(-I "$multiarch_inc")
+
+    clang -O2 -g -target bpf -mcpu=v3 \
+        "${include_args[@]}" \
+        -c "$REPO_ROOT/handlers/gre_handler.c" -o "$handler_obj" || return 1
+    printf '[slots]\nenabled = []\n' > "$config_path"
+
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin_cli \
+        --config "$config_path" \
+        --bpf-pin-dir "$_PIN_DIR" \
+        --handlers-dir /tmp \
+        slot load 47 "$handler_obj" >/dev/null || return 1
+    old_id=$(_pinned_prog_id "$_PIN_DIR/handlers/proto_47") || return 1
+
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin_cli \
+        --config "$config_path" \
+        --bpf-pin-dir "$_PIN_DIR" \
+        --handlers-dir /tmp \
+        slot load 47 "$handler_obj" >/dev/null || return 1
+    new_id=$(_pinned_prog_id "$_PIN_DIR/handlers/proto_47") || return 1
+    map_id=$(_map_lookup_u32 "$_PIN_DIR/proto_handlers" "$(_u32le 47)") || return 1
+
+    [[ "$new_id" != "$old_id" ]] || {
+        echo "handler hot swap did not load a new program generation"
+        return 1
+    }
+    [[ "$map_id" == "$new_id" ]] || {
+        echo "proto_handlers entry points to $map_id, expected candidate $new_id"
+        return 1
+    }
+    if find "$_PIN_DIR/handlers" -maxdepth 1 \
+            \( -name 'proto_47_next_*' -o -name 'proto_47_rollback_*' \) | grep -q .; then
+        echo "handler transaction left candidate or rollback pins after success"
+        return 1
+    fi
+    rm -f "$handler_obj" "$config_path"
 }
 
 test_reload() {
@@ -422,7 +621,7 @@ print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIIIII', $rate_max, 0, 0, 32,
     now_ns=$(_ktime_ns)
     rate_val_hex=$(python3 -c "
 import struct
-tick = $now_ns // 1000000
+tick = ($now_ns // 1_000_000) & 0xffffffff
 state = (tick << 32) | $rate_max
 print(' '.join(f'{b:02x}' for b in struct.pack('<Q', state)))
 ")
@@ -430,8 +629,15 @@ print(' '.join(f'{b:02x}' for b in struct.pack('<Q', state)))
     # $port, then pre-fill the source's counter with count=rate_max inside the
     # current window so the next SYN overflows. BPF_F_INNER_MAP is valid for
     # array inner maps, not LRU hash maps; the latter are created with flags 0.
-    local inner_pin="$_PIN_DIR/it_syn4_$port"
-    bpftool map create "$inner_pin" type lru_hash key 4 value 8 \
+    local inner_pin="$_PIN_DIR/it_syn4_$port" value_bytes=8
+    value_bytes=$(python3 -c '
+import json, subprocess, sys
+data = json.loads(subprocess.check_output(["bpftool", "-j", "map", "show", "pinned", sys.argv[1]]))
+if isinstance(data, list):
+    data = data[0]
+print(int(data.get("bytes_value", data.get("value_size", 8))))
+' "$_PIN_DIR/tsc4")
+    bpftool map create "$inner_pin" type lru_hash key 4 value "$value_bytes" \
         entries 1024 name "s4_$port" flags 0 >/dev/null 2>&1 || {
         echo "inner map create failed"; return 1; }
     bpftool map update pinned "$_PIN_DIR/syn4" \
@@ -444,6 +650,217 @@ print(' '.join(f'{b:02x}' for b in struct.pack('<Q', state)))
     rm -f "$inner_pin"
     [ "$probe_rc" -eq 1 ] && { echo "rate-limited SYN was not dropped"; return 1; }
     return 0
+}
+
+test_connection_limits() {
+    local source_at=7710 prefix_below=7711 prefix_at=7712
+    local port_below=7713 port_at=7714 disabled=7715
+    local port policy_hex state_hex key_hex
+
+    for port in "$source_at" "$prefix_below" "$prefix_at" \
+            "$port_below" "$port_at" "$disabled"; do
+        bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
+            key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1 || return 1
+    done
+
+    # Use a current 100-ms activity tick so the preloaded counter is live for
+    # the real BPF timeout check. The low word is the established count.
+    _connection_state_hex() {
+        local count="$1"
+        python3 -c "
+import struct, time
+tick = (time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 100_000_000) & 0xffffffff
+state = (tick << 32) | ($count & 0xffffffff)
+print(' '.join(f'{byte:02x}' for byte in struct.pack('<Q', state)))
+"
+    }
+
+    _connection_policy_hex() {
+        local source_max="$1" prefix_max="$2" port_max="$3"
+        python3 -c "
+import struct
+values = (0, 0, $source_max, 32, 128, $prefix_max, $port_max, 0)
+print(' '.join(f'{byte:02x}' for byte in struct.pack('<IIIIIIII', *values)))
+"
+    }
+
+    # Per-source cap at the limit drops.
+    policy_hex=$(_connection_policy_hex 2 0 0)
+    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
+        key hex $(_u32le "$source_at") value hex $policy_hex >/dev/null 2>&1 || return 1
+    key_hex="$(_ip4be "$_NS_IP") $(_u32le "$source_at")"
+    state_hex=$(_connection_state_hex 2)
+    bpftool map update pinned "$_PIN_DIR/tsc4" \
+        key hex $key_hex value hex $state_hex >/dev/null 2>&1 || return 1
+    _tcp_probe "$source_at" && { echo "SYN at per-source cap was not dropped"; return 1; }
+
+    # Per-prefix cap passes immediately below the limit and drops at it.
+    policy_hex=$(_connection_policy_hex 0 2 0)
+    for port in "$prefix_below" "$prefix_at"; do
+        bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
+            key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1 || return 1
+    done
+    key_hex="$(_ip4be "$_NS_IP") $(_u32le "$prefix_below")"
+    state_hex=$(_connection_state_hex 1)
+    bpftool map update pinned "$_PIN_DIR/tsc_pfx4" \
+        key hex $key_hex value hex $state_hex >/dev/null 2>&1 || return 1
+    _tcp_probe "$prefix_below" || { echo "SYN below per-prefix cap was dropped"; return 1; }
+
+    key_hex="$(_ip4be "$_NS_IP") $(_u32le "$prefix_at")"
+    state_hex=$(_connection_state_hex 2)
+    bpftool map update pinned "$_PIN_DIR/tsc_pfx4" \
+        key hex $key_hex value hex $state_hex >/dev/null 2>&1 || return 1
+    _tcp_probe "$prefix_at" && { echo "SYN at per-prefix cap was not dropped"; return 1; }
+
+    # Per-port cap has the same boundary and does not depend on a source key.
+    policy_hex=$(_connection_policy_hex 0 0 2)
+    for port in "$port_below" "$port_at"; do
+        bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
+            key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1 || return 1
+    done
+    state_hex=$(_connection_state_hex 1)
+    bpftool map update pinned "$_PIN_DIR/tsc_port" \
+        key hex $(_u32le "$port_below") value hex $state_hex >/dev/null 2>&1 || return 1
+    _tcp_probe "$port_below" || { echo "SYN below per-port cap was dropped"; return 1; }
+
+    state_hex=$(_connection_state_hex 2)
+    bpftool map update pinned "$_PIN_DIR/tsc_port" \
+        key hex $(_u32le "$port_at") value hex $state_hex >/dev/null 2>&1 || return 1
+    _tcp_probe "$port_at" && { echo "SYN at per-port cap was not dropped"; return 1; }
+
+    # A populated counter is inert when all connection-limit policy fields are
+    # zero, which is the public disabled-state contract.
+    policy_hex=$(_connection_policy_hex 0 0 0)
+    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
+        key hex $(_u32le "$disabled") value hex $policy_hex >/dev/null 2>&1 || return 1
+    state_hex=$(_connection_state_hex 4294967295)
+    bpftool map update pinned "$_PIN_DIR/tsc_port" \
+        key hex $(_u32le "$disabled") value hex $state_hex >/dev/null 2>&1 || return 1
+    _tcp_probe "$disabled" || { echo "disabled connection cap dropped SYN"; return 1; }
+}
+
+test_connection_counter_cas_contention() {
+    local port=7716 per_worker=8 workers total
+    local ready_file server_pid client_pid state source_count prefix_count port_count
+    ready_file=$(mktemp)
+    workers=$(ip netns exec "$_NS" python3 -c 'import os; print(min(8, len(os.sched_getaffinity(0))))')
+    if [[ "$workers" -lt 2 ]]; then
+        test_log_warning "SKIP CAS contention needs at least two available CPUs"
+        rm -f "$ready_file"
+        return 0
+    fi
+    total=$((workers * per_worker))
+
+    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
+        key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1 || return 1
+
+    python3 - "$port" "$total" <<'PYEOF' &
+import socket, sys, time
+
+port, total = map(int, sys.argv[1:])
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("10.99.0.1", port))
+server.listen(total)
+connections = [server.accept()[0] for _ in range(total)]
+time.sleep(4)
+for connection in connections:
+    connection.close()
+server.close()
+PYEOF
+    server_pid=$!
+
+    ip netns exec "$_NS" python3 - "$port" "$workers" "$per_worker" "$ready_file" <<'PYEOF' &
+import multiprocessing as mp
+import os
+import socket
+import sys
+import time
+
+port, workers, per_worker = map(int, sys.argv[1:4])
+ready_file = sys.argv[4]
+cpus = sorted(os.sched_getaffinity(0))[:workers]
+start = mp.Event()
+close = mp.Event()
+ready = mp.Queue()
+
+def worker(cpu):
+    os.sched_setaffinity(0, {cpu})
+    start.wait()
+    connections = []
+    for _ in range(per_worker):
+        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        connection.connect(("10.99.0.1", port))
+        connections.append(connection)
+    ready.put(len(connections))
+    close.wait()
+    for connection in connections:
+        connection.close()
+
+processes = [mp.Process(target=worker, args=(cpu,)) for cpu in cpus]
+for process in processes:
+    process.start()
+start.set()
+connected = sum(ready.get(timeout=8) for _ in processes)
+with open(ready_file, "w", encoding="ascii") as output:
+    output.write(str(connected))
+time.sleep(2)
+close.set()
+for process in processes:
+    process.join(5)
+    if process.exitcode != 0:
+        raise SystemExit(f"worker exited with {process.exitcode}")
+PYEOF
+    client_pid=$!
+
+    for ((state = 0; state < 100; state++)); do
+        [[ ! -s "$ready_file" ]] || break
+        sleep 0.05
+    done
+    if [[ "$(cat "$ready_file")" != "$total" ]]; then
+        echo "concurrent clients did not establish all $total connections"
+        kill "$client_pid" "$server_pid" 2>/dev/null || true
+        wait "$client_pid" "$server_pid" 2>/dev/null || true
+        rm -f "$ready_file"
+        return 1
+    fi
+
+    state=$(_map_lookup_u64_offset \
+        "$_PIN_DIR/tsc4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0) || return 1
+    source_count=$((state & 0xFFFFFFFF))
+    state=$(_map_lookup_u64_offset \
+        "$_PIN_DIR/tsc_pfx4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0) || return 1
+    prefix_count=$((state & 0xFFFFFFFF))
+    state=$(_map_lookup_u64_offset "$_PIN_DIR/tsc_port" "$(_u32le "$port")" 0) || return 1
+    port_count=$((state & 0xFFFFFFFF))
+    if [[ "$source_count" -ne "$total" || "$prefix_count" -ne "$total" ||
+          "$port_count" -ne "$total" ]]; then
+        echo "CAS record mismatch expected=$total source=$source_count prefix=$prefix_count port=$port_count"
+        kill "$client_pid" "$server_pid" 2>/dev/null || true
+        wait "$client_pid" "$server_pid" 2>/dev/null || true
+        rm -f "$ready_file"
+        return 1
+    fi
+
+    wait "$client_pid" || return 1
+    wait "$server_pid" || return 1
+    rm -f "$ready_file"
+
+    for ((state = 0; state < 40; state++)); do
+        source_count=$(_map_lookup_u64_offset \
+            "$_PIN_DIR/tsc4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0)
+        prefix_count=$(_map_lookup_u64_offset \
+            "$_PIN_DIR/tsc_pfx4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0)
+        port_count=$(_map_lookup_u64_offset \
+            "$_PIN_DIR/tsc_port" "$(_u32le "$port")" 0)
+        source_count=$((source_count & 0xFFFFFFFF))
+        prefix_count=$((prefix_count & 0xFFFFFFFF))
+        port_count=$((port_count & 0xFFFFFFFF))
+        [[ "$source_count" -ne 0 || "$prefix_count" -ne 0 || "$port_count" -ne 0 ]] || return 0
+        sleep 0.05
+    done
+    echo "CAS close mismatch source=$source_count prefix=$prefix_count port=$port_count"
+    return 1
 }
 
 test_service_restart() {
@@ -540,6 +957,102 @@ test_ipv6_whitelist() {
     return 0
 }
 
+test_ipv6_udp_whitelist() {
+    local sport=5300 dport=7708 recv_file listen_pid got
+    ip -6 neigh replace "$_NS_IP6" lladdr "$(ip netns exec "$_NS" cat /sys/class/net/$_VETH_IN/address)" \
+        dev "$_VETH" nud permanent 2>/dev/null || true
+    ip netns exec "$_NS" ip -6 neigh replace "$_HOST_IP6" \
+        lladdr "$(cat /sys/class/net/$_VETH/address)" dev "$_VETH_IN" nud permanent 2>/dev/null || true
+
+    bpftool map update pinned "$_PIN_DIR/udp_whitelist" \
+        key hex $(_u32le "$dport") value hex 01 00 00 00 >/dev/null 2>&1
+    recv_file=$(mktemp)
+    _udp_listen_py "$dport" inet6 >"$recv_file" 2>/dev/null &
+    listen_pid=$!
+    sleep 0.15
+    _udp_send inet6 "$_NS_IP6" "$sport" "$_HOST_IP6" "$dport" 1 32 || return 1
+    sleep 0.2
+    kill "$listen_pid" 2>/dev/null || true
+    wait "$listen_pid" 2>/dev/null || true
+    got=$(<"$recv_file")
+    rm -f "$recv_file"
+    [[ "$got" == *"xxx"* ]] || {
+        echo "IPv6 UDP packet to whitelisted port was dropped"
+        return 1
+    }
+
+    bpftool map update pinned "$_PIN_DIR/udp_whitelist" \
+        key hex $(_u32le "$dport") value hex 00 00 00 00 >/dev/null 2>&1
+    recv_file=$(mktemp)
+    _udp_listen_py "$dport" inet6 >"$recv_file" 2>/dev/null &
+    listen_pid=$!
+    sleep 0.15
+    _udp_send inet6 "$_NS_IP6" "$sport" "$_HOST_IP6" "$dport" 1 32 || return 1
+    sleep 0.2
+    kill "$listen_pid" 2>/dev/null || true
+    wait "$listen_pid" 2>/dev/null || true
+    got=$(<"$recv_file")
+    rm -f "$recv_file"
+    [[ -z "$got" ]] || {
+        echo "IPv6 UDP packet to non-whitelisted port was not dropped"
+        return 1
+    }
+}
+
+test_udp_global_rate_limit() {
+    local sport=5400 dport=7709 packets=140 payload_bytes=1200
+    local recv_file listen_pid received global_hex blocked_until now_ns
+
+    bpftool map update pinned "$_PIN_DIR/udp_whitelist" \
+        key hex $(_u32le "$dport") value hex 01 00 00 00 >/dev/null 2>&1
+    global_hex=$(python3 -c '
+import struct
+print(" ".join(f"{byte:02x}" for byte in struct.pack("<IIQQQQ", 0, 1, 0, 0, 0, 0)))
+')
+    bpftool map update pinned "$_PIN_DIR/udp_global_rl" \
+        key hex 00 00 00 00 value hex $global_hex >/dev/null 2>&1
+
+    recv_file=$(mktemp)
+    python3 - "$dport" "$recv_file" <<'PYEOF' &
+import socket, sys
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("", int(sys.argv[1])))
+s.settimeout(2)
+count = 0
+try:
+    while True:
+        s.recvfrom(2048)
+        count += 1
+except socket.timeout:
+    pass
+with open(sys.argv[2], "w", encoding="ascii") as handle:
+    handle.write(str(count))
+PYEOF
+    listen_pid=$!
+    sleep 0.15
+    _udp_send inet "$_NS_IP" "$sport" "$_HOST_IP" "$dport" "$packets" "$payload_bytes" || return 1
+
+    now_ns=$(_ktime_ns)
+    blocked_until=$(_map_lookup_u64_offset "$_PIN_DIR/udp_global_rl" "00 00 00 00" 32)
+    [[ "$blocked_until" -gt "$now_ns" ]] || {
+        echo "UDP global limiter did not enter a blocked window"
+        kill "$listen_pid" 2>/dev/null || true
+        wait "$listen_pid" 2>/dev/null || true
+        rm -f "$recv_file"
+        return 1
+    }
+
+    wait "$listen_pid" 2>/dev/null || true
+    received=$(<"$recv_file")
+    rm -f "$recv_file"
+    [[ "$received" -gt 0 && "$received" -lt "$packets" ]] || {
+        echo "UDP global limiter received=$received packets=$packets"
+        return 1
+    }
+}
+
 test_nftables_packet_path() {
     command -v nft >/dev/null 2>&1 || { echo "nft not found"; return 1; }
     ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
@@ -571,57 +1084,24 @@ PYEOF
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-_require_setup() {
-    local test_name="$1"
-    if _setup; then
-        return 0
+_run_kernel_test() {
+    local name="$1"
+    shift
+    if ! _setup; then
+        printf 'fatal: integration setup failed before %s\n' "$name" >&2
+        exit 1
     fi
-    printf 'fatal: integration setup failed before %s\n' "$test_name" >&2
-    exit 1
+    run_test "$name" "$@"
+    _teardown
 }
 
-_require_setup "attach test"
-run_test "attach: XDP loads and pins all required maps" test_attach
-_teardown
-
-_require_setup "reload test"
-run_test "reload: xdp_maps_ready detects missing map pin" test_reload
-_teardown
-
-_require_setup "fallback test"
-run_test "fallback: veth attach uses generic XDP mode" test_fallback
-_teardown
-
-_require_setup "port sync test"
-run_test "port sync: tcp_whitelist allows and blocks TCP SYN by port" test_port_sync
-_teardown
-
-_require_setup "UDP reply test"
-run_test "UDP reply: udp_ct4 CT entry passes inbound reply packet" test_udp_reply
-_teardown
-
-_require_setup "ACL test"
-run_test "ACL: tcp_acl_v4 entry permits SYN without whitelist" test_acl
-_teardown
-
-_require_setup "rate limit test"
-run_test "rate limit: excess SYNs from same IP are dropped" test_rate_limit
-_teardown
-
-_require_setup "service restart test"
-run_test "service restart: XDP re-attaches and accepts traffic after reload" test_service_restart
-_teardown
-
-_require_setup "tc egress test"
-run_test "tc egress: outbound UDP creates reverse conntrack that XDP honors" test_tc_egress_udp_reply
-_teardown
-
-_require_setup "IPv6 whitelist test"
-run_test "IPv6: tcp_whitelist allows and blocks IPv6 TCP SYN by port" test_ipv6_whitelist
-_teardown
-
-_require_setup "nftables packet test"
-run_test "nftables: real kernel ruleset allows and blocks TCP SYN" test_nftables_packet_path
+trap - EXIT
+while IFS= read -r function_name; do
+    [[ -n "$function_name" ]] || continue
+    _run_kernel_test "${function_name#test_}" "$function_name"
+done < <(
+    discover_test_functions "${BASH_SOURCE[0]}"
+)
 _teardown
 
 finish_tests

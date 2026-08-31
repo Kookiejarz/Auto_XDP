@@ -1,8 +1,19 @@
 """Unit tests for BpfRateOuterMap (per-port ARRAY_OF_MAPS wrapper)."""
+import struct
 import unittest
 from unittest import mock
 
+import pytest
+
 from auto_xdp.bpf import maps as maps_mod
+
+
+pytestmark = pytest.mark.component
+
+
+def test_port_policy_value_abi_is_eight_u32_fields():
+    assert maps_mod.BpfPortPolicyMap._STRUCT_FMT == "=IIIIIIII"
+    assert struct.calcsize(maps_mod.BpfPortPolicyMap._STRUCT_FMT) == 32
 
 
 class FakeInnerRegistry:

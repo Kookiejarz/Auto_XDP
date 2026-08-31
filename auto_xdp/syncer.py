@@ -7,6 +7,7 @@ import select
 import signal
 import socket as _socket
 import time
+from collections.abc import Callable
 
 from auto_xdp import config as cfg
 from auto_xdp.backends import NftablesBackend, PortBackend, XdpBackend
@@ -146,6 +147,8 @@ def watch(
     config_path: str = TOML_CONFIG_PATH,
     cli_trusted_ips: dict[str, str] | None = None,
     cli_log_level: str | None = None,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     backend = None
     nl = None
@@ -176,12 +179,12 @@ def watch(
                     backend = open_backend(backend_name)
                     log.info("Backend initialized.")
                     sync_once(backend, dry_run)
-                    last_reconcile_t = time.monotonic()
+                    last_reconcile_t = monotonic()
                     last_event_t = 0.0
                     first_event_t = 0.0
                 except DiscoveryError as exc:
                     log.error("Initial discovery failed; keeping existing policy: %s", exc)
-                    last_reconcile_t = time.monotonic()
+                    last_reconcile_t = monotonic()
                     continue
                 except (OSError, RuntimeError) as exc:
                     log.error("Failed to open backend: %s. Retrying in 5s...", exc)
@@ -190,7 +193,7 @@ def watch(
 
             # Netlink is an optional acceleration path. Failure must not stop
             # relay events, the periodic safety reconcile, GC, or drift checks.
-            now_mono = time.monotonic()
+            now_mono = monotonic()
             if (
                 nl is None
                 and now_mono - last_netlink_connect_t
@@ -212,12 +215,12 @@ def watch(
                     log.info("Connected to pkt_relay for port_change events.")
 
             debounce_s = cfg.DEBOUNCE_SECONDS
-            timeout = max(0.05, debounce_s - (time.monotonic() - last_event_t)) if last_event_t else 1.0
+            timeout = max(0.05, debounce_s - (monotonic() - last_event_t)) if last_event_t else 1.0
             if last_reconcile_t:
                 until_reconcile = max(
                     0.05,
                     FULL_RECONCILE_INTERVAL_SECONDS
-                    - (time.monotonic() - last_reconcile_t),
+                    - (monotonic() - last_reconcile_t),
                 )
                 timeout = min(timeout, until_reconcile)
 
@@ -235,7 +238,7 @@ def watch(
                     rdy = []
                 if nl is not None and nl in rdy and drain_proc_events(nl):
                     log.debug("Proc event -> debounce armed.")
-                    _now = time.monotonic()
+                    _now = monotonic()
                     if not first_event_t:
                         first_event_t = _now
                     last_event_t = _now
@@ -245,12 +248,12 @@ def watch(
                             log.debug("port_change from relay → immediate sync.")
                             try:
                                 sync_once(backend, dry_run)
-                                last_reconcile_t = time.monotonic()
+                                last_reconcile_t = monotonic()
                                 last_event_t = 0.0
                                 first_event_t = 0.0
                             except DiscoveryError as exc:
                                 log.error("Discovery failed; keeping existing policy: %s", exc)
-                                last_event_t = time.monotonic()
+                                last_event_t = monotonic()
                                 first_event_t = last_event_t
                                 continue
                             except (OSError, RuntimeError) as exc:
@@ -262,13 +265,13 @@ def watch(
                         relay_sock.close()
                         relay_sock = None
                         relay_pending.clear()
-                        last_relay_connect_t = time.monotonic()
+                        last_relay_connect_t = monotonic()
             except OSError as exc:
                 log.warning("Netlink event error (%s); reconnecting proc connector.", exc)
                 if nl:
                     nl.close()
                 nl = None
-                last_netlink_connect_t = time.monotonic()
+                last_netlink_connect_t = monotonic()
 
             if reload_requested:
                 reload_requested = False
@@ -299,13 +302,13 @@ def watch(
                     )
                     backend.close()
                     backend = None
-                last_event_t = time.monotonic() - cfg.DEBOUNCE_SECONDS
+                last_event_t = monotonic() - cfg.DEBOUNCE_SECONDS
                 first_event_t = last_event_t
 
             if backend is None:
                 continue
 
-            now = time.monotonic()
+            now = monotonic()
             if last_event_t and (
                 now - last_event_t >= cfg.DEBOUNCE_SECONDS
                 or now - first_event_t >= DEBOUNCE_MAX_WAIT_SECONDS
@@ -315,10 +318,10 @@ def watch(
                 log.debug("Sync triggered by event.")
                 try:
                     sync_once(backend, dry_run)
-                    last_reconcile_t = time.monotonic()
+                    last_reconcile_t = monotonic()
                 except DiscoveryError as exc:
                     log.error("Discovery failed; keeping existing policy: %s", exc)
-                    last_event_t = time.monotonic()
+                    last_event_t = monotonic()
                     first_event_t = last_event_t
                     continue
                 except (OSError, RuntimeError) as exc:
@@ -339,24 +342,24 @@ def watch(
                     )
                     backend.verify_kernel_state()
                     # Arm debounce so a corrective sync runs shortly.
-                    last_event_t = time.monotonic()
+                    last_event_t = monotonic()
                     first_event_t = last_event_t
 
             if (
-                time.monotonic() - last_reconcile_t
+                monotonic() - last_reconcile_t
                 >= FULL_RECONCILE_INTERVAL_SECONDS
             ):
                 log.debug("Periodic safety reconcile.")
                 try:
                     sync_once(backend, dry_run)
-                    last_reconcile_t = time.monotonic()
+                    last_reconcile_t = monotonic()
                     # This was a full discovery, so it also satisfies any
                     # pending event-triggered reconcile.
                     last_event_t = 0.0
                     first_event_t = 0.0
                 except DiscoveryError as exc:
                     log.error("Periodic discovery failed; keeping existing policy: %s", exc)
-                    last_reconcile_t = time.monotonic()
+                    last_reconcile_t = monotonic()
                 except (OSError, RuntimeError) as exc:
                     log.error("Periodic sync error: %s", exc)
                     log.warning("Backend may be broken; will attempt to re-initialize.")
@@ -365,15 +368,15 @@ def watch(
                     continue
 
             gc_interval = cfg.XDP_CONNTRACK_GC_INTERVAL_SECONDS
-            if gc_interval > 0 and (time.monotonic() - last_gc_t >= gc_interval):
+            if gc_interval > 0 and (monotonic() - last_gc_t >= gc_interval):
                 try:
                     backend.run_ct_gc()
                 except OSError as exc:
                     log.warning("Conntrack GC error: %s", exc)
-                last_gc_t = time.monotonic()
+                last_gc_t = monotonic()
 
-            if time.monotonic() - last_stale_check_t >= 30.0:
-                last_stale_check_t = time.monotonic()
+            if monotonic() - last_stale_check_t >= 30.0:
+                last_stale_check_t = monotonic()
                 if hasattr(backend, "is_stale") and backend.is_stale():
                     log.warning(
                         "XDP map FDs are stale (BPF program was reloaded); "
@@ -384,7 +387,7 @@ def watch(
                 elif hasattr(backend, "verify_kernel_state"):
                     if backend.verify_kernel_state():
                         # Drift found: arm debounce to schedule a corrective sync.
-                        _now = time.monotonic()
+                        _now = monotonic()
                         if not first_event_t:
                             first_event_t = _now
                         last_event_t = _now

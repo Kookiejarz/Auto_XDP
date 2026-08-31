@@ -3,7 +3,12 @@ import struct
 import unittest
 from unittest import mock
 
+import pytest
+
 from auto_xdp.bpf import syscall as sc
+
+
+pytestmark = pytest.mark.component
 
 
 class MapCreateAttrTests(unittest.TestCase):

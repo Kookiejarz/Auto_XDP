@@ -1,8 +1,10 @@
 import struct
 import socket
-import time
 import unittest
 
+import pytest
+
+import auto_xdp.sock_state as sock_state_mod
 from auto_xdp.sock_state import SockStateReader, SOCK_STATE_EVENT_SIZE
 
 _STRUCT = struct.Struct("<QHBBB3x")
@@ -48,11 +50,9 @@ class TestSockStateReader(unittest.TestCase):
 
     def test_seen_at_is_recent(self):
         raw = _make_raw()
-        before = time.time()
-        ev = SockStateReader.decode_raw(raw)
-        after = time.time()
-        self.assertGreaterEqual(ev["seen_at"], before)
-        self.assertLessEqual(ev["seen_at"],    after)
+        with mock.patch.object(sock_state_mod.time, "time", return_value=1234.5):
+            ev = SockStateReader.decode_raw(raw)
+        self.assertEqual(ev["seen_at"], 1234.5)
 
 
 import json
@@ -123,6 +123,7 @@ class TestRelayBroadcastPortChange(unittest.TestCase):
         self.assertEqual(server._history[0]["seen_at"], 996.0)
 
 
+@pytest.mark.component
 class TestRelaySecurity(unittest.TestCase):
     def _relay(self, directory: str) -> relay_mod.RelayServer:
         rb = mock.MagicMock()
