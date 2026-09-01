@@ -72,7 +72,7 @@ cleanup() {
     if [[ $CREATED_NETNS -eq 1 ]]; then
         ip netns del "$NETNS" 2>/dev/null || cleanup_status=1
     fi
-    if [[ $CREATED_IFACE -eq 1 ]]; then
+    if [[ $CREATED_IFACE -eq 1 ]] && ip link show "$IFACE" >/dev/null 2>&1; then
         ip link del "$IFACE" 2>/dev/null || cleanup_status=1
     fi
     [[ -z "$WORK_DIR" ]] || rm -rf "$WORK_DIR"
