@@ -48,7 +48,6 @@ wait_for_socket() {
 require_command ip
 require_command tc
 require_command python3
-require_command bpftool
 [[ -x "$AXDP_CMD" ]] || fail "installed axdp command not found: $AXDP_CMD"
 [[ -f "$CONFIG_FILE" ]] || fail "installed environment config not found: $CONFIG_FILE"
 
@@ -56,6 +55,14 @@ require_command bpftool
 source "$CONFIG_FILE"
 IFS=' ' read -ra interfaces <<< "${IFACES:-}"
 [[ ${#interfaces[@]} -gt 0 ]] || fail "no protected interface in $CONFIG_FILE"
+
+# Resolve the same kernel-specific bpftool path used by the installer before
+# waiting for XDP pins; otherwise a present-but-unusable wrapper fails later as
+# an opaque missing-program timeout.
+# shellcheck disable=SC1090
+source "${INSTALL_DIR}/auto_xdp_runtime_common.sh"
+_auto_xdp_resolve_bpftool \
+    || fail "no usable bpftool for kernel $(uname -r)"
 iface="${interfaces[0]}"
 [[ -n "$TOML_CONFIG" && -f "$TOML_CONFIG" ]] || fail "TOML config not found: $TOML_CONFIG"
 

@@ -8,6 +8,16 @@ BASE_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 # shellcheck source=tests/bash/testlib.sh
 source "$REPO_ROOT/tests/bash/testlib.sh"
 
+test_log_colors_disable_for_non_tty_and_no_color() (
+    local output
+
+    output=$(bash -c 'source "$1"; printf "%s" "$C_GREEN"' bash "$REPO_ROOT/setup_xdp.sh")
+    assert_eq "$output" "" "non-TTY output"
+
+    output=$(bash -c 'source "$1"; NO_COLOR=1; log_init_colors; log_printf "%b\\n" "${C_GREEN}✓ complete${C_RESET}"' bash "$REPO_ROOT/setup_xdp.sh")
+    assert_eq "$output" "✓ complete" "NO_COLOR output"
+)
+
 test_detect_os_release_maps_supported_families() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -985,10 +995,74 @@ test_transactional_xdp_load_failure_reports_verifier_log() (
     output=$(transactional_reload_xdp 2>&1)
     status=$?
     assert_eq "$status" "1" || return 1
-    assert_contains "$output" "bpftool verifier log follows" || return 1
+    assert_contains "$output" "BPF verifier rejected candidate program" || return 1
     assert_contains "$output" "processed 1000001 insns (limit 1000000)" || return 1
     assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
     [[ ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
+test_transactional_xdp_load_failure_reports_missing_bpftool() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir output status
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=("eth0")
+    export test_kernel_release="$(uname -r)"
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' > "$BPF_PIN_DIR/prog"
+    touch "$XDP_OBJ_INSTALLED"
+
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    uname() { printf '%s\n' "$test_kernel_release"; }
+    bpftool() {
+        printf 'WARNING: bpftool not found for kernel %s\n' "$test_kernel_release" >&2
+        return 1
+    }
+
+    output=$(transactional_reload_xdp 2>&1)
+    status=$?
+    assert_eq "$status" "1" || return 1
+    assert_contains "$output" "Unable to invoke bpftool for running kernel ${test_kernel_release}" || return 1
+    assert_contains "$output" "host tooling issue, not a BPF verifier rejection" || return 1
+    assert_contains "$output" "linux-tools-${test_kernel_release}" || return 1
+    [[ "$output" != *"BPF verifier rejected candidate program"* ]] || {
+        printf 'missing bpftool must not be reported as a verifier rejection\n'
+        return 1
+    }
+    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
+test_bpftool_resolver_prefers_exact_kernel_then_usable_fallback() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir kernel_release exact_path fallback_path
+    tmpdir=$(mktemp -d)
+    kernel_release=$(uname -r)
+    exact_path="$tmpdir/linux-tools/$kernel_release/bpftool"
+    fallback_path="$tmpdir/linux-tools/fallback/bpftool"
+    mkdir -p "$(dirname "$exact_path")" "$(dirname "$fallback_path")" "$tmpdir/bin"
+    printf '#!/bin/sh\nexit 1\n' >"$tmpdir/bin/bpftool"
+    printf '#!/bin/sh\nexit 0\n' >"$exact_path"
+    printf '#!/bin/sh\nexit 0\n' >"$fallback_path"
+    chmod +x "$tmpdir/bin/bpftool" "$exact_path" "$fallback_path"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+    AUTO_XDP_LINUX_TOOLS_DIR="$tmpdir/linux-tools"
+    unset BPFTOOL_BIN
+    _auto_xdp_resolve_bpftool || return 1
+    assert_eq "$BPFTOOL_BIN" "$exact_path" || return 1
+
+    printf '#!/bin/sh\nexit 1\n' >"$exact_path"
+    chmod +x "$exact_path"
+    PATH="$tmpdir/bin:$BASE_PATH"
+    unset BPFTOOL_BIN
+    _auto_xdp_resolve_bpftool || return 1
+    assert_eq "$BPFTOOL_BIN" "$fallback_path"
 )
 
 test_extract_verifier_metrics_normalizes_bpftool_summary() (
@@ -1003,6 +1077,23 @@ EOF_METRICS
     )
     expected=$'integration_setup\t13481\t282798\t27\t11892\t4610\t1519394\t288'
     assert_eq "$output" "$expected"
+)
+
+test_verifier_summary_prints_processed_and_stack() (
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+    set +e
+
+    local tmpdir output
+    tmpdir=$(mktemp -d)
+    printf '%s\n' \
+        'verification time 123 usec' \
+        'stack depth 288+0' \
+        'processed 456 insns (limit 1000000) max_states_per_insn 2 total_states 3 peak_states 4' \
+        >"$tmpdir/verifier.log"
+
+    output=$(_auto_xdp_print_verifier_summary "$tmpdir/verifier.log" 2>&1)
+    assert_contains "$output" 'processed_insns=456' || return 1
+    assert_contains "$output" 'stack_depth=288'
 )
 
 test_transactional_handler_failure_keeps_current_generation() (
@@ -2392,23 +2483,6 @@ test_install_packages_succeeds_on_non_apt_managers() (
             return 1
         }
     done
-)
-
-test_install_bpftool_apt_replaces_unusable_wrapper() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local installed=0 output
-    PKG_MANAGER="apt-get"
-    bpftool() { [[ $installed -eq 1 ]]; }
-    as_root() {
-        output="$*"
-        installed=1
-    }
-    pkg_install_optional() { return 1; }
-
-    install_bpftool_apt || return 1
-    assert_contains "$output" "apt-get install -y -qq bpftool"
 )
 
 test_ensure_curses_installs_opensuse_capability() (

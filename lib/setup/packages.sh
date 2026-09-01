@@ -107,17 +107,12 @@ optional_package_list_for_manager() {
 }
 
 install_bpftool_apt() {
+    local kernel_tools_package="linux-tools-$(uname -r)"
     _tool_present bpftool && return 0
-    if as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool 2>/dev/null \
-            && _tool_present bpftool; then
-        return 0
-    fi
-    local package
-    for package in "linux-tools-$(uname -r)" linux-tools-azure linux-tools-common; do
-        pkg_install_optional "$package"
-        _tool_present bpftool && return 0
-    done
-    return 1
+    pkg_install "$kernel_tools_package" || true
+    _tool_present bpftool && return 0
+    pkg_install bpftool || true
+    _tool_present bpftool
 }
 
 enable_rpm_build_repos() {
@@ -234,8 +229,12 @@ PY
 }
 
 _tool_present() {
-    command -v "$1" &>/dev/null || return 1
-    [[ "$1" != "bpftool" ]] || bpftool version >/dev/null 2>&1
+    if [[ "$1" == "bpftool" ]] && declare -F _auto_xdp_resolve_bpftool >/dev/null 2>&1; then
+        _auto_xdp_resolve_bpftool
+    else
+        command -v "$1" &>/dev/null || return 1
+        [[ "$1" != "bpftool" ]] || bpftool version >/dev/null 2>&1
+    fi
 }
 
 # One checklist line per tool: ✓ when present, ✗ when missing. Missing tools
@@ -265,8 +264,12 @@ check_required_tools_step() {
         for cmd in "${missing[@]}"; do
             if ! substep_run "$cmd (after install)" _tool_present "$cmd"; then
                 case "$cmd" in
-                    clang|bpftool)
+                    clang)
                         warn "$cmd still missing — XDP backend may be unavailable"
+                        ;;
+                    bpftool)
+                        warn "bpftool still missing — XDP backend may be unavailable"
+                        warn "Install linux-tools-$(uname -r) and rerun."
                         ;;
                     tar)
                         warn "$cmd still missing — remote source staging will be unavailable"

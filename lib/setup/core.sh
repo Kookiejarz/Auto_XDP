@@ -333,8 +333,8 @@ PY
 }
 
 print_basic_info() {
-    echo -e "\n${BOLD}${CYAN}Auto XDP Installer${NC}\n"
-    echo -e "${BOLD}Basic information${NC}"
+    log_printf '%b\n' "\n${BOLD}${CYAN}Auto XDP Installer${NC}\n"
+    log_printf '%b\n' "${BOLD}Basic information${NC}"
     echo "  distro         : ${DISTRO_NAME} (${DISTRO_FAMILY} family)"
     echo "  kernel         : $(uname -r) $(uname -m)"
     if [[ ${#IFACES[@]} -eq 1 ]]; then
@@ -353,7 +353,7 @@ print_basic_info() {
     echo "  install dir    : $INSTALL_DIR"
     echo "  config dir     : $CONFIG_DIR"
     if [[ ${EXISTING_INSTALL:-0} -eq 1 ]]; then
-        echo -e "  existing       : ${YELLOW}detected${NC} — runtime files will be replaced"
+        log_printf '%b\n' "  existing       : ${YELLOW}detected${NC} — runtime files will be replaced"
     else
         echo "  existing       : none (fresh install)"
     fi
@@ -519,8 +519,8 @@ print_deployment_summary() {
     ▒▒▒▒▒   ▒▒▒▒▒   ▒▒▒▒▒▒▒▒      ▒▒▒▒▒       ▒▒▒▒▒▒▒       ▒▒▒▒▒ ▒▒▒▒▒ ▒▒▒▒▒▒▒▒▒▒   ▒▒▒▒▒
 EOF
     echo ""
-    echo -e "${GREEN}Deployment summary${NC}"
-    echo -e "  Status         : ${OK_MARK} complete"
+    log_printf '%b\n' "${GREEN}Deployment summary${NC}"
+    log_printf '%b\n' "  Status         : ${OK_MARK} complete"
     echo "  Source         : ${SOURCE_REVISION:-local}"
     if [[ ${#IFACES[@]} -eq 1 ]]; then
         echo "  Interface      : ${IFACES[0]}  [${IFACE_SOURCE:-arguments}]"

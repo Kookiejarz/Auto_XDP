@@ -42,6 +42,102 @@ _auto_xdp_warn() {
     fi
 }
 
+_auto_xdp_use_bpftool() {
+    local candidate="$1" candidate_dir
+
+    BPFTOOL_BIN="$candidate"
+    export BPFTOOL_BIN
+    if [[ "$candidate" == /* ]]; then
+        candidate_dir=${candidate%/*}
+        case ":${PATH:-}:" in
+            *":${candidate_dir}:"*) ;;
+            *) PATH="${candidate_dir}${PATH:+:${PATH}}"; export PATH ;;
+        esac
+        hash -r 2>/dev/null || true
+    fi
+}
+
+_auto_xdp_resolve_bpftool() {
+    local candidate kernel_release tools_root
+
+    if [[ -n "${BPFTOOL_BIN:-}" ]]; then
+        if [[ "$BPFTOOL_BIN" == /* && -x "$BPFTOOL_BIN" ]] \
+                && "$BPFTOOL_BIN" version >/dev/null 2>&1; then
+            _auto_xdp_use_bpftool "$BPFTOOL_BIN"
+            return 0
+        fi
+        if [[ "$BPFTOOL_BIN" != /* ]] \
+                && command -v "$BPFTOOL_BIN" >/dev/null 2>&1 \
+                && "$BPFTOOL_BIN" version >/dev/null 2>&1; then
+            _auto_xdp_use_bpftool "$BPFTOOL_BIN"
+            return 0
+        fi
+    fi
+
+    candidate=$(command -v bpftool 2>/dev/null || true)
+    if [[ "$candidate" == /* ]]; then
+        if "$candidate" version >/dev/null 2>&1; then
+            _auto_xdp_use_bpftool "$candidate"
+            return 0
+        fi
+    elif [[ -n "$candidate" ]] && bpftool version >/dev/null 2>&1; then
+        _auto_xdp_use_bpftool "$candidate"
+        return 0
+    fi
+
+    kernel_release=$(uname -r)
+    tools_root="${AUTO_XDP_LINUX_TOOLS_DIR:-/usr/lib/linux-tools}"
+    candidate="${tools_root}/${kernel_release}/bpftool"
+    if [[ -x "$candidate" ]] && "$candidate" version >/dev/null 2>&1; then
+        _auto_xdp_use_bpftool "$candidate"
+        return 0
+    fi
+
+    for candidate in "${tools_root}"/*/bpftool; do
+        [[ -x "$candidate" ]] || continue
+        "$candidate" version >/dev/null 2>&1 || continue
+        _auto_xdp_use_bpftool "$candidate"
+        return 0
+    done
+
+    return 1
+}
+
+_auto_xdp_print_verifier_summary() {
+    local verifier_log="$1" summary
+
+    summary=$(awk '
+        /found program .*code size [0-9]+ insns/ {
+            for (i = 1; i <= NF; i++)
+                if ($i == "size") static_insns += $(i + 1)
+        }
+        /^verification time [0-9]+ usec$/ { verification_time_usec = $3 }
+        /^stack depth [0-9]+(\+[0-9]+)*$/ {
+            stack_depth = $3
+            sub(/\+.*/, "", stack_depth)
+        }
+        /^processed [0-9]+ insns / {
+            processed_insns = $2
+            for (i = 1; i <= NF; i++) {
+                if ($i == "max_states_per_insn") max_states_per_insn = $(i + 1)
+                if ($i == "total_states") total_states = $(i + 1)
+                if ($i == "peak_states") peak_states = $(i + 1)
+            }
+        }
+        END {
+            printf "static_insns=%s processed_insns=%s max_states_per_insn=%s total_states=%s peak_states=%s verification_time_usec=%s stack_depth=%s\n",
+                   static_insns ? static_insns : "-",
+                   processed_insns ? processed_insns : "-",
+                   max_states_per_insn ? max_states_per_insn : "-",
+                   total_states ? total_states : "-",
+                   peak_states ? peak_states : "-",
+                   verification_time_usec ? verification_time_usec : "-",
+                   stack_depth ? stack_depth : "-"
+        }
+    ' "$verifier_log" 2>/dev/null || true)
+    printf '[auto_xdp] verifier summary: %s\n' "${summary:-unavailable}" >&2
+}
+
 _auto_xdp_truthy() {
     case "${1:-}" in
         1|y|Y|yes|YES|true|TRUE|on|ON|enabled|ENABLED)
@@ -1098,6 +1194,31 @@ _auto_xdp_restore_interrupted_reload() {
     return 0
 }
 
+_auto_xdp_bpftool_host_tooling_error() {
+    local log_path="${1:-}"
+    [[ -f "$log_path" ]] || return 1
+    grep -Eqi \
+        'bpftool not found|command not found|not found for kernel' \
+        "$log_path"
+}
+
+_auto_xdp_report_xdp_load_failure() {
+    local log_path="${1:-}"
+    local kernel_release
+    kernel_release=$(uname -r)
+
+    if _auto_xdp_bpftool_host_tooling_error "$log_path"; then
+        _auto_xdp_warn "Unable to invoke bpftool for running kernel ${kernel_release}."
+        _auto_xdp_warn "This is a host tooling issue, not a BPF verifier rejection."
+        _auto_xdp_warn "Missing package: linux-tools-${kernel_release}"
+        cat "$log_path" >&2
+        return 0
+    fi
+
+    _auto_xdp_warn "BPF verifier rejected candidate program; bpftool log follows."
+    cat "$log_path" >&2
+}
+
 transactional_reload_xdp() {
     local xdp_obj_path=""
     xdp_obj_path=$(_auto_xdp_first_value XDP_OBJ_PATH XDP_OBJ_INSTALLED) || xdp_obj_path=""
@@ -1152,11 +1273,13 @@ transactional_reload_xdp() {
         rm -rf "$candidate_dir"
         return 1
     }
-    if ! bpftool -d prog load "$xdp_obj_path" "$candidate_dir/prog" type xdp \
+    if bpftool -d prog load "$xdp_obj_path" "$candidate_dir/prog" type xdp \
             pinmaps "$candidate_dir" >"$verifier_log" 2>&1; then
+        _auto_xdp_print_verifier_summary "$verifier_log"
+    else
         BPF_PIN_DIR="$saved_pin_dir"
-        _auto_xdp_warn "Candidate XDP program failed to load; bpftool verifier log follows."
-        cat "$verifier_log" >&2
+        _auto_xdp_print_verifier_summary "$verifier_log"
+        _auto_xdp_report_xdp_load_failure "$verifier_log"
         rm -f "$verifier_log"
         rm -rf "$candidate_dir"
         return 1

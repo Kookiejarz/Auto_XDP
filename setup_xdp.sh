@@ -8,17 +8,44 @@
 
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+# Keep errors raised before setup libraries are loaded readable.  The shared
+# helper below replaces these with TTY-aware values once it is available.
+C_GREEN=''; C_RED=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''; C_BOLD=''; C_RESET=''
+GREEN=''; RED=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
 
 IN_STEP=0
 _STEP_NEWLINED=0
 _PENDING_NL=0
 # Prefix used to indent sub-lines inside a step (aligns with label text).
 _STEP_INDENT="             "
-OK_MARK="${GREEN}✓${NC}"
-WARN_MARK="${YELLOW}!${NC}"
-FAIL_MARK="${RED}✗${NC}"
+OK_MARK='✓'
+WARN_MARK='!'
+FAIL_MARK='✗'
+
+if [[ -r "${BASH_SOURCE[0]:-}" ]]; then
+    _early_setup_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    if [[ -r "$_early_setup_root/lib/setup/log.sh" ]]; then
+        # shellcheck disable=SC1090
+        source "$_early_setup_root/lib/setup/log.sh"
+    fi
+fi
+if ! declare -F log_printf >/dev/null 2>&1; then
+    log_printf() {
+        local rendered format="$1"
+        shift
+        printf -v rendered "$format" "$@"
+        printf '%b' "$rendered"
+    }
+    log_eprintf() {
+        local rendered format="$1"
+        shift
+        printf -v rendered "$format" "$@"
+        printf '%b' "$rendered" >&2
+    }
+fi
+if declare -F log_init_colors >/dev/null 2>&1; then
+    log_init_colors
+fi
 
 info()  {
     if [[ $IN_STEP -eq 1 ]]; then
@@ -28,7 +55,7 @@ info()  {
         _PENDING_NL=1
     else
         if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; _PENDING_NL=0; fi
-        echo -e "${CYAN}[INFO]${NC}  $*"
+        log_printf '%b\n' "${CYAN}[INFO]${NC}  $*"
     fi
 }
 warn()  {
@@ -38,7 +65,7 @@ warn()  {
         printf "${_STEP_INDENT}${YELLOW}[WARN]${NC}  %s\n" "$*"
     else
         if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; _PENDING_NL=0; fi
-        echo -e "${YELLOW}[WARN]${NC}  $*"
+        log_printf '%b\n' "${YELLOW}[WARN]${NC}  $*"
     fi
 }
 die()   {
@@ -51,7 +78,7 @@ die()   {
         fi
         IN_STEP=0; _STEP_NEWLINED=0; _PENDING_NL=0
     fi
-    echo -e "${RED}[ERR ]${NC}  $*" >&2
+    log_eprintf '%b\n' "${RED}[ERR ]${NC}  $*"
     exit 1
 }
 
@@ -68,7 +95,7 @@ die_with_next() {
         fi
         IN_STEP=0; _STEP_NEWLINED=0; _PENDING_NL=0
     fi
-    echo -e "${RED}[ERR ]${NC}  $message" >&2
+    log_eprintf '%b\n' "${RED}[ERR ]${NC}  $message"
     echo "       Next: $next_step" >&2
     exit 1
 }
@@ -315,6 +342,8 @@ source_setup_lib() {
 }
 
 source_setup_lib "lib/setup/core.sh"
+source_setup_lib "lib/setup/log.sh"
+log_init_colors
 source_setup_lib "lib/setup/detect.sh"
 source_setup_lib "lib/setup/packages.sh"
 source_setup_lib "lib/setup/fetch.sh"
