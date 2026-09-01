@@ -274,6 +274,7 @@ static __always_inline int udp_agg_rate_check(struct flow_key *key, __u64 now,
     struct prefix_rate_key_v6 rkey;
     fill_prefix_rate_key_v6(&rkey, key, dest_port, prefix_v6);
     WINDOW_RATE_CHECK(&udpag6, rkey, struct prefix_rate_val, now, window_ns, pkt_bytes, (__u64)rate_max);
+    return XDP_PASS;
 }
 
 /* Connection counters need the timestamp and count to change as one unit.

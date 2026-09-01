@@ -1347,6 +1347,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             ["nft"],
             0,
             stdout=(
+                "set policy_schema_v2\n"
                 f"set {cfg.NFT_TCP_SET}\n"
                 f"set {cfg.NFT_UDP_SET}\n"
                 f"set {cfg.NFT_SCTP_SET}\n"
@@ -1362,17 +1363,35 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
 
     def test_nftables_backend_ensure_ruleset_recreates_incomplete_ruleset(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
-        existing = subprocess.CompletedProcess(["nft"], 0, stdout="table inet auto_xdp { }")
-        deleted = subprocess.CompletedProcess(["nft"], 0, stdout="")
+        existing = subprocess.CompletedProcess(
+            ["nft"],
+            0,
+            stdout=(
+                "table inet auto_xdp {\n"
+                "  set tcp_ports {\n    type inet_service\n    elements = { 22, 443 }\n  }\n"
+                "  set udp_ports {\n    type inet_service\n    elements = { 53 }\n  }\n"
+                "  set sctp_ports {\n    type inet_service\n    elements = { 3868 }\n  }\n"
+                "  set trusted_v4 {\n    type ipv4_addr\n    elements = { 198.51.100.0/24 }\n  }\n"
+                "  set trusted_v6 {\n    type ipv6_addr\n    elements = { 2001:db8::/64 }\n  }\n"
+                "}\n"
+            ),
+        )
         created = subprocess.CompletedProcess(["nft"], 0, stdout="")
 
-        with mock.patch.object(nftables_mod, "_run_nft", side_effect=[existing, deleted, created]) as run_nft:
+        with mock.patch.object(nftables_mod, "_run_nft", side_effect=[existing, created]) as run_nft:
             backend._ensure_ruleset()
 
-        self.assertEqual(run_nft.call_args_list[1], mock.call(["delete", "table", cfg.NFT_FAMILY, cfg.NFT_TABLE], check=True))
-        create_call = run_nft.call_args_list[2]
+        self.assertEqual(run_nft.call_count, 2)
+        create_call = run_nft.call_args_list[1]
         self.assertEqual(create_call.args[0], ["-f", "-"])
+        self.assertIn(f"delete table {cfg.NFT_FAMILY} {cfg.NFT_TABLE}", create_call.kwargs["input_text"])
         self.assertIn(f"set {cfg.NFT_TCP_SET}", create_call.kwargs["input_text"])
+        self.assertIn("set policy_schema_v2", create_call.kwargs["input_text"])
+        self.assertIn("elements = { 22, 443 }", create_call.kwargs["input_text"])
+        self.assertIn("elements = { 53 }", create_call.kwargs["input_text"])
+        self.assertIn("elements = { 3868 }", create_call.kwargs["input_text"])
+        self.assertIn("elements = { 198.51.100.0/24 }", create_call.kwargs["input_text"])
+        self.assertIn("elements = { 2001:db8::/64 }", create_call.kwargs["input_text"])
 
     def test_nftables_backend_refreshes_caches_from_existing_sets(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
@@ -1399,12 +1418,13 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         self.assertEqual(backend._sctp_cache, {3868})
         self.assertEqual(backend._trusted_cache, {"198.51.100.0/24", "2001:db8::/64"})
 
-    def test_nftables_backend_apply_reconcile_plan_emits_incremental_updates(self):
+    def test_nftables_backend_apply_reconcile_plan_replaces_complete_policy_atomically(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
         backend._tcp_cache = {22, 80}
         backend._udp_cache = {53, 9999}
         backend._sctp_cache = {3868, 9899}
         backend._trusted_cache = {"203.0.113.1/32"}
+        backend._reset_policy_cache()
 
         plan = state_mod.ReconcilePlan(
             tcp_ports_to_add={443},
@@ -1416,23 +1436,47 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             trusted_cidrs_to_remove={"203.0.113.1/32"},
         )
 
-        with mock.patch.object(nftables_mod, "_run_nft") as run_nft:
+        desired = state_mod.DesiredState(
+            tcp_ports={22, 443},
+            udp_ports={53},
+            sctp_ports={2905, 3868},
+            trusted_cidrs={"198.51.100.5/32"},
+            tcp_syn_rate_limits={22: 5, 443: 100},
+            tcp_syn_agg_rate_limits={22: 50, 443: 1000},
+            tcp_conn_limits={22: 5, 443: 50},
+            tcp_conn_prefix_limits={22: 20, 443: 200},
+            tcp_conn_port_limits={22: 200, 443: 5000},
+            udp_rate_limits={53: 100},
+            udp_agg_rate_limits={53: 120000},
+            acl_rules={("tcp", "203.0.113.0/24"): frozenset({8443})},
+            bogon_filter_enabled=True,
+            rate_limit_source_prefix_v4=24,
+            rate_limit_source_prefix_v6=64,
+            udp_global_byte_rate=1_000_000,
+        )
+
+        completed = subprocess.CompletedProcess(["nft"], 0)
+        with mock.patch.object(nftables_mod, "_run_nft", return_value=completed) as run_nft:
             backend.apply_reconcile_plan(
                 plan,
                 dry_run=False,
-                desired_state=state_mod.DesiredState(),
+                desired_state=desired,
             )
 
-        self.assertEqual(run_nft.call_count, 2)
-        ports_script = run_nft.call_args_list[0].kwargs["input_text"]
-        trusted_script = run_nft.call_args_list[1].kwargs["input_text"]
-        self.assertIn("delete element inet auto_xdp tcp_ports { 80 }", ports_script)
-        self.assertIn("add element inet auto_xdp tcp_ports { 443 }", ports_script)
-        self.assertIn("delete element inet auto_xdp udp_ports { 9999 }", ports_script)
-        self.assertIn("add element inet auto_xdp sctp_ports { 2905 }", ports_script)
-        self.assertIn("delete element inet auto_xdp sctp_ports { 9899 }", ports_script)
-        self.assertIn("delete element inet auto_xdp trusted_v4 { 203.0.113.1/32 }", trusted_script)
-        self.assertIn("add element inet auto_xdp trusted_v4 { 198.51.100.5/32 }", trusted_script)
+        run_nft.assert_called_once()
+        script = run_nft.call_args.kwargs["input_text"]
+        self.assertIn("delete table inet auto_xdp\ntable inet auto_xdp", script)
+        self.assertIn("elements = { 22, 443 }", script)
+        self.assertIn("ip saddr @bogon_v4 counter drop", script)
+        self.assertIn("ip saddr 203.0.113.0/24 tcp flags", script)
+        self.assertIn("meter ts4_22", script)
+        self.assertIn("meter tp4_443", script)
+        self.assertIn("ct count over 5", script)
+        self.assertIn("limit rate over 1000000 bytes/second", script)
+        self.assertNotIn("udp sport { 53, 67, 123, 443, 547 } accept", script)
+        self.assertNotIn("tcp flags & (ack | rst | fin) != 0 accept", script)
+        self.assertEqual(backend._tcp_cache, {22, 443})
+        self.assertEqual(backend._policy_signature, nftables_mod._policy_signature(desired))
 
     def test_nftables_backend_dry_run_does_not_mutate_caches(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
@@ -1440,6 +1484,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         backend._udp_cache = {53, 9999}
         backend._sctp_cache = {3868, 9899}
         backend._trusted_cache = {"203.0.113.1/32"}
+        backend._reset_policy_cache()
 
         plan = state_mod.ReconcilePlan(
             tcp_ports_to_add={443},
@@ -1458,6 +1503,26 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         self.assertEqual(backend._udp_cache, {53, 9999})
         self.assertEqual(backend._sctp_cache, {3868, 9899})
         self.assertEqual(backend._trusted_cache, {"203.0.113.1/32"})
+        self.assertIsNone(backend._policy_signature)
+
+    def test_nftables_backend_skips_identical_policy_transaction(self):
+        backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
+        backend._tcp_cache = set()
+        backend._udp_cache = set()
+        backend._sctp_cache = set()
+        backend._trusted_cache = set()
+        backend._reset_policy_cache()
+        desired = state_mod.DesiredState(tcp_ports={443})
+        backend._remember_desired(desired)
+
+        with mock.patch.object(nftables_mod, "_run_nft") as run_nft:
+            backend.apply_reconcile_plan(
+                state_mod.ReconcilePlan(),
+                dry_run=False,
+                desired_state=desired,
+            )
+
+        run_nft.assert_not_called()
 
     def test_open_backend_validates_requested_backend(self):
         status = backends_mod.BackendStatus(

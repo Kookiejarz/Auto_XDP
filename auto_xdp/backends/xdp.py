@@ -216,10 +216,10 @@ class XdpBackend(PortBackend):
         self.udprt4_outer: BpfRateOuterMap | None = None
         self.udprt6_outer: BpfRateOuterMap | None = None
         try:
-            self.syn4_outer = BpfRateOuterMap(cfg.SYN4_MAP_PATH, 4, 16, "s4_")
-            self.syn6_outer = BpfRateOuterMap(cfg.SYN6_MAP_PATH, 16, 16, "s6_")
-            self.udprt4_outer = BpfRateOuterMap(cfg.UDPRT4_MAP_PATH, 4, 16, "u4_")
-            self.udprt6_outer = BpfRateOuterMap(cfg.UDPRT6_MAP_PATH, 16, 16, "u6_")
+            self.syn4_outer = BpfRateOuterMap(cfg.SYN4_MAP_PATH, 4, 8, "s4_")
+            self.syn6_outer = BpfRateOuterMap(cfg.SYN6_MAP_PATH, 16, 8, "s6_")
+            self.udprt4_outer = BpfRateOuterMap(cfg.UDPRT4_MAP_PATH, 4, 8, "u4_")
+            self.udprt6_outer = BpfRateOuterMap(cfg.UDPRT6_MAP_PATH, 16, 8, "u6_")
             log.debug("rate outer maps opened; per-port rate-limit isolation active.")
         except OSError as exc:
             log.debug("rate outer maps unavailable (%s); per-port rate-limit isolation inactive.", exc)
