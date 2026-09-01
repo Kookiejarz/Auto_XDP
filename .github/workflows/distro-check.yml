@@ -120,8 +120,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  ubuntu-e2e:
-    name: Full E2E + Kernel (Ubuntu own kernel)
+  ubuntu-xdp-e2e:
+    name: Full XDP E2E + Kernel (Ubuntu own kernel)
     needs: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 50
@@ -155,12 +155,29 @@ jobs:
           sudo ip link set axdpci0 up
           sudo ip link set axdpci1 up
 
+      - name: Require XDP backend
+        run: |
+          set -Eeuo pipefail
+          sed -i 's/^preferred_backend = "auto"$/preferred_backend = "xdp"/' config.toml
+          grep -qx 'preferred_backend = "xdp"' <(sed -n '/^preferred_backend =/p' config.toml)
+
       - name: Install without teardown
         run: |
           cd /tmp
           sudo bash "$GITHUB_WORKSPACE/setup_xdp.sh" \
             --allow-container-interfaces axdpci0 \
             2>&1 | tee "$GITHUB_WORKSPACE/install.log"
+
+      - name: Verify forced XDP backend
+        run: |
+          set -Eeuo pipefail
+          grep -qx 'PREFERRED_BACKEND="xdp"' /etc/auto_xdp/auto_xdp.env
+          deadline=$((SECONDS + 40))
+          while [[ ! -f /run/auto_xdp/backend ]] && (( SECONDS < deadline )); do sleep 0.2; done
+          [[ -f /run/auto_xdp/backend ]]
+          grep -qx xdp /run/auto_xdp/backend
+          ip -d link show dev axdpci0 \
+            | grep -Eq '(^|[[:space:]])prog/xdp([[:space:]]|$)|(^|[[:space:]])xdpgeneric([[:space:]]|$)|(^|[[:space:]])xdpoffload([[:space:]]|$)'
 
       - name: Verify installed artifacts and runtime
         run: |
@@ -207,14 +224,11 @@ jobs:
           bash tests/bash/assert_install_artifacts.sh reinstall.log --replace
           sudo bash tests/run.sh uninstall 2>&1 | tee final-uninstall.log
 
-      - name: Install and exercise the nftables fallback
-        run: sudo bash tests/bash/e2e_nftables_fallback.sh 2>&1 | tee nftables-fallback.log
-
       - name: Upload diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ubuntu-e2e-${{ github.run_id }}
+          name: ubuntu-xdp-e2e-${{ github.run_id }}
           path: |
             install.log
             kernel-integration.log
@@ -223,7 +237,6 @@ jobs:
             reinstall.log
             final-uninstall.log
             upgrade-rollback.log
-            nftables-fallback.log
           if-no-files-found: warn
           retention-days: 7
 
@@ -237,3 +250,42 @@ jobs:
           sudo ip link set dev axdpci0 xdp off 2>/dev/null || true
           sudo nft delete table inet auto_xdp 2>/dev/null || true
           sudo ip link del axdpci0 2>/dev/null || true
+
+  ubuntu-fallback-e2e:
+    name: nftables Fallback E2E (Ubuntu own kernel)
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Verify Ubuntu VM runner
+        run: |
+          set -Eeuo pipefail
+          source /etc/os-release
+          test "${ID:-}" = ubuntu
+          if systemd-detect-virt --container --quiet; then
+            echo "runner must be a VM or bare-metal Ubuntu host, not a container" >&2
+            exit 1
+          fi
+          test -r /sys/kernel/btf/vmlinux
+          sudo -n true
+          uname -a
+
+      - name: Run nftables fallback detection flow
+        run: |
+          set -Eeuo pipefail
+          sudo bash tests/bash/e2e_nftables_fallback.sh 2>&1 | tee nftables-fallback.log
+
+      - name: Upload fallback diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-fallback-e2e-${{ github.run_id }}
+          path: nftables-fallback.log
+          if-no-files-found: warn
+          retention-days: 7
