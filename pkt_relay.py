@@ -176,7 +176,7 @@ def _peer_is_authorized(conn: socket.socket) -> bool:
 _PERF_EVENT_OPEN_NR: dict[str, int] = {
     "x86_64": 298, "aarch64": 241, "armv7l": 364, "i386": 336,
 }
-_PERF_TYPE_TRACEPOINT   = 1
+_PERF_TYPE_TRACEPOINT   = 2
 _PERF_FLAG_FD_CLOEXEC   = 1 << 3
 _PERF_EVENT_IOC_ENABLE  = 0x2400
 _PERF_EVENT_IOC_SET_BPF = 0x40042408

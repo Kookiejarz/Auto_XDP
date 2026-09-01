@@ -807,6 +807,7 @@ import time
 port, workers, per_worker = map(int, sys.argv[1:4])
 ready_file = sys.argv[4]
 cpus = sorted(os.sched_getaffinity(0))[:workers]
+mp.set_start_method("fork")
 start = mp.Event()
 close = mp.Event()
 ready = mp.Queue()

@@ -118,7 +118,7 @@ upgrade_log="$TMP_ROOT/upgrade.log"
 printf '[INFO] running in-place upgrade from %s\n' "$REPO_ROOT"
 if ! AUTO_XDP_PRESTAGED_SOURCE_ROOT="$REPO_ROOT" \
     AUTO_XDP_SOURCE_REF=refs/heads/main \
-    bash "$REPO_ROOT/setup_xdp.sh" --force "${interfaces[@]}" >"$upgrade_log" 2>&1; then
+    bash "$REPO_ROOT/setup_xdp.sh" --force --allow-container-interfaces "${interfaces[@]}" >"$upgrade_log" 2>&1; then
     tail -n 80 "$upgrade_log" >&2
     fail 'in-place upgrade failed'
 fi
@@ -172,7 +172,7 @@ rollback_status=0
 if PATH="$systemctl_wrapper_dir:$PATH" \
     AUTO_XDP_PRESTAGED_SOURCE_ROOT="$REPO_ROOT" \
     AUTO_XDP_SOURCE_REF=refs/heads/main \
-    bash "$REPO_ROOT/setup_xdp.sh" --force "${interfaces[@]}" >"$rollback_log" 2>&1; then
+    bash "$REPO_ROOT/setup_xdp.sh" --force --allow-container-interfaces "${interfaces[@]}" >"$rollback_log" 2>&1; then
     rollback_status=0
 else
     rollback_status=$?

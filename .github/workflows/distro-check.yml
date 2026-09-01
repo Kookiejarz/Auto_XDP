@@ -229,7 +229,7 @@ jobs:
 
       - name: Verify reinstall, uninstall again, and check final residue
         run: |
-          bash tests/bash/assert_install_artifacts.sh reinstall.log --replace
+          bash tests/bash/assert_install_artifacts.sh reinstall.log
           sudo bash tests/run.sh uninstall 2>&1 | tee final-uninstall.log
 
       - name: Upload diagnostics
