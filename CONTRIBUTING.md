@@ -59,7 +59,8 @@ Privileged Linux hosts can also run `sudo bash tests/run.sh kernel`. Do not add 
 
 ## Security
 
-If you discover a security issue, please open an issue with clear reproduction details and impact notes.
+If you discover a security vulnerability, please report it privately through GitHub's **Private Vulnerability Reporting** feature rather than opening a public issue.
+
 Avoid committing secrets, credentials, or private infrastructure details.
 
 ## In the End
