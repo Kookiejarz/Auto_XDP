@@ -148,7 +148,13 @@ run_sync_script() {
 }
 
 ensure_xdp_loaded() {
-    _auto_xdp_resolve_bpftool || return 1
+    if declare -F _auto_xdp_resolve_bpftool >/dev/null 2>&1; then
+        _auto_xdp_resolve_bpftool || return 1
+    else
+        # Keep this helper usable when runtime_common is intentionally mocked
+        # out by component tests.
+        command -v bpftool &>/dev/null || return 1
+    fi
     [[ -f "$XDP_OBJ_PATH" ]] || return 1
 
     ensure_bpffs
