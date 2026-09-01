@@ -178,13 +178,14 @@ jobs:
       - name: Verify forced XDP backend
         run: |
           set -Eeuo pipefail
-          grep -qx 'PREFERRED_BACKEND="xdp"' /etc/auto_xdp/auto_xdp.env
+          sudo grep -qx 'PREFERRED_BACKEND="xdp"' /etc/auto_xdp/auto_xdp.env
           deadline=$((SECONDS + 40))
-          while [[ ! -f /run/auto_xdp/backend ]] && (( SECONDS < deadline )); do sleep 0.2; done
-          [[ -f /run/auto_xdp/backend ]]
-          grep -qx xdp /run/auto_xdp/backend
-          ip -d link show dev axdpci0 \
-            | grep -Eq '(^|[[:space:]])prog/xdp([[:space:]]|$)|(^|[[:space:]])xdpgeneric([[:space:]]|$)|(^|[[:space:]])xdpoffload([[:space:]]|$)'
+          while ! sudo test -f /run/auto_xdp/backend && (( SECONDS < deadline )); do sleep 0.2; done
+          sudo test -f /run/auto_xdp/backend
+          sudo grep -qx xdp /run/auto_xdp/backend
+          link_details=$(sudo ip -d link show dev axdpci0)
+          grep -Eq '(^|[[:space:]])prog/xdp([[:space:]]|$)|(^|[[:space:]])xdpgeneric([[:space:]]|$)|(^|[[:space:]])xdpoffload([[:space:]]|$)' \
+            <<<"$link_details"
 
       - name: Verify installed artifacts and runtime
         run: |
@@ -292,7 +293,7 @@ jobs:
 
       - name: Upload fallback diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ubuntu-fallback-e2e-${{ github.run_id }}
           path: nftables-fallback.log
