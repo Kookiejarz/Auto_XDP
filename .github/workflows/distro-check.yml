@@ -15,7 +15,9 @@ concurrency:
 jobs:
   quality:
     name: Static, Type, Unit, and Component
-    runs-on: ubuntu-latest
+    # Pin 26.04: GitHub's Ubuntu 24.04 Azure 6.17 runner has a broken
+    # kernel-tools layout that leaves bpftool unusable.
+    runs-on: ubuntu-26.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -40,7 +42,10 @@ jobs:
   distro-install:
     name: Distro install + compile (${{ matrix.name }})
     needs: quality
-    runs-on: ubuntu-latest
+    # Pin 26.04: GitHub's Ubuntu 24.04 Azure 6.17 runner has a broken
+    # kernel-tools layout that leaves bpftool unusable. Containers share the
+    # runner kernel, so the Ubuntu matrix image must use the same release.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -50,7 +55,7 @@ jobs:
             image: debian:12-slim
             preinstall: apt-get update && apt-get install -y bash ca-certificates curl git python3 procps iproute2
           - name: ubuntu
-            image: ubuntu:24.04
+            image: ubuntu:26.04
             preinstall: apt-get update && apt-get install -y bash ca-certificates curl git python3 procps iproute2
           - name: fedora
             image: fedora:41
@@ -123,7 +128,9 @@ jobs:
   ubuntu-xdp-e2e:
     name: Full XDP E2E + Kernel (Ubuntu own kernel)
     needs: quality
-    runs-on: ubuntu-24.04
+    # GitHub's Ubuntu 24.04 Azure 6.17 runner has a broken kernel-tools
+    # layout that leaves bpftool unusable; 26.04 ships a working bpftool.
+    runs-on: ubuntu-26.04
     timeout-minutes: 50
     defaults:
       run:
@@ -254,7 +261,9 @@ jobs:
   ubuntu-fallback-e2e:
     name: nftables Fallback E2E (Ubuntu own kernel)
     needs: quality
-    runs-on: ubuntu-24.04
+    # GitHub's Ubuntu 24.04 Azure 6.17 runner has a broken kernel-tools
+    # layout that leaves bpftool unusable; 26.04 ships a working bpftool.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     defaults:
       run:
