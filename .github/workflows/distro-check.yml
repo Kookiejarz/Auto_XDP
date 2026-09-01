@@ -175,7 +175,19 @@ jobs:
           set -Eeuo pipefail
           sudo mkdir -p /sys/fs/bpf
           mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
-          sudo env REQUIRE_KERNEL_TESTS=1 bash tests/run.sh kernel 2>&1 | tee kernel-integration.log
+          sudo env \
+            REQUIRE_KERNEL_TESTS=1 \
+            VERIFIER_METRICS_FILE="$GITHUB_WORKSPACE/verifier-metrics.tsv" \
+            bash tests/run.sh kernel 2>&1 | tee kernel-integration.log
+
+      - name: Upload verifier metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verifier-metrics-${{ github.run_id }}
+          path: verifier-metrics.tsv
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Verify in-place upgrade and failed-candidate rollback
         run: sudo bash tests/bash/e2e_upgrade_rollback.sh 2>&1 | tee upgrade-rollback.log
@@ -206,6 +218,7 @@ jobs:
           path: |
             install.log
             kernel-integration.log
+            verifier-metrics.tsv
             uninstall.log
             reinstall.log
             final-uninstall.log

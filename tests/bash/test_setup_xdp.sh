@@ -959,6 +959,49 @@ test_transactional_xdp_validation_failure_keeps_current_generation() (
     }
 )
 
+test_transactional_xdp_load_failure_reports_verifier_log() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir output status
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=("eth0")
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' > "$BPF_PIN_DIR/prog"
+    touch "$XDP_OBJ_INSTALLED"
+
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    bpftool() {
+        assert_eq "$1" "-d" || return 1
+        printf 'processed 1000001 insns (limit 1000000)\n' >&2
+        return 1
+    }
+
+    output=$(transactional_reload_xdp 2>&1)
+    status=$?
+    assert_eq "$status" "1" || return 1
+    assert_contains "$output" "bpftool verifier log follows" || return 1
+    assert_contains "$output" "processed 1000001 insns (limit 1000000)" || return 1
+    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
+test_extract_verifier_metrics_normalizes_bpftool_summary() (
+    local output expected
+    output=$(
+        bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "integration setup" <<'EOF_METRICS'
+libbpf: sec 'xdp': found program 'xdp_port_whitelist' at insn offset 0 (0 bytes), code size 13481 insns (107848 bytes)
+verification time 1519394 usec
+stack depth 288
+processed 282798 insns (limit 1000000) max_states_per_insn 27 total_states 11892 peak_states 4610 mark_read 0
+EOF_METRICS
+    )
+    expected=$'integration_setup\t13481\t282798\t27\t11892\t4610\t1519394\t288'
+    assert_eq "$output" "$expected"
+)
+
 test_transactional_handler_failure_keeps_current_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -2346,6 +2389,28 @@ test_install_packages_succeeds_on_non_apt_managers() (
             return 1
         }
     done
+)
+
+test_ensure_curses_installs_opensuse_capability() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local installed=0 output
+    PKG_MANAGER="zypper"
+    python3() {
+        [[ $installed -eq 1 ]] && return 0
+        if [[ "$*" == *"sys.version_info"* ]]; then
+            printf 'python313-curses\n'
+        fi
+        return 1
+    }
+    as_root() {
+        printf '%s\n' "$*"
+        installed=1
+    }
+
+    output=$(ensure_curses) || return 1
+    assert_contains "$output" "zypper --non-interactive install -y python313-curses"
 )
 
 test_check_required_tools_step_requires_tar_for_remote_sources() (

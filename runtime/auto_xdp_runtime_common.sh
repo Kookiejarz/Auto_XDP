@@ -1145,16 +1145,44 @@ transactional_reload_xdp() {
 
     mkdir -p "$candidate_dir" || return 1
 
-    local saved_pin_dir="$BPF_PIN_DIR"
+    local saved_pin_dir="$BPF_PIN_DIR" verifier_log=""
     BPF_PIN_DIR="$candidate_dir"
-    if ! bpftool prog load "$xdp_obj_path" "$candidate_dir/prog" type xdp \
-            pinmaps "$candidate_dir" >/dev/null 2>&1 \
-            || ! xdp_maps_ready \
-            || ! preseed_xdp_candidate_policy "$candidate_dir" \
-            || ! preseed_xdp_candidate_handlers \
-            || ! seed_existing_tcp_conntrack; then
+    verifier_log=$(mktemp) || {
         BPF_PIN_DIR="$saved_pin_dir"
-        _auto_xdp_warn "Candidate XDP program failed validation or policy pre-seeding; current protection was not changed."
+        rm -rf "$candidate_dir"
+        return 1
+    }
+    if ! bpftool -d prog load "$xdp_obj_path" "$candidate_dir/prog" type xdp \
+            pinmaps "$candidate_dir" >"$verifier_log" 2>&1; then
+        BPF_PIN_DIR="$saved_pin_dir"
+        _auto_xdp_warn "Candidate XDP program failed to load; bpftool verifier log follows."
+        cat "$verifier_log" >&2
+        rm -f "$verifier_log"
+        rm -rf "$candidate_dir"
+        return 1
+    fi
+    rm -f "$verifier_log"
+    if ! xdp_maps_ready; then
+        BPF_PIN_DIR="$saved_pin_dir"
+        _auto_xdp_warn "Candidate XDP map validation failed; current protection was not changed."
+        rm -rf "$candidate_dir"
+        return 1
+    fi
+    if ! preseed_xdp_candidate_policy "$candidate_dir"; then
+        BPF_PIN_DIR="$saved_pin_dir"
+        _auto_xdp_warn "Candidate XDP policy pre-seeding failed; current protection was not changed."
+        rm -rf "$candidate_dir"
+        return 1
+    fi
+    if ! preseed_xdp_candidate_handlers; then
+        BPF_PIN_DIR="$saved_pin_dir"
+        _auto_xdp_warn "Candidate XDP handler pre-seeding failed; current protection was not changed."
+        rm -rf "$candidate_dir"
+        return 1
+    fi
+    if ! seed_existing_tcp_conntrack; then
+        BPF_PIN_DIR="$saved_pin_dir"
+        _auto_xdp_warn "Candidate XDP conntrack pre-seeding failed; current protection was not changed."
         rm -rf "$candidate_dir"
         return 1
     fi

@@ -114,9 +114,9 @@ static __always_inline int check_tcp_conntrack(
             }
 
             if (is_half_open) {
-                /* Promotion: half-open -> ESTABLISHED. Increment counters. */
-                tcp_conntrack_update(ipv4, &key_v4, &key_v6, now, BPF_EXIST);
-                tcp_src_conn_record_established(key, now, dest_port, cfg);
+                /* Only the ACK that wins this transition records the connection. */
+                if (__sync_val_compare_and_swap(last_seen, raw, now) == raw)
+                    tcp_src_conn_record_established(key, now, dest_port, cfg);
             } else if (age > ct_refresh) {
                 /* Heartbeat refresh on existing ESTABLISHED: no count change. */
                 tcp_conntrack_update(ipv4, &key_v4, &key_v6, now, BPF_EXIST);

@@ -91,12 +91,39 @@ source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
 # ---------------------------------------------------------------------------
 _load_xdp_program() {
     local phase="${1:-load}"
-    local load_log status debug_status
+    local load_log status debug_status metrics_tmp metrics_status
+    local -a pipe_status
     load_log=$(mktemp)
 
-    bpftool prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
-        pinmaps "$_PIN_DIR" >"$load_log" 2>&1
-    status=$?
+    if [[ -n "${VERIFIER_METRICS_FILE:-}" && ! -s "$VERIFIER_METRICS_FILE" ]]; then
+        metrics_tmp=$(mktemp)
+        bpftool -d prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
+            pinmaps "$_PIN_DIR" 2>&1 \
+            | bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "$phase" \
+                >"$metrics_tmp"
+        pipe_status=("${PIPESTATUS[@]}")
+        status=${pipe_status[0]}
+        metrics_status=${pipe_status[1]}
+        if [[ $status -eq 0 && $metrics_status -eq 0 ]]; then
+            {
+                printf '# kernel\t%s\n' "$(uname -r)"
+                printf '# clang\t%s\n' "$(clang --version | head -n 1)"
+                printf '# bpftool\t%s\n' "$(bpftool version | head -n 1)"
+                printf 'phase\tstatic_insns\tprocessed_insns\tmax_states_per_insn\ttotal_states\tpeak_states\tverification_time_usec\tstack_depth\n'
+                cat "$metrics_tmp"
+            } >"$VERIFIER_METRICS_FILE"
+        fi
+        rm -f "$metrics_tmp"
+        if [[ $status -eq 0 && $metrics_status -ne 0 ]]; then
+            printf 'error: unable to parse bpftool verifier metrics during %s\n' "$phase" >&2
+            rm -f "$load_log"
+            return 1
+        fi
+    else
+        bpftool prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
+            pinmaps "$_PIN_DIR" >"$load_log" 2>&1
+        status=$?
+    fi
     if [[ $status -eq 0 ]]; then
         rm -f "$load_log"
         return 0

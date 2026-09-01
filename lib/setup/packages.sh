@@ -175,6 +175,16 @@ ensure_psutil() {
     esac
 }
 
+ensure_curses() {
+    python3 -c "import curses" 2>/dev/null && return 0
+    [[ "$PKG_MANAGER" == "zypper" ]] || return 1
+    local curses_package
+    curses_package=$(python3 -c \
+        'import sys; print(f"python{sys.version_info.major}{sys.version_info.minor}-curses")')
+    as_root zypper --non-interactive install -y "$curses_package" 2>/dev/null \
+        && python3 -c "import curses" 2>/dev/null
+}
+
 ensure_python_runtime() {
     python3 - <<'PY' || die "Auto XDP requires Python 3.10 or newer."
 import sys
@@ -286,6 +296,8 @@ check_required_tools_step() {
     substep_run "python3 >= 3.10" ensure_python_runtime
     substep_run "python3 psutil module" ensure_psutil \
         || die_with_next "Failed to install the psutil Python module." "install python3-psutil (or pip install psutil), then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
+    substep_run "python3 curses module" ensure_curses \
+        || die_with_next "Failed to load the curses Python module." "install the matching Python curses package (for example python313-curses), then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
     substep_run "python3 TOML support" ensure_tomli_for_python310 \
         || die_with_next "Failed to install the tomli Python module." "install python3-tomli (or pip install tomli), then rerun: bash setup_xdp.sh --force ${IFACES[*]}"
     PYTHON3_BIN=$(command -v python3)
