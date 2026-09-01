@@ -154,6 +154,12 @@ else
     printf '[INFO] no systemd PID 1; running installed launcher directly\n'
 fi
 
+nft_policy_schema_present() {
+    local table_dump
+    table_dump=$(nft list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null) || return 1
+    [[ "$table_dump" == *"set tcp_ports"* && "$table_dump" == *"chain input"* ]]
+}
+
 deadline=$((SECONDS + WAIT_SECONDS))
 while [[ ! -f /run/auto_xdp/backend ]] && (( SECONDS < deadline )); do sleep 0.2; done
 [[ -f /run/auto_xdp/backend ]] || fail "backend state file missing"
@@ -161,18 +167,12 @@ grep -qx nftables /run/auto_xdp/backend \
     || fail "installed backend is not nftables"
 deadline=$((SECONDS + WAIT_SECONDS))
 while (( SECONDS < deadline )); do
-    if nft list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null \
-            | grep -Fq 'set tcp_ports' \
-        && nft list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null \
-            | grep -Fq 'chain input'; then
+    if nft_policy_schema_present; then
         break
     fi
     sleep 0.2
 done
-if ! nft list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null \
-        | grep -Fq 'set tcp_ports' \
-    || ! nft list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null \
-        | grep -Fq 'chain input'; then
+if ! nft_policy_schema_present; then
     nft list ruleset >&2 || true
     [[ -z "$LAUNCHER_PID" ]] || cat "$WORK_DIR/launcher.log" >&2
     fail "installed nftables policy schema is missing"
