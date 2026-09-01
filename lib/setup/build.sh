@@ -22,7 +22,7 @@ bootstrap_bpf_helper_step() {
         step_warn "map operations limited"
     fi
 
-    if ! command -v bpftool &>/dev/null || ! command -v clang &>/dev/null; then
+    if ! command -v clang &>/dev/null || ! _tool_present bpftool; then
         warn "bpftool or clang still missing — XDP backend may be unavailable"
     fi
 }
@@ -253,7 +253,7 @@ compile_xdp_program() {
     local _handlers_dir=""
     HANDLER_BUILD_FAILED=0
 
-    if ! command -v clang &>/dev/null || ! command -v bpftool &>/dev/null; then
+    if ! command -v clang &>/dev/null || ! _tool_present bpftool; then
         warn "clang or bpftool missing; XDP backend will be skipped."
         return 1
     fi

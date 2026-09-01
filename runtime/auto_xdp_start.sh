@@ -148,7 +148,7 @@ run_sync_script() {
 }
 
 ensure_xdp_loaded() {
-    command -v bpftool &>/dev/null || return 1
+    _auto_xdp_resolve_bpftool || return 1
     [[ -f "$XDP_OBJ_PATH" ]] || return 1
 
     ensure_bpffs
