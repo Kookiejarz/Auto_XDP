@@ -65,20 +65,20 @@ package_list_for_manager() {
             if [[ "$(uname -m)" == "x86_64" ]]; then
                 multilib=" gcc-multilib"
             fi
-            echo "clang llvm libbpf-dev build-essential iproute2 curl tar python3 python3-pip nftables${multilib}"
+            echo "clang llvm libbpf-dev build-essential iproute2 curl tar findutils python3 python3-pip nftables${multilib}"
             ;;
         dnf|yum)
             # tc lives in iproute-tc on Fedora/RHEL, not in iproute.
-            echo "clang llvm libbpf-devel bpftool iproute iproute-tc curl tar python3 python3-pip gcc make nftables"
+            echo "clang llvm libbpf-devel bpftool iproute iproute-tc curl tar findutils python3 python3-pip gcc make nftables"
             ;;
         zypper)
-            echo "clang llvm libbpf-devel bpftool iproute2 curl tar python3 python3-pip gcc make nftables"
+            echo "clang llvm libbpf-devel bpftool iproute2 curl tar findutils python3 python3-pip gcc make nftables"
             ;;
         pacman)
-            echo "clang llvm libbpf iproute2 curl tar python python-pip bpf base-devel nftables"
+            echo "clang llvm libbpf iproute2 curl tar findutils python python-pip bpf base-devel nftables"
             ;;
         apk)
-            echo "clang llvm libbpf-dev bpftool iproute2 curl tar python3 py3-pip build-base nftables"
+            echo "clang llvm libbpf-dev bpftool iproute2 curl tar findutils python3 py3-pip build-base nftables"
             ;;
         *)
             return 1
@@ -228,7 +228,7 @@ check_required_tools_step() {
     local cmd
 
     step_begin "Checking required tools"
-    for cmd in clang bpftool python3 curl tar ip tc nft; do
+    for cmd in clang bpftool python3 curl tar find ip tc nft; do
         substep_run "$cmd" _tool_present "$cmd" || missing+=("$cmd")
     done
 
