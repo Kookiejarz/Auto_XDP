@@ -113,7 +113,7 @@ static __always_inline void fill_tcp_src_conn_key_v6(
  */
 #define RATE_STATE_COUNT_MASK 0xFFFFFFFFULL
 #define RATE_STATE_TICK_NS 1000000ULL
-#define RATE_STATE_RETRIES 64
+#define RATE_STATE_RETRIES 16
 
 static __always_inline __u32 rate_state_tick(__u64 now)
 {
@@ -284,7 +284,7 @@ static __always_inline int udp_agg_rate_check(struct flow_key *key, __u64 now,
  */
 #define CONN_STATE_COUNT_MASK 0xFFFFFFFFULL
 #define CONN_STATE_TICK_NS 100000000ULL
-#define CONN_STATE_RETRIES 64
+#define CONN_STATE_RETRIES 16
 
 static __always_inline __u32 conn_state_tick(__u64 now)
 {
