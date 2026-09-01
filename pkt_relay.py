@@ -234,7 +234,7 @@ def attach_tracepoint(prog_pin: str, tracepoint: str) -> list[int]:
             continue
         pfd = int(ret)
         try:
-            fcntl.ioctl(pfd, _PERF_EVENT_IOC_SET_BPF, struct.pack("I", prog_fd))
+            fcntl.ioctl(pfd, _PERF_EVENT_IOC_SET_BPF, prog_fd)
             fcntl.ioctl(pfd, _PERF_EVENT_IOC_ENABLE, 0)
             perf_fds.append(pfd)
         except OSError:

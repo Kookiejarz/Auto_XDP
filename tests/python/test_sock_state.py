@@ -66,6 +66,21 @@ import pkt_relay as relay_mod
 
 class TestRelayBroadcastPortChange(unittest.TestCase):
 
+    def test_tracepoint_attach_passes_program_fd_by_value(self):
+        with (
+            mock.patch.object(relay_mod, "_tp_id", return_value=123),
+            mock.patch.object(relay_mod, "obj_get", return_value=41),
+            mock.patch.object(relay_mod.platform, "machine", return_value="x86_64"),
+            mock.patch.object(relay_mod.os, "cpu_count", return_value=1),
+            mock.patch.object(relay_mod, "_libc") as libc,
+            mock.patch.object(relay_mod.fcntl, "ioctl") as ioctl,
+            mock.patch.object(relay_mod.os, "close"),
+        ):
+            libc.syscall.return_value = 42
+            self.assertEqual(relay_mod.attach_tracepoint("/prog", "sock/tp"), [42])
+
+        ioctl.assert_any_call(42, relay_mod._PERF_EVENT_IOC_SET_BPF, 41)
+
     def test_ringbuf_reader_accepts_sock_state_record_size(self):
         raw = _make_raw(port=45683)
         reader = relay_mod.RingBufReader.__new__(relay_mod.RingBufReader)
