@@ -38,9 +38,11 @@ class FakeInnerRegistry:
 def _make_map(reg, key_size=4):
     m = object.__new__(maps_mod.BpfRateOuterMap)
     m.path = "/sys/fs/bpf/xdp_fw/syn4"
-    m.fd = 9
+    # No real map fd belongs to this source-only fixture.  Keeping a positive
+    # dummy fd lets __del__ close an unrelated pytest descriptor at teardown.
+    m.fd = -1
     m._inner_key_size = key_size
-    m._inner_value_size = 16
+    m._inner_value_size = 8
     m._name_prefix = "s4_"
     m._max_entries = 65536
     m._cache = {}
@@ -66,7 +68,7 @@ class RateOuterMapTests(unittest.TestCase):
             self.assertTrue(m.set(443, 8192))
         upd.assert_called_once()
         self.assertEqual(self.reg.created[0][:4],
-                         (4, 16, 8192, 0))
+                         (4, 8, 8192, 0))
         self.assertEqual(m.active(), {443: 8192})
 
     def test_set_same_capacity_is_noop(self):

@@ -29,6 +29,18 @@ debounce_seconds = 0.5
 # nftables  = force nftables fallback regardless of XDP availability.
 preferred_backend = "auto"
 
+[interfaces]
+# auto discovers active host ingress interfaces. Loopback, veth and common
+# Docker/CNI plumbing are excluded. Set include for an explicit stable list.
+mode = "auto"
+include = []
+exclude = []
+allow_container = false
+
+# auto tries native XDP first per interface, then generic. The last verified
+# mode is stored per interface and preferred again after a service restart.
+xdp_mode = "auto"
+
 [ringbuf]
 # Unix socket used by pkt_relay.py and axdp tui.
 socket_path = "/var/run/auto_xdp/pkt_events.sock"
@@ -71,7 +83,9 @@ sctp = []   # e.g. [5060]
 # XDP UDP: trusted sources do NOT open closed UDP ports; the destination UDP
 # port must already be whitelisted. Once whitelisted, trusted sources bypass
 # UDP rate limits and port handlers.
-# nftables fallback: trusted sources are accepted before port checks.
+# nftables fallback mirrors the XDP distinction: trusted TCP sources may open
+# a SYN to an otherwise closed port, while trusted UDP sources still require
+# the destination port to be open; both bypass fallback rate limits.
 # Format: "CIDR" = "label"
 # "10.0.0.0/8"    = "internal network"
 # "203.0.113.5/32" = "monitoring host"
@@ -271,10 +285,10 @@ refresh_seconds = 3600
 # Handlers run after the main whitelist/rate-limit pass for the port.
 
 [port_handlers.tcp]
-# Example: 443 = "/usr/lib/auto_xdp/handlers/tls_sni.o"
+# Example: 443 = "/etc/auto_xdp/handlers/tls_sni.o"
 
 [port_handlers.udp]
-# Example: 53 = "/usr/lib/auto_xdp/handlers/dns_validate.o"
+# Example: 53 = "/etc/auto_xdp/handlers/dns_validate.o"
 
 
 # XDP backend

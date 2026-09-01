@@ -71,7 +71,7 @@ def main() -> None:
     )
     p.add_argument(
         "--config",
-        default=cfg.TOML_CONFIG_PATH,
+        default=bootstrap_args.config,
         metavar="PATH",
         help=f"TOML config file path (default: {cfg.TOML_CONFIG_PATH})",
     )

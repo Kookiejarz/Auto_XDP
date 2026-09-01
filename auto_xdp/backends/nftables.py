@@ -1,7 +1,14 @@
-"""nftables fallback backend."""
+"""nftables fallback backend.
+
+The fallback shares Auto XDP's desired policy model, but applies it as one
+versioned nftables transaction.  A complete replacement avoids transient
+half-applied policy when ports, ACLs, and rate limits change together.
+"""
 from __future__ import annotations
 
+import ipaddress
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -9,11 +16,7 @@ from typing import cast
 
 from auto_xdp import config as cfg
 from auto_xdp.backends.base import BackendStatus, PortBackend
-from auto_xdp.bpf.maps import (
-    render_nft_addrs as _render_nft_addrs,
-    render_nft_ports as _render_nft_ports,
-    run_nft as _run_nft,
-)
+from auto_xdp.bpf.maps import run_nft as _run_nft
 from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcilePlan
 
 log = logging.getLogger(__name__)
@@ -124,8 +127,23 @@ class NftablesBackend(PortBackend):
         self._udp_cache: set[int] = set()
         self._sctp_cache: set[int] = set()
         self._trusted_cache: set[str] = set()
+        self._reset_policy_cache()
         self._ensure_ruleset()
         self._refresh_caches()
+
+    def _reset_policy_cache(self) -> None:
+        self._tcp_syn_rate_cache: dict[int, int] = {}
+        self._tcp_syn_agg_rate_cache: dict[int, int] = {}
+        self._tcp_conn_limit_cache: dict[int, int] = {}
+        self._tcp_conn_prefix_limit_cache: dict[int, int] = {}
+        self._tcp_conn_port_limit_cache: dict[int, int] = {}
+        self._udp_rate_cache: dict[int, int] = {}
+        self._udp_agg_rate_cache: dict[int, int] = {}
+        self._acl_cache: dict[tuple[str, str], frozenset[int]] = {}
+        self._bogon_cache: bool | None = None
+        self._drop_events_cache: bool | None = None
+        self._udp_global_byte_rate_cache: int | None = None
+        self._policy_signature: tuple[object, ...] | None = None
 
     def _parse_set_elements(self, body: str) -> list[str]:
         match = re.search(r"elements\s*=\s*\{(.*?)\}", body, re.DOTALL)
@@ -135,6 +153,14 @@ class NftablesBackend(PortBackend):
         if not raw:
             return []
         return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def _parse_named_set_elements(self, table_body: str, set_name: str) -> list[str]:
+        match = re.search(
+            rf"\bset\s+{re.escape(set_name)}\s*\{{(.*?)(?=\n\s*\}})",
+            table_body,
+            re.DOTALL,
+        )
+        return self._parse_set_elements(match.group(1)) if match else []
 
     def _list_set_elements(self, set_name: str) -> list[str]:
         result = _run_nft(
@@ -158,110 +184,342 @@ class NftablesBackend(PortBackend):
             udp_ports=set(self._udp_cache),
             sctp_ports=set(self._sctp_cache),
             trusted_cidrs=set(self._trusted_cache),
+            tcp_syn_rate_limits=dict(self._tcp_syn_rate_cache),
+            tcp_syn_agg_rate_limits=dict(self._tcp_syn_agg_rate_cache),
+            tcp_conn_limits=dict(self._tcp_conn_limit_cache),
+            tcp_conn_prefix_limits=dict(self._tcp_conn_prefix_limit_cache),
+            tcp_conn_port_limits=dict(self._tcp_conn_port_limit_cache),
+            udp_rate_limits=dict(self._udp_rate_cache),
+            udp_agg_rate_limits=dict(self._udp_agg_rate_cache),
+            acl_rules=dict(self._acl_cache),
+            bogon_filter_enabled=self._bogon_cache,
+            drop_events_enabled=self._drop_events_cache,
+            udp_global_byte_rate=self._udp_global_byte_rate_cache,
         )
 
-    def _ensure_ruleset(self) -> None:
-        result = _run_nft(["list", "table", cfg.NFT_FAMILY, cfg.NFT_TABLE], check=False)
-        if result.returncode == 0:
-            body = result.stdout
-            if all(marker in body for marker in (
-                f"set {cfg.NFT_TCP_SET}", f"set {cfg.NFT_UDP_SET}", f"set {cfg.NFT_SCTP_SET}",
-                f"set {cfg.NFT_TRUSTED_SET4}", "chain input",
-            )):
-                return
-            _run_nft(["delete", "table", cfg.NFT_FAMILY, cfg.NFT_TABLE], check=True)
+    def _family_flags(self) -> tuple[bool, bool]:
+        return cfg.NFT_FAMILY in {"inet", "ip"}, cfg.NFT_FAMILY in {"inet", "ip6"}
 
-        script = f"""table {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {{
-    set {cfg.NFT_TCP_SET} {{
-        type inet_service
-    }}
+    def _acl_rules(self, desired: DesiredState, proto: str, family: int) -> list[str]:
+        result: list[str] = []
+        addr_expr = "ip saddr" if family == 4 else "ip6 saddr"
+        port_set = cfg.NFT_TCP_SET if proto == "tcp" else cfg.NFT_UDP_SET
+        for (rule_proto, cidr), ports in sorted(desired.acl_rules.items()):
+            if rule_proto != proto or (":" in cidr) != (family == 6) or not ports:
+                continue
+            rendered_ports = ", ".join(str(port) for port in sorted(ports))
+            if proto == "tcp":
+                result.append(
+                    f"        {addr_expr} {cidr} tcp flags & (syn | ack) == syn "
+                    f"tcp dport {{ {rendered_ports} }} counter accept"
+                )
+            else:
+                result.append(
+                    f"        {addr_expr} {cidr} udp dport @{port_set} "
+                    f"udp dport {{ {rendered_ports} }} counter accept"
+                )
+        return result
 
-    set {cfg.NFT_UDP_SET} {{
-        type inet_service
-    }}
+    def _tcp_policy_objects(self, desired: DesiredState, family: int) -> list[str]:
+        value_type = "ipv4_addr" if family == 4 else "ipv6_addr"
+        blocks: list[str] = []
+        for port in sorted(desired.tcp_ports):
+            if desired.tcp_conn_limits.get(port, 0) > 0:
+                blocks.append(_set_block(f"tc{family}s_{port}", value_type, []))
+                blocks[-1] = blocks[-1].replace("    }", "        flags dynamic\n    }")
+            if desired.tcp_conn_prefix_limits.get(port, 0) > 0:
+                blocks.append(_set_block(f"tc{family}p_{port}", value_type, []))
+                blocks[-1] = blocks[-1].replace("    }", "        flags dynamic\n    }")
+        return blocks
 
-    set {cfg.NFT_SCTP_SET} {{
-        type inet_service
-    }}
+    def _tcp_policy_rules(self, desired: DesiredState, family: int) -> list[str]:
+        addr_expr = "ip saddr" if family == 4 else "ip6 saddr"
+        prefix = (
+            desired.rate_limit_source_prefix_v4
+            if family == 4
+            else desired.rate_limit_source_prefix_v6
+        )
+        mask = _prefix_mask(family, prefix)
+        rules: list[str] = []
+        for port in sorted(desired.tcp_ports):
+            per_src = desired.tcp_syn_rate_limits.get(port, 0)
+            if per_src > 0:
+                rate = _rate(per_src)
+                rules.append(
+                    f"        tcp dport {port} tcp flags & (syn | ack) == syn "
+                    f"meter ts{family}_{port} {{ {addr_expr} limit rate over {rate}/second "
+                    f"burst {rate} packets }} counter drop"
+                )
+            per_prefix = desired.tcp_syn_agg_rate_limits.get(port, 0)
+            if per_prefix > 0:
+                rate = _rate(per_prefix)
+                rules.append(
+                    f"        tcp dport {port} tcp flags & (syn | ack) == syn "
+                    f"meter tp{family}_{port} {{ {addr_expr} & {mask} limit rate over {rate}/second "
+                    f"burst {rate} packets }} counter drop"
+                )
+            conn_src = desired.tcp_conn_limits.get(port, 0)
+            if conn_src > 0:
+                rules.append(
+                    f"        tcp dport {port} ct state new add @tc{family}s_{port} "
+                    f"{{ {addr_expr} ct count over {conn_src} }} counter drop"
+                )
+            conn_prefix = desired.tcp_conn_prefix_limits.get(port, 0)
+            if conn_prefix > 0:
+                rules.append(
+                    f"        tcp dport {port} ct state new add @tc{family}p_{port} "
+                    f"{{ {addr_expr} & {mask} ct count over {conn_prefix} }} counter drop"
+                )
+            conn_port = desired.tcp_conn_port_limits.get(port, 0)
+            if conn_port > 0:
+                rules.append(
+                    f"        tcp dport {port} ct state new add @tcp_conn_ports "
+                    f"{{ tcp dport ct count over {conn_port} }} counter drop"
+                )
+        return rules
 
-    set {cfg.NFT_TRUSTED_SET4} {{
-        type ipv4_addr
-        flags interval
-    }}
+    def _udp_policy_rules(self, desired: DesiredState, family: int) -> list[str]:
+        addr_expr = "ip saddr" if family == 4 else "ip6 saddr"
+        prefix = (
+            desired.rate_limit_source_prefix_v4
+            if family == 4
+            else desired.rate_limit_source_prefix_v6
+        )
+        mask = _prefix_mask(family, prefix)
+        rules: list[str] = []
+        for port in sorted(desired.udp_ports):
+            per_src = desired.udp_rate_limits.get(port, 0)
+            if per_src > 0:
+                rate = _rate(per_src)
+                rules.append(
+                    f"        udp dport {port} meter us{family}_{port} "
+                    f"{{ {addr_expr} limit rate over {rate}/second burst {rate} packets }} counter drop"
+                )
+            per_prefix = desired.udp_agg_rate_limits.get(port, 0)
+            if per_prefix > 0:
+                rate = _rate(per_prefix)
+                rules.append(
+                    f"        udp dport {port} meter up{family}_{port} "
+                    f"{{ {addr_expr} & {mask} limit rate over {rate} bytes/second "
+                    f"burst {rate} bytes }} counter drop"
+                )
+        return rules
 
-    set {cfg.NFT_TRUSTED_SET6} {{
-        type ipv6_addr
-        flags interval
-    }}
+    def _render_ruleset(self, desired: DesiredState, *, replace: bool) -> str:
+        has_v4, has_v6 = self._family_flags()
+        trusted_v4 = _collapse_cidrs(sorted(cidr for cidr in desired.trusted_cidrs if ":" not in cidr))
+        trusted_v6 = _collapse_cidrs(sorted(cidr for cidr in desired.trusted_cidrs if ":" in cidr))
+        blocks = [
+            _set_block(_NFT_SCHEMA_MARKER, "mark", []),
+            _set_block(cfg.NFT_TCP_SET, "inet_service", [str(port) for port in sorted(desired.tcp_ports)]),
+            _set_block(cfg.NFT_UDP_SET, "inet_service", [str(port) for port in sorted(desired.udp_ports)]),
+            _set_block(cfg.NFT_SCTP_SET, "inet_service", [str(port) for port in sorted(desired.sctp_ports)]),
+            _set_block(cfg.NFT_TRUSTED_SET4, "ipv4_addr", trusted_v4, interval=True),
+            _set_block(cfg.NFT_TRUSTED_SET6, "ipv6_addr", trusted_v6, interval=True),
+        ]
+        if has_v4 and desired.bogon_filter_enabled:
+            blocks.append(_set_block("bogon_v4", "ipv4_addr", list(_BOGON_V4), interval=True))
+        if has_v6 and desired.bogon_filter_enabled:
+            blocks.append(_set_block("bogon_v6", "ipv6_addr", list(_BOGON_V6), interval=True))
+        if has_v4:
+            blocks.extend(self._tcp_policy_objects(desired, 4))
+        if has_v6:
+            blocks.extend(self._tcp_policy_objects(desired, 6))
+        if any(desired.tcp_conn_port_limits.get(port, 0) > 0 for port in desired.tcp_ports):
+            blocks.append(_set_block("tcp_conn_ports", "inet_service", []))
+            blocks[-1] = blocks[-1].replace("    }", "        flags dynamic\n    }")
 
-    chain input {{
-        type filter hook input priority filter; policy accept;
-        iifname "lo" accept
-        ct state established,related accept
-        ip saddr @{cfg.NFT_TRUSTED_SET4} accept
-        ip6 saddr @{cfg.NFT_TRUSTED_SET6} accept
-        ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept
-        tcp flags & (ack | rst | fin) != 0 accept
-        tcp flags & (syn | ack) == syn tcp dport @{cfg.NFT_TCP_SET} accept
-        udp sport {{ 53, 67, 123, 443, 547 }} accept
-        udp dport @{cfg.NFT_UDP_SET} accept
-        sctp dport @{cfg.NFT_SCTP_SET} accept
-        counter drop
-    }}
-}}
-"""
-        _run_nft(["-f", "-"], input_text=script, check=True)
+        rules = [
+            "        iifname \"lo\" counter accept",
+        ]
+        if has_v4:
+            rules.append("        ip frag-off & 0x3fff != 0 counter drop")
+        if has_v6:
+            rules.append("        exthdr frag exists counter drop")
+        if has_v4 and desired.bogon_filter_enabled:
+            rules.append("        ip saddr @bogon_v4 counter drop")
+        if has_v6 and desired.bogon_filter_enabled:
+            rules.append("        ip6 saddr @bogon_v6 counter drop")
 
-    def _apply_lines(self, lines: list[str], dry_run: bool, error_prefix: str) -> None:
-        if not lines:
-            return
-        script = "\n".join(lines) + "\n"
+        rules.extend(
+            [
+                "        tcp sport 0 counter drop",
+                "        tcp dport 0 counter drop",
+                "        tcp flags == 0 counter drop",
+                "        tcp flags & (syn | fin) == (syn | fin) counter drop",
+                "        tcp flags & (syn | rst) == (syn | rst) counter drop",
+                "        tcp flags & (rst | fin) == (rst | fin) counter drop",
+                "        tcp flags & (fin | psh | urg) == (fin | psh | urg) counter drop",
+                "        udp sport 0 counter drop",
+                "        udp dport 0 counter drop",
+                "        udp length < 8 counter drop",
+                "        ct state invalid counter drop",
+                "        ct state established,related counter accept",
+            ]
+        )
+
+        if has_v4:
+            rules.append(
+                f"        ip saddr @{cfg.NFT_TRUSTED_SET4} tcp flags & (syn | ack) == syn counter accept"
+            )
+            rules.extend(self._acl_rules(desired, "tcp", 4))
+        if has_v6:
+            rules.append(
+                f"        ip6 saddr @{cfg.NFT_TRUSTED_SET6} tcp flags & (syn | ack) == syn counter accept"
+            )
+            rules.extend(self._acl_rules(desired, "tcp", 6))
+        if has_v4:
+            rules.extend(self._tcp_policy_rules(desired, 4))
+        if has_v6:
+            rules.extend(self._tcp_policy_rules(desired, 6))
+        rules.extend(
+            [
+                f"        tcp flags & (syn | ack) == syn tcp dport @{cfg.NFT_TCP_SET} counter accept",
+                "        meta l4proto tcp counter drop",
+            ]
+        )
+
+        if has_v4:
+            rules.append(f"        ip saddr @{cfg.NFT_TRUSTED_SET4} udp dport @{cfg.NFT_UDP_SET} counter accept")
+            rules.extend(self._acl_rules(desired, "udp", 4))
+        if has_v6:
+            rules.append(f"        ip6 saddr @{cfg.NFT_TRUSTED_SET6} udp dport @{cfg.NFT_UDP_SET} counter accept")
+            rules.extend(self._acl_rules(desired, "udp", 6))
+        if desired.udp_global_byte_rate > 0:
+            rate = _rate(desired.udp_global_byte_rate)
+            rules.append(
+                f"        udp dport @{cfg.NFT_UDP_SET} limit rate over {rate} bytes/second "
+                f"burst {rate} bytes counter drop"
+            )
+        if has_v4:
+            rules.extend(self._udp_policy_rules(desired, 4))
+        if has_v6:
+            rules.extend(self._udp_policy_rules(desired, 6))
+        rules.extend(
+            [
+                f"        udp dport @{cfg.NFT_UDP_SET} counter accept",
+                "        meta l4proto udp counter drop",
+                f"        sctp dport @{cfg.NFT_SCTP_SET} counter accept",
+                "        meta l4proto sctp counter drop",
+            ]
+        )
+
+        icmp_rate = _rate(cfg.XDP_ICMP_RATE_PPS) if cfg.XDP_ICMP_RATE_PPS > 0 else 0
+        icmp_burst = max(1, cfg.XDP_ICMP_BURST_PACKETS)
+        if has_v4:
+            rules.append(
+                "        ip protocol icmp icmp type { destination-unreachable, "
+                "time-exceeded, parameter-problem } counter accept"
+            )
+            rules.append(f"        ip saddr @{cfg.NFT_TRUSTED_SET4} ip protocol icmp counter accept")
+            if icmp_rate:
+                rules.append(
+                    f"        ip protocol icmp icmp type echo-request limit rate over {icmp_rate}/second "
+                    f"burst {icmp_burst} packets counter drop"
+                )
+            rules.append("        ip protocol icmp counter accept")
+        if has_v6:
+            rules.append(f"        ip6 saddr @{cfg.NFT_TRUSTED_SET6} meta l4proto ipv6-icmp counter accept")
+            if icmp_rate:
+                rules.append(
+                    f"        meta l4proto ipv6-icmp icmpv6 type echo-request limit rate over {icmp_rate}/second "
+                    f"burst {icmp_burst} packets counter drop"
+                )
+            rules.append("        meta l4proto ipv6-icmp counter accept")
+
+        if has_v4 and cfg.SIT4_ENDPOINTS:
+            endpoints = ", ".join(sorted(cfg.SIT4_ENDPOINTS))
+            rules.append(f"        ip protocol ipv6 ip saddr {{ {endpoints} }} counter accept")
+            rules.append("        ip protocol ipv6 counter drop")
+
+        if cfg.SLOT_DEFAULT_ACTION == "drop":
+            rules.append("        counter drop")
+        else:
+            rules.append("        counter accept")
+
+        prefix = f"delete table {cfg.NFT_FAMILY} {cfg.NFT_TABLE}\n" if replace else ""
+        body = "\n\n".join(blocks)
+        chain = "\n".join(rules)
+        return (
+            f"{prefix}table {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {{\n"
+            f"{body}\n\n"
+            "    chain input {\n"
+            "        type filter hook input priority filter; policy accept;\n"
+            f"{chain}\n"
+            "    }\n"
+            "}\n"
+        )
+
+    def _install_ruleset(self, desired: DesiredState, *, replace: bool, dry_run: bool = False) -> None:
+        script = self._render_ruleset(desired, replace=replace)
         if dry_run:
-            for line in lines:
+            for line in script.splitlines():
                 log.info("[DRY] nft %s", line)
             return
         try:
             _run_nft(["-f", "-"], input_text=script, check=True)
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.strip() if exc.stderr else str(exc)
-            raise RuntimeError(f"{error_prefix}: {stderr}") from exc
+            raise RuntimeError(f"nftables policy transaction failed: {stderr}") from exc
 
-    def _port_diff_lines(self, set_name: str, to_add: set[int], to_remove: set[int]) -> list[str]:
-        lines: list[str] = []
-        if to_remove:
-            lines.append(
-                f"delete element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {set_name} {_render_nft_ports(to_remove)}"
+    def _ensure_ruleset(self) -> None:
+        result = _run_nft(["list", "table", cfg.NFT_FAMILY, cfg.NFT_TABLE], check=False)
+        exists = result.returncode == 0
+        if exists and all(
+            marker in result.stdout
+            for marker in (
+                f"set {_NFT_SCHEMA_MARKER}",
+                f"set {cfg.NFT_TCP_SET}",
+                f"set {cfg.NFT_UDP_SET}",
+                f"set {cfg.NFT_SCTP_SET}",
+                f"set {cfg.NFT_TRUSTED_SET4}",
+                "chain input",
             )
-        if to_add:
-            lines.append(
-                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {set_name} {_render_nft_ports(to_add)}"
+        ):
+            return
+        bootstrap = DesiredState(bogon_filter_enabled=cfg.BOGON_FILTER_ENABLED)
+        if exists:
+            # Preserve the old admission sets during the v1 -> v2 migration.
+            # The next normal reconcile fills in rate limits and ACL policy,
+            # but active listener/trust state never passes through an empty
+            # generation.
+            bootstrap.tcp_ports = {
+                int(item)
+                for item in self._parse_named_set_elements(result.stdout, cfg.NFT_TCP_SET)
+            }
+            bootstrap.udp_ports = {
+                int(item)
+                for item in self._parse_named_set_elements(result.stdout, cfg.NFT_UDP_SET)
+            }
+            bootstrap.sctp_ports = {
+                int(item)
+                for item in self._parse_named_set_elements(result.stdout, cfg.NFT_SCTP_SET)
+            }
+            bootstrap.trusted_cidrs = set(
+                self._parse_named_set_elements(result.stdout, cfg.NFT_TRUSTED_SET4)
             )
-        return lines
+            bootstrap.trusted_cidrs.update(
+                self._parse_named_set_elements(result.stdout, cfg.NFT_TRUSTED_SET6)
+            )
+        self._install_ruleset(bootstrap, replace=exists)
 
-    def _trusted_diff_lines(self, to_add: set[str], to_remove: set[str]) -> list[str]:
-        lines: list[str] = []
-        remove_v4 = {a for a in to_remove if ":" not in a}
-        remove_v6 = {a for a in to_remove if ":" in a}
-        add_v4 = {a for a in to_add if ":" not in a}
-        add_v6 = {a for a in to_add if ":" in a}
-        if remove_v4:
-            lines.append(
-                f"delete element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET4} {_render_nft_addrs(remove_v4)}"
-            )
-        if remove_v6:
-            lines.append(
-                f"delete element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET6} {_render_nft_addrs(remove_v6)}"
-            )
-        if add_v4:
-            lines.append(
-                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET4} {_render_nft_addrs(add_v4)}"
-            )
-        if add_v6:
-            lines.append(
-                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET6} {_render_nft_addrs(add_v6)}"
-            )
-        return lines
+    def _remember_desired(self, desired: DesiredState) -> None:
+        self._tcp_cache = set(desired.tcp_ports)
+        self._udp_cache = set(desired.udp_ports)
+        self._sctp_cache = set(desired.sctp_ports)
+        self._trusted_cache = set(desired.trusted_cidrs)
+        self._tcp_syn_rate_cache = dict(desired.tcp_syn_rate_limits)
+        self._tcp_syn_agg_rate_cache = dict(desired.tcp_syn_agg_rate_limits)
+        self._tcp_conn_limit_cache = dict(desired.tcp_conn_limits)
+        self._tcp_conn_prefix_limit_cache = dict(desired.tcp_conn_prefix_limits)
+        self._tcp_conn_port_limit_cache = dict(desired.tcp_conn_port_limits)
+        self._udp_rate_cache = dict(desired.udp_rate_limits)
+        self._udp_agg_rate_cache = dict(desired.udp_agg_rate_limits)
+        self._acl_cache = dict(desired.acl_rules)
+        self._bogon_cache = desired.bogon_filter_enabled
+        self._drop_events_cache = desired.drop_events_enabled
+        self._udp_global_byte_rate_cache = desired.udp_global_byte_rate
+        self._policy_signature = _policy_signature(desired)
 
     def apply_reconcile_plan(
         self,
@@ -270,63 +528,16 @@ class NftablesBackend(PortBackend):
         desired_state: DesiredState,
         observed_state: ObservedState | None = None,
     ) -> None:
-        changed = False
-        _ = observed_state  # kernel conntrack handles established flows natively
-
-        for ip_str in sorted(plan.trusted_cidrs_to_add):
-            tag = f" [{cfg.TRUSTED_SRC_IPS[ip_str]}]" if ip_str in cfg.TRUSTED_SRC_IPS else ""
-            log.info("TRUST +%s%s", ip_str, tag)
-            changed = True
-        for ip_str in sorted(plan.trusted_cidrs_to_remove):
-            log.info("TRUST -%s  (removed)", ip_str)
-            changed = True
-
-        for port in sorted(plan.tcp_ports_to_add):
-            tag = f" [{cfg.TCP_PERMANENT[port]}]" if port in cfg.TCP_PERMANENT else ""
-            log.info("TCP +%d%s", port, tag)
-            changed = True
-        for port in sorted(plan.tcp_ports_to_remove):
-            log.info("TCP -%d  (stopped)", port)
-            changed = True
-
-        for port in sorted(plan.udp_ports_to_add):
-            tag = f" [{cfg.UDP_PERMANENT[port]}]" if port in cfg.UDP_PERMANENT else ""
-            log.info("UDP +%d%s", port, tag)
-            changed = True
-        for port in sorted(plan.udp_ports_to_remove):
-            log.info("UDP -%d  (stopped)", port)
-            changed = True
-
-        for port in sorted(plan.sctp_ports_to_add):
-            tag = f" [{cfg.SCTP_PERMANENT[port]}]" if port in cfg.SCTP_PERMANENT else ""
-            log.info("SCTP +%d%s", port, tag)
-            changed = True
-        for port in sorted(plan.sctp_ports_to_remove):
-            log.info("SCTP -%d  (stopped)", port)
-            changed = True
-
-        self._apply_lines(
-            self._port_diff_lines(cfg.NFT_TCP_SET, plan.tcp_ports_to_add, plan.tcp_ports_to_remove)
-            + self._port_diff_lines(cfg.NFT_UDP_SET, plan.udp_ports_to_add, plan.udp_ports_to_remove)
-            + self._port_diff_lines(cfg.NFT_SCTP_SET, plan.sctp_ports_to_add, plan.sctp_ports_to_remove),
-            dry_run,
-            "nftables update failed",
-        )
-        self._apply_lines(
-            self._trusted_diff_lines(plan.trusted_cidrs_to_add, plan.trusted_cidrs_to_remove),
-            dry_run,
-            "nftables trusted-ip update failed",
-        )
-        if dry_run:
+        _ = plan, observed_state  # native conntrack owns established-flow state
+        signature = _policy_signature(desired_state)
+        if signature == self._policy_signature:
+            log.debug("nftables policy up-to-date.")
             return
-        self._tcp_cache.update(plan.tcp_ports_to_add)
-        self._tcp_cache.difference_update(plan.tcp_ports_to_remove)
-        self._udp_cache.update(plan.udp_ports_to_add)
-        self._udp_cache.difference_update(plan.udp_ports_to_remove)
-        self._sctp_cache.update(plan.sctp_ports_to_add)
-        self._sctp_cache.difference_update(plan.sctp_ports_to_remove)
-        self._trusted_cache.update(plan.trusted_cidrs_to_add)
-        self._trusted_cache.difference_update(plan.trusted_cidrs_to_remove)
 
-        if not changed:
-            log.debug("Whitelist up-to-date.")
+        # A single nft batch validates the complete candidate and commits it
+        # atomically.  If parsing or kernel validation fails, the old table is
+        # retained by the nftables transaction engine.
+        self._install_ruleset(desired_state, replace=True, dry_run=dry_run)
+        if not dry_run:
+            self._remember_desired(desired_state)
+            log.info("Applied complete nftables fallback policy transaction.")

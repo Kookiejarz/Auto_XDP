@@ -102,13 +102,16 @@ class AdminCliTests(unittest.TestCase):
                 calls.append(list(cmd))
                 return subprocess.CompletedProcess(cmd, 0, "", "")
 
-            with mock.patch("auto_xdp.admin_cli.subprocess.run", side_effect=fake_run):
+            with mock.patch("auto_xdp.admin_cli.subprocess.run", side_effect=fake_run), \
+                 mock.patch("auto_xdp.admin_cli._transactional_file_prog_swap") as swap:
                 rc = admin_cli.main(
                     [
                         "--config",
                         str(config_path),
                         "--bpf-pin-dir",
                         str(bpf_pin_dir),
+                        "--install-dir",
+                        str(root),
                         "--handlers-dir",
                         str(handlers_dir),
                         "slot",
@@ -118,14 +121,110 @@ class AdminCliTests(unittest.TestCase):
                 )
 
             self.assertEqual(rc, 0)
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 1)
             self.assertIn("slot_ctx_map", calls[0])
             self.assertIn("sctp_whitelist", calls[0])
             self.assertIn("sctp_conntrack", calls[0])
-            self.assertEqual(calls[1][:5], ["bpftool", "map", "update", "pinned", str(bpf_pin_dir / "proto_handlers")])
+            swap.assert_called_once()
+            self.assertEqual(swap.call_args.args[0], bpf_pin_dir / "proto_handlers")
+            self.assertEqual(swap.call_args.args[1], 132)
             text = config_path.read_text()
             self.assertIn('[slots]', text)
             self.assertIn('enabled = ["sctp"]', text)
+
+    def test_file_handler_swap_keeps_old_pin_until_verified_commit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            map_path = root / "proto_handlers"
+            live_pin = root / "proto_47"
+            candidate_pin = root / "proto_47_next"
+            map_path.touch()
+            live_pin.write_text("old")
+            candidate_pin.write_text("new")
+            active = {47: 1}
+            operations: list[str] = []
+
+            def prog_id(path: Path) -> int:
+                return 1 if path.read_text() == "old" else 2
+
+            def update(_map: Path, key: int, pin: Path) -> None:
+                operations.append(f"update:{pin.read_text()}")
+                active[key] = prog_id(pin)
+
+            with mock.patch.object(admin_cli, "_pinned_program_id", side_effect=prog_id), \
+                 mock.patch.object(admin_cli, "_prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
+                 mock.patch.object(admin_cli, "_prog_array_update", side_effect=update):
+                admin_cli._transactional_file_prog_swap(map_path, 47, candidate_pin, live_pin)
+
+            self.assertEqual(active[47], 2)
+            self.assertEqual(live_pin.read_text(), "new")
+            self.assertFalse(candidate_pin.exists())
+            self.assertEqual(operations, ["update:new"])
+            self.assertFalse(list(root.glob("proto_47_rollback_*")))
+
+    def test_file_handler_swap_restores_old_program_when_verification_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            map_path = root / "proto_handlers"
+            live_pin = root / "proto_50"
+            candidate_pin = root / "proto_50_next"
+            map_path.touch()
+            live_pin.write_text("old")
+            candidate_pin.write_text("new")
+            active = {50: 1}
+            updates: list[int] = []
+
+            def prog_id(path: Path) -> int:
+                return 1 if path.read_text() == "old" else 2
+
+            def update(_map: Path, key: int, pin: Path) -> None:
+                active[key] = prog_id(pin)
+                updates.append(active[key])
+
+            verifies = [RuntimeError("candidate mismatch"), None]
+            with mock.patch.object(admin_cli, "_pinned_program_id", side_effect=prog_id), \
+                 mock.patch.object(admin_cli, "_prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
+                 mock.patch.object(admin_cli, "_prog_array_update", side_effect=update), \
+                 mock.patch.object(admin_cli, "_verify_prog_array_entry", side_effect=verifies):
+                with self.assertRaisesRegex(RuntimeError, "previous program restored"):
+                    admin_cli._transactional_file_prog_swap(map_path, 50, candidate_pin, live_pin)
+
+            self.assertEqual(active[50], 1)
+            self.assertEqual(updates, [2, 1])
+            self.assertEqual(live_pin.read_text(), "old")
+            self.assertFalse(candidate_pin.exists())
+
+    def test_directory_handler_swap_commits_candidate_then_removes_old_generation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            map_path = root / "tcp_port_handlers"
+            live_dir = root / "443"
+            candidate_dir = root / "443_next"
+            map_path.touch()
+            live_dir.mkdir()
+            candidate_dir.mkdir()
+            (live_dir / "prog").write_text("old")
+            (live_dir / "private_map").write_text("old-map")
+            (candidate_dir / "prog").write_text("new")
+            (candidate_dir / "private_map").write_text("new-map")
+            active = {443: 10}
+
+            def prog_id(path: Path) -> int:
+                return 10 if path.read_text() == "old" else 20
+
+            def update(_map: Path, key: int, pin: Path) -> None:
+                active[key] = prog_id(pin)
+
+            with mock.patch.object(admin_cli, "_pinned_program_id", side_effect=prog_id), \
+                 mock.patch.object(admin_cli, "_prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
+                 mock.patch.object(admin_cli, "_prog_array_update", side_effect=update):
+                admin_cli._transactional_dir_prog_swap(map_path, 443, candidate_dir, live_dir)
+
+            self.assertEqual(active[443], 20)
+            self.assertEqual((live_dir / "prog").read_text(), "new")
+            self.assertEqual((live_dir / "private_map").read_text(), "new-map")
+            self.assertFalse(candidate_dir.exists())
+            self.assertFalse(list(root.glob("443_rollback_*")))
 
     def test_slot_list_excludes_port_handler_candidates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -225,7 +324,18 @@ class AdminCliTests(unittest.TestCase):
             bpf_pin_dir.mkdir()
             bin_dir.mkdir()
 
-            env_config.write_text('IFACES="eth9"\nPREFERRED_BACKEND="auto"\n')
+            runtime_state = root / "runtime-state.json"
+            machine_state = root / "machine-state.json"
+
+            env_config.write_text(
+                'IFACES="eth9"\nPREFERRED_BACKEND="auto"\n'
+                f'RUNTIME_STATE="{runtime_state}"\nMACHINE_STATE="{machine_state}"\n'
+            )
+            runtime_state.write_text(
+                '{"generation":"verified","healthy":true,"xdp_mode":"native",'
+                '"interfaces":{"eth9":{"program_id":77}}}'
+            )
+            machine_state.write_text('{"excluded":{"lo":"loopback"}}')
             (run_state_dir / "backend").write_text("xdp\n")
             (run_state_dir / "xdp_mode").write_text("native\n")
             for path in (
@@ -239,7 +349,10 @@ class AdminCliTests(unittest.TestCase):
 
             (bin_dir / "ip").write_text(
                 "#!/bin/sh\n"
-                "printf '%s\\n' '2: eth9: <BROADCAST> mtu 1500 xdp'\n"
+                "case \"$*\" in\n"
+                "  *'-j -d'*) printf '%s\\n' '[{\"ifname\":\"eth9\",\"xdp\":{\"prog_id\":77}}]' ;;\n"
+                "  *) printf '%s\\n' '2: eth9: <BROADCAST> mtu 1500 xdp' ;;\n"
+                "esac\n"
             )
             (bin_dir / "tc").write_text(
                 "#!/bin/sh\n"
@@ -280,6 +393,9 @@ class AdminCliTests(unittest.TestCase):
             self.assertIn('"backend": "xdp"', output)
             self.assertIn('"interfaces": ["eth9"]', output)
             self.assertIn('"conntrack": {"tcp": 2, "udp": 1}', output)
+            self.assertIn('"generation": "verified"', output)
+            self.assertIn('"healthy": true', output)
+            self.assertIn('"excluded_interfaces": {"lo": "loopback"}', output)
 
     def test_exclude_port_commands_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
