@@ -32,7 +32,7 @@ import time
 
 from auto_xdp.bpf.syscall import obj_get
 from auto_xdp.config import load_toml_config
-from auto_xdp.sock_state import SockStateReader
+from auto_xdp.sock_state import SOCK_STATE_EVENT_SIZE, SockStateReader
 
 # paths & defaults
 
@@ -297,9 +297,15 @@ def decode_event(raw: bytes) -> dict | None:
 class RingBufReader:
     """Consumes a pinned BPF_MAP_TYPE_RINGBUF via mmap."""
 
-    def __init__(self, pin_path: str, max_entries: int = RINGBUF_MAX_ENTRIES) -> None:
+    def __init__(
+        self,
+        pin_path: str,
+        max_entries: int = RINGBUF_MAX_ENTRIES,
+        event_size: int = _PKT_EVENT_SIZE,
+    ) -> None:
         self._max = max_entries
         self._mask = max_entries - 1
+        self._event_size = event_size
         self._fd = obj_get(pin_path)
 
         # Consumer page: read+write — we store the consumer position here.
@@ -336,7 +342,7 @@ class RingBufReader:
                 break
 
             data_len = hdr & ~(_BUSY_BIT | _DISCARD_BIT)
-            if not (hdr & _DISCARD_BIT) and data_len == _PKT_EVENT_SIZE:
+            if not (hdr & _DISCARD_BIT) and data_len == self._event_size:
                 yield bytes(self._data[off + _HDR_SZ: off + _HDR_SZ + data_len])
 
             cpos += _HDR_SZ + ((data_len + 7) & ~7)
@@ -674,7 +680,11 @@ def main() -> None:
 
     ss_reader: SockStateReader | None = None
     try:
-        ss_rb = RingBufReader(args.sock_state_rb, SOCK_STATE_RB_MAX_ENTRIES)
+        ss_rb = RingBufReader(
+            args.sock_state_rb,
+            SOCK_STATE_RB_MAX_ENTRIES,
+            SOCK_STATE_EVENT_SIZE,
+        )
         ss_reader = SockStateReader(ss_rb)
         log.info("sock_state_rb opened; port_change events enabled.")
     except (OSError, FileNotFoundError):

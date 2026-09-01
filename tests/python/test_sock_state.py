@@ -66,6 +66,17 @@ import pkt_relay as relay_mod
 
 class TestRelayBroadcastPortChange(unittest.TestCase):
 
+    def test_ringbuf_reader_accepts_sock_state_record_size(self):
+        raw = _make_raw(port=45683)
+        reader = relay_mod.RingBufReader.__new__(relay_mod.RingBufReader)
+        reader._mask = 63
+        reader._event_size = SOCK_STATE_EVENT_SIZE
+        reader._consumer = bytearray(8)
+        reader._producer = bytearray(struct.pack("<Q", 24))
+        reader._data = bytearray(struct.pack("<II", len(raw), 0) + raw + b"\0" * 40)
+
+        self.assertEqual(list(reader.drain()), [raw])
+
     def _make_relay(self):
         rb = mock.MagicMock()
         rb.drain.return_value = iter([])
