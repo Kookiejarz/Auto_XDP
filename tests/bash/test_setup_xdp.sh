@@ -617,11 +617,14 @@ test_xdp_maps_ready_requires_all_expected_pins() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
-    local tmpdir map_name
+    local tmpdir map_name candidate
     tmpdir=$(mktemp -d)
     BPF_PIN_DIR="$tmpdir"
 
-    map_name=$(xdp_required_map_names | head -n 1)
+    map_name=""
+    while IFS= read -r candidate; do
+        [[ -n "$map_name" ]] || map_name="$candidate"
+    done < <(xdp_required_map_names)
     [[ -n "$map_name" ]] || {
         printf 'expected shared XDP map manifest to be readable\n'
         return 1
@@ -2389,6 +2392,23 @@ test_install_packages_succeeds_on_non_apt_managers() (
             return 1
         }
     done
+)
+
+test_install_bpftool_apt_replaces_unusable_wrapper() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local installed=0 output
+    PKG_MANAGER="apt-get"
+    bpftool() { [[ $installed -eq 1 ]]; }
+    as_root() {
+        output="$*"
+        installed=1
+    }
+    pkg_install_optional() { return 1; }
+
+    install_bpftool_apt || return 1
+    assert_contains "$output" "apt-get install -y -qq bpftool"
 )
 
 test_ensure_curses_installs_opensuse_capability() (

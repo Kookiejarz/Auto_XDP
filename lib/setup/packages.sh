@@ -107,11 +107,17 @@ optional_package_list_for_manager() {
 }
 
 install_bpftool_apt() {
-    command -v bpftool &>/dev/null && return 0
-    if as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool 2>/dev/null; then
+    _tool_present bpftool && return 0
+    if as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool 2>/dev/null \
+            && _tool_present bpftool; then
         return 0
     fi
-    pkg_install_optional "linux-tools-$(uname -r)" linux-tools-common
+    local package
+    for package in "linux-tools-$(uname -r)" linux-tools-azure linux-tools-common; do
+        pkg_install_optional "$package"
+        _tool_present bpftool && return 0
+    done
+    return 1
 }
 
 enable_rpm_build_repos() {
@@ -228,7 +234,8 @@ PY
 }
 
 _tool_present() {
-    command -v "$1" &>/dev/null
+    command -v "$1" &>/dev/null || return 1
+    [[ "$1" != "bpftool" ]] || bpftool version >/dev/null 2>&1
 }
 
 # One checklist line per tool: ✓ when present, ✗ when missing. Missing tools
