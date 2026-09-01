@@ -79,7 +79,9 @@ class TestRelayBroadcastPortChange(unittest.TestCase):
             libc.syscall.return_value = 42
             self.assertEqual(relay_mod.attach_tracepoint("/prog", "sock/tp"), [42])
 
-        ioctl.assert_any_call(42, relay_mod._PERF_EVENT_IOC_SET_BPF, 41)
+            attr = bytes(libc.syscall.call_args.args[1]._obj)
+            self.assertEqual(struct.unpack_from("<IIQ", attr), (2, 128, 123))
+            ioctl.assert_any_call(42, relay_mod._PERF_EVENT_IOC_SET_BPF, 41)
 
     def test_ringbuf_reader_accepts_sock_state_record_size(self):
         raw = _make_raw(port=45683)
