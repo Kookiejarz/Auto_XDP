@@ -486,7 +486,7 @@ PartOf=${SERVICE_NAME}.service
 [Service]
 Type=simple
 Environment=PYTHONPATH=${CURRENT_LINK}/python
-ExecStart=${CURRENT_LINK}/pkt_relay.py --config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf
+ExecStart=${CURRENT_LINK}/pkt_relay.py --config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf --wait-for-ringbuf
 Restart=on-failure
 RestartSec=2
 User=root
@@ -528,7 +528,7 @@ EOF_OPENRC
 #!/sbin/openrc-run
 description="Auto XDP packet event relay"
 command="${CURRENT_LINK}/pkt_relay.py"
-command_args="--config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf"
+command_args="--config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf --wait-for-ringbuf"
 command_background=true
 command_user="root:${RELAY_GROUP}"
 pidfile="/run/\${RC_SVCNAME}.pid"

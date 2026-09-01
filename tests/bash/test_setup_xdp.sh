@@ -144,6 +144,7 @@ test_package_lists_cover_all_supported_managers() (
         packages=$(package_list_for_manager)
         optional=$(optional_package_list_for_manager)
         assert_contains "$packages" "curl" "$pm packages" || return 1
+        assert_contains "$packages" "findutils" "$pm packages" || return 1
         assert_contains "$packages" "python" "$pm packages" || return 1
         [[ -n "$optional" ]] || {
             printf 'optional package list empty for [%s]\n' "$pm"
@@ -1818,6 +1819,7 @@ test_install_openrc_service_writes_units_and_enables() (
     assert_file_contains "$OPENRC_INIT_DIR/$SERVICE_NAME" "command=\"${CURRENT_LINK}/auto_xdp_start.sh\"" || return 1
     assert_file_contains "$OPENRC_INIT_DIR/$SERVICE_NAME" 'command_user="root:auto-xdp"' || return 1
     assert_file_contains "$OPENRC_INIT_DIR/$RELAY_SERVICE_NAME" "command=\"${CURRENT_LINK}/pkt_relay.py\"" || return 1
+    assert_file_contains "$OPENRC_INIT_DIR/$RELAY_SERVICE_NAME" "command_args=\"--config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf --wait-for-ringbuf\"" || return 1
     assert_file_contains "$OPENRC_INIT_DIR/$RELAY_SERVICE_NAME" "after ${SERVICE_NAME}" || return 1
     assert_file_contains "$ops_log" "as_root rc-update add xdp-port-sync default" || return 1
     assert_file_contains "$ops_log" "as_root rc-update add auto-xdp-relay default" || return 1
@@ -1872,6 +1874,7 @@ test_relay_service_security_directives() (
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'UMask=0007' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RuntimeDirectory=auto_xdp' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'PartOf=${SERVICE_NAME}.service' || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'ExecStart=${CURRENT_LINK}/pkt_relay.py --config ${TOML_CONFIG} --pin-path ${BPF_PIN_DIR}/pkt_ringbuf --wait-for-ringbuf' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" '.relay-group-created' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'command_user="root:${RELAY_GROUP}"' || return 1
 )
