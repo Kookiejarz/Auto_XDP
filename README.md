@@ -146,6 +146,43 @@ kill %1
 
 After the next policy sync, port 8080 should appear while the server is running and disappear after it stops.
 
+## Real-World Performance Benchmark
+
+This historical benchmark simulates a volumetric UDP flood. An AMD EPYC™ 7Y43 server generated approximately 367k packets per second (188 Mbps) against a 1 vCPU AMD Ryzen 9 3900X instance protected by Auto XDP.
+
+| Metric | Auto XDP off | Auto XDP on | Improvement |
+|---|---:|---:|---:|
+| Softirq CPU usage | **85.9%** | **3.0%** | **~28× reduction** |
+| System responsiveness | Extremely laggy | **Smooth** | Significant |
+| Packet handling | Kernel networking stack | Driver-level drop | — |
+
+The result shows the expected difference between processing the flood in the kernel networking stack and dropping it at the XDP hook. It is a historical measurement, not a current performance guarantee; hardware, kernel, driver, traffic shape, and XDP mode affect the result.
+
+### Test environment
+
+- Attacker: AMD EPYC™ 7Y43 @ 2.55 GHz, approximately 367k PPS / 188 Mbps
+- Target: AMD Ryzen 9 3900X @ 2.0 GHz, 1 vCPU, 1 GB RAM
+- Tool: `pktgen` (Linux kernel packet generator)
+- Attacker and target connected over the public internet
+
+### How to reproduce
+
+Run on a disposable, privileged Linux host. Replace `INTERFACE`, `TARGET_IP`, and `TARGET_MAC` with the target values:
+
+```bash
+modprobe pktgen
+
+PGDEV=/proc/net/pktgen/INTERFACE
+echo "rem_device_all" > /proc/net/pktgen/kpktgend_0
+echo "add_device INTERFACE" > /proc/net/pktgen/kpktgend_0
+
+echo "count 10000000" > "$PGDEV"
+echo "pkt_size 64" > "$PGDEV"
+echo "dst TARGET_IP" > "$PGDEV"
+echo "dst_mac TARGET_MAC" > "$PGDEV"
+echo "clone_skb 100" > "$PGDEV"
+```
+
 ## Important behavior
 
 Auto XDP treats a socket bound to a non-loopback or wildcard address, such as `0.0.0.0` or `::`, as potentially public. Use discovery exclusions or explicit ACLs for private and management services. The [Configuration Reference](https://github.com/Kookiejarz/Auto_XDP/wiki/Configuration-Reference) covers these settings.
@@ -158,6 +195,7 @@ Auto XDP treats a socket bound to a non-loopback or wildcard address, such as `0
 - [Architecture and packet flow](https://github.com/Kookiejarz/Auto_XDP/wiki/Architecture-and-Packet-Flow)
 - [Security policies and rate limits](https://github.com/Kookiejarz/Auto_XDP/wiki/Security-Policies-and-Rate-Limits)
 - [Operations and troubleshooting](https://github.com/Kookiejarz/Auto_XDP/wiki/Operations-and-Troubleshooting)
+- [Performance benchmark](https://github.com/Kookiejarz/Auto_XDP/wiki/Performance-Benchmark)
 - [Testing and development](https://github.com/Kookiejarz/Auto_XDP/wiki/Testing-and-Development)
 - [Uninstall and recovery](https://github.com/Kookiejarz/Auto_XDP/wiki/Uninstall-and-Recovery)
 
