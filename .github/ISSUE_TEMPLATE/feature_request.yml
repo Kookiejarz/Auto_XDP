@@ -1,0 +1,72 @@
+name: Feature request
+description: Propose a focused improvement to Auto XDP
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the idea. Please describe the problem first so we can compare the smallest useful solutions.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Explain the operational pain or missing capability, including who encounters it.
+      placeholder: When running Auto XDP on ..., I cannot ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Example usage
+      description: Show the command, configuration, or workflow you would expect.
+      render: shell
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected area
+      options:
+        - Installer, upgrade, or uninstall
+        - Service or port discovery
+        - XDP/eBPF backend
+        - nftables fallback
+        - CLI or TUI
+        - Custom handlers
+        - Configuration
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include current workarounds or simpler alternatives, if any.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add links, screenshots, prior art, or implementation constraints.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and did not find this request.
+          required: true
+        - label: This request describes one focused problem.
+          required: true

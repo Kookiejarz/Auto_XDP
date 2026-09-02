@@ -2,7 +2,35 @@ name: CI / Full Validation
 
 on:
   push:
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.gif"
+      - "**/*.jpeg"
+      - "**/*.jpg"
+      - "**/*.mov"
+      - "**/*.mp4"
+      - "**/*.png"
+      - "**/*.svg"
+      - "**/*.woff2"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".gitignore"
+      - ".gitattributes"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.gif"
+      - "**/*.jpeg"
+      - "**/*.jpg"
+      - "**/*.mov"
+      - "**/*.mp4"
+      - "**/*.png"
+      - "**/*.svg"
+      - "**/*.woff2"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".gitignore"
+      - ".gitattributes"
+      - "LICENSE"
   workflow_dispatch:
 
 permissions:
