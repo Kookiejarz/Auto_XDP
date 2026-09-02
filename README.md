@@ -1,9 +1,8 @@
 # Auto XDP
 
 **Automatically keep a Linux host's firewall policy aligned with the services actually listening on it.**
-
 <p align="center">
-  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki"><strong>📑 Manuals & Wiki<strong></a>
+  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki"><strong>📑 Manuals & Wiki</strong></a>
 </p>
 
 <p align="center">
@@ -70,6 +69,28 @@ Auto XDP is a good fit when a single Linux host needs a default-deny inbound pol
 The installer checks and installs the required toolchain, including `clang`, `llvm`, `libbpf`, `bpftool`, and `iproute2`, on supported distributions. See the [compatibility notes](https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade) before installing on a production host.
 
 ## Installation
+
+### Quick Install
+
+Install the latest published release:
+
+```bash
+(
+  set -e
+  # quick-install-version:start
+  AUTO_XDP_VERSION=v26.8.13a
+  # quick-install-version:end
+  auto_xdp_tmp=$(mktemp -d)
+  trap 'rm -rf "$auto_xdp_tmp"' EXIT
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -sSfL \
+    "https://github.com/Kookiejarz/Auto_XDP/archive/refs/tags/${AUTO_XDP_VERSION}.tar.gz" \
+    | tar -xz -C "$auto_xdp_tmp" --strip-components=1
+  cd "$auto_xdp_tmp"
+  sudo bash setup_xdp.sh
+)
+```
+
+The release archive keeps the installer, build inputs, Python runtime, and handlers on the same tag. For a source install, use the steps below.
 
 ### Install from source
 

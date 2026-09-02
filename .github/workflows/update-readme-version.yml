@@ -16,15 +16,41 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Update, commit and push README version
+      - name: Update, commit and push README Quick Install version
         env:
           NEW_VERSION: ${{ github.event.release.tag_name }}
         run: |
+          set -euo pipefail
           [[ "$NEW_VERSION" =~ ^v[0-9A-Za-z._-]+$ ]]
-          sed -i -E "s|^  AUTO_XDP_VERSION=v[^[:space:]]*$|  AUTO_XDP_VERSION=$NEW_VERSION|" README.md
-          grep -qx "  AUTO_XDP_VERSION=$NEW_VERSION" README.md
+          readme_path="README.md"
+          readme_tmp="$(mktemp)"
+          trap 'rm -f "$readme_tmp"' EXIT
+          awk -v new_release_tag="$NEW_VERSION" '
+            BEGIN { in_version_block = 0; replacements = 0 }
+            /^  # quick-install-version:start$/ {
+              in_version_block = 1
+              print
+              next
+            }
+            /^  # quick-install-version:end$/ {
+              in_version_block = 0
+              print
+              next
+            }
+            in_version_block && /^  AUTO_XDP_VERSION=v[^[:space:]]*$/ {
+              print "  AUTO_XDP_VERSION=" new_release_tag
+              replacements++
+              next
+            }
+            { print }
+            END {
+              if (replacements != 1) exit 1
+            }
+          ' "$readme_path" > "$readme_tmp"
+          mv "$readme_tmp" "$readme_path"
+          grep -q "^  AUTO_XDP_VERSION=$NEW_VERSION$" "$readme_path"
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add README.md
-          git commit -m "docs: update README installation version to $NEW_VERSION" || exit 0
+          git add "$readme_path"
+          git commit -m "Update README Quick Install version to $NEW_VERSION" || exit 0
           git push origin main
