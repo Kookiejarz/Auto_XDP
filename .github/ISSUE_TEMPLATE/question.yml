@@ -1,0 +1,77 @@
+name: Question
+description: Ask about installing, configuring, or using Auto XDP
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ask a specific question about Auto XDP. If something is broken and reproducible, choose the **Bug report** form instead.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe your setup and the result you want.
+      placeholder: I want to expose a service on ... while keeping ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: What do you need help with?
+      description: Ask the specific question and identify where you are stuck.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Include relevant documentation, commands, configuration, and the result you observed.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Related area
+      options:
+        - Installation, upgrade, or uninstall
+        - Service or port discovery
+        - XDP/eBPF backend
+        - nftables fallback
+        - CLI or TUI
+        - Custom handlers
+        - Configuration
+        - Development or testing
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment (if relevant)
+      value: |
+        - Auto XDP version/commit:
+        - Linux distribution:
+        - Kernel (`uname -r`):
+        - Active backend (`sudo axdp backend`):
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output or logs
+      description: Remove IPs, credentials, and other sensitive data before posting.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the README and existing issues first.
+          required: true
+        - label: I removed secrets, credentials, and private infrastructure details.
+          required: true

@@ -6,31 +6,40 @@ labels:
 body:
   - type: markdown
     attributes:
-      value: Thanks for the idea. Please describe the problem first so we can compare the smallest useful solutions.
+      value: |
+        Thanks for the idea. Feature requests work best when they describe a concrete use case and desired outcome. If you need help using Auto XDP, choose the **Question** form instead.
 
   - type: textarea
-    id: problem
+    id: use-case
     attributes:
-      label: What problem would this solve?
-      description: Explain the operational pain or missing capability, including who encounters it.
-      placeholder: When running Auto XDP on ..., I cannot ...
+      label: What are you trying to accomplish?
+      description: Describe the setup, workflow, or use case and who would benefit.
+      placeholder: On hosts with multiple public interfaces, I need to ...
     validations:
       required: true
 
   - type: textarea
-    id: proposal
+    id: limitation
     attributes:
-      label: Proposed solution
-      description: Describe the behavior you want.
+      label: What prevents this today?
+      description: Explain the current behavior, limitation, or workaround and why it is insufficient.
     validations:
       required: true
 
   - type: textarea
-    id: example
+    id: outcome
     attributes:
-      label: Example usage
-      description: Show the command, configuration, or workflow you would expect.
-      render: shell
+      label: What would a successful solution look like?
+      description: Describe the observable result without requiring a particular implementation.
+      placeholder: I should be able to ... while Auto XDP continues to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: approach
+    attributes:
+      label: Suggested approach (optional)
+      description: Share an API, command, configuration example, or implementation idea if you have one.
 
   - type: dropdown
     id: component
@@ -50,16 +59,10 @@ body:
       required: true
 
   - type: textarea
-    id: alternatives
-    attributes:
-      label: Alternatives considered
-      description: Include current workarounds or simpler alternatives, if any.
-
-  - type: textarea
     id: context
     attributes:
       label: Additional context
-      description: Add links, screenshots, prior art, or implementation constraints.
+      description: Add links, screenshots, prior art, or constraints that clarify the request.
 
   - type: checkboxes
     id: checks
