@@ -1,0 +1,110 @@
+name: Bug report
+description: Report a reproducible problem with Auto XDP
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Auto XDP. Search existing issues first.
+
+        **Security vulnerabilities must not be reported here.** Use [private vulnerability reporting](https://github.com/Kookiejarz/Auto_XDP/security/advisories/new).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem and its impact.
+      placeholder: Auto XDP selected the XDP backend, but TCP port 443 remained unreachable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it?
+      description: Include the smallest reliable sequence of commands or configuration changes.
+      placeholder: |
+        1. Install with ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: TCP port 443 should appear in `sudo axdp ports` and accept connections.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected area
+      options:
+        - Installer, upgrade, or uninstall
+        - Service or port discovery
+        - XDP/eBPF backend
+        - nftables fallback
+        - CLI or TUI
+        - Custom handlers
+        - Configuration
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Paste exact values where possible.
+      value: |
+        - Auto XDP version/commit:
+        - Installation method:
+        - Linux distribution:
+        - Kernel (`uname -r`):
+        - Architecture (`uname -m`):
+        - NIC and driver (`sudo ethtool -i <interface>`):
+        - Active backend (`sudo axdp backend`):
+        - Init system (systemd/OpenRC):
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Diagnostics and logs
+      description: Run the relevant commands below and remove IPs, credentials, and other sensitive data before posting.
+      placeholder: |
+        sudo axdp status
+        sudo axdp backend
+        sudo axdp ports
+        sudo journalctl -u xdp-port-sync -u auto-xdp-relay --no-pager -n 200
+      render: shell
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Paste only the relevant parts of config.toml, with secrets and private addresses removed.
+      render: toml
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add screenshots, packet captures, workarounds, or anything else that may help.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed secrets, credentials, and private infrastructure details.
+          required: true
