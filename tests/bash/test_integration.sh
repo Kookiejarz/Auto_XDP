@@ -20,7 +20,6 @@ readonly _PIN_DIR="/sys/fs/bpf/axdp_integ"
 readonly _DEBUG_PIN_DIR="/sys/fs/bpf/axdp_integ_debug"
 readonly _RUN_DIR="/run/axdp_integ"
 readonly _XDP_OBJ="/tmp/axdp_integ_fw.o"
-readonly _TC_OBJ="/tmp/axdp_integ_tc.o"
 
 # ---------------------------------------------------------------------------
 # Prerequisites
@@ -68,16 +67,6 @@ if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
     test_log_error "XDP compile failed"
     exit 1
 fi
-_tc_src="$REPO_ROOT/tc_flow_track.c"
-[[ -f "$_tc_src" ]] || _kernel_unavailable "$_tc_src not found"
-rm -f "$_TC_OBJ"
-if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
-    "${_include_args[@]}" \
-    -c "$_tc_src" -o "$_TC_OBJ"; then
-    test_log_error "tc egress compile failed"
-    exit 1
-fi
-
 # ---------------------------------------------------------------------------
 # Runtime common (xdp_required_map_names, xdp_maps_ready, etc.)
 # ---------------------------------------------------------------------------
@@ -174,8 +163,6 @@ _setup() {
 
 _teardown() {
     ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
-    tc filter del dev "$_VETH" egress pref 49152 handle 1 2>/dev/null || true
-    tc qdisc del dev "$_VETH" clsact 2>/dev/null || true
     nft delete table inet axdp_integ 2>/dev/null || true
     ip netns del "$_NS" 2>/dev/null || true
     ip link del "$_VETH" 2>/dev/null || true
@@ -261,7 +248,7 @@ if actual != expected:
 
 # Integration traffic uses an RFC1918 veth subnet. Production defaults treat
 # private source addresses as bogons, so disable that independent policy here;
-# otherwise whitelist, ACL, conntrack, and rate-limit assertions never reach
+# otherwise whitelist, ACL, and rate-limit assertions never reach
 # the code paths they claim to exercise.
 _configure_test_runtime() {
     local value_hex value_bytes=72
@@ -382,24 +369,12 @@ _header_define() {
 }
 
 test_loaded_map_abi() {
-    local ct4 ct6 rate4 rate6
-    ct4=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" CT_MAP_MAX_ENTRIES_V4)
-    ct6=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" CT_MAP_MAX_ENTRIES_V6)
+    local rate4 rate6
     rate4=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" RATE_MAP_MAX_ENTRIES_V4)
     rate6=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" RATE_MAP_MAX_ENTRIES_V6)
 
-    _assert_map_abi tcp_ct4 lru_hash 12 8 "$ct4" || return 1
-    _assert_map_abi tcp_ct6 lru_hash 36 8 "$ct6" || return 1
-    _assert_map_abi udp_ct4 lru_hash 12 8 "$ct4" || return 1
-    _assert_map_abi udp_ct6 lru_hash 36 8 "$ct6" || return 1
     _assert_map_abi syn4 array_of_maps 4 4 65536 || return 1
     _assert_map_abi syn6 array_of_maps 4 4 65536 || return 1
-
-    _assert_map_abi tsc4 lru_hash 8 8 "$rate4" || return 1
-    _assert_map_abi tsc6 lru_hash 20 8 "$rate6" || return 1
-    _assert_map_abi tsc_pfx4 lru_hash 8 8 "$rate4" || return 1
-    _assert_map_abi tsc_pfx6 lru_hash 20 8 "$rate6" || return 1
-    _assert_map_abi tsc_port array 4 8 65536 || return 1
 
     _assert_map_abi tcp_port_policies hash 4 32 1024 || return 1
     _assert_map_abi udp_global_rl array 4 40 1 || return 1
@@ -490,19 +465,19 @@ test_reload() {
 
     xdp_maps_ready || { echo "xdp_maps_ready failed with full map set"; return 1; }
 
-    map_id=$(bpftool -j map show pinned "$_PIN_DIR/tcp_ct4" \
+    map_id=$(bpftool -j map show pinned "$_PIN_DIR/tcp_whitelist" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') || {
-        echo "failed to resolve tcp_ct4 map id"; return 1;
+        echo "failed to resolve tcp_whitelist map id"; return 1;
     }
 
-    rm "$_PIN_DIR/tcp_ct4"
-    xdp_maps_ready && { echo "xdp_maps_ready should detect missing tcp_ct4"; return 1; }
+    rm "$_PIN_DIR/tcp_whitelist"
+    xdp_maps_ready && { echo "xdp_maps_ready should detect missing tcp_whitelist"; return 1; }
 
     # Removing a pin does not destroy a map still referenced by the attached
     # program. Re-pin that exact map; loading a second program with pinmaps
     # would collide with every map name that remains in this directory.
-    bpftool map pin id "$map_id" "$_PIN_DIR/tcp_ct4" >/dev/null || {
-        echo "failed to re-pin tcp_ct4 map id $map_id"; return 1;
+    bpftool map pin id "$map_id" "$_PIN_DIR/tcp_whitelist" >/dev/null || {
+        echo "failed to re-pin tcp_whitelist map id $map_id"; return 1;
     }
 
     xdp_maps_ready || { echo "xdp_maps_ready failed after re-pinning"; return 1; }
@@ -536,65 +511,6 @@ test_port_sync() {
     _tcp_probe "$port" && { echo "SYN to non-whitelisted port was not dropped"; return 1; }
 
     return 0
-}
-
-test_udp_reply() {
-    local sport=5100 dport=9901
-    local key_hex val_hex
-
-    # ct_key_v4: sport(__be16) + dport(__be16) + saddr(__be32) + daddr(__be32)
-    key_hex="$(_u16be "$sport") $(_u16be "$dport") $(_ip4be "$_NS_IP") $(_ip4be "$_HOST_IP")"
-    val_hex=$(_u64le "$(_ktime_ns)")
-
-    bpftool map update pinned "$_PIN_DIR/udp_ct4" \
-        key hex $key_hex value hex $val_hex >/dev/null 2>&1
-
-    local recv_file
-    recv_file=$(mktemp)
-
-    _udp_listen_py "$dport" >"$recv_file" 2>/dev/null &
-    local listen_pid=$!
-    sleep 0.15
-
-    # Send UDP from inside ns, bound to the exact source port in the CT entry.
-    ip netns exec "$_NS" python3 - "$_NS_IP" "$sport" "$_HOST_IP" "$dport" <<'PYEOF' 2>/dev/null
-import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind((sys.argv[1], int(sys.argv[2])))
-s.sendto(b'axdp-test', (sys.argv[3], int(sys.argv[4])))
-PYEOF
-
-    sleep 0.4
-    kill "$listen_pid" 2>/dev/null || true
-    wait "$listen_pid" 2>/dev/null || true
-
-    local got
-    got=$(<"$recv_file")
-    rm -f "$recv_file"
-    [[ "$got" == *"axdp-test"* ]] || {
-        echo "UDP reply packet not received (XDP may have dropped it)"
-        return 1
-    }
-}
-
-_attach_tc_egress() {
-    command -v tc >/dev/null 2>&1 || { echo "tc not found"; return 1; }
-    bpftool prog load "$_TC_OBJ" "$_PIN_DIR/tc_egress_prog" type classifier \
-        map name tcp_ct4 pinned "$_PIN_DIR/tcp_ct4" \
-        map name tcp_ct6 pinned "$_PIN_DIR/tcp_ct6" \
-        map name udp_ct4 pinned "$_PIN_DIR/udp_ct4" \
-        map name udp_ct6 pinned "$_PIN_DIR/udp_ct6" \
-        map name sctp_conntrack pinned "$_PIN_DIR/sctp_conntrack" \
-        map name xdp_runtime_cfg pinned "$_PIN_DIR/xdp_runtime_cfg" >/dev/null || {
-        echo "failed to load tc egress program against shared maps"
-        return 1
-    }
-    tc qdisc add dev "$_VETH" clsact 2>/dev/null || true
-    tc filter replace dev "$_VETH" egress pref 49152 handle 1 \
-        bpf direct-action object-pinned "$_PIN_DIR/tc_egress_prog" >/dev/null || {
-        echo "failed to attach tc egress filter"
-        return 1
-    }
 }
 
 _map_has_key() {
@@ -663,7 +579,7 @@ data = json.loads(subprocess.check_output(["bpftool", "-j", "map", "show", "pinn
 if isinstance(data, list):
     data = data[0]
 print(int(data.get("bytes_value", data.get("value_size", 8))))
-' "$_PIN_DIR/tsc4")
+' "$_PIN_DIR/syn4")
     bpftool map create "$inner_pin" type lru_hash key 4 value "$value_bytes" \
         entries 1024 name "s4_$port" flags 0 >/dev/null 2>&1 || {
         echo "inner map create failed"; return 1; }
@@ -679,226 +595,7 @@ print(int(data.get("bytes_value", data.get("value_size", 8))))
     return 0
 }
 
-test_connection_limits() {
-    local source_at=7710 prefix_below=7711 prefix_at=7712
-    local port_below=7713 port_at=7714 disabled=7715
-    local port policy_hex state_hex key_hex
-
-    for port in "$source_at" "$prefix_below" "$prefix_at" \
-            "$port_below" "$port_at" "$disabled"; do
-        bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-            key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1 || return 1
-    done
-
-    # Use a current 100-ms activity tick so the preloaded counter is live for
-    # the real BPF timeout check. The low word is the established count.
-    _connection_state_hex() {
-        local count="$1"
-        python3 -c "
-import struct, time
-tick = (time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 100_000_000) & 0xffffffff
-state = (tick << 32) | ($count & 0xffffffff)
-print(' '.join(f'{byte:02x}' for byte in struct.pack('<Q', state)))
-"
-    }
-
-    _connection_policy_hex() {
-        local source_max="$1" prefix_max="$2" port_max="$3"
-        python3 -c "
-import struct
-values = (0, 0, $source_max, 32, 128, $prefix_max, $port_max, 0)
-print(' '.join(f'{byte:02x}' for byte in struct.pack('<IIIIIIII', *values)))
-"
-    }
-
-    # Per-source cap at the limit drops.
-    policy_hex=$(_connection_policy_hex 2 0 0)
-    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-        key hex $(_u32le "$source_at") value hex $policy_hex >/dev/null 2>&1 || return 1
-    key_hex="$(_ip4be "$_NS_IP") $(_u32le "$source_at")"
-    state_hex=$(_connection_state_hex 2)
-    bpftool map update pinned "$_PIN_DIR/tsc4" \
-        key hex $key_hex value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$source_at" && { echo "SYN at per-source cap was not dropped"; return 1; }
-
-    # Per-prefix cap passes immediately below the limit and drops at it.
-    policy_hex=$(_connection_policy_hex 0 2 0)
-    for port in "$prefix_below" "$prefix_at"; do
-        bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-            key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1 || return 1
-    done
-    key_hex="$(_ip4be "$_NS_IP") $(_u32le "$prefix_below")"
-    state_hex=$(_connection_state_hex 1)
-    bpftool map update pinned "$_PIN_DIR/tsc_pfx4" \
-        key hex $key_hex value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$prefix_below" || { echo "SYN below per-prefix cap was dropped"; return 1; }
-
-    key_hex="$(_ip4be "$_NS_IP") $(_u32le "$prefix_at")"
-    state_hex=$(_connection_state_hex 2)
-    bpftool map update pinned "$_PIN_DIR/tsc_pfx4" \
-        key hex $key_hex value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$prefix_at" && { echo "SYN at per-prefix cap was not dropped"; return 1; }
-
-    # Per-port cap has the same boundary and does not depend on a source key.
-    policy_hex=$(_connection_policy_hex 0 0 2)
-    for port in "$port_below" "$port_at"; do
-        bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-            key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1 || return 1
-    done
-    state_hex=$(_connection_state_hex 1)
-    bpftool map update pinned "$_PIN_DIR/tsc_port" \
-        key hex $(_u32le "$port_below") value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$port_below" || { echo "SYN below per-port cap was dropped"; return 1; }
-
-    state_hex=$(_connection_state_hex 2)
-    bpftool map update pinned "$_PIN_DIR/tsc_port" \
-        key hex $(_u32le "$port_at") value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$port_at" && { echo "SYN at per-port cap was not dropped"; return 1; }
-
-    # A populated counter is inert when all connection-limit policy fields are
-    # zero, which is the public disabled-state contract.
-    policy_hex=$(_connection_policy_hex 0 0 0)
-    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-        key hex $(_u32le "$disabled") value hex $policy_hex >/dev/null 2>&1 || return 1
-    state_hex=$(_connection_state_hex 4294967295)
-    bpftool map update pinned "$_PIN_DIR/tsc_port" \
-        key hex $(_u32le "$disabled") value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$disabled" || { echo "disabled connection cap dropped SYN"; return 1; }
-}
-
-test_connection_counter_cas_contention() {
-    local port=7716 per_worker=8 workers total
-    local ready_file server_pid client_pid state source_count prefix_count port_count
-    ready_file=$(mktemp)
-    workers=$(ip netns exec "$_NS" python3 -c 'import os; print(min(8, len(os.sched_getaffinity(0))))')
-    if [[ "$workers" -lt 2 ]]; then
-        test_log_warning "SKIP CAS contention needs at least two available CPUs"
-        rm -f "$ready_file"
-        return 0
-    fi
-    total=$((workers * per_worker))
-
-    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1 || return 1
-
-    python3 - "$port" "$total" <<'PYEOF' &
-import socket, sys, time
-
-port, total = map(int, sys.argv[1:])
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(("10.99.0.1", port))
-server.listen(total)
-connections = [server.accept()[0] for _ in range(total)]
-time.sleep(4)
-for connection in connections:
-    connection.close()
-server.close()
-PYEOF
-    server_pid=$!
-
-    ip netns exec "$_NS" python3 - "$port" "$workers" "$per_worker" "$ready_file" <<'PYEOF' &
-import multiprocessing as mp
-import os
-import socket
-import sys
-import time
-
-port, workers, per_worker = map(int, sys.argv[1:4])
-ready_file = sys.argv[4]
-cpus = sorted(os.sched_getaffinity(0))[:workers]
-mp.set_start_method("fork")
-start = mp.Event()
-close = mp.Event()
-ready = mp.Queue()
-
-def worker(cpu):
-    os.sched_setaffinity(0, {cpu})
-    start.wait()
-    connections = []
-    for _ in range(per_worker):
-        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        connection.connect(("10.99.0.1", port))
-        connections.append(connection)
-    ready.put(len(connections))
-    close.wait()
-    for connection in connections:
-        connection.close()
-
-processes = [mp.Process(target=worker, args=(cpu,)) for cpu in cpus]
-for process in processes:
-    process.start()
-start.set()
-connected = sum(ready.get(timeout=8) for _ in processes)
-with open(ready_file, "w", encoding="ascii") as output:
-    output.write(str(connected))
-time.sleep(2)
-close.set()
-for process in processes:
-    process.join(5)
-    if process.exitcode != 0:
-        raise SystemExit(f"worker exited with {process.exitcode}")
-PYEOF
-    client_pid=$!
-
-    for ((state = 0; state < 100; state++)); do
-        [[ ! -s "$ready_file" ]] || break
-        sleep 0.05
-    done
-    if [[ "$(cat "$ready_file")" != "$total" ]]; then
-        echo "concurrent clients did not establish all $total connections"
-        kill "$client_pid" "$server_pid" 2>/dev/null || true
-        wait "$client_pid" "$server_pid" 2>/dev/null || true
-        rm -f "$ready_file"
-        return 1
-    fi
-
-    state=$(_map_lookup_u64_offset \
-        "$_PIN_DIR/tsc4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0) || return 1
-    source_count=$((state & 0xFFFFFFFF))
-    state=$(_map_lookup_u64_offset \
-        "$_PIN_DIR/tsc_pfx4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0) || return 1
-    prefix_count=$((state & 0xFFFFFFFF))
-    state=$(_map_lookup_u64_offset "$_PIN_DIR/tsc_port" "$(_u32le "$port")" 0) || return 1
-    port_count=$((state & 0xFFFFFFFF))
-    if [[ "$source_count" -ne "$total" || "$prefix_count" -ne "$total" ||
-          "$port_count" -ne "$total" ]]; then
-        echo "CAS record mismatch expected=$total source=$source_count prefix=$prefix_count port=$port_count"
-        kill "$client_pid" "$server_pid" 2>/dev/null || true
-        wait "$client_pid" "$server_pid" 2>/dev/null || true
-        rm -f "$ready_file"
-        return 1
-    fi
-
-    wait "$client_pid" || return 1
-    wait "$server_pid" || return 1
-    rm -f "$ready_file"
-
-    for ((state = 0; state < 40; state++)); do
-        source_count=$(_map_lookup_u64_offset \
-            "$_PIN_DIR/tsc4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0)
-        prefix_count=$(_map_lookup_u64_offset \
-            "$_PIN_DIR/tsc_pfx4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0)
-        port_count=$(_map_lookup_u64_offset \
-            "$_PIN_DIR/tsc_port" "$(_u32le "$port")" 0)
-        source_count=$((source_count & 0xFFFFFFFF))
-        prefix_count=$((prefix_count & 0xFFFFFFFF))
-        port_count=$((port_count & 0xFFFFFFFF))
-        [[ "$source_count" -ne 0 || "$prefix_count" -ne 0 || "$port_count" -ne 0 ]] || return 0
-        sleep 0.05
-    done
-    echo "CAS close mismatch source=$source_count prefix=$prefix_count port=$port_count"
-    return 1
-}
-
 test_service_restart() {
-    # Seed a conntrack entry before the reload to confirm prog re-pins cleanly.
-    local ct_key ct_val
-    ct_key="$(_u16be 6100) $(_u16be 7704) $(_ip4be "$_NS_IP") $(_ip4be "$_HOST_IP")"
-    ct_val=$(_u64le "$(_ktime_ns)")
-    bpftool map update pinned "$_PIN_DIR/tcp_ct4" \
-        key hex $ct_key value hex $ct_val >/dev/null 2>&1
-
     # Simulate service restart: detach, wipe pins, reload, re-attach.
     ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
     rm -rf "$_PIN_DIR"
@@ -914,54 +611,6 @@ test_service_restart() {
     bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
         key hex $(_u32le 7705) value hex 01 00 00 00 >/dev/null 2>&1
     _tcp_probe 7705 || { echo "traffic not passing after service restart"; return 1; }
-}
-
-test_tc_egress_udp_reply() {
-    local sport=5200 dport=9902
-    local key_hex
-
-    _attach_tc_egress || return 1
-
-    python3 - "$_HOST_IP" "$dport" "$_NS_IP" "$sport" <<'PYEOF' &
-import socket, sys, time
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind((sys.argv[1], int(sys.argv[2])))
-time.sleep(0.2)
-s.sendto(b'axdp-tc', (sys.argv[3], int(sys.argv[4])))
-s.close()
-PYEOF
-    local send_pid=$!
-    sleep 0.4
-    wait "$send_pid" 2>/dev/null || true
-
-    # Reverse tuple recorded by tc: sport=remote, dport=local, saddr=remote, daddr=local.
-    key_hex="$(_u16be "$sport") $(_u16be "$dport") $(_ip4be "$_NS_IP") $(_ip4be "$_HOST_IP")"
-    _map_has_key "$_PIN_DIR/udp_ct4" $key_hex || {
-        echo "tc egress did not insert udp_ct4 reverse tuple"
-        return 1
-    }
-
-    local recv_file
-    recv_file=$(mktemp)
-    _udp_listen_py "$dport" >"$recv_file" 2>/dev/null &
-    local listen_pid=$!
-    sleep 0.15
-    ip netns exec "$_NS" python3 - "$_NS_IP" "$sport" "$_HOST_IP" "$dport" <<'PYEOF' 2>/dev/null
-import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind((sys.argv[1], int(sys.argv[2])))
-s.sendto(b'axdp-tc-reply', (sys.argv[3], int(sys.argv[4])))
-PYEOF
-    sleep 0.4
-    kill "$listen_pid" 2>/dev/null || true
-    wait "$listen_pid" 2>/dev/null || true
-    local got
-    got=$(<"$recv_file")
-    rm -f "$recv_file"
-    [[ "$got" == *"axdp-tc-reply"* ]] || {
-        echo "inbound UDP reply after tc-created conntrack was dropped"
-        return 1
-    }
 }
 
 test_ipv6_whitelist() {

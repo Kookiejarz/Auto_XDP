@@ -1,6 +1,7 @@
 import subprocess
 import tempfile
 import unittest
+import json
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -9,12 +10,107 @@ import pytest
 
 import auto_xdp.admin.main as admin_main
 import auto_xdp.admin_cli as admin_cli
+from auto_xdp import approvals
+from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
 
 
 pytestmark = pytest.mark.component
 
 
 class AdminCliTests(unittest.TestCase):
+    def test_approval_workflow_updates_and_reverts_service_exposure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            store_path = root / "run" / "approval_requests.json"
+            config_path.write_text(
+                "[zones.public]\ninterfaces = []\n"
+                "[subjects.web.resolve]\nsystemd_unit = \"nginx.service\"\n"
+            )
+
+            request = approvals.create_request(
+                store_path,
+                config_path,
+                subject="web",
+                zone="public",
+                protocol="tcp",
+                ports=[443],
+                reason="publish the website",
+                actor="tester",
+            )
+            self.assertEqual(request["status"], "pending")
+            with mock.patch.object(approvals, "reload_daemon"):
+                approved = approvals.approve_request(store_path, config_path, request["id"], actor="approver")
+            self.assertEqual(approved["status"], "approved")
+            self.assertIn("ports = [443]", config_path.read_text())
+            self.assertEqual(approvals.list_grants(config_path)[0]["ports"], [443])
+
+            with mock.patch.object(approvals, "reload_daemon"):
+                revoked = approvals.revoke_request(store_path, config_path, request["id"], actor="approver")
+            self.assertEqual(revoked["status"], "revoked")
+            self.assertIn("ports = []", config_path.read_text())
+            state = json.loads(store_path.read_text())
+            self.assertEqual(state["revision"], 3)
+            self.assertEqual([item["action"] for item in state["history"]], ["request", "approve", "revoke"])
+
+    def test_approval_new_subject_requires_runtime_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            config_path.write_text("[zones.public]\ninterfaces = []\n")
+            with self.assertRaisesRegex(ValueError, "systemd-unit or --process-name"):
+                approvals.create_request(
+                    root / "approval.json",
+                    config_path,
+                    subject="web",
+                    zone="public",
+                    protocol="tcp",
+                    ports=[443],
+                    reason="missing resolver",
+                )
+
+    def test_approval_commands_are_root_only(self):
+        parser = admin_cli.build_parser()
+        self.assertEqual(parser.parse_args(["--config", "/tmp/c.toml", "approval", "list"]).command, "approval")
+        with mock.patch.object(admin_cli.os, "geteuid", return_value=1000), mock.patch("sys.stderr", new=StringIO()):
+            self.assertEqual(admin_cli.main(["--config", "/tmp/c.toml", "approval", "list"]), 77)
+
+    def test_exposure_and_explain_render_policy_decisions(self):
+        endpoint = RuntimeEndpoint(
+            "tcp", "0.0.0.0", 443, "wildcard", "public", "nginx.service", "exact", "systemd-cgroup"
+        )
+        decision = ExposureDecision(endpoint, "allow", "matched explicit exposure grant", "website", "web")
+        args = mock.Mock(config="/tmp/config.toml", iface="", bpf_pin_dir="/tmp/bpf", run_state_dir="/tmp/run", nft_family="inet", nft_table="auto_xdp", endpoint="tcp/443")
+        with mock.patch.object(admin_cli, "_policy_snapshot", return_value=(ObservedState(), DesiredState(exposure_decisions=[decision]))), \
+             mock.patch.object(admin_cli, "_active_backend_name", return_value="xdp"), \
+             mock.patch("sys.stdout", new=StringIO()) as output:
+            self.assertEqual(admin_cli._cmd_exposure(args), 0)
+            exposure = output.getvalue()
+        self.assertIn("PUBLIC", exposure)
+        self.assertIn("443/tcp", exposure)
+        self.assertIn("grant: website.public_https", exposure)
+        self.assertIn("status: allowed", exposure)
+
+        with mock.patch.object(admin_cli, "_policy_snapshot", return_value=(ObservedState(), DesiredState(exposure_decisions=[decision]))), \
+             mock.patch.object(admin_cli, "_active_backend_name", return_value="xdp"), \
+             mock.patch("sys.stdout", new=StringIO()) as output:
+            self.assertEqual(admin_cli._cmd_explain(args), 0)
+            explanation = output.getvalue()
+        self.assertIn("ALLOW", explanation)
+        self.assertIn("0.0.0.0:443", explanation)
+        self.assertIn("nginx.service", explanation)
+        self.assertIn("public/tcp/443", explanation)
+        self.assertIn("XDP", explanation)
+
+    def test_explain_missing_endpoint_is_blocked(self):
+        args = mock.Mock(config="/tmp/config.toml", iface="", bpf_pin_dir="/tmp/bpf", run_state_dir="/tmp/run", nft_family="inet", nft_table="auto_xdp", endpoint="tcp/443")
+        with mock.patch.object(admin_cli, "_policy_snapshot", return_value=(ObservedState(), DesiredState())), \
+             mock.patch.object(admin_cli, "_active_backend_name", return_value="nftables"), \
+             mock.patch("sys.stdout", new=StringIO()) as output:
+            self.assertEqual(admin_cli._cmd_explain(args), 0)
+        self.assertIn("BLOCK", output.getvalue())
+        self.assertIn("not listening", output.getvalue())
+
     def test_human_format_helpers_render_expected_output(self):
         # Migrated from the removed bash helpers (human_bytes / human_bps /
         # format_rate) after axdp delegated stats formatting to admin_cli.
@@ -90,7 +186,6 @@ class AdminCliTests(unittest.TestCase):
             for path in (
                 bpf_pin_dir / "slot_ctx_map",
                 bpf_pin_dir / "sctp_whitelist",
-                bpf_pin_dir / "sctp_conntrack",
                 bpf_pin_dir / "proto_handlers",
             ):
                 path.touch()
@@ -124,7 +219,6 @@ class AdminCliTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertIn("slot_ctx_map", calls[0])
             self.assertIn("sctp_whitelist", calls[0])
-            self.assertIn("sctp_conntrack", calls[0])
             swap.assert_called_once()
             self.assertEqual(swap.call_args.args[0], bpf_pin_dir / "proto_handlers")
             self.assertEqual(swap.call_args.args[1], 132)
@@ -235,10 +329,6 @@ class AdminCliTests(unittest.TestCase):
             handlers_dir.mkdir()
             bpf_pin_dir.mkdir()
             (bpf_pin_dir / "proto_handlers").touch()
-            (handlers_dir / "minecraft_handler.c").write_text(
-                'struct { int x; } tcp_ct4 SEC(".maps");\nSEC("xdp/minecraft") int x(void *ctx) { return 0; }\n'
-            )
-            (handlers_dir / "minecraft_handler.o").touch()
 
             stdout = StringIO()
             with mock.patch("sys.stdout", stdout):
@@ -271,11 +361,6 @@ class AdminCliTests(unittest.TestCase):
             bpf_pin_dir.mkdir()
             (handlers_dir / "gre_handler.o").touch()
             (handlers_dir / "custom_47_demo.o").touch()
-            (handlers_dir / "minecraft_handler.c").write_text(
-                'struct { int x; } tcp_ct4 SEC(".maps");\nSEC("xdp/minecraft") int x(void *ctx) { return 0; }\n'
-            )
-            (handlers_dir / "minecraft_handler.o").touch()
-
             stdout = StringIO()
             with mock.patch("sys.stdout", stdout):
                 rc = admin_cli.main(
@@ -294,8 +379,7 @@ class AdminCliTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             output = stdout.getvalue()
             self.assertIn("Available local port handler files:", output)
-            self.assertIn("minecraft_handler", output)
-            self.assertIn(str(handlers_dir / "minecraft_handler.o"), output)
+            self.assertNotIn("minecraft_handler", output)
             self.assertNotIn("custom_47_demo", output)
             self.assertNotIn(str(handlers_dir / "gre_handler.o"), output)
 
@@ -338,14 +422,7 @@ class AdminCliTests(unittest.TestCase):
             machine_state.write_text('{"excluded":{"lo":"loopback"}}')
             (run_state_dir / "backend").write_text("xdp\n")
             (run_state_dir / "xdp_mode").write_text("native\n")
-            for path in (
-                bpf_pin_dir / "pkt_counters",
-                bpf_pin_dir / "tcp_ct4",
-                bpf_pin_dir / "tcp_ct6",
-                bpf_pin_dir / "udp_ct4",
-                bpf_pin_dir / "udp_ct6",
-            ):
-                path.touch()
+            (bpf_pin_dir / "pkt_counters").touch()
 
             (bin_dir / "ip").write_text(
                 "#!/bin/sh\n"
@@ -354,23 +431,10 @@ class AdminCliTests(unittest.TestCase):
                 "  *) printf '%s\\n' '2: eth9: <BROADCAST> mtu 1500 xdp' ;;\n"
                 "esac\n"
             )
-            (bin_dir / "tc").write_text(
-                "#!/bin/sh\n"
-                "if [ \"$1\" = \"filter\" ]; then\n"
-                "  printf '%s\\n' 'filter protocol all pref 49152 bpf chain 0'\n"
-                "fi\n"
-            )
             (bin_dir / "bpftool").write_text(
-                "#!/bin/sh\n"
-                "case \"$*\" in\n"
-                "  *\"tcp_ct4\"*) printf '%s\\n' '[{\"key\":[1]}]' ;;\n"
-                "  *\"tcp_ct6\"*) printf '%s\\n' '[{\"key\":[1]}]' ;;\n"
-                "  *\"udp_ct4\"*) printf '%s\\n' '[{\"key\":[1]}]' ;;\n"
-                "  *\"udp_ct6\"*) printf '%s\\n' '[]' ;;\n"
-                "  *) printf '%s\\n' '[]' ;;\n"
-                "esac\n"
+                "#!/bin/sh\nprintf '%s\\n' '[]'\n"
             )
-            for name in ("ip", "tc", "bpftool"):
+            for name in ("ip", "bpftool"):
                 (bin_dir / name).chmod(0o755)
 
             with mock.patch.dict("os.environ", {"PATH": f"{bin_dir}:{Path('/usr/bin')}:{Path('/bin')}"}, clear=False), \
@@ -392,7 +456,6 @@ class AdminCliTests(unittest.TestCase):
             output = "".join(call.args[0] for call in write_mock.call_args_list).strip()
             self.assertIn('"backend": "xdp"', output)
             self.assertIn('"interfaces": ["eth9"]', output)
-            self.assertIn('"conntrack": {"tcp": 2, "udp": 1}', output)
             self.assertIn('"generation": "verified"', output)
             self.assertIn('"healthy": true', output)
             self.assertIn('"excluded_interfaces": {"lo": "loopback"}', output)

@@ -202,11 +202,6 @@ test_config_updates_preserve_unrelated_sections() (
 [firewall]
 bogon_filter = false
 
-[permanent_ports]
-tcp = [22]
-udp = []
-sctp = [3868]
-
 [trusted_ips]
 "203.0.113.1/32" = "office"
 
@@ -222,34 +217,7 @@ EOF_CFG
     assert_file_contains "$TOML_CONFIG" "[slots]" || return 1
     assert_file_contains "$TOML_CONFIG" 'default_action = "drop"' || return 1
     assert_file_contains "$TOML_CONFIG" 'enabled = ["sctp", { proto = 47, path = "/tmp/gre_handler.o" }]' || return 1
-    assert_file_contains "$TOML_CONFIG" "sctp = [3868]" || return 1
     assert_file_contains "$TOML_CONFIG" '"198.51.100.8/32" = "office"'
-)
-
-test_run_permanent_supports_sctp_ports() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    TOML_CONFIG="$tmpdir/config.toml"
-    PYTHON_LIB_DIR="$REPO_ROOT"
-    require_root() { :; }
-    reload_daemon() { :; }
-
-    cat >"$TOML_CONFIG" <<'EOF_CFG'
-[permanent_ports]
-tcp = []
-udp = []
-sctp = []
-EOF_CFG
-
-    run_permanent add sctp 3868 >/dev/null || return 1
-
-    local output
-    output=$(run_permanent list) || return 1
-    assert_contains "$output" "SCTP 3868" || return 1
-    assert_file_contains "$TOML_CONFIG" "sctp = [3868]"
 )
 
 _setup_reattach_test_env() {
@@ -261,7 +229,7 @@ _setup_reattach_test_env() {
 
     # satisfy ensure_xdp_loaded preconditions
     touch "$BPF_PIN_DIR/prog" "$XDP_OBJ_PATH"
-    for _m in tcp_whitelist udp_whitelist pkt_counters syn_rate tcp_ct4 tcp_ct6 udp_ct4 udp_ct6; do
+    for _m in tcp_whitelist udp_whitelist pkt_counters syn_rate; do
         touch "$BPF_PIN_DIR/$_m"
     done
 
@@ -275,7 +243,7 @@ _setup_reattach_test_env() {
 
     # stubs for functions from auto_xdp_runtime_common.sh (not loaded in tests)
     ensure_bpffs() { return 0; }
-    cleanup_tc_egress_filter() { return 0; }
+    load_sock_state_tracker() { return 0; }
     xdp_maps_ready() { return 0; }
     load_port_handlers() { return 0; }
     auto_tune_interface_parallelism() { return 0; }
@@ -296,12 +264,6 @@ _setup_reattach_test_env() {
             return 0
         fi
         return 1
-    }
-    TC_RESTORE_STATUS=0
-    TC_RESTORE_CALLED=0
-    _auto_xdp_restore_tc_egress() {
-        TC_RESTORE_CALLED=$((TC_RESTORE_CALLED + 1))
-        return "$TC_RESTORE_STATUS"
     }
     _auto_xdp_record_xdp_state() { return 0; }
 }
@@ -391,34 +353,6 @@ EOF_IP
     assert_eq "$(cat "$RUN_STATE_DIR/xdp_mode")" "generic"
 )
 
-test_ensure_xdp_reattach_restores_tc_and_blocks_fallback_on_failure() (
-    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    _setup_reattach_test_env "$tmpdir"
-    TC_RESTORE_STATUS=1
-
-    cat >"$tmpdir/bin/ip" <<'EOF_IP'
-#!/bin/sh
-args="$*"
-if echo "$args" | grep -q "show.*eth0\\b\\|show dev eth0"; then
-    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\\n    link/ether\\n"
-elif echo "$args" | grep -q "set.*eth0.*xdp "; then
-    exit 0
-fi
-exit 0
-EOF_IP
-    chmod +x "$tmpdir/bin/ip"
-
-    _IFACES=(eth0)
-    ensure_xdp_loaded >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "2" || return 1
-    assert_eq "$TC_RESTORE_CALLED" "1"
-)
-
 test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails() (
     source "$REPO_ROOT/runtime/auto_xdp_start.sh"
     set +e
@@ -461,176 +395,6 @@ test_select_backend_refuses_nftables_while_xdp_remains_attached() (
     local status=$?
     assert_eq "$status" "1" || return 1
     [[ ! -e "$RUN_STATE_DIR/backend" ]]
-)
-
-test_run_backend_reports_runtime_state_and_conntrack_counts() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    RUN_STATE_DIR="$tmpdir/run"
-    BPF_PIN_DIR="$tmpdir/bpf"
-    CONFIG_FILE="$tmpdir/auto_xdp.env"
-    PYTHON_LIB_DIR="$REPO_ROOT"
-    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
-    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
-    printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
-    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" "$BPF_PIN_DIR/udp_ct6"
-    cat >"$CONFIG_FILE" <<'EOF_CFG'
-IFACES="eth9"
-PREFERRED_BACKEND="auto"
-EOF_CFG
-
-    cat >"$tmpdir/bin/ip" <<'EOF_IP'
-#!/bin/sh
-printf '%s\n' '2: eth9: <BROADCAST> mtu 1500 xdp'
-EOF_IP
-    cat >"$tmpdir/bin/tc" <<'EOF_TC'
-#!/bin/sh
-if [ "$1" = "filter" ]; then
-  printf '%s\n' 'filter protocol all pref 49152 bpf chain 0'
-fi
-EOF_TC
-    cat >"$tmpdir/bin/bpftool" <<EOF_BPF
-#!/bin/sh
-case "\$*" in
-  *"tcp_ct4"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[2,0,0,0,0,81,1,187]}]'
-    ;;
-  *"udp_ct6"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
-    ;;
-  *)
-    printf '%s\n' '[]'
-    ;;
-esac
-EOF_BPF
-    chmod +x "$tmpdir/bin/ip" "$tmpdir/bin/tc" "$tmpdir/bin/bpftool"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-    IFACE=""
-    BACKEND=""
-
-    local output
-    output=$(run_backend) || return 1
-    assert_contains "$output" "Backend   : xdp" || return 1
-    assert_contains "$output" "XDP mode  : native" || return 1
-    assert_contains "$output" "XDP attach: eth9=native" || return 1
-    assert_contains "$output" "tc egress : eth9=attached" || return 1
-    assert_contains "$output" "Conntrack : tcp=2 udp=1"
-)
-
-test_run_backend_json_reports_runtime_state_and_conntrack_counts() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    RUN_STATE_DIR="$tmpdir/run"
-    BPF_PIN_DIR="$tmpdir/bpf"
-    CONFIG_FILE="$tmpdir/auto_xdp.env"
-    PYTHON_LIB_DIR="$REPO_ROOT"
-    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
-    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
-    printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
-    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" "$BPF_PIN_DIR/udp_ct6"
-    cat >"$CONFIG_FILE" <<'EOF_CFG'
-IFACES="eth9"
-PREFERRED_BACKEND="auto"
-EOF_CFG
-
-    cat >"$tmpdir/bin/ip" <<'EOF_IP'
-#!/bin/sh
-printf '%s\n' '2: eth9: <BROADCAST> mtu 1500 xdp'
-EOF_IP
-    cat >"$tmpdir/bin/tc" <<'EOF_TC'
-#!/bin/sh
-if [ "$1" = "filter" ]; then
-  printf '%s\n' 'filter protocol all pref 49152 bpf chain 0'
-fi
-EOF_TC
-    cat >"$tmpdir/bin/bpftool" <<EOF_BPF
-#!/bin/sh
-case "\$*" in
-  *"tcp_ct4"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[2,0,0,0,0,81,1,187]}]'
-    ;;
-  *"udp_ct6"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
-    ;;
-  *)
-    printf '%s\n' '[]'
-    ;;
-esac
-EOF_BPF
-    chmod +x "$tmpdir/bin/ip" "$tmpdir/bin/tc" "$tmpdir/bin/bpftool"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-
-    local output
-    output=$(run_backend --json) || return 1
-    python3 - "$output" <<'PY'
-import json
-import sys
-
-data = json.loads(sys.argv[1])
-assert data["backend"] == "xdp"
-assert data["preferred_backend"] == "auto"
-assert data["interfaces"] == ["eth9"]
-assert data["xdp_mode"] == "native"
-assert data["xdp_attach"] == {"eth9": "native"}
-assert data["tc_egress"] == {"eth9": "attached"}
-assert data["conntrack"] == {"tcp": 2, "udp": 1}
-PY
-)
-
-test_run_conntrack_summarizes_destination_ports() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    INSTALL_DIR="$tmpdir/install"
-    PYTHON_LIB_DIR="$REPO_ROOT"
-    TOML_CONFIG="$tmpdir/config.toml"
-    mkdir -p "$BPF_PIN_DIR" "$INSTALL_DIR" "$tmpdir/bin"
-    touch "$TOML_CONFIG"
-    # New split maps: ct_key_v4 (12 bytes), ct_key_v6 (36 bytes)
-    # ct_key_v4 layout: sport[2] dport[2] saddr[4] daddr[4]
-    # ct_key_v6 layout: sport[2] dport[2] saddr[16] daddr[16]
-    touch "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" \
-          "$BPF_PIN_DIR/udp_ct4" "$BPF_PIN_DIR/udp_ct6"
-
-    cat >"$tmpdir/bin/bpftool" <<EOF_BPF
-#!/bin/sh
-case "\$*" in
-  *"tcp_ct4"*)
-    printf '%s\n' '[{"key":[0,80,0,22,1,2,3,4,5,6,7,8]},{"key":[0,82,1,187,1,2,3,4,5,6,7,8]}]'
-    ;;
-  *"tcp_ct6"*)
-    printf '%s\n' '[{"key":[0,80,0,22,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2]}]'
-    ;;
-  *"udp_ct4"*)
-    printf '%s\n' '[{"key":[0,53,0,53,1,2,3,4,5,6,7,8]}]'
-    ;;
-  *)
-    printf '%s\n' '[]'
-    ;;
-esac
-EOF_BPF
-    chmod +x "$tmpdir/bin/bpftool"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-
-    local output
-    output=$(run_conntrack tcp --limit 2) || return 1
-    assert_contains "$output" "TCP conntrack:" || return 1
-    assert_contains "$output" "dport 22" || return 1
-    assert_contains "$output" "ipv4=1" || return 1
-    assert_contains "$output" "ipv6=1" || return 1
-    assert_contains "$output" "total=3"
 )
 
 test_cli_help_runs_without_runtime_state() (
@@ -702,10 +466,6 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         esac
         return 0
     }
-    tc() {
-        printf 'tc %s\n' "$*" >>"$ops_log"
-        return 0
-    }
     nft() {
         printf 'nft %s\n' "$*" >>"$ops_log"
         case "$*" in
@@ -733,8 +493,6 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         }
     done
 
-    assert_file_contains "$ops_log" \
-        "tc filter del dev eth0 egress protocol all pref 49152 handle 1 bpf" || return 1
     assert_file_contains "$ops_log" "ip link set dev eth1 xdpgeneric off" || return 1
     assert_file_contains "$ops_log" "groupdel auto-xdp" || return 1
     if grep -q "qdisc del" "$ops_log"; then
@@ -851,7 +609,6 @@ test_slot_load_sctp_reuses_shared_maps() (
     touch \
         "$BPF_PIN_DIR/slot_ctx_map" \
         "$BPF_PIN_DIR/sctp_whitelist" \
-        "$BPF_PIN_DIR/sctp_conntrack" \
         "$BPF_PIN_DIR/proto_handlers" \
         "$INSTALL_DIR/handlers/sctp_handler.o"
     cat >"$TOML_CONFIG" <<'EOF_CFG'
@@ -881,7 +638,6 @@ EOF_BPFSH
 
     assert_file_contains "$tmpdir/bpftool.log" "map name slot_ctx_map pinned $BPF_PIN_DIR/slot_ctx_map" || return 1
     assert_file_contains "$tmpdir/bpftool.log" "map name sctp_whitelist pinned $BPF_PIN_DIR/sctp_whitelist" || return 1
-    assert_file_contains "$tmpdir/bpftool.log" "map name sctp_conntrack pinned $BPF_PIN_DIR/sctp_conntrack"
 )
 
 test_slot_load_custom_c_compiles_and_persists_object_path() (

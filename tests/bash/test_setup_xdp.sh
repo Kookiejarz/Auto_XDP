@@ -417,7 +417,6 @@ test_write_config_enables_queue_auto_tuning() (
     PYTHON3_BIN="/usr/bin/python3"
     BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
     XDP_OBJ_INSTALLED="/tmp/xdp_firewall.o"
-    TC_OBJ_INSTALLED="/tmp/tc_flow_track.o"
     BPF_HELPER_INSTALLED="/tmp/auto_xdp_bpf_helpers.py"
     INSTALL_DIR="/tmp/auto_xdp"
     CURRENT_LINK="/tmp/auto_xdp"
@@ -709,152 +708,6 @@ test_xdp_required_map_fallback_matches_manifest() (
     diff -u \
         <(sed 's/#.*//; /^[[:space:]]*$/d' "$REPO_ROOT/auto_xdp/xdp_required_maps.txt") \
         <(xdp_required_map_names)
-)
-
-test_load_tc_egress_program_reuses_sctp_conntrack_map() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    TC_OBJ_INSTALLED="$tmpdir/tc_flow_track.o"
-    IFACE="eth9"
-    IFACES=("eth9")
-    mkdir -p "$BPF_PIN_DIR" "$tmpdir/bin"
-    touch "$TC_OBJ_INSTALLED" \
-        "$BPF_PIN_DIR/tcp_ct4" \
-        "$BPF_PIN_DIR/tcp_ct6" \
-        "$BPF_PIN_DIR/udp_ct4" \
-        "$BPF_PIN_DIR/udp_ct6" \
-        "$BPF_PIN_DIR/sctp_conntrack"
-
-    cat >"$tmpdir/bin/bpftool" <<EOF_BPFSH
-#!/bin/sh
-printf '%s\n' "\$*" >> "$tmpdir/bpftool.log"
-exit 0
-EOF_BPFSH
-    cat >"$tmpdir/bin/tc" <<EOF_TCSH
-#!/bin/sh
-printf '%s\n' "\$*" >> "$tmpdir/tc.log"
-exit 0
-EOF_TCSH
-    chmod +x "$tmpdir/bin/bpftool" "$tmpdir/bin/tc"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-    load_tc_egress_program || return 1
-
-    assert_file_contains "$tmpdir/bpftool.log" "map name sctp_conntrack pinned $BPF_PIN_DIR/sctp_conntrack"
-    assert_file_contains "$tmpdir/tc.log" \
-        "filter replace dev eth9 egress pref 49152 handle 1 bpf direct-action"
-)
-
-test_tc_switch_failure_restores_previous_filter() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    TC_OBJ_INSTALLED="$tmpdir/tc_flow_track.o"
-    TC_ROLLBACK_PROG_PATH="$tmpdir/rollback/tc_egress_prog"
-    IFACES=("eth0" "eth1")
-    mkdir -p "$BPF_PIN_DIR" "$tmpdir/rollback"
-    touch "$TC_OBJ_INSTALLED" "$TC_ROLLBACK_PROG_PATH" \
-        "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" \
-        "$BPF_PIN_DIR/udp_ct4" "$BPF_PIN_DIR/udp_ct6" \
-        "$BPF_PIN_DIR/sctp_conntrack"
-
-    bpftool() {
-        printf 'bpftool %s\n' "$*" >> "$tmpdir/ops.log"
-        touch "$BPF_PIN_DIR/tc_egress_prog"
-        return 0
-    }
-    tc() {
-        printf 'tc %s\n' "$*" >> "$tmpdir/ops.log"
-        case "$*" in
-            "filter show dev "*" egress pref "*) printf 'old filter\n'; return 0 ;;
-            "filter replace dev eth1 "*"object-pinned $BPF_PIN_DIR/tc_egress_prog") return 1 ;;
-        esac
-        return 0
-    }
-
-    load_tc_egress_program >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "1" || return 1
-    assert_file_contains "$tmpdir/ops.log" \
-        "filter replace dev eth0 egress pref 49152 handle 1 bpf direct-action object-pinned $TC_ROLLBACK_PROG_PATH" || return 1
-    if grep -q "filter del dev eth0" "$tmpdir/ops.log"; then
-        printf 'tc rollback deleted eth0 instead of restoring its previous filter\n'
-        return 1
-    fi
-)
-
-test_tc_rollback_failure_retains_candidate_program() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    TC_OBJ_INSTALLED="$tmpdir/tc_flow_track.o"
-    TC_ROLLBACK_PROG_PATH="$tmpdir/rollback/tc_egress_prog"
-    IFACES=("eth0" "eth1")
-    mkdir -p "$BPF_PIN_DIR" "$tmpdir/rollback"
-    touch "$TC_OBJ_INSTALLED" "$TC_ROLLBACK_PROG_PATH" \
-        "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" \
-        "$BPF_PIN_DIR/udp_ct4" "$BPF_PIN_DIR/udp_ct6" \
-        "$BPF_PIN_DIR/sctp_conntrack"
-
-    bpftool() { touch "$BPF_PIN_DIR/tc_egress_prog"; return 0; }
-    tc() {
-        case "$*" in
-            "filter show dev "*) printf 'old filter\n'; return 0 ;;
-            "filter replace dev eth1 "*"object-pinned $BPF_PIN_DIR/tc_egress_prog") return 1 ;;
-            "filter replace dev eth0 "*"object-pinned $TC_ROLLBACK_PROG_PATH") return 1 ;;
-        esac
-        return 0
-    }
-
-    load_tc_egress_program >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "1" || return 1
-    assert_eq "$AUTO_XDP_TC_ROLLBACK_COMPLETE" "0" || return 1
-    [[ -e "$BPF_PIN_DIR/tc_egress_prog" ]]
-)
-
-test_transaction_retains_candidate_after_incomplete_tc_rollback() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
-    IFACES=("eth0")
-    mkdir -p "$BPF_PIN_DIR"
-    printf 'old\n' > "$BPF_PIN_DIR/prog"
-    touch "$XDP_OBJ_INSTALLED"
-
-    _auto_xdp_iface_xdp_mode() { printf 'native'; }
-    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
-    xdp_maps_ready() { return 0; }
-    preseed_xdp_candidate_policy() { return 0; }
-    preseed_xdp_candidate_handlers() { return 0; }
-    _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE="native"; return 0; }
-    _auto_xdp_verify_iface_program() { return 0; }
-    _auto_xdp_attach_mode() { return 0; }
-    load_tc_egress_program() {
-        AUTO_XDP_TC_ROLLBACK_COMPLETE=0
-        return 1
-    }
-
-    transactional_reload_xdp >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "1" || return 1
-    assert_eq "$AUTO_XDP_SWITCH_ROLLED_BACK" "0" || return 1
-    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
-    assert_eq "$(cat "${BPF_PIN_DIR}_next/prog")" "new"
 )
 
 test_xdp_attach_mode_uses_atomic_bpftool_overwrite() (
@@ -1211,10 +1064,6 @@ test_transactional_xdp_attach_failure_restores_switched_interfaces() (
         printf 'restore %s %s %s\n' "$1" "$2" "$3" >> "$tmpdir/ops.log"
         return 0
     }
-    load_tc_egress_program() {
-        printf 'unexpected tc switch\n' >> "$tmpdir/ops.log"
-        return 0
-    }
 
     transactional_reload_xdp >/dev/null 2>&1
     local status=$?
@@ -1264,10 +1113,6 @@ test_transactional_xdp_verification_failure_restores_current_interface() (
         printf 'restore %s %s %s\n' "$1" "$2" "$3" >> "$tmpdir/ops.log"
         return 0
     }
-    load_tc_egress_program() {
-        printf 'unexpected tc switch\n' >> "$tmpdir/ops.log"
-        return 0
-    }
 
     transactional_reload_xdp >/dev/null 2>&1
     local status=$?
@@ -1279,56 +1124,6 @@ test_transactional_xdp_verification_failure_restores_current_interface() (
     [[ ! -e "${BPF_PIN_DIR}_next" ]] || return 1
     if grep -q "unexpected tc switch" "$tmpdir/ops.log"; then
         printf 'tc switch ran after XDP verification failure\n'
-        return 1
-    fi
-)
-
-test_transactional_tc_failure_restores_xdp_generation() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
-    IFACES=("eth0")
-    mkdir -p "$BPF_PIN_DIR"
-    printf 'old\n' > "$BPF_PIN_DIR/prog"
-    touch "$XDP_OBJ_INSTALLED"
-
-    _auto_xdp_iface_xdp_mode() { printf 'native'; }
-    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
-    xdp_maps_ready() { return 0; }
-    preseed_xdp_candidate_policy() { return 0; }
-    preseed_xdp_candidate_handlers() { return 0; }
-    _auto_xdp_attach_candidate() {
-        printf 'candidate %s %s\n' "$1" "$2" >> "$tmpdir/ops.log"
-        AUTO_XDP_LAST_ATTACH_MODE="native"
-        return 0
-    }
-    _auto_xdp_verify_iface_program() { return 0; }
-    _auto_xdp_detach_mode() {
-        printf 'detach %s %s\n' "$1" "$2" >> "$tmpdir/ops.log"
-    }
-    _auto_xdp_attach_mode() {
-        printf 'restore %s %s %s\n' "$1" "$2" "$3" >> "$tmpdir/ops.log"
-        return 0
-    }
-    load_tc_egress_program() {
-        printf 'tc failed\n' >> "$tmpdir/ops.log"
-        return 1
-    }
-
-    transactional_reload_xdp >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "1" || return 1
-    assert_eq "$AUTO_XDP_SWITCH_ROLLED_BACK" "1" || return 1
-    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
-    assert_file_contains "$tmpdir/ops.log" "tc failed" || return 1
-    assert_file_contains "$tmpdir/ops.log" \
-        "restore eth0 ${BPF_PIN_DIR}/prog native" || return 1
-    if grep -q "detach eth0 native" "$tmpdir/ops.log"; then
-        printf 'tc failure rollback detached XDP before restoring the previous program\n'
         return 1
     fi
 )
@@ -1353,46 +1148,15 @@ test_transactional_xdp_success_commits_candidate_generation() (
     preseed_xdp_candidate_handlers() { return 0; }
     _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE="native"; return 0; }
     _auto_xdp_verify_iface_program() { return 0; }
-    load_tc_egress_program() { return 0; }
     _auto_xdp_record_xdp_state() { return 0; }
-    seed_existing_tcp_conntrack() { seed_called=$((seed_called + 1)); return 0; }
-    local seed_called=0
 
     transactional_reload_xdp >/dev/null 2>&1 || return 1
     assert_eq "$(cat "$BPF_PIN_DIR/prog")" "new" || return 1
     assert_eq "$AUTO_XDP_SWITCH_MODE" "native" || return 1
-    assert_eq "$seed_called" "1" || return 1
     [[ ! -e "${BPF_PIN_DIR}_rollback" ]] || {
         printf 'rollback generation remained after successful commit\n'
         return 1
     }
-)
-
-test_transactional_xdp_conntrack_seed_failure_keeps_current_generation() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir status
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
-    IFACES=("eth0")
-    mkdir -p "$BPF_PIN_DIR"
-    printf 'old\n' > "$BPF_PIN_DIR/prog"
-    touch "$XDP_OBJ_INSTALLED"
-
-    _auto_xdp_iface_xdp_mode() { printf 'native'; }
-    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
-    xdp_maps_ready() { return 0; }
-    preseed_xdp_candidate_policy() { return 0; }
-    preseed_xdp_candidate_handlers() { return 0; }
-    seed_existing_tcp_conntrack() { return 1; }
-
-    transactional_reload_xdp >/dev/null 2>&1
-    status=$?
-    assert_eq "$status" "1" || return 1
-    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
-    [[ ! -e "${BPF_PIN_DIR}_next" ]]
 )
 
 test_interrupted_xdp_reload_resumes_candidate_generation() (
@@ -1415,17 +1179,12 @@ test_interrupted_xdp_reload_resumes_candidate_generation() (
     }
     _auto_xdp_verify_iface_program() { return 0; }
     _auto_xdp_record_xdp_state() { return 0; }
-    load_tc_egress_program() {
-        printf 'tc %s %s\n' "$BPF_PIN_DIR" "$TC_ROLLBACK_PROG_PATH" >> "$tmpdir/ops.log"
-        return 0
-    }
 
     _auto_xdp_finish_interrupted_reload >/dev/null 2>&1 || return 1
     assert_eq "$(cat "$BPF_PIN_DIR/prog")" "new" || return 1
     assert_eq "$AUTO_XDP_RECOVERY_HANDLED" "1" || return 1
     assert_file_contains "$tmpdir/ops.log" "candidate eth0 ${BPF_PIN_DIR}_next/prog" || return 1
     assert_file_contains "$tmpdir/ops.log" "candidate eth1 ${BPF_PIN_DIR}_next/prog" || return 1
-    assert_file_contains "$tmpdir/ops.log" "tc ${BPF_PIN_DIR}_next ${BPF_PIN_DIR}/tc_egress_prog" || return 1
     [[ ! -e "${BPF_PIN_DIR}_next" && ! -e "${BPF_PIN_DIR}_rollback" ]]
 )
 
@@ -1442,7 +1201,7 @@ test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
     mkdir -p "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next"
     printf 'old\n' > "$BPF_PIN_DIR/prog"
     printf 'stale\n' > "${BPF_PIN_DIR}_next/prog"
-    touch "$BPF_PIN_DIR/tc_egress_prog" "$XDP_OBJ_INSTALLED"
+    touch "$XDP_OBJ_INSTALLED"
 
     _auto_xdp_finish_interrupted_reload() { return 1; }
     _auto_xdp_pinned_prog_id() {
@@ -1470,10 +1229,6 @@ test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
         expected=$(_auto_xdp_pinned_prog_id "$2") || return 1
         [[ "$TEST_ACTUAL_XDP_ID" == "$expected" ]]
     }
-    tc() {
-        printf 'tc %s\n' "$*" >> "$tmpdir/ops.log"
-        return 0
-    }
     bpftool() {
         printf 'fresh\n' > "$BPF_PIN_DIR/prog"
         return 0
@@ -1487,7 +1242,6 @@ test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
         AUTO_XDP_LAST_ATTACH_MODE="native"
         return 0
     }
-    load_tc_egress_program() { return 0; }
     _auto_xdp_record_xdp_state() { return 0; }
 
     if ! transactional_reload_xdp >"$tmpdir/transaction.log" 2>&1; then
@@ -1657,7 +1411,7 @@ test_check_required_tools_step_only_requires_runtime_commands() (
     mkdir -p "$tmpdir/bin"
 
     local cmd
-    for cmd in python3 curl ip tc nft; do
+    for cmd in python3 curl ip nft; do
         cat >"$tmpdir/bin/$cmd" <<'EOF_CMD'
 #!/bin/sh
 exit 0
@@ -1750,7 +1504,6 @@ test_nftables_cutover_restores_detached_interfaces_on_partial_failure() (
         printf 'attach %s %s\n' "$1" "$3" >>"${tmpdir}/events"
     }
     _auto_xdp_verify_iface_program() { return 0; }
-    cleanup_tc_egress_filter() { printf 'unexpected tc cleanup\n'; return 1; }
 
     local output status
     output=$(finalize_nftables_cutover 2>&1)
@@ -1814,33 +1567,6 @@ test_deploy_backend_step_refuses_fallback_with_active_xdp() (
     local status=$?
     assert_eq "$status" "1" || return 1
     assert_eq "$XDP_FALLBACK_BLOCKED" "1"
-)
-
-test_deploy_xdp_removes_tc_filter_from_removed_interface() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
-    touch "$XDP_OBJ_INSTALLED"
-    IFACES=("eth0")
-
-    ensure_bpffs() { return 0; }
-    cleanup_existing_xdp() { XDP_PREVIOUS_IFACES=("eth0" "old0"); }
-    transactional_reload_xdp() { AUTO_XDP_SWITCH_MODE="native"; return 0; }
-    load_sock_state_tracker() { return 0; }
-    auto_tune_interface_parallelism() { return 0; }
-    ip() { printf 'ip %s\n' "$*" >> "$tmpdir/ops.log"; return 0; }
-    tc() { printf 'tc %s\n' "$*" >> "$tmpdir/ops.log"; return 0; }
-
-    deploy_xdp_backend >/dev/null 2>&1 || return 1
-    assert_file_contains "$tmpdir/ops.log" \
-        "tc filter del dev old0 egress pref 49152 handle 1" || return 1
-    if grep -q "tc filter del dev eth0" "$tmpdir/ops.log"; then
-        printf 'tc filter was removed from an active target interface\n'
-        return 1
-    fi
 )
 
 test_install_runtime_service_step_warns_without_init_system() (
@@ -2040,27 +1766,23 @@ test_cleanup_build_artifacts_step_preserves_local_sources() (
     tmpdir=$(mktemp -d)
 
     XDP_OBJ="$tmpdir/xdp_firewall.o"
-    TC_OBJ="$tmpdir/tc_flow_track.o"
     XDP_SRC="$tmpdir/xdp_firewall.c"
-    TC_SRC="$tmpdir/tc_flow_track.c"
     BPF_HELPER_SRC="$tmpdir/auto_xdp_bpf_helpers.py"
     BPF_HELPER_BOOTSTRAP="$tmpdir/bootstrap-helper.py"
     PREFER_REMOTE_SOURCES=0
 
     : >"$XDP_OBJ"
-    : >"$TC_OBJ"
     : >"$XDP_SRC"
-    : >"$TC_SRC"
     : >"$BPF_HELPER_SRC"
     : >"$BPF_HELPER_BOOTSTRAP"
 
     cleanup_build_artifacts_step >/dev/null || return 1
 
-    [[ ! -f "$XDP_OBJ" && ! -f "$TC_OBJ" && ! -f "$BPF_HELPER_BOOTSTRAP" ]] || {
+    [[ ! -f "$XDP_OBJ" && ! -f "$BPF_HELPER_BOOTSTRAP" ]] || {
         printf 'expected objects and bootstrap helper to be removed\n'
         return 1
     }
-    [[ -f "$XDP_SRC" && -f "$TC_SRC" && -f "$BPF_HELPER_SRC" ]] || {
+    [[ -f "$XDP_SRC" && -f "$BPF_HELPER_SRC" ]] || {
         printf 'expected local source files to be preserved\n'
         return 1
     }
@@ -2514,7 +2236,7 @@ test_check_required_tools_step_requires_tar_for_remote_sources() (
     local tmpdir output status cmd
     tmpdir=$(mktemp -d)
     mkdir -p "$tmpdir/bin"
-    for cmd in clang bpftool python3 curl ip tc nft; do
+    for cmd in clang bpftool python3 curl ip nft; do
         printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
         chmod +x "$tmpdir/bin/$cmd"
     done
@@ -2557,7 +2279,7 @@ test_check_required_tools_step_dies_when_install_fails() (
     local tmpdir log status output cmd
     tmpdir=$(mktemp -d)
     mkdir -p "$tmpdir/bin"
-    for cmd in clang python3 curl ip tc nft; do
+    for cmd in clang python3 curl ip nft; do
         printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
         chmod +x "$tmpdir/bin/$cmd"
     done
@@ -2585,7 +2307,7 @@ test_check_required_tools_step_installs_when_bpf_headers_missing() (
     local tmpdir output cmd
     tmpdir=$(mktemp -d)
     mkdir -p "$tmpdir/bin"
-    for cmd in clang bpftool python3 curl tar ip tc nft; do
+    for cmd in clang bpftool python3 curl tar ip nft; do
         printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
         chmod +x "$tmpdir/bin/$cmd"
     done
@@ -2704,7 +2426,7 @@ test_check_update_candidates_cover_installed_sources() (
         }
     done < <(
         printf '%s\n' setup_xdp.sh axdp config.toml xdp_port_sync.py \
-            pkt_relay.py auto_xdp_bpf_helpers.py tc_flow_track.c
+            pkt_relay.py auto_xdp_bpf_helpers.py
         find lib/setup runtime bpf/include handlers auto_xdp \
             \( -name '*.sh' -o -name '*.c' -o -name '*.h' -o -name '*.py' \
                -o -name 'Makefile' -o -name '*.toml' -o -name '*.txt' \) \

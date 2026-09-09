@@ -113,7 +113,7 @@ SOURCE_ROOT="$WORK_DIR/source"
 mkdir -p "$SOURCE_ROOT"
 for source_path in \
     setup_xdp.sh axdp config.toml xdp_port_sync.py pkt_relay.py \
-    auto_xdp_bpf_helpers.py tc_flow_track.c auto_xdp bpf handlers lib runtime; do
+    auto_xdp_bpf_helpers.py auto_xdp bpf handlers lib runtime; do
     cp -a "$REPO_ROOT/$source_path" "$SOURCE_ROOT/"
 done
 sed -i \

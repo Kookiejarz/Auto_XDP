@@ -45,14 +45,8 @@ if [[ $sock_status -ne 0 ]]; then
 fi
 
 XDP_OBJ_INSTALLED="$BUILD_STAGING_DIR/$XDP_OBJ"
-TC_OBJ_INSTALLED="$BUILD_STAGING_DIR/$TC_OBJ"
 [[ -s "$XDP_OBJ_INSTALLED" ]] || {
     echo "[ERROR] missing staged XDP object: $XDP_OBJ_INSTALLED" >&2
-    exit 1
-}
-
-[[ -s "$BUILD_STAGING_DIR/$TC_OBJ" ]] || {
-    echo "[ERROR] missing staged tc object: $BUILD_STAGING_DIR/$TC_OBJ" >&2
     exit 1
 }
 
