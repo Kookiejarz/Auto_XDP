@@ -356,10 +356,6 @@ wait_for_path "$BPF_PIN_DIR/sock_state_prog"
 wait_for_path "$BPF_PIN_DIR/sock_state_rb"
 wait_for_socket "$socket_path"
 
-tc filter show dev "$iface" egress 2>/dev/null \
-    | grep -q 'pref 49152' \
-    || fail "installed TC egress filter is not active on $iface"
-
 test_auto_port_sync_closed_loop
 
 if [[ $systemd_mode -eq 1 ]]; then
@@ -367,4 +363,4 @@ if [[ $systemd_mode -eq 1 ]]; then
     systemctl is-active --quiet auto-xdp-relay
 fi
 
-printf '[INFO] installed runtime: XDP + TC + sock_state + relay passed\n'
+printf '[INFO] installed runtime: XDP + sock_state + relay passed\n'

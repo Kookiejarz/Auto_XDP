@@ -59,7 +59,7 @@ class InstallStateTests(unittest.TestCase):
     def test_machine_state_preserves_each_interfaces_previous_mode(self):
         previous = {
             "interfaces": {
-                "eth0": {"xdp_mode": "native", "last_program_id": 41, "tc_egress": True},
+                "eth0": {"xdp_mode": "native", "last_program_id": 41},
                 "eth1": {"xdp_mode": "generic", "last_program_id": 42},
             }
         }
@@ -115,8 +115,8 @@ class InstallStateTests(unittest.TestCase):
                     "--runtime-state", str(runtime),
                     "--requested-backend", "auto",
                     "--active-backend", "xdp",
-                    "--interface-state", "eth0=native:41:attached",
-                    "--interface-state", "eth1=generic:41:attached",
+                    "--interface-state", "eth0=native:41",
+                    "--interface-state", "eth1=generic:41",
                 ]
             )
             self.assertEqual(rc, 0)

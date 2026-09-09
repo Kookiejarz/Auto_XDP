@@ -14,8 +14,6 @@ from auto_xdp.discovery import (
     DiscoveryError,
     _bind_ip_is_exposed,
     _discovery_exclude_networks,
-    _pack_conntrack_key_raw,
-    _pack_tcp_conntrack_key,
 )
 from auto_xdp.bpf.maps import render_nft_ports as _render_nft_ports
 from auto_xdp import config as cfg
@@ -121,41 +119,6 @@ class FakeTrustedMap:
         self.delete_ops.append((key, dry_run))
         self._active.discard(key)
         return True
-
-    def close(self):
-        self.closed = True
-
-
-class FakeConntrackMap:
-    def __init__(self, active=None):
-        self._active = set(active or [])
-        self.ops = []
-        self.delete_ops = []
-        self.delete_port_ops = []
-        self.lookup_ops = []
-        self.closed = False
-
-    def active_keys(self):
-        return set(self._active)
-
-    def existing_keys(self, keys):
-        wanted = set(keys)
-        self.lookup_ops.append(wanted)
-        return self._active & wanted
-
-    def set(self, key, dry_run=False):
-        self.ops.append((key, dry_run))
-        self._active.add(key)
-        return True
-
-    def delete(self, key, dry_run=False):
-        self.delete_ops.append((key, dry_run))
-        self._active.discard(key)
-        return True
-
-    def delete_dest_ports(self, ports, dry_run=False):
-        self.delete_port_ops.append((set(ports), dry_run))
-        return len(self._active)
 
     def close(self):
         self.closed = True
@@ -319,14 +282,9 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.udp_map = FakePortMap()
         backend.sctp_map = None
         backend.trusted_map = FakeTrustedMap()
-        backend.conntrack_map = FakeConntrackMap()
-        backend.udp_conntrack_map = FakeConntrackMap()
         backend.syn_rate_map = FakeSynRateMap()
         backend.syn_rate_map.fail_set = True
         backend.syn_agg_rate_map = None
-        backend.tcp_conn_limit_map = None
-        backend.tcp_conn_prefix_limit_map = None
-        backend.tcp_conn_port_limit_map = None
         backend.udp_rate_map = None
         backend.udp_agg_rate_map = None
         backend.acl_maps = None
@@ -360,19 +318,13 @@ class XdpPortSyncTests(unittest.TestCase):
             "preferred_backend": cfg.PREFERRED_BACKEND,
             "exclude_loopback": cfg.DISCOVERY_EXCLUDE_LOOPBACK,
             "exclude_bind_cidrs": list(cfg.DISCOVERY_EXCLUDE_BIND_CIDRS),
-            "xdp_conntrack_stale_reconciles": cfg.XDP_CONNTRACK_STALE_RECONCILES,
             "drop_events_enabled": cfg.DROP_EVENTS_ENABLED,
             "syn_agg_by_proc": dict(cfg._SYN_AGG_RATE_BY_PROC),
             "syn_agg_by_service": dict(cfg._SYN_AGG_RATE_BY_SERVICE),
-            "tcp_conn_by_proc": dict(cfg._TCP_CONN_BY_PROC),
-            "tcp_conn_by_service": dict(cfg._TCP_CONN_BY_SERVICE),
             "udp_agg_bytes_by_proc": dict(cfg._UDP_AGG_BYTES_BY_PROC),
             "udp_agg_bytes_by_service": dict(cfg._UDP_AGG_BYTES_BY_SERVICE),
             "rate_limit_source_prefix_v4": cfg.RATE_LIMIT_SOURCE_PREFIX_V4,
             "rate_limit_source_prefix_v6": cfg.RATE_LIMIT_SOURCE_PREFIX_V6,
-            "xdp_tcp_timeout_seconds": cfg.XDP_TCP_TIMEOUT_SECONDS,
-            "xdp_udp_timeout_seconds": cfg.XDP_UDP_TIMEOUT_SECONDS,
-            "xdp_conntrack_refresh_seconds": cfg.XDP_CONNTRACK_REFRESH_SECONDS,
             "xdp_icmp_burst_packets": cfg.XDP_ICMP_BURST_PACKETS,
             "xdp_icmp_rate_pps": cfg.XDP_ICMP_RATE_PPS,
             "xdp_udp_global_window_seconds": cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS,
@@ -395,8 +347,6 @@ class XdpPortSyncTests(unittest.TestCase):
                     "source_cidr_v6": "/64",
                     "syn_agg_by_proc": {"sshd": 16},
                     "syn_agg_by_service": {"ssh": 12},
-                    "tcp_conn_by_proc": {"sshd": 64},
-                    "tcp_conn_by_service": {"ssh": 48},
                     "udp_agg_bytes_by_proc": {"dnsmasq": 6000000},
                     "udp_agg_bytes_by_service": {"domain": 7000000},
                 },
@@ -404,11 +354,7 @@ class XdpPortSyncTests(unittest.TestCase):
                     "enabled": True,
                 },
                 "xdp": {
-                    "conntrack_stale_reconciles": 4,
                     "runtime": {
-                        "tcp_timeout_seconds": 600,
-                        "udp_timeout_seconds": 120,
-                        "conntrack_refresh_seconds": 45,
                         "icmp_burst_packets": 200,
                         "icmp_rate_pps": 50,
                         "udp_global_window_seconds": 2,
@@ -428,16 +374,10 @@ class XdpPortSyncTests(unittest.TestCase):
             )
             self.assertEqual(cfg._SYN_AGG_RATE_BY_PROC, {"sshd": 16})
             self.assertEqual(cfg._SYN_AGG_RATE_BY_SERVICE, {"ssh": 12})
-            self.assertEqual(cfg._TCP_CONN_BY_PROC, {"sshd": 64})
-            self.assertEqual(cfg._TCP_CONN_BY_SERVICE, {"ssh": 48})
             self.assertEqual(cfg._UDP_AGG_BYTES_BY_PROC, {"dnsmasq": 6000000})
             self.assertEqual(cfg._UDP_AGG_BYTES_BY_SERVICE, {"domain": 7000000})
             self.assertEqual(cfg.RATE_LIMIT_SOURCE_PREFIX_V4, 24)
             self.assertEqual(cfg.RATE_LIMIT_SOURCE_PREFIX_V6, 64)
-            self.assertEqual(cfg.XDP_CONNTRACK_STALE_RECONCILES, 4)
-            self.assertEqual(cfg.XDP_TCP_TIMEOUT_SECONDS, 600)
-            self.assertEqual(cfg.XDP_UDP_TIMEOUT_SECONDS, 120)
-            self.assertEqual(cfg.XDP_CONNTRACK_REFRESH_SECONDS, 45)
             self.assertEqual(cfg.XDP_ICMP_BURST_PACKETS, 200)
             self.assertEqual(cfg.XDP_ICMP_RATE_PPS, 50)
             self.assertEqual(cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS, 2)
@@ -450,25 +390,17 @@ class XdpPortSyncTests(unittest.TestCase):
             cfg.PREFERRED_BACKEND = old_values["preferred_backend"]
             cfg.DISCOVERY_EXCLUDE_LOOPBACK = old_values["exclude_loopback"]
             cfg.DISCOVERY_EXCLUDE_BIND_CIDRS[:] = old_values["exclude_bind_cidrs"]
-            cfg.XDP_CONNTRACK_STALE_RECONCILES = old_values["xdp_conntrack_stale_reconciles"]
             cfg.DROP_EVENTS_ENABLED = old_values["drop_events_enabled"]
             cfg._SYN_AGG_RATE_BY_PROC.clear()
             cfg._SYN_AGG_RATE_BY_PROC.update(old_values["syn_agg_by_proc"])
             cfg._SYN_AGG_RATE_BY_SERVICE.clear()
             cfg._SYN_AGG_RATE_BY_SERVICE.update(old_values["syn_agg_by_service"])
-            cfg._TCP_CONN_BY_PROC.clear()
-            cfg._TCP_CONN_BY_PROC.update(old_values["tcp_conn_by_proc"])
-            cfg._TCP_CONN_BY_SERVICE.clear()
-            cfg._TCP_CONN_BY_SERVICE.update(old_values["tcp_conn_by_service"])
             cfg._UDP_AGG_BYTES_BY_PROC.clear()
             cfg._UDP_AGG_BYTES_BY_PROC.update(old_values["udp_agg_bytes_by_proc"])
             cfg._UDP_AGG_BYTES_BY_SERVICE.clear()
             cfg._UDP_AGG_BYTES_BY_SERVICE.update(old_values["udp_agg_bytes_by_service"])
             cfg.RATE_LIMIT_SOURCE_PREFIX_V4 = old_values["rate_limit_source_prefix_v4"]
             cfg.RATE_LIMIT_SOURCE_PREFIX_V6 = old_values["rate_limit_source_prefix_v6"]
-            cfg.XDP_TCP_TIMEOUT_SECONDS = old_values["xdp_tcp_timeout_seconds"]
-            cfg.XDP_UDP_TIMEOUT_SECONDS = old_values["xdp_udp_timeout_seconds"]
-            cfg.XDP_CONNTRACK_REFRESH_SECONDS = old_values["xdp_conntrack_refresh_seconds"]
             cfg.XDP_ICMP_BURST_PACKETS = old_values["xdp_icmp_burst_packets"]
             cfg.XDP_ICMP_RATE_PPS = old_values["xdp_icmp_rate_pps"]
             cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS = old_values["xdp_udp_global_window_seconds"]
@@ -619,7 +551,6 @@ class XdpPortSyncTests(unittest.TestCase):
 
         self.assertEqual(state.tcp, {22, 443})
         self.assertEqual(state.udp, {53})
-        self.assertEqual(len(state.established), 1)
 
     def test_get_listening_ports_filters_configured_exclude_ports(self):
         fake_psutil = types.SimpleNamespace(CONN_LISTEN="LISTEN", CONN_ESTABLISHED="ESTABLISHED")
@@ -652,26 +583,6 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(state.tcp, {22})
         self.assertEqual(state.udp, set())
 
-    def test_sync_once_merges_permanent_ports_and_trusted_ips(self):
-        backend = mock.Mock()
-        state = state_mod.ObservedState(tcp={80}, udp={53}, sctp=set(), established={b"flow"})
-
-        with mock.patch.object(syncer_mod, "get_listening_ports", return_value=state), \
-             mock.patch.object(policy_mod.cfg, "TCP_PERMANENT", {22: "ssh"}), \
-             mock.patch.object(policy_mod.cfg, "UDP_PERMANENT", {123: "ntp"}), \
-             mock.patch.object(policy_mod.cfg, "SCTP_PERMANENT", {3868: "diameter"}), \
-             mock.patch.object(policy_mod.cfg, "TRUSTED_SRC_IPS", {"203.0.113.8/32": "office"}):
-            syncer_mod.sync_once(backend, dry_run=True)
-
-        backend.reconcile.assert_called_once()
-        desired_state, dry_run, observed_state = backend.reconcile.call_args.args
-        self.assertTrue(dry_run)
-        self.assertEqual(observed_state, state)
-        self.assertEqual(desired_state.tcp_ports, {22, 80})
-        self.assertEqual(desired_state.udp_ports, {53, 123})
-        self.assertEqual(desired_state.sctp_ports, {3868})
-        self.assertEqual(desired_state.trusted_cidrs, {"203.0.113.8/32"})
-
     def test_sync_once_keeps_existing_policy_when_discovery_fails(self):
         backend = mock.Mock()
         with mock.patch.object(
@@ -681,42 +592,7 @@ class XdpPortSyncTests(unittest.TestCase):
                 syncer_mod.sync_once(backend, dry_run=False)
         backend.reconcile.assert_not_called()
 
-    def test_ipv4_mapped_ipv6_established_conntrack_key_uses_v4_layout(self):
-        conn = make_conn(
-            family=socket.AF_INET6,
-            conn_type=socket.SOCK_STREAM,
-            status="ESTABLISHED",
-            laddr=make_addr("::ffff:203.0.113.10", 443),
-            raddr=make_addr("::ffff:198.51.100.20", 50000),
-        )
-
-        packed = _pack_tcp_conntrack_key(conn)
-        expected = struct.pack(
-            "!HH4s4s",
-            50000,
-            443,
-            socket.inet_aton("198.51.100.20"),
-            socket.inet_aton("203.0.113.10"),
-        )
-        self.assertEqual(packed, expected)
-        self.assertEqual(len(packed), 12)
-
-    def test_netlink_ipv4_mapped_ipv6_established_key_uses_v4_layout(self):
-        src = socket.inet_pton(socket.AF_INET6, "::ffff:198.51.100.20")
-        dst = socket.inet_pton(socket.AF_INET6, "::ffff:203.0.113.10")
-
-        packed = _pack_conntrack_key_raw(socket.AF_INET6, 443, 50000, dst, src)
-        expected = struct.pack(
-            "!HH4s4s",
-            50000,
-            443,
-            socket.inet_aton("198.51.100.20"),
-            socket.inet_aton("203.0.113.10"),
-        )
-        self.assertEqual(packed, expected)
-        self.assertEqual(len(packed), 12)
-
-    def test_resolve_desired_state_merges_ports_and_policy_targets(self):
+    def test_port_protection_policy_resolves_observed_ports(self):
         observed = state_mod.ObservedState(
             tcp={80, 2222},
             udp={53},
@@ -742,40 +618,27 @@ class XdpPortSyncTests(unittest.TestCase):
                  _SYN_RATE_BY_SERVICE={"ssh": 2},
                  _UDP_RATE_BY_PROC={"named": 5000},
                  _UDP_RATE_BY_SERVICE={"domain": 5000},
-                 TCP_PERMANENT={22: "ssh"},
-                 UDP_PERMANENT={123: "ntp"},
-                 SCTP_PERMANENT={3868: "diameter"},
                  TRUSTED_SRC_IPS={"203.0.113.8/32": "office"},
                  ACL_RULES=[{"proto": "tcp", "cidr": "203.0.113.0/24", "ports": [22, 443]}],
                  BOGON_FILTER_ENABLED=True,
                  RATE_LIMIT_SOURCE_PREFIX_V4=24,
                  RATE_LIMIT_SOURCE_PREFIX_V6=64,
-                 XDP_TCP_TIMEOUT_SECONDS=600.0,
-                 XDP_UDP_TIMEOUT_SECONDS=120.0,
-                 XDP_CONNTRACK_REFRESH_SECONDS=45.0,
                  XDP_ICMP_BURST_PACKETS=200,
                  XDP_ICMP_RATE_PPS=50.0,
                  XDP_UDP_GLOBAL_WINDOW_SECONDS=2.0,
                  XDP_RATE_WINDOW_SECONDS=0.5,
-                 XDP_SYN_TIMEOUT_SECONDS=10.0,
                  XDP_UDP_GLOBAL_BYTE_RATE=124_625_000,
              ):
-            desired = policy_mod.resolve_desired_state(observed)
+            desired = policy_mod._desired_state_for_ports(observed)
 
-        self.assertEqual(desired.tcp_ports, {22, 80, 2222})
-        self.assertEqual(desired.udp_ports, {53, 123})
-        self.assertEqual(desired.sctp_ports, {2905, 3868})
+        self.assertEqual(desired.tcp_ports, {80, 2222})
+        self.assertEqual(desired.udp_ports, {53})
+        self.assertEqual(desired.sctp_ports, {2905})
         self.assertEqual(desired.trusted_cidrs, {"203.0.113.8/32"})
-        # Port 2222: explicit proc (sshd=2). Port 22: ssh=2 ≤ threshold → strict
-        # default tier. Port 80: no match → normal default tier.
+        # Port 2222 has an explicit process limit; port 80 uses the default tier.
         self.assertEqual(desired.tcp_syn_rate_limits.get(2222), 2)
-        self.assertEqual(desired.tcp_syn_rate_limits.get(22), cfg.XDP_DEFAULT_TCP_SYN_RATE_STRICT)
         self.assertEqual(desired.tcp_syn_rate_limits.get(80), cfg.XDP_DEFAULT_TCP_SYN_RATE)
-        # UDP resolvers still return 0 for unconfigured ports; the filter
-        # removal means those 0-valued entries now appear in desired_state
-        # (harmless — BPF treats 0 as disabled, same as no entry).
         self.assertEqual(desired.udp_rate_limits.get(53), 5000)
-        self.assertIn(123, desired.udp_rate_limits)  # present, value 0 (no config)
         self.assertEqual(desired.acl_rules, {("tcp", "203.0.113.0/24"): frozenset({22, 443})})
         self.assertTrue(desired.bogon_filter_enabled)
         self.assertEqual(desired.rate_limit_source_prefix_v4, 24)
@@ -784,14 +647,14 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(
             desired.xdp_runtime_config,
             (
-                600_000_000_000,
-                120_000_000_000,
-                45_000_000_000,
+                0,
+                0,
+                0,
                 200,
                 20_000_000,
                 2_000_000_000,
                 500_000_000,
-                10_000_000_000,
+                0,
             ),
         )
 
@@ -801,13 +664,8 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.udp_map = FakePortMap({53, 9999})
         backend.sctp_map = FakePortMap({3868, 9899})
         backend.trusted_map = FakeTrustedMap({"203.0.113.1/32"})
-        backend.conntrack_map = FakeConntrackMap({b"keep"})
-        backend.udp_conntrack_map = FakeConntrackMap({b"udp-keep"})
         backend.syn_rate_map = FakeSynRateMap({22: 1})
         backend.syn_agg_rate_map = FakeSynRateMap()
-        backend.tcp_conn_limit_map = FakeSynRateMap()
-        backend.tcp_conn_prefix_limit_map = None
-        backend.tcp_conn_port_limit_map = None
         backend.udp_rate_map = FakeUdpPortMap()
         backend.udp_agg_rate_map = FakeUdpPortMap()
         backend.acl_maps = None
@@ -818,11 +676,10 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.syn6_outer = FakeRateOuterMap()
         backend.udprt4_outer = FakeRateOuterMap()
         backend.udprt6_outer = FakeRateOuterMap()
-        backend._conntrack_stale_rounds = {}
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
         runtime_cfg = (
-            600_000_000_000,
+            0,
             120_000_000_000,
             45_000_000_000,
             200,
@@ -836,10 +693,8 @@ class XdpPortSyncTests(unittest.TestCase):
             udp_ports={53},
             sctp_ports={3868, 2905},
             trusted_cidrs={"198.51.100.5/32"},
-            conntrack_entries={b"keep", b"seed"},
             tcp_syn_rate_limits={22: 2},
             tcp_syn_agg_rate_limits={22: 16},
-            tcp_conn_limits={22: 32},
             udp_rate_limits={53: 5000},
             udp_agg_rate_limits={53: 6000000},
             drop_events_enabled=False,
@@ -848,10 +703,7 @@ class XdpPortSyncTests(unittest.TestCase):
         )
         observed = state_mod.ObservedState(tcp_processes={22: "sshd"}, udp_processes={53: "named"})
 
-        with mock.patch.object(cfg, "TCP_PERMANENT", {22: "ssh"}), \
-             mock.patch.object(cfg, "UDP_PERMANENT", {53: "dns"}), \
-             mock.patch.object(cfg, "SCTP_PERMANENT", {3868: "diameter"}), \
-             mock.patch.object(cfg, "SLOT_DEFAULT_ACTION", "pass"), \
+        with mock.patch.object(cfg, "SLOT_DEFAULT_ACTION", "pass"), \
              mock.patch.object(cfg, "TRUSTED_SRC_IPS", {"198.51.100.5/32": "office"}):
             backend.reconcile(desired, dry_run=False, observed_state=observed)
 
@@ -860,117 +712,13 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(backend.sctp_map.ops, [(2905, 1, False), (9899, 0, False)])
         self.assertEqual(backend.trusted_map.set_ops, [("198.51.100.5/32", 1, False)])
         self.assertEqual(backend.trusted_map.delete_ops, [("203.0.113.1/32", False)])
-        self.assertEqual(backend.conntrack_map.ops, [(b"seed", False)])
-        self.assertEqual(backend.conntrack_map.delete_ops, [])
-        self.assertEqual(backend.conntrack_map.delete_port_ops, [({80}, False)])
-        self.assertEqual(backend.udp_conntrack_map.delete_port_ops, [({9999}, False)])
         self.assertEqual(backend.syn_rate_map.set_ops, [(22, 2, False)])
         self.assertEqual(backend.syn_agg_rate_map.set_ops, [(22, 16, False)])
-        self.assertEqual(backend.tcp_conn_limit_map.set_ops, [(22, 32, False)])
         self.assertEqual(backend.udp_rate_map.set_ops, [(53, 5000, False)])
         self.assertEqual(backend.udp_agg_rate_map.set_ops, [(53, 6000000, False)])
         # bogon_filter_enabled=False (default) → BOGON_DISABLED(1), drop_events_enabled=False → DROP_EVENTS_DISABLED(4)
         self.assertEqual(backend.runtime_config_map.ops, [(runtime_cfg, 5, False)])
         self.assertEqual(backend.global_rl_map.ops, [(124_625_000, False)])
-
-    def test_xdp_backend_stale_conntrack_removal_requires_repeated_misses(self):
-        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
-        backend.tcp_map = FakePortMap()
-        backend.udp_map = FakePortMap()
-        backend.sctp_map = FakePortMap()
-        backend.trusted_map = FakeTrustedMap()
-        backend.conntrack_map = FakeConntrackMap({b"stale"})
-        backend.udp_conntrack_map = FakeConntrackMap()
-        backend.syn_rate_map = None
-        backend.syn_agg_rate_map = None
-        backend.tcp_conn_limit_map = None
-        backend.tcp_conn_prefix_limit_map = None
-        backend.tcp_conn_port_limit_map = None
-        backend.udp_rate_map = None
-        backend.udp_agg_rate_map = None
-        backend.acl_maps = None
-        backend.sit4_map = None
-        backend.syn4_outer = FakeRateOuterMap()
-        backend.syn6_outer = FakeRateOuterMap()
-        backend.udprt4_outer = FakeRateOuterMap()
-        backend.udprt6_outer = FakeRateOuterMap()
-        backend.runtime_config_map = FakeRuntimeConfigMap()
-        backend._tcp_policy_map = None
-        backend._udp_policy_map = None
-        backend.global_rl_map = None
-        backend._conntrack_stale_rounds = {}
-
-        desired = state_mod.DesiredState()
-
-        backend.reconcile(desired, dry_run=False, observed_state=state_mod.ObservedState())
-        self.assertEqual(backend.conntrack_map.delete_ops, [])
-        self.assertEqual(backend._conntrack_stale_rounds, {b"stale": 1})
-
-        backend.reconcile(desired, dry_run=False, observed_state=state_mod.ObservedState())
-        self.assertEqual(backend.conntrack_map.delete_ops, [(b"stale", False)])
-        self.assertEqual(backend._conntrack_stale_rounds, {})
-
-    def test_xdp_backend_reseeds_conntrack_entries_missing_from_kernel_but_still_cached(self):
-        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
-        backend.tcp_map = FakePortMap()
-        backend.udp_map = FakePortMap()
-        backend.sctp_map = FakePortMap()
-        backend.trusted_map = FakeTrustedMap()
-        backend.conntrack_map = FakeConntrackMap({b"seed"})
-        backend.udp_conntrack_map = FakeConntrackMap()
-        backend.syn_rate_map = None
-        backend.syn_agg_rate_map = None
-        backend.tcp_conn_limit_map = None
-        backend.tcp_conn_prefix_limit_map = None
-        backend.tcp_conn_port_limit_map = None
-        backend.udp_rate_map = None
-        backend.udp_agg_rate_map = None
-        backend.acl_maps = None
-        backend.sit4_map = None
-        backend.syn4_outer = FakeRateOuterMap()
-        backend.syn6_outer = FakeRateOuterMap()
-        backend.udprt4_outer = FakeRateOuterMap()
-        backend.udprt6_outer = FakeRateOuterMap()
-        backend.runtime_config_map = FakeRuntimeConfigMap()
-        backend._tcp_policy_map = None
-        backend._udp_policy_map = None
-        backend.global_rl_map = None
-        backend._conntrack_stale_rounds = {}
-        backend.conntrack_map.existing_keys = mock.Mock(return_value=set())
-
-        backend.reconcile(
-            state_mod.DesiredState(conntrack_entries={b"seed"}),
-            dry_run=False,
-            observed_state=state_mod.ObservedState(),
-        )
-
-        backend.conntrack_map.existing_keys.assert_called_once_with({b"seed"})
-        self.assertEqual(backend.conntrack_map.ops, [(b"seed", False)])
-        self.assertEqual(backend.conntrack_map.delete_ops, [])
-
-    def test_bpf_conntrack_map_delete_dest_ports_matches_ct_key_dport(self):
-        conntrack = bpf_maps_mod.BpfConntrackMap.__new__(bpf_maps_mod.BpfConntrackMap)
-        conntrack._dport_offset = 2
-        deleted = []
-
-        def ct_key(dest_port: int) -> bytes:
-            key = bytearray(12)
-            struct.pack_into("!H", key, 2, dest_port)
-            return bytes(key)
-
-        conntrack._cache = {
-            ct_key(22),
-            ct_key(80),
-            ct_key(443),
-        }
-        conntrack._iter_raw_keys = mock.Mock(side_effect=AssertionError("should use cache"))
-        conntrack.delete = mock.Mock(side_effect=lambda key, dry_run=False: deleted.append((key, dry_run)) or True)
-
-        removed = bpf_maps_mod.BpfConntrackMap.delete_dest_ports(conntrack, {80, 443}, dry_run=False)
-
-        self.assertEqual(removed, 2)
-        self.assertEqual(len(deleted), 2)
-        self.assertEqual({struct.unpack_from("!H", key, 2)[0] for key, _ in deleted}, {80, 443})
 
     def test_listening_port_processes_reuses_pid_lookup_cache(self):
         calls = []
@@ -1055,14 +803,6 @@ class XdpPortSyncTests(unittest.TestCase):
         acl_map.delete("203.0.113.0/24", dry_run=True)
         self.assertEqual(acl_map._cache, {"203.0.113.0/24": frozenset({22})})
 
-        conntrack_map = bpf_maps_mod.BpfConntrackMap.__new__(bpf_maps_mod.BpfConntrackMap)
-        conntrack_map.path = "/tmp/tcp_conntrack"
-        conntrack_map._dport_offset = 2
-        conntrack_map._cache = {b"keep"}
-        conntrack_map.set(b"seed", dry_run=True)
-        conntrack_map.delete(b"keep", dry_run=True)
-        self.assertEqual(conntrack_map._cache, {b"keep"})
-
         rate_map = bpf_maps_mod.BpfSynRatePortsMap.__new__(bpf_maps_mod.BpfSynRatePortsMap)
         rate_map.path = "/tmp/syn_rate_ports"
         rate_map._cache = {22: 2}
@@ -1096,38 +836,6 @@ class XdpPortSyncTests(unittest.TestCase):
         )
         self.assertEqual(backend.syn_rate_map.delete_ops, [(8080, False)])
 
-    def test_xdp_backend_dry_run_does_not_advance_stale_conntrack_rounds(self):
-        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
-        backend.tcp_map = FakePortMap()
-        backend.udp_map = FakePortMap()
-        backend.sctp_map = FakePortMap()
-        backend.trusted_map = FakeTrustedMap()
-        backend.conntrack_map = FakeConntrackMap({b"stale"})
-        backend.udp_conntrack_map = FakeConntrackMap()
-        backend.syn_rate_map = None
-        backend.syn_agg_rate_map = None
-        backend.tcp_conn_limit_map = None
-        backend.tcp_conn_prefix_limit_map = None
-        backend.tcp_conn_port_limit_map = None
-        backend.udp_rate_map = None
-        backend.udp_agg_rate_map = None
-        backend.acl_maps = None
-        backend.sit4_map = None
-        backend.syn4_outer = FakeRateOuterMap()
-        backend.syn6_outer = FakeRateOuterMap()
-        backend.udprt4_outer = FakeRateOuterMap()
-        backend.udprt6_outer = FakeRateOuterMap()
-        backend.runtime_config_map = FakeRuntimeConfigMap()
-        backend._tcp_policy_map = None
-        backend._udp_policy_map = None
-        backend.global_rl_map = None
-        backend._conntrack_stale_rounds = {}
-
-        backend.reconcile(state_mod.DesiredState(), dry_run=True, observed_state=state_mod.ObservedState())
-
-        self.assertEqual(backend._conntrack_stale_rounds, {})
-        self.assertEqual(backend.conntrack_map.delete_ops, [])
-
     def test_udp_port_rate_limit_prefers_process_name_then_service_name(self):
         import auto_xdp.policy as policy
         def fake_service_name(port, proto):
@@ -1144,22 +852,15 @@ class XdpPortSyncTests(unittest.TestCase):
             self.assertEqual(policy._udp_port_rate_limit(123), 500)
             self.assertEqual(policy._udp_port_rate_limit(12345), 0)
 
-    def test_syn_aggregate_and_tcp_conn_limits_use_default_tiers(self):
-        # Replaces old "derive via 8× / 16× multiplier" test.
-        # ssh=2 ≤ sensitive_threshold (5) → strict default tier for all caps.
-        # port 80: no match → normal default tier.
+    def test_syn_aggregate_uses_default_tiers(self):
         import auto_xdp.policy as policy
         with mock.patch.object(policy, "service_name", side_effect=lambda port, proto: "ssh" if port == 22 else "http"), \
              mock.patch.object(policy.cfg, "_SYN_RATE_BY_SERVICE", {"ssh": 2}), \
              mock.patch.object(policy.cfg, "_SYN_AGG_RATE_BY_SERVICE", {}), \
-             mock.patch.object(policy.cfg, "_TCP_CONN_BY_SERVICE", {}), \
              mock.patch.object(policy.cfg, "_SYN_RATE_BY_PROC", {}), \
-             mock.patch.object(policy.cfg, "_SYN_AGG_RATE_BY_PROC", {}), \
-             mock.patch.object(policy.cfg, "_TCP_CONN_BY_PROC", {}):
+             mock.patch.object(policy.cfg, "_SYN_AGG_RATE_BY_PROC", {}):
             self.assertEqual(policy._syn_aggregate_rate_limit(22), cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT)
-            self.assertEqual(policy._tcp_conn_limit(22), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT)
             self.assertEqual(policy._syn_aggregate_rate_limit(80), cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE)
-            self.assertEqual(policy._tcp_conn_limit(80), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC)
 
     def test_udp_aggregate_byte_limit_uses_explicit_or_derived_values(self):
         import auto_xdp.policy as policy
@@ -1225,15 +926,10 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.udp_map = FakePortMap()
         backend.sctp_map = FakePortMap()
         backend.trusted_map = FakeTrustedMap()
-        backend.conntrack_map = FakeConntrackMap()
-        backend.udp_conntrack_map = FakeConntrackMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
         backend.syn_rate_map = FakeSynRateMap()
         backend.syn_agg_rate_map = FakeSynRateMap()
-        backend.tcp_conn_limit_map = FakeSynRateMap()
-        backend.tcp_conn_prefix_limit_map = None
-        backend.tcp_conn_port_limit_map = None
         backend.udp_rate_map = FakeUdpPortMap()
         backend.udp_agg_rate_map = FakeUdpPortMap()
         backend.acl_maps = None
@@ -1253,8 +949,6 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertTrue(backend.udp_map.closed)
         self.assertTrue(backend.sctp_map.closed)
         self.assertTrue(backend.trusted_map.closed)
-        self.assertTrue(backend.conntrack_map.closed)
-        self.assertTrue(backend.udp_conntrack_map.closed)
         self.assertTrue(backend.syn4_outer.closed)
         self.assertTrue(backend.syn6_outer.closed)
         self.assertTrue(backend.udprt4_outer.closed)
@@ -1264,34 +958,24 @@ class XdpPortSyncTests(unittest.TestCase):
 
 
 class TcpDefaultOnSmokeTests(unittest.TestCase):
-    """End-to-end: default-on protection reaches the plan layer on all 5 layers."""
+    """End-to-end: default-on SYN protection reaches the plan layer."""
 
-    def test_unconfigured_port_produces_plan_entries_for_all_five_layers(self):
+    def test_unconfigured_port_produces_plan_entries_for_syn_layers(self):
         observed = state_mod.ObservedState(
             tcp={8080},
             tcp_processes={8080: "myapp"},
         )
-        desired = policy_mod.resolve_desired_state(observed)
+        desired = policy_mod._desired_state_for_ports(observed)
 
         # L1 SYN rate — Bug 1 fix
         self.assertEqual(desired.tcp_syn_rate_limits.get(8080), cfg.XDP_DEFAULT_TCP_SYN_RATE)
         # L2 SYN agg rate — Bug 1 fix
         self.assertEqual(desired.tcp_syn_agg_rate_limits.get(8080), cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE)
-        # L3 per-src ESTABLISHED — Bug 1 fix
-        self.assertEqual(desired.tcp_conn_limits.get(8080), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC)
-        # L4 per-prefix ESTABLISHED — Bug 2
-        self.assertEqual(desired.tcp_conn_prefix_limits.get(8080), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX)
-        # L5 per-port ESTABLISHED — Bug 2
-        self.assertEqual(desired.tcp_conn_port_limits.get(8080), cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT)
-
-        # All 5 layers must propagate into a fresh reconcile plan.
+        # Both stateless SYN layers must propagate into a fresh reconcile plan.
         applied = state_mod.AppliedState()
         plan = state_mod.compute_reconcile_plan(desired, applied)
         self.assertIn(8080, plan.tcp_syn_rate_limits_to_upsert)
         self.assertIn(8080, plan.tcp_syn_agg_rate_limits_to_upsert)
-        self.assertIn(8080, plan.tcp_conn_limits_to_upsert)
-        self.assertIn(8080, plan.tcp_conn_prefix_limits_to_upsert)
-        self.assertIn(8080, plan.tcp_conn_port_limits_to_upsert)
 
 
 class RateMapEntriesPolicyTests(unittest.TestCase):
@@ -1311,14 +995,11 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             _UDP_RATE_BY_SERVICE={},
             _RATE_MAP_ENTRIES_BY_PROC={},
             _RATE_MAP_ENTRIES_BY_SERVICE={},
-            TCP_PERMANENT={},
-            UDP_PERMANENT={},
-            SCTP_PERMANENT={},
         )
         base.update(cfg_overrides)
         with mock.patch.object(policy_mod, "service_name", return_value=""), \
              mock.patch.multiple(policy_mod.cfg, **base):
-            return policy_mod.resolve_desired_state(observed)
+            return policy_mod._desired_state_for_ports(observed)
 
     def test_default_capacity_for_rate_limited_ports(self):
         desired = self._resolve()
@@ -1443,9 +1124,6 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             trusted_cidrs={"198.51.100.5/32"},
             tcp_syn_rate_limits={22: 5, 443: 100},
             tcp_syn_agg_rate_limits={22: 50, 443: 1000},
-            tcp_conn_limits={22: 5, 443: 50},
-            tcp_conn_prefix_limits={22: 20, 443: 200},
-            tcp_conn_port_limits={22: 200, 443: 5000},
             udp_rate_limits={53: 100},
             udp_agg_rate_limits={53: 120000},
             acl_rules={("tcp", "203.0.113.0/24"): frozenset({8443})},
@@ -1471,7 +1149,6 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         self.assertIn("ip saddr 203.0.113.0/24 tcp flags", script)
         self.assertIn("meter ts4_22", script)
         self.assertIn("meter tp4_443", script)
-        self.assertIn("ct count over 5", script)
         self.assertIn("limit rate over 1000000 bytes/second", script)
         self.assertNotIn("udp sport { 53, 67, 123, 443, 547 } accept", script)
         self.assertNotIn("tcp flags & (ack | rst | fin) != 0 accept", script)
@@ -1719,20 +1396,6 @@ class FailingTrustedMap(FakeTrustedMap):
         return dry_run
 
 
-class FailingConntrackMap(FakeConntrackMap):
-    def set(self, key, dry_run=False):
-        super().set(key, dry_run)
-        return dry_run
-
-    def delete(self, key, dry_run=False):
-        super().delete(key, dry_run)
-        return dry_run
-
-    def delete_dest_ports(self, ports, dry_run=False):
-        super().delete_dest_ports(ports, dry_run)
-        return 0
-
-
 class FailingSynRateMap(FakeSynRateMap):
     def set(self, port, rate_max, dry_run=False):
         super().set(port, rate_max, dry_run)
@@ -1819,13 +1482,8 @@ def _make_failing_backend():
     backend.udp_map = FailingPortMap({53, 9999})
     backend.sctp_map = FailingPortMap({3868, 9899})
     backend.trusted_map = FailingTrustedMap({"203.0.113.1/32"})
-    backend.conntrack_map = FailingConntrackMap({b"keep"})
-    backend.udp_conntrack_map = FailingConntrackMap()
     backend.syn_rate_map = FailingSynRateMap()
     backend.syn_agg_rate_map = FailingSynRateMap()
-    backend.tcp_conn_limit_map = FailingSynRateMap()
-    backend.tcp_conn_prefix_limit_map = None
-    backend.tcp_conn_port_limit_map = None
     backend.udp_rate_map = FailingSynRateMap()
     backend.udp_agg_rate_map = FailingSynRateMap()
     backend.acl_maps = FailingAclMaps()
@@ -1836,7 +1494,6 @@ def _make_failing_backend():
     backend.syn6_outer = FailingRateOuterMap()
     backend.udprt4_outer = FailingRateOuterMap()
     backend.udprt6_outer = FailingRateOuterMap()
-    backend._conntrack_stale_rounds = {}
     backend._tcp_policy_map = None
     backend._udp_policy_map = None
     return backend
@@ -1848,10 +1505,8 @@ def _failing_desired_state():
         udp_ports={53},
         sctp_ports={3868, 2905},
         trusted_cidrs={"198.51.100.5/32"},
-        conntrack_entries={b"keep", b"seed"},
         tcp_syn_rate_limits={22: 2},
         tcp_syn_agg_rate_limits={22: 16},
-        tcp_conn_limits={22: 32},
         udp_rate_limits={53: 5000},
         udp_agg_rate_limits={53: 6000000},
         tcp_rate_map_entries={22: 16384},
@@ -1866,10 +1521,7 @@ def _failing_desired_state():
 class ApplyFailureCountingTests(unittest.TestCase):
     def _reconcile(self, backend, dry_run):
         desired = _failing_desired_state()
-        with mock.patch.object(cfg, "TCP_PERMANENT", {}), \
-             mock.patch.object(cfg, "UDP_PERMANENT", {}), \
-             mock.patch.object(cfg, "SCTP_PERMANENT", {}), \
-             mock.patch.object(cfg, "TRUSTED_SRC_IPS", {}), \
+        with mock.patch.object(cfg, "TRUSTED_SRC_IPS", {}), \
              mock.patch.object(cfg, "SIT4_ENDPOINTS", ["198.51.100.77"]):
             backend.reconcile(desired, dry_run=dry_run, observed_state=state_mod.ObservedState())
 
@@ -1880,14 +1532,11 @@ class ApplyFailureCountingTests(unittest.TestCase):
             + len(backend.sctp_map.ops)
             + len(backend.trusted_map.set_ops)
             + len(backend.trusted_map.delete_ops)
-            + len(backend.conntrack_map.ops)
-            + len(backend.conntrack_map.delete_ops)
             + sum(
                 len(m.set_ops) + len(m.delete_ops)
                 for m in (
                     backend.syn_rate_map,
                     backend.syn_agg_rate_map,
-                    backend.tcp_conn_limit_map,
                     backend.udp_rate_map,
                     backend.udp_agg_rate_map,
                 )
@@ -1923,7 +1572,6 @@ class ApplyFailureCountingTests(unittest.TestCase):
         self.assertTrue(backend.sctp_map.ops)
         self.assertTrue(backend.trusted_map.set_ops)
         self.assertTrue(backend.trusted_map.delete_ops)
-        self.assertTrue(backend.conntrack_map.ops)
         self.assertTrue(backend.syn_rate_map.set_ops)
         self.assertTrue(backend.udp_rate_map.set_ops)
         self.assertTrue(backend.runtime_config_map.ops)
@@ -1964,13 +1612,8 @@ def _make_outer_backend():
     backend.udp_map = FakePortMap()
     backend.sctp_map = FakePortMap()
     backend.trusted_map = FakeTrustedMap()
-    backend.conntrack_map = FakeConntrackMap()
-    backend.udp_conntrack_map = FakeConntrackMap()
     backend.syn_rate_map = None
     backend.syn_agg_rate_map = None
-    backend.tcp_conn_limit_map = None
-    backend.tcp_conn_prefix_limit_map = None
-    backend.tcp_conn_port_limit_map = None
     backend.udp_rate_map = None
     backend.udp_agg_rate_map = None
     backend.acl_maps = None
@@ -1981,7 +1624,6 @@ def _make_outer_backend():
     backend.syn6_outer = FakeRateOuterMap()
     backend.udprt4_outer = FakeRateOuterMap()
     backend.udprt6_outer = FakeRateOuterMap()
-    backend._conntrack_stale_rounds = {}
     backend._tcp_policy_map = None
     backend._udp_policy_map = None
     return backend
@@ -1990,10 +1632,7 @@ def _make_outer_backend():
 @pytest.mark.component
 class RateOuterReconcileTests(unittest.TestCase):
     def _reconcile(self, backend, desired, dry_run=False):
-        with mock.patch.object(cfg, "TCP_PERMANENT", {}), \
-             mock.patch.object(cfg, "UDP_PERMANENT", {}), \
-             mock.patch.object(cfg, "SCTP_PERMANENT", {}), \
-             mock.patch.object(cfg, "TRUSTED_SRC_IPS", {}):
+        with mock.patch.object(cfg, "TRUSTED_SRC_IPS", {}):
             backend.reconcile(desired, dry_run=dry_run, observed_state=state_mod.ObservedState())
 
     def test_reconcile_creates_inner_for_rate_limited_ports(self):
@@ -2030,7 +1669,6 @@ class ProbeInnerMapSupportTests(unittest.TestCase):
         with mock.patch.object(xdp_backend_mod.shutil, "which", return_value="/usr/sbin/bpftool"), \
              mock.patch.object(cfg, "REQUIRED_XDP_MAP_PATHS", ()), \
              mock.patch.object(cfg, "XDP_OBJ_PATH", ""), \
-             mock.patch.object(cfg, "TC_OBJ_PATH", ""), \
              mock.patch.object(xdp_backend_mod, "probe_inner_map_support", return_value=False):
             status = backends_mod.XdpBackend.probe()
         self.assertFalse(status.available)
@@ -2106,12 +1744,12 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
              mock.patch.object(syncer_mod, "drain_proc_events", return_value=True), \
              mock.patch.object(syncer_mod, "sync_once") as sync_once, \
              mock.patch.object(syncer_mod.select, "select", side_effect=select_effects), \
-             mock.patch.object(cfg, "DEBOUNCE_SECONDS", 0.0), \
-             mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
+             mock.patch.object(cfg, "DEBOUNCE_SECONDS", 0.0):
             syncer_mod.watch(
                 dry_run=False,
                 backend_name="xdp",
                 monotonic=lambda: 100.0,
+                mode="enforce",
             )
         return sync_once
 
@@ -2147,12 +1785,12 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
                  "select",
                  side_effect=[([], [], []), KeyboardInterrupt()],
              ), \
-             mock.patch.object(cfg, "DEBOUNCE_SECONDS", 0.0), \
-             mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
+             mock.patch.object(cfg, "DEBOUNCE_SECONDS", 0.0):
             syncer_mod.watch(
                 dry_run=False,
                 backend_name="xdp",
                 monotonic=lambda: 100.0,
+                mode="enforce",
             )
 
         backend.is_stale.assert_called_once()
@@ -2174,9 +1812,8 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
                  syncer_mod.select,
                  "select",
                  side_effect=[([relay], [], []), KeyboardInterrupt()],
-             ), \
-             mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
-            syncer_mod.watch(dry_run=False, backend_name="xdp")
+             ):
+            syncer_mod.watch(dry_run=False, backend_name="xdp", mode="enforce")
 
         open_relay.assert_called()
         # Initial reconcile plus the relay-triggered reconcile.
@@ -2193,9 +1830,8 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
              mock.patch.object(syncer_mod, "_open_relay_client", return_value=None), \
              mock.patch.object(syncer_mod, "sync_once") as sync_once, \
              mock.patch.object(syncer_mod.time, "sleep", side_effect=[None, KeyboardInterrupt()]), \
-             mock.patch.object(syncer_mod, "FULL_RECONCILE_INTERVAL_SECONDS", 0.0), \
-             mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
-            syncer_mod.watch(dry_run=False, backend_name="xdp")
+             mock.patch.object(syncer_mod, "FULL_RECONCILE_INTERVAL_SECONDS", 0.0):
+            syncer_mod.watch(dry_run=False, backend_name="xdp", mode="enforce")
 
         # Initial reconcile plus a timer-triggered full reconcile.
         self.assertEqual(sync_once.call_count, 2)
@@ -2214,10 +1850,9 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
                  side_effect=[None, DiscoveryError("truncated dump"), KeyboardInterrupt()],
              ), \
              mock.patch.object(syncer_mod.time, "sleep", return_value=None), \
-             mock.patch.object(syncer_mod, "FULL_RECONCILE_INTERVAL_SECONDS", 0.0), \
-             mock.patch.object(cfg, "XDP_CONNTRACK_GC_INTERVAL_SECONDS", 0):
+             mock.patch.object(syncer_mod, "FULL_RECONCILE_INTERVAL_SECONDS", 0.0):
             with self.assertLogs("auto_xdp.syncer", level="ERROR") as logs:
-                syncer_mod.watch(dry_run=False, backend_name="xdp")
+                syncer_mod.watch(dry_run=False, backend_name="xdp", mode="enforce")
         # Discovery failures must not tear down a working backend mid-loop.
         # The only close() is the shutdown path in watch()'s finally block.
         self.assertEqual(backend.close.call_count, 1)
@@ -2227,18 +1862,14 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
 @pytest.mark.component
 class ConfigReloadTests(unittest.TestCase):
     def test_invalid_sighup_config_keeps_last_known_good_state(self):
-        old_ports = dict(cfg.TCP_PERMANENT)
-        cfg.apply_toml_config({"permanent_ports": {"tcp": [443]}})
-        try:
-            with tempfile.NamedTemporaryFile(mode="wb") as config_file:
-                config_file.write(b"[daemon\n")
-                config_file.flush()
-                with self.assertLogs("auto_xdp.syncer", level="ERROR") as logs:
-                    self.assertFalse(syncer_mod._reload_config(config_file.name))
-            self.assertEqual(cfg.TCP_PERMANENT, {443: "config"})
-            self.assertTrue(any("retaining previous" in line for line in logs.output))
-        finally:
-            cfg.apply_toml_config({"permanent_ports": {"tcp": list(old_ports)}})
+        cfg.apply_toml_config({"policy": {"mode": "audit"}})
+        with tempfile.NamedTemporaryFile(mode="wb") as config_file:
+            config_file.write(b"[daemon\n")
+            config_file.flush()
+            with self.assertLogs("auto_xdp.syncer", level="ERROR") as logs:
+                self.assertFalse(syncer_mod._reload_config(config_file.name))
+        self.assertEqual(cfg.POLICY_MODE, "audit")
+        self.assertTrue(any("retaining previous" in line for line in logs.output))
 
 
 if __name__ == "__main__":

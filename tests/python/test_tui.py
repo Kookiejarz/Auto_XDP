@@ -19,6 +19,9 @@ from auto_xdp.tui import (
     _event_bottom_top,
     _event_window,
     _filter_port_rows,
+    _audit_fingerprint,
+    _audit_needs_review,
+    _mark_audit_reviewed,
 )
 
 
@@ -231,11 +234,11 @@ class TuiTopTrafficTests(unittest.TestCase):
 class TuiMapUsageTests(unittest.TestCase):
     def test_high_churn_map_is_sampled_outside_under_attack(self):
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tcp_ct4").touch()
+            Path(td, "hblk4").touch()
             cache = MapUsageCache()
 
             with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"tcp_ct4": {"name": "tcp_ct4", "type": "hash", "max_entries": 100}}), \
+                mock.patch("auto_xdp.tui._all_map_info", return_value={"hblk4": {"name": "hblk4", "type": "hash", "max_entries": 100}}), \
                 mock.patch("auto_xdp.tui._dump_count", return_value=12) as dump_count:
                 rows = _collect_map_usage(td, cache=cache, now=100.0)
 
@@ -245,11 +248,11 @@ class TuiMapUsageTests(unittest.TestCase):
 
     def test_high_churn_map_uses_cache_within_sample_interval(self):
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tcp_ct4").touch()
-            cache = MapUsageCache(counts={"tcp_ct4": 12}, refreshed_at={"tcp_ct4": 100.0})
+            Path(td, "hblk4").touch()
+            cache = MapUsageCache(counts={"hblk4": 12}, refreshed_at={"hblk4": 100.0})
 
             with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"tcp_ct4": {"name": "tcp_ct4", "type": "hash", "max_entries": 100}}), \
+                mock.patch("auto_xdp.tui._all_map_info", return_value={"hblk4": {"name": "hblk4", "type": "hash", "max_entries": 100}}), \
                 mock.patch("auto_xdp.tui._dump_count") as dump_count:
                 rows = _collect_map_usage(td, cache=cache, now=110.0)
 
@@ -259,11 +262,11 @@ class TuiMapUsageTests(unittest.TestCase):
 
     def test_high_churn_map_skips_dump_under_attack(self):
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tcp_ct4").touch()
+            Path(td, "hblk4").touch()
             cache = MapUsageCache()
 
             with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"tcp_ct4": {"name": "tcp_ct4", "type": "hash", "max_entries": 100}}), \
+                mock.patch("auto_xdp.tui._all_map_info", return_value={"hblk4": {"name": "hblk4", "type": "hash", "max_entries": 100}}), \
                 mock.patch("auto_xdp.tui._dump_count") as dump_count:
                 rows = _collect_map_usage(td, under_attack=True, cache=cache, now=100.0)
 
@@ -273,20 +276,20 @@ class TuiMapUsageTests(unittest.TestCase):
 
     def test_fast_map_usage_defers_non_whitelist_counts(self):
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tcp_ct4").touch()
+            Path(td, "hblk4").touch()
             Path(td, "udp_whitelist").touch()
 
             with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([22], [53])), \
                 mock.patch("auto_xdp.tui._all_map_info", return_value={
-                    "tcp_ct4": {"name": "tcp_ct4", "type": "hash", "max_entries": 100},
+                    "hblk4": {"name": "hblk4", "type": "hash", "max_entries": 100},
                     "udp_whitelist": {"name": "udp_whitelist", "type": "hash", "max_entries": 100},
                 }), \
                 mock.patch("auto_xdp.tui._dump_count") as dump_count:
                 rows = _collect_map_usage(td, sample_counts=False)
 
         by_name = {row.name: row for row in rows}
-        self.assertIsNone(by_name["tcp_ct4"].current)
-        self.assertEqual(by_name["tcp_ct4"].note, "deferred")
+        self.assertIsNone(by_name["hblk4"].current)
+        self.assertEqual(by_name["hblk4"].note, "deferred")
         self.assertEqual(by_name["udp_whitelist"].current, 1)
         dump_count.assert_not_called()
 
@@ -306,12 +309,12 @@ class TuiMapUsageTests(unittest.TestCase):
 
     def test_array_map_uses_max_entries_without_dump(self):
         # Array maps are dense: live count == max_entries, so no per-map
-        # `bpftool map dump` subprocess is needed (tsc_port is 65536 entries).
+        # `bpftool map dump` subprocess is needed.
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tsc_port").touch()
+            Path(td, "weird_array").touch()
 
             with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"tsc_port": {"name": "tsc_port", "type": "array", "max_entries": 65536}}), \
+                mock.patch("auto_xdp.tui._all_map_info", return_value={"weird_array": {"name": "weird_array", "type": "array", "max_entries": 65536}}), \
                 mock.patch("auto_xdp.tui._dump_count") as dump_count:
                 rows = _collect_map_usage(td, now=100.0)
 
@@ -406,6 +409,19 @@ class TuiPortFilterTests(unittest.TestCase):
         self.assertIn("domain", rendered)
         self.assertNotIn("TCP", rendered)
         self.assertNotIn("ssh", rendered)
+
+
+class TuiAuditMarkerTests(unittest.TestCase):
+    def test_audit_marker_only_requests_first_or_changed_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker = Path(tmpdir) / "audit.json"
+            rows = [{"action": "drop", "port": 443, "subject": "unknown"}]
+            fingerprint = _audit_fingerprint(rows)
+            self.assertTrue(_audit_needs_review(marker, fingerprint))
+            _mark_audit_reviewed(marker, fingerprint)
+            self.assertFalse(_audit_needs_review(marker, fingerprint))
+            changed = _audit_fingerprint(rows + [{"action": "allow", "port": 22, "subject": "ssh"}])
+            self.assertTrue(_audit_needs_review(marker, changed))
 
 
 if __name__ == "__main__":

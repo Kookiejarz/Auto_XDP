@@ -34,9 +34,6 @@ for iface in "${interfaces[@]}"; do
             | grep -Eq 'prog/xdp|xdpgeneric|xdpoffload'; then
         fail "XDP is still attached to $iface"
     fi
-    if tc filter show dev "$iface" egress pref 49152 handle 1 2>/dev/null | grep -q .; then
-        fail "TC egress filter remains on $iface"
-    fi
 done
 
 if command -v nft >/dev/null 2>&1 \

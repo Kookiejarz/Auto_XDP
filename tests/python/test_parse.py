@@ -25,9 +25,9 @@ def test_counter_names_cover_current_drop_reasons():
     names = admin_cli._XDP_COUNTER_NAMES
     assert names[enum["CNT_TCP_NEW_ALLOW"]] == "TCP_NEW_ALLOW"
     assert names[enum["CNT_BOGON_DROP"]] == "BOGON_DROP"
-    assert names[enum["CNT_TCP_CONN_LIMIT_DROP"]] == "TCP_CONN_LIMIT_DROP"
-    assert names[enum["CNT_TCP_CONN_PREFIX_LIMIT_DROP"]] == "TCP_CONN_PREFIX_LIMIT_DROP"
-    assert names[enum["CNT_TCP_CONN_PORT_LIMIT_DROP"]] == "TCP_CONN_PORT_LIMIT_DROP"
+    assert names[enum["CNT_RESERVED_28"]] == "RESERVED_28"
+    assert names[enum["CNT_RESERVED_32"]] == "RESERVED_32"
+    assert names[enum["CNT_RESERVED_33"]] == "RESERVED_33"
     assert names[enum["CNT_ABUSEIPDB_DROP"]] == "ABUSEIPDB_DROP"
     assert len(names) == enum["CNT_MAX"]
 
@@ -40,7 +40,7 @@ def test_read_xdp_rows_uses_named_counters_and_byte_totals(tmp_path):
 
     dump = [
         {"key": ["0x01", "0x00", "0x00", "0x00"], "values": [{"cpu": 0, "value": 5}]},
-        {"key": enum["CNT_TCP_CONN_LIMIT_DROP"], "values": [{"cpu": 0, "value": 10}]},
+        {"key": enum["CNT_RESERVED_28"], "values": [{"cpu": 0, "value": 10}]},
         {"key": enum["CNT_ABUSEIPDB_DROP"], "values": [{"cpu": 0, "value": 2}]},
     ]
 
@@ -51,8 +51,8 @@ def test_read_xdp_rows_uses_named_counters_and_byte_totals(tmp_path):
         rows = admin_cli._read_xdp_rows(str(pin))
 
     by_name = {name: (packets, nbytes) for name, packets, nbytes in rows}
-    assert by_name["TCP_ESTABLISHED"] == (5, -1)
-    assert by_name["TCP_CONN_LIMIT_DROP"] == (10, -1)
+    assert by_name["TCP_PASS"] == (5, -1)
+    assert by_name["RESERVED_28"] == (10, -1)
     assert by_name["ABUSEIPDB_DROP"] == (2, -1)
     assert by_name["XDP_TOTAL"] == (17, 100)
     assert by_name["XDP_DROP_TOTAL"] == (12, 20)
