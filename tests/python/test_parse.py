@@ -56,3 +56,11 @@ def test_read_xdp_rows_uses_named_counters_and_byte_totals(tmp_path):
     assert by_name["ABUSEIPDB_DROP"] == (2, -1)
     assert by_name["XDP_TOTAL"] == (17, 100)
     assert by_name["XDP_DROP_TOTAL"] == (12, 20)
+
+
+def test_ipv6_fragment_header_is_always_fail_closed():
+    source = (REPO_ROOT / "bpf/include/parse.h").read_text()
+    fragment_case = source.split("case IPPROTO_FRAGMENT", 1)[1].split("default:", 1)[0]
+
+    assert "frag_off_flags &" not in fragment_case
+    assert "return IPV6_FRAG_DROP_SENTINEL;" in fragment_case

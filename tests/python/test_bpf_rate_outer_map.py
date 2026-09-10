@@ -43,6 +43,7 @@ def _make_map(reg, key_size=4):
     m.fd = -1
     m._inner_key_size = key_size
     m._inner_value_size = 8
+    m._inner_max_entries = 8192
     m._name_prefix = "s4_"
     m._max_entries = 65536
     m._cache = {}
@@ -77,13 +78,13 @@ class RateOuterMapTests(unittest.TestCase):
         self.assertTrue(m.set(443, 8192))
         self.assertEqual(self.reg.created, [])
 
-    def test_set_capacity_change_rebuilds_inner(self):
+    def test_set_rejects_capacity_that_cannot_match_template(self):
         m = _make_map(self.reg)
         m._cache = {443: 8192}
         with mock.patch.object(m, "_update_slot", return_value=True):
-            self.assertTrue(m.set(443, 16384))
-        self.assertEqual(self.reg.created[0][2], 16384)
-        self.assertEqual(m.active(), {443: 16384})
+            self.assertFalse(m.set(443, 16384))
+        self.assertEqual(self.reg.created, [])
+        self.assertEqual(m.active(), {443: 8192})
 
     def test_set_dry_run_touches_nothing(self):
         m = _make_map(self.reg)

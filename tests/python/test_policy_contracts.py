@@ -143,6 +143,25 @@ def test_shared_port_with_incompatible_protection_is_closed() -> None:
     assert all("incompatible" in item.reason for item in decisions)
 
 
+def test_shared_port_with_unknown_owner_is_closed() -> None:
+    cfg.ZONES = {"public": {"interfaces": []}}
+    cfg.SUBJECTS = {
+        "dns": {
+            "resolve": {"process_name": "dns-a"},
+            "exposure": {"public": {"udp": {"ports": [5353]}}},
+        }
+    }
+    observed = ObservedState(endpoints=[
+        RuntimeEndpoint("udp", "0.0.0.0", 5353, "specific", "public", "dns-a", "shared"),
+        RuntimeEndpoint("udp", "192.0.2.10", 5353, "specific", "public", "", "ambiguous"),
+    ])
+
+    decisions = policy.resolve_exposure_decisions(observed)
+
+    assert all(item.action == "drop" for item in decisions)
+    assert all("unknown or ambiguous" in item.reason for item in decisions)
+
+
 def test_private_grant_uses_zone_admission_without_public_port() -> None:
     cfg.ZONES = {
         "public": {"interfaces": []},
@@ -162,6 +181,31 @@ def test_private_grant_uses_zone_admission_without_public_port() -> None:
     assert desired.tcp_ports == set()
     assert desired.zone_tcp_ports == {"trusted": {5432}}
     assert desired.tcp_syn_rate_limits == {5432: 100}
+
+
+def test_wildcard_listener_is_evaluated_for_each_ingress_zone() -> None:
+    cfg.ZONES = {
+        "public": {"interfaces": ["eth0"]},
+        "trusted": {"interfaces": ["wg0"]},
+    }
+    cfg.SUBJECTS = {
+        "postgres": {
+            "resolve": {"systemd_unit": "postgres.service"},
+            "exposure": {"trusted": {"tcp": {"ports": [5432]}}},
+        }
+    }
+
+    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+        RuntimeEndpoint(
+            "tcp", "0.0.0.0", 5432, "wildcard", "public",
+            "postgres.service", "exact", "systemd-cgroup",
+        ),
+    ]))
+
+    by_zone = {item.endpoint.ingress_zone: item.action for item in desired.exposure_decisions}
+    assert by_zone == {"public": "drop", "trusted": "allow"}
+    assert desired.tcp_ports == set()
+    assert desired.zone_tcp_ports == {"trusted": {5432}}
 
 
 def test_interface_scoped_public_grant_does_not_use_global_port_map() -> None:

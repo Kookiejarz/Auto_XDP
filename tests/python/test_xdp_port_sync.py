@@ -583,6 +583,54 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(state.tcp, {22})
         self.assertEqual(state.udp, set())
 
+    def test_netlink_preserves_exact_systemd_unit_subject(self):
+        address = socket.inet_aton("0.0.0.0")
+
+        def fake_dump(family, protocol, _states):
+            if family == socket.AF_INET and protocol == socket.IPPROTO_TCP:
+                return iter([(8080, 0, address, b"", 101, 0)])
+            return iter(())
+
+        with mock.patch.object(discovery_mod, "_nldiag_dump", side_effect=fake_dump), \
+             mock.patch.object(discovery_mod, "_build_inode_pid", return_value={101: 42}), \
+             mock.patch.object(discovery_mod, "_pid_comm", return_value="gunicorn"), \
+             mock.patch.object(discovery_mod, "_pid_systemd_unit", return_value="my-web.service"), \
+             mock.patch.object(discovery_mod, "_container_from_pid", return_value=None), \
+             mock.patch.object(discovery_mod, "_container_for_endpoint", return_value=None), \
+             mock.patch.object(discovery_mod, "_parse_proc_udp", return_value={}):
+            state = discovery_mod._get_listening_ports_netlink()
+
+        self.assertEqual(state.endpoints[0].subject, "my-web.service")
+        self.assertEqual(state.endpoints[0].attribution_source, "systemd-cgroup")
+
+    def test_netlink_keeps_each_udp_owner_for_shared_port_policy(self):
+        wildcard = socket.inet_aton("0.0.0.0")
+        specific = socket.inet_aton("192.0.2.10")
+
+        def fake_dump(family, protocol, _states):
+            if family == socket.AF_INET and protocol == socket.IPPROTO_UDP:
+                return iter([
+                    (5353, 0, wildcard, b"", 101, 0),
+                    (5353, 0, specific, b"", 202, 0),
+                ])
+            return iter(())
+
+        with mock.patch.object(discovery_mod, "_nldiag_dump", side_effect=fake_dump), \
+             mock.patch.object(discovery_mod, "_build_inode_pid", return_value={101: 42}), \
+             mock.patch.object(discovery_mod, "_pid_comm", return_value="dns-a"), \
+             mock.patch.object(discovery_mod, "_pid_systemd_unit", return_value=""), \
+             mock.patch.object(discovery_mod, "_container_from_pid", return_value=None), \
+             mock.patch.object(discovery_mod, "_container_for_endpoint", return_value=None), \
+             mock.patch.object(discovery_mod, "_parse_proc_udp", return_value={}):
+            state = discovery_mod._get_listening_ports_netlink()
+
+        endpoints = [item for item in state.endpoints if item.protocol == "udp"]
+        self.assertEqual(len(endpoints), 2)
+        self.assertEqual(
+            {(item.subject, item.attribution_state) for item in endpoints},
+            {("dns-a", "shared"), ("", "ambiguous")},
+        )
+
     def test_sync_once_keeps_existing_policy_when_discovery_fails(self):
         backend = mock.Mock()
         with mock.patch.object(
@@ -1014,13 +1062,15 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         self.assertNotIn(2222, desired.tcp_rate_map_entries)
         self.assertNotIn(5353, desired.udp_rate_map_entries)
 
-    def test_per_proc_override(self):
-        desired = self._resolve(_RATE_MAP_ENTRIES_BY_PROC={"sshd": 2048})
-        self.assertEqual(desired.tcp_rate_map_entries[2222], 2048)
+    def test_config_rejects_dynamic_inner_map_capacity(self):
+        with self.assertRaisesRegex(ValueError, "fixed by the compiled XDP map ABI"):
+            cfg.apply_toml_config({
+                "rate_limits": {"map_entries_by_proc": {"sshd": 2048}},
+            })
 
     def test_v6_derivation_helper(self):
         self.assertEqual(policy_mod.rate_map_entries_v6(16384), 4096)
-        self.assertEqual(policy_mod.rate_map_entries_v6(100), 64)  # floor
+        self.assertEqual(policy_mod.rate_map_entries_v6(100), 4096)
 
     def test_nftables_backend_ensure_ruleset_keeps_existing_complete_ruleset(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
