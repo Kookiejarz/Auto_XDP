@@ -39,6 +39,26 @@ def test_docker_published_port_is_attributed_from_inspect(monkeypatch: pytest.Mo
     assert endpoint.container_labels == {"app": "web"}
 
 
+def test_published_port_without_host_listener_is_still_discovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = discovery.ContainerIdentity("docker", "a" * 64, "web", {"app": "web"}, "0.0.0.0")
+    monkeypatch.setattr(discovery, "_IS_LINUX", True)
+    monkeypatch.setattr(
+        discovery,
+        "_container_metadata",
+        lambda: ({("tcp", 18080): [identity]}, {identity.container_id: identity}),
+    )
+    monkeypatch.setattr(discovery, "_get_listening_ports_netlink", ObservedState)
+
+    state = discovery.get_listening_ports()
+
+    assert state.tcp == {18080}
+    assert len(state.endpoints) == 1
+    assert state.endpoints[0].container_id == identity.container_id
+    assert state.endpoints[0].attribution_source == "docker-inspect"
+
+
 def test_container_port_collision_is_not_authorized(monkeypatch: pytest.MonkeyPatch) -> None:
     records = [
         {"Id": "a" * 64, "Name": "/one", "Config": {}, "NetworkSettings": {"Ports": {"80/tcp": [{"HostPort": "18080"}]}}},

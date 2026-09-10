@@ -519,6 +519,41 @@ _map_has_key() {
     bpftool map lookup pinned "$map_path" key hex "$@" >/dev/null 2>&1
 }
 
+_configure_exhausted_tcp_rate() {
+    local port="$1" rate_max="$2"
+    local policy_hex now_ns rate_val_hex outer_error
+    local inner_pin="$_PIN_DIR/it_syn4_$port"
+
+    policy_hex=$(python3 -c "
+import struct
+print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIIIII', $rate_max, 0, 0, 32, 128, 0, 0, 0)))
+")
+    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
+        key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1 || {
+        echo "tcp policy update failed"; return 1;
+    }
+
+    now_ns=$(_ktime_ns)
+    rate_val_hex=$(python3 -c "
+import struct
+tick = ($now_ns // 1_000_000) & 0xffffffff
+state = (tick << 32) | $rate_max
+print(' '.join(f'{b:02x}' for b in struct.pack('<Q', state)))
+")
+    bpftool map create "$inner_pin" type lru_hash key 4 value 8 \
+        entries 16384 name "s4_$port" flags 0 >/dev/null 2>&1 || {
+        echo "inner map create failed"; return 1;
+    }
+    outer_error=$(bpftool map update pinned "$_PIN_DIR/syn4" \
+        key hex $(_u32le "$port") value pinned "$inner_pin" 2>&1) || {
+        echo "rate outer map update failed: $outer_error"; return 1;
+    }
+    bpftool map update pinned "$inner_pin" \
+        key hex $(_ip4be "$_NS_IP") value hex $rate_val_hex >/dev/null 2>&1 || {
+        echo "rate inner map update failed"; return 1;
+    }
+}
+
 test_acl() {
     local port=7702
 
@@ -535,11 +570,15 @@ test_acl() {
     bpftool map update pinned "$_PIN_DIR/tcp_acl_v4" \
         key hex $key_hex value hex $val_hex >/dev/null 2>&1
 
-    # Explicitly clear the whitelist for this port — ACL must grant access on its own.
+    # Source ACLs constrain/bypass mitigation but never create exposure.
     bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
         key hex $(_u32le "$port") value hex 00 00 00 00 >/dev/null 2>&1
+    _tcp_probe "$port" && { echo "ACL widened a closed port"; return 1; }
 
-    _tcp_probe "$port" || { echo "SYN from ACL-permitted source was dropped"; return 1; }
+    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
+        key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1
+    _configure_exhausted_tcp_rate "$port" 1 || return 1
+    _tcp_probe "$port" || { echo "ACL did not bypass mitigation on an exposed port"; return 1; }
 }
 
 test_rate_limit() {
@@ -549,48 +588,10 @@ test_rate_limit() {
     bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
         key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1
 
-    # tcp_port_policy_cfg: three rate/connection limits, two source prefixes,
-    # two additional connection limits, and padding (__u32 x 8).
-    local policy_hex
-    policy_hex=$(python3 -c "
-import struct
-print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIIIII', $rate_max, 0, 0, 32, 128, 0, 0, 0)))
-")
-    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-        key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1
-
-    # syn_rate_val.state packs window tick (upper 32) and count (lower 32).
-    local now_ns rate_val_hex
-    now_ns=$(_ktime_ns)
-    rate_val_hex=$(python3 -c "
-import struct
-tick = ($now_ns // 1_000_000) & 0xffffffff
-state = (tick << 32) | $rate_max
-print(' '.join(f'{b:02x}' for b in struct.pack('<Q', state)))
-")
-    # Create a per-port inner LRU and install it into the syn4 outer slot for
-    # $port, then pre-fill the source's counter with count=rate_max inside the
-    # current window so the next SYN overflows. BPF_F_INNER_MAP is valid for
-    # array inner maps, not LRU hash maps; the latter are created with flags 0.
-    local inner_pin="$_PIN_DIR/it_syn4_$port" value_bytes=8
-    value_bytes=$(python3 -c '
-import json, subprocess, sys
-data = json.loads(subprocess.check_output(["bpftool", "-j", "map", "show", "pinned", sys.argv[1]]))
-if isinstance(data, list):
-    data = data[0]
-print(int(data.get("bytes_value", data.get("value_size", 8))))
-' "$_PIN_DIR/syn4")
-    bpftool map create "$inner_pin" type lru_hash key 4 value "$value_bytes" \
-        entries 1024 name "s4_$port" flags 0 >/dev/null 2>&1 || {
-        echo "inner map create failed"; return 1; }
-    bpftool map update pinned "$_PIN_DIR/syn4" \
-        key hex $(_u32le "$port") value pinned "$inner_pin" >/dev/null 2>&1
-    bpftool map update pinned "$inner_pin" \
-        key hex $(_ip4be "$_NS_IP") value hex $rate_val_hex >/dev/null 2>&1
+    _configure_exhausted_tcp_rate "$port" "$rate_max" || return 1
 
     local probe_rc=0
     _tcp_probe "$port" && probe_rc=1
-    rm -f "$inner_pin"
     [ "$probe_rc" -eq 1 ] && { echo "rate-limited SYN was not dropped"; return 1; }
     return 0
 }
