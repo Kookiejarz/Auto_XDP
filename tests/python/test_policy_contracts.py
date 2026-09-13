@@ -118,6 +118,27 @@ def test_service_aware_policy_requires_explicit_grant_and_runtime_owner() -> Non
     assert desired.exposure_decisions[0].protection_profile == "web"
 
 
+def test_minecraft_profile_changes_desired_tcp_protection() -> None:
+    cfg.ZONES = {"public": {"interfaces": []}}
+    cfg.SUBJECTS = {
+        "minecraft": {
+            "resolve": {"systemd_unit": "minecraft.service"},
+            "exposure": {"public": {"tcp": {"ports": [25565]}}},
+            "protection": {"profile": " Minecraft "},
+        }
+    }
+
+    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+        RuntimeEndpoint(
+            "tcp", "0.0.0.0", 25565, "wildcard", "public",
+            "minecraft.service", "exact", "systemd-cgroup",
+        ),
+    ]))
+
+    assert desired.tcp_ports == {25565}
+    assert desired.tcp_protection_profiles == {25565: "minecraft"}
+
+
 def test_shared_port_with_incompatible_protection_is_closed() -> None:
     cfg.ZONES = {"public": {"interfaces": []}}
     cfg.SUBJECTS = {
