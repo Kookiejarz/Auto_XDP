@@ -1,3 +1,4 @@
+import json
 import socket
 import struct
 import subprocess
@@ -276,6 +277,54 @@ class DiscoveryDumpTests(unittest.TestCase):
 
 
 class XdpPortSyncTests(unittest.TestCase):
+    def test_minecraft_profile_handler_is_loaded_and_removed_with_workload(self):
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            install_dir = root / "install"
+            pin_dir = root / "bpf"
+            run_dir = root / "run"
+            object_path = install_dir / "handlers" / "minecraft_handler.o"
+            object_path.parent.mkdir(parents=True)
+            object_path.touch()
+
+            with mock.patch.dict(
+                "os.environ",
+                {"PYTHON_LIB_DIR": str(install_dir / "python"), "RUN_STATE_DIR": str(run_dir)},
+            ), mock.patch.object(cfg, "BPF_PIN_DIR", str(pin_dir)), \
+                 mock.patch.object(backend, "_pinned_program_id", side_effect=[None, 42]), \
+                 mock.patch.object(backend, "_profile_command", return_value=True) as command:
+                self.assertEqual(
+                    backend._ensure_profile_handlers({25565: "minecraft"}, dry_run=False),
+                    set(),
+                )
+
+            marker = run_dir / "profile-handlers" / "tcp" / "25565"
+            self.assertEqual(
+                json.loads(marker.read_text()),
+                {"profile": "minecraft", "program_id": 42},
+            )
+            command.assert_called_once_with("load", 25565, object_path.resolve())
+
+            with mock.patch.dict("os.environ", {"RUN_STATE_DIR": str(run_dir)}), \
+                 mock.patch.object(cfg, "BPF_PIN_DIR", str(pin_dir)), \
+                 mock.patch.object(backend, "_pinned_program_id", return_value=42), \
+                 mock.patch.object(backend, "_profile_command", return_value=True) as command:
+                self.assertEqual(backend._remove_stale_profile_handlers({}, dry_run=False), 0)
+
+            command.assert_called_once_with("unload", 25565)
+            self.assertFalse(marker.exists())
+
+            with mock.patch.dict("os.environ", {"RUN_STATE_DIR": str(run_dir)}), \
+                 mock.patch.object(cfg, "BPF_PIN_DIR", str(pin_dir)), \
+                 mock.patch.object(backend, "_pinned_program_id", return_value=77), \
+                 mock.patch.object(backend, "_profile_command") as command:
+                self.assertEqual(
+                    backend._ensure_profile_handlers({25565: "minecraft"}, dry_run=False),
+                    {25565},
+                )
+            command.assert_not_called()
+
     def test_new_port_stays_closed_when_protection_setup_fails(self):
         backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
         backend.tcp_map = FakePortMap()
@@ -1028,6 +1077,28 @@ class TcpDefaultOnSmokeTests(unittest.TestCase):
 
 class RateMapEntriesPolicyTests(unittest.TestCase):
     """Per-port rate-limit inner map capacity resolution."""
+
+    def test_nftables_keeps_minecraft_profile_port_closed(self):
+        backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
+        backend._policy_signature = None
+        desired = state_mod.DesiredState(
+            tcp_ports={443, 25565},
+            zone_tcp_ports={"public": {443, 25565}},
+            tcp_protection_profiles={25565: "minecraft"},
+        )
+
+        with mock.patch.object(backend, "_install_ruleset") as install, \
+             mock.patch.object(backend, "_remember_desired") as remember:
+            backend.apply_reconcile_plan(
+                state_mod.ReconcilePlan(),
+                dry_run=False,
+                desired_state=desired,
+            )
+
+        effective = install.call_args.args[0]
+        self.assertEqual(effective.tcp_ports, {443})
+        self.assertEqual(effective.zone_tcp_ports, {"public": {443}})
+        remember.assert_called_once_with(effective)
 
     def _resolve(self, **cfg_overrides):
         observed = state_mod.ObservedState(

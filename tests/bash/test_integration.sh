@@ -460,6 +460,124 @@ test_handler_transactional_hot_swap() {
     rm -f "$handler_obj" "$config_path"
 }
 
+test_minecraft_profile_dataplane() {
+    local port=25565
+    local handler_obj="/tmp/axdp_integ_minecraft_handler.o"
+    local result_file="/tmp/axdp_integ_minecraft_result"
+    local asm_inc multiarch_inc server_pid
+    asm_inc=$(clang -print-file-name=include) || return 1
+    multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
+    local -a include_args=(
+        -I "$REPO_ROOT/handlers"
+        -I "$REPO_ROOT/bpf/include"
+        -I /usr/include
+        -I /usr/include/bpf
+        -I "$asm_inc"
+    )
+    [[ ! -d "$multiarch_inc" ]] || include_args+=(-I "$multiarch_inc")
+
+    clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+        "${include_args[@]}" \
+        -c "$REPO_ROOT/handlers/minecraft_handler.c" -o "$handler_obj" || return 1
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin_cli \
+        --config /tmp/axdp_integ_missing.toml \
+        --bpf-pin-dir "$_PIN_DIR" \
+        --install-dir "$REPO_ROOT" \
+        port-handler load tcp "$port" "$handler_obj" --no-config-update \
+        >/dev/null || return 1
+    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
+        key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null || return 1
+
+    rm -f "$result_file"
+    python3 - "$port" "$result_file" <<'PYEOF' &
+import socket, sys
+
+port, result_path = int(sys.argv[1]), sys.argv[2]
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("0.0.0.0", port))
+server.listen(4)
+server.settimeout(3)
+valid = b""
+try:
+    conn, _ = server.accept()
+    conn.settimeout(2)
+    while b"PLAY" not in valid:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        valid += chunk
+    conn.close()
+except OSError:
+    pass
+
+server.settimeout(2)
+invalid_payload = b""
+try:
+    conn, _ = server.accept()
+    conn.settimeout(1)
+    try:
+        invalid_payload = conn.recv(4096)
+    except OSError:
+        pass
+    conn.close()
+except OSError:
+    pass
+server.close()
+with open(result_path, "w", encoding="ascii") as handle:
+    handle.write(f"{valid.hex()}\n{invalid_payload.hex()}\n")
+PYEOF
+    server_pid=$!
+    sleep 0.15
+
+    if ! ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" <<'PYEOF'
+import socket, sys, time
+
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+s.sendall(b"\x0f\x00\x2f\x09localhost\x63\xdd\x02")
+time.sleep(0.1)
+s.sendall(b"\x06\x00\x04Test")
+time.sleep(0.1)
+s.sendall(b"PLAY")
+time.sleep(0.1)
+s.close()
+PYEOF
+    then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" <<'PYEOF'
+import socket, sys, time
+
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.sendall(b"GET / HTTP/1.1\r\n\r\n")
+time.sleep(0.1)
+s.close()
+PYEOF
+    then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        return 1
+    fi
+
+    wait "$server_pid" || return 1
+    python3 - "$result_file" <<'PYEOF' || return 1
+import sys
+
+lines = open(sys.argv[1], encoding="ascii").read().splitlines()
+payload = bytes.fromhex(lines[0])
+expected = b"\x0f\x00\x2f\x09localhost\x63\xdd\x02\x06\x00\x04TestPLAY"
+if payload != expected:
+    raise SystemExit(f"valid Minecraft flow mismatch: {payload!r}")
+if lines[1]:
+    raise SystemExit("non-Minecraft payload reached the protected listener")
+PYEOF
+    rm -f "$handler_obj" "$result_file"
+}
+
 test_reload() {
     local map_id
 
