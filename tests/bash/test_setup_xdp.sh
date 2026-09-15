@@ -332,6 +332,26 @@ test_backend_phase_dispatch_preserves_remote_ref_across_sudo() (
     assert_file_contains "$tmpdir/as-root.log" "AUTO_XDP_FORCE_REMOTE=1"
 )
 
+test_backend_phase_defers_activation_for_audit_policy() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local calls=""
+    configured_policy_mode() { printf 'audit\n'; }
+    _auto_xdp_resolve_preferred_backend() { printf 'auto\n'; }
+    step_begin() { :; }
+    step_ok() { :; }
+    deactivate_installed_runtime() { calls+="deactivate|"; }
+    run_initial_sync_step() { calls+="sync|"; }
+    install_runtime_service_step() { calls+="service|"; }
+    deploy_backend_step() { calls+="deploy|"; }
+
+    run_backend_phase || return 1
+    assert_eq "$POLICY_DEFERRED" "1" || return 1
+    assert_eq "$ACTIVE_XDP_MODE" "none" || return 1
+    assert_eq "$calls" "deactivate|sync|service|"
+)
+
 test_readme_release_install_uses_one_local_archive_tree() (
     local readme
     readme=$(<"$REPO_ROOT/README.md")

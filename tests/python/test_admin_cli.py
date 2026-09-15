@@ -9,6 +9,8 @@ from unittest import mock
 import pytest
 
 import auto_xdp.admin.main as admin_main
+import auto_xdp.admin.detect as admin_detect
+import auto_xdp.admin.runtime as admin_runtime
 import auto_xdp.admin_cli as admin_cli
 from auto_xdp import approvals
 from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
@@ -18,6 +20,175 @@ pytestmark = pytest.mark.component
 
 
 class AdminCliTests(unittest.TestCase):
+    def test_approval_store_supports_persistent_axdp_path(self):
+        with mock.patch.dict(
+            "os.environ", {"AUTO_XDP_APPROVAL_STORE": "/etc/auto_xdp/approvals.json"}
+        ):
+            self.assertEqual(
+                approvals.store_path("/run/auto_xdp"),
+                Path("/etc/auto_xdp/approvals.json"),
+            )
+
+    def test_xdp_detection_preserves_offload_mode(self):
+        with mock.patch.object(
+            admin_detect.subprocess,
+            "check_output",
+            return_value="2: eth0: <UP> xdpoffload prog/xdp id 77",
+        ):
+            self.assertEqual(admin_detect.iface_xdp_state("eth0"), "offload")
+
+    def test_allow_and_deny_service_shortcuts_update_policy_and_audit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            run_dir = root / "run"
+            config_path.write_text("[zones.public]\ninterfaces = []\n[policy]\nmode = \"audit\"\n")
+
+            with mock.patch.object(admin_cli.os, "geteuid", return_value=0), \
+                 mock.patch.object(approvals, "reload_daemon"):
+                self.assertEqual(admin_cli.main([
+                    "--config", str(config_path), "--run-state-dir", str(run_dir),
+                    "allow", "paper.service", "tcp/25565", "--profile", "minecraft",
+                ]), 0)
+                self.assertEqual(admin_cli.main([
+                    "--config", str(config_path), "--run-state-dir", str(run_dir),
+                    "deny", "paper.service", "tcp/25565",
+                ]), 0)
+
+            config = config_path.read_text()
+            self.assertIn('systemd_unit = "paper.service"', config)
+            self.assertIn('profile = "minecraft"', config)
+            self.assertIn("ports = []", config)
+            state = json.loads((run_dir / "approval_requests.json").read_text())
+            self.assertEqual(
+                [item["action"] for item in state["history"]],
+                ["request", "approve", "deny"],
+            )
+
+    def test_policy_mode_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text("[firewall]\nbogon_filter = false\n[policy]\nmode = \"audit\"\n")
+
+            with mock.patch.object(admin_cli.os, "geteuid", return_value=0):
+                self.assertEqual(
+                    admin_cli.main(["--config", str(config_path), "policy", "mode", "enforce"]),
+                    0,
+                )
+            self.assertIn('mode = "enforce"', config_path.read_text())
+            self.assertIn("bogon_filter = false", config_path.read_text())
+
+    def test_deactivate_runtime_detaches_only_owned_xdp_and_removes_pins(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env_config = root / "auto_xdp.env"
+            pin_dir = root / "sys" / "fs" / "bpf" / "xdp_fw"
+            run_dir = root / "run"
+            pin_dir.mkdir(parents=True)
+            run_dir.mkdir()
+            (pin_dir / "prog").write_text("")
+            env_config.write_text('IFACES="eth0"\n')
+            attached = {"eth0": 77}
+
+            def run_text(command):
+                if command[:4] == ["ip", "link", "set", "dev"]:
+                    attached[command[4]] = None
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            context = admin_runtime.RuntimeContext(env_config, pin_dir, run_dir, "inet", "auto_xdp")
+            with mock.patch.object(admin_runtime, "_pinned_xdp_program_id", return_value=77), \
+                 mock.patch.object(admin_runtime, "_iface_xdp_program_id", side_effect=lambda iface: attached[iface]), \
+                 mock.patch.object(admin_runtime, "_iface_xdp_state", return_value="native"), \
+                 mock.patch.object(admin_runtime, "_all_interface_names", return_value=[]), \
+                 mock.patch.object(admin_runtime, "_command_exists", return_value=False), \
+                 mock.patch.object(admin_runtime, "_run_text", side_effect=run_text):
+                messages = admin_runtime.deactivate_runtime(context)
+
+            self.assertFalse(pin_dir.exists())
+            self.assertIn("detached Auto XDP from eth0", messages)
+
+    def test_deactivate_runtime_includes_previously_managed_interfaces(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env_config = root / "auto_xdp.env"
+            pin_dir = root / "sys" / "fs" / "bpf" / "xdp_fw"
+            run_dir = root / "run"
+            pin_dir.mkdir(parents=True)
+            run_dir.mkdir()
+            (pin_dir / "prog").write_text("")
+            env_config.write_text('IFACES="eth0"\n')
+            attached = {"eth0": None, "eth1": 77}
+
+            def run_text(command):
+                if command[:4] == ["ip", "link", "set", "dev"]:
+                    attached[command[4]] = None
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            context = admin_runtime.RuntimeContext(
+                env_config, pin_dir, run_dir, "inet", "auto_xdp"
+            )
+            with mock.patch.object(admin_runtime, "_pinned_xdp_program_id", return_value=77), \
+                 mock.patch.object(
+                     admin_runtime,
+                     "_iface_xdp_program_id",
+                     side_effect=lambda iface: attached[iface],
+                 ), \
+                 mock.patch.object(admin_runtime, "_iface_xdp_state", return_value="native"), \
+                 mock.patch.object(admin_runtime, "_all_interface_names", return_value=["eth0", "eth1"]), \
+                 mock.patch.object(admin_runtime, "_command_exists", return_value=False), \
+                 mock.patch.object(admin_runtime, "_run_text", side_effect=run_text):
+                messages = admin_runtime.deactivate_runtime(context)
+
+            self.assertIn("detached Auto XDP from eth1", messages)
+
+    def test_deactivate_runtime_rejects_unsafe_pin_root(self):
+        context = admin_runtime.RuntimeContext(
+            Path("/tmp/absent-auto-xdp.env"), Path("/"), Path("/tmp/run"),
+            "inet", "auto_xdp",
+        )
+        with self.assertRaisesRegex(RuntimeError, "unsafe BPF pin path"):
+            admin_runtime.deactivate_runtime(context)
+
+    def test_deactivate_runtime_refuses_foreign_xdp(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env_config = root / "auto_xdp.env"
+            pin_dir = root / "sys" / "fs" / "bpf" / "xdp_fw"
+            pin_dir.mkdir(parents=True)
+            (pin_dir / "prog").write_text("")
+            env_config.write_text('IFACES="eth0"\n')
+            context = admin_runtime.RuntimeContext(env_config, pin_dir, root / "run", "inet", "auto_xdp")
+
+            with mock.patch.object(admin_runtime, "_pinned_xdp_program_id", return_value=77), \
+                 mock.patch.object(admin_runtime, "_iface_xdp_program_id", return_value=88):
+                with self.assertRaisesRegex(RuntimeError, "non-Auto-XDP"):
+                    admin_runtime.deactivate_runtime(context)
+            self.assertTrue(pin_dir.exists())
+
+    def test_backend_report_treats_audit_without_dataplane_as_healthy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            env_config = root / "auto_xdp.env"
+            install_dir = root / "install"
+            install_dir.mkdir()
+            (install_dir / "release.json").write_text('{"release":"test-release"}\n')
+            config_path.write_text('[policy]\nmode = "audit"\n')
+            env_config.write_text(
+                f'IFACES="eth0"\nTOML_CONFIG="{config_path}"\nINSTALL_DIR="{install_dir}"\n'
+            )
+            context = admin_runtime.RuntimeContext(
+                env_config, root / "bpf", root / "run", "inet", "auto_xdp"
+            )
+
+            with mock.patch.object(admin_runtime, "detect_backend", side_effect=RuntimeError("none")), \
+                 mock.patch.object(admin_runtime, "_iface_xdp_state", return_value="off"):
+                report = admin_runtime.collect_backend_report(context)
+
+            self.assertEqual(report.backend, "inactive")
+            self.assertTrue(report.healthy)
+            self.assertEqual(report.policy, "audit (data plane inactive)")
+
     def test_approval_workflow_updates_and_reverts_service_exposure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -101,6 +272,29 @@ class AdminCliTests(unittest.TestCase):
         self.assertIn("nginx.service", explanation)
         self.assertIn("public/tcp/443", explanation)
         self.assertIn("XDP", explanation)
+
+    def test_exposure_shows_owner_for_blocked_endpoint(self):
+        endpoint = RuntimeEndpoint(
+            "tcp", "0.0.0.0", 25565, "wildcard", "public",
+            "paper.service", "exact", "systemd-cgroup",
+        )
+        decision = ExposureDecision(
+            endpoint, "block", "no explicit exposure grant", "", "minecraft"
+        )
+        args = mock.Mock(
+            config="/tmp/config.toml", iface="", bpf_pin_dir="/tmp/bpf",
+            run_state_dir="/tmp/run", nft_family="inet", nft_table="auto_xdp",
+        )
+        with mock.patch.object(
+            admin_cli,
+            "_policy_snapshot",
+            return_value=(ObservedState(), DesiredState(exposure_decisions=[decision])),
+        ), mock.patch.object(admin_cli, "_active_backend_name", return_value="inactive"), \
+             mock.patch("sys.stdout", new=StringIO()) as output:
+            self.assertEqual(admin_cli._cmd_exposure(args), 0)
+
+        self.assertIn("owner: paper.service", output.getvalue())
+        self.assertIn("status: blocked", output.getvalue())
 
     def test_explain_missing_endpoint_is_blocked(self):
         args = mock.Mock(config="/tmp/config.toml", iface="", bpf_pin_dir="/tmp/bpf", run_state_dir="/tmp/run", nft_family="inet", nft_table="auto_xdp", endpoint="tcp/443")
