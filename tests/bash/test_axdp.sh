@@ -78,6 +78,89 @@ test_main_dispatches_under_attack_command() (
     assert_eq "$called" "yes:on"
 )
 
+test_main_dispatches_integrated_policy_commands() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local calls=""
+    run_exposure() { calls+="discover:$*|"; }
+    run_allow() { calls+="allow:$*|"; }
+    run_deny() { calls+="deny:$*|"; }
+    run_mode() { calls+="mode:$*|"; }
+
+    main discover || return 1
+    main allow paper.service tcp/25565 --profile minecraft || return 1
+    main deny paper.service tcp/25565 || return 1
+    main mode enforce || return 1
+    assert_eq "$calls" "discover:|allow:paper.service tcp/25565 --profile minecraft|deny:paper.service tcp/25565|mode:enforce|"
+)
+
+test_enable_refuses_ungranted_remote_ssh() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    TOML_CONFIG="$tmpdir/config.toml"
+    : > "$TOML_CONFIG"
+    require_root() { :; }
+    run_admin_config() {
+        [[ "$*" == "explain tcp/22" ]] && printf 'BLOCK\n'
+    }
+    SSH_CONNECTION="198.51.100.4 40000 203.0.113.2 22"
+    local output status
+    output=$(run_enable 2>&1)
+    status=$?
+    [[ $status -ne 0 ]] || return 1
+    assert_contains "$output" "current SSH listener has no matching grant"
+)
+
+test_remote_ssh_guard_rejects_mixed_allow_and_block() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    run_admin_config() { printf 'ALLOW\n---\nBLOCK\n'; }
+    SSH_CONNECTION="198.51.100.4 40000 203.0.113.2 22"
+    ! remote_access_is_granted
+)
+
+test_service_command_propagates_primary_daemon_failure() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    SYSTEMD_RUN_DIR="$tmpdir"
+    systemctl() {
+        [[ "$1" == "list-unit-files" ]] && return 0
+        [[ "$2" == "$RELAY_SERVICE_NAME" ]]
+    }
+
+    run_service_cmd restart
+    [[ $? -ne 0 ]]
+)
+
+test_enable_failure_restores_audit_discovery() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir calls=""
+    tmpdir=$(mktemp -d)
+    TOML_CONFIG="$tmpdir/config.toml"
+    : > "$TOML_CONFIG"
+    require_root() { :; }
+    remote_access_is_granted() { return 0; }
+    run_admin_config() { calls+="config:$*|"; }
+    run_service_cmd() {
+        calls+="service:$*|"
+        [[ "$1" != "restart" ]]
+    }
+
+    run_enable >/dev/null 2>&1
+    [[ $? -ne 0 ]] || return 1
+    assert_eq "$calls" "config:policy mode enforce|service:restart|config:policy mode audit|service:start|"
+)
+
 test_status_combines_service_and_backend_health() (
     source "$REPO_ROOT/axdp"
     set +e
