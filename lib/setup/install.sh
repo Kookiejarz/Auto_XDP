@@ -130,6 +130,7 @@ SYNC_SCRIPT="${CURRENT_LINK}/xdp_port_sync.py"
 PYTHON3_BIN="${PYTHON3_BIN}"
 BPF_PIN_DIR="${BPF_PIN_DIR}"
 XDP_OBJ_PATH="${CURRENT_LINK}/${XDP_OBJ}"
+MC_EGRESS_OBJ_PATH="${CURRENT_LINK}/${MC_EGRESS_OBJ}"
 SOCK_STATE_OBJ_PATH="${CURRENT_LINK}/${SOCK_STATE_OBJ}"
 BPFTOOL_BIN="${BPFTOOL_BIN:-}"
 PREFERRED_BACKEND="${REQUESTED_BACKEND}"
@@ -404,7 +405,7 @@ build_release_payload() {
 
     install_compiled_bpf_objects() {
         local object source
-        for object in "$XDP_OBJ" "$SOCK_STATE_OBJ"; do
+        for object in "$XDP_OBJ" "$MC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
             source="${BUILD_STAGING_DIR}/${object}"
             [[ -f "$source" ]] || continue
             place_file "$source" "${INSTALL_DIR}/${object}" || return 1

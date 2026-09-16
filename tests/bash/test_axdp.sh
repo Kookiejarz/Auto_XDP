@@ -327,6 +327,7 @@ _setup_reattach_test_env() {
     # stubs for functions from auto_xdp_runtime_common.sh (not loaded in tests)
     ensure_bpffs() { return 0; }
     load_sock_state_tracker() { return 0; }
+    load_minecraft_egress() { return 0; }
     xdp_maps_ready() { return 0; }
     load_port_handlers() { return 0; }
     auto_tune_interface_parallelism() { return 0; }

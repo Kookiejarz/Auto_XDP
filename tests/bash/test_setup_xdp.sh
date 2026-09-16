@@ -709,6 +709,7 @@ sources = (
     repo_root / "bpf/include/common.h",
     repo_root / "bpf/include/counters.h",
     repo_root / "bpf/include/maps.h",
+    repo_root / "bpf/include/minecraft.h",
     repo_root / "handlers/xdp_slot_ctx.h",
     repo_root / "handlers/xdp_profile_ctx.h",
 )

@@ -202,6 +202,20 @@ class TestRelaySecurity(unittest.TestCase):
                 client.close()
                 server._cleanup()
 
+    def test_initial_history_is_sent_before_client_becomes_nonblocking(self):
+        server = self._relay("/tmp")
+        conn = mock.MagicMock()
+        conn.fileno.return_value = 7
+        server._server = mock.MagicMock()
+        server._server.accept.return_value = (conn, None)
+
+        with mock.patch.object(relay_mod, "_peer_is_authorized", return_value=True):
+            server._accept_client()
+
+        self.assertEqual(conn.method_calls[0], mock.call.settimeout(1.0))
+        self.assertEqual(conn.method_calls[-2], mock.call.setblocking(False))
+        self.assertIs(server._clients[7], conn)
+
     @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "Linux SO_PEERCRED is required")
     def test_peer_credentials_authorize_same_process(self):
         left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)

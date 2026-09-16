@@ -63,6 +63,7 @@ test -x /usr/local/lib/auto_xdp/current/auto_xdp_start.sh
 test -f /usr/local/lib/auto_xdp/current/auto_xdp_bpf_helpers.py
 test -f /usr/local/lib/auto_xdp/current/release.json
 test -s /usr/local/lib/auto_xdp/current/xdp_firewall.o
+test -s /usr/local/lib/auto_xdp/current/minecraft_egress.o
 test -s /usr/local/lib/auto_xdp/current/xdp_map_abi.txt
 test ! -e /usr/local/bin/auto_xdp_start.sh
 test ! -e /usr/local/bin/xdp_port_sync.py

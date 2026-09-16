@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # auto-xdp-test-suite: kernel
 # Real-environment XDP integration tests: kernel BPF, network namespaces, veth.
-# Requires root, clang, bpftool, iproute2 (with netns support), python3.
+# Requires root, clang, bpftool, iproute2/tc (with netns support), python3.
 
 set -uo pipefail
 
@@ -37,7 +37,7 @@ if [[ $EUID -ne 0 ]]; then
     _kernel_unavailable "must run as root"
 fi
 
-for _cmd in clang bpftool ip python3; do
+for _cmd in clang bpftool ip python3 tc; do
     command -v "$_cmd" &>/dev/null || _kernel_unavailable "$_cmd not found"
 done
 
@@ -504,6 +504,7 @@ test_handler_transactional_hot_swap() {
 test_minecraft_profile_dataplane() {
     local port=25565
     local handler_obj="/tmp/axdp_integ_minecraft_handler.o"
+    local egress_obj="/tmp/axdp_integ_minecraft_egress.o"
     local result_file="/tmp/axdp_integ_minecraft_result"
     local ready_file="/tmp/axdp_integ_minecraft_ready"
     local continue_file="/tmp/axdp_integ_minecraft_continue"
@@ -526,17 +527,27 @@ test_minecraft_profile_dataplane() {
     clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
         "${include_args[@]}" \
         -c "$REPO_ROOT/handlers/minecraft_handler.c" -o "$handler_obj" || return 1
+    clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+        "${include_args[@]}" -I "$REPO_ROOT" \
+        -c "$REPO_ROOT/bpf/minecraft_egress.c" -o "$egress_obj" || return 1
     PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin_cli \
         --config /tmp/axdp_integ_missing.toml \
         --bpf-pin-dir "$_PIN_DIR" \
         --install-dir "$REPO_ROOT" \
         profile-handler load 1 "$handler_obj" \
         >/dev/null || return 1
+    bpftool prog load "$egress_obj" "$_PIN_DIR/minecraft_egress_test" type classifier \
+        map name tcp_whitelist pinned "$_PIN_DIR/tcp_whitelist" \
+        map name tcp_zone_whitelist pinned "$_PIN_DIR/tcp_zone_whitelist" \
+        map name mc_l7_pending pinned "$_PIN_DIR/mc_l7_pending" \
+        >/dev/null || return 1
+    tc qdisc add dev "$_VETH" clsact 2>/dev/null || true
+    tc filter replace dev "$_VETH" egress pref 49153 handle 2 \
+        bpf direct-action object-pinned "$_PIN_DIR/minecraft_egress_test" \
+        >/dev/null || return 1
     _set_tcp_policy "$port" 1 1 11 22 || return 1
 
-    # Exercise the profile through the base program with deterministic raw
-    # packets. A byte-for-byte retransmission of the last accepted Minecraft
-    # segment must pass without advancing or penalizing the parser state.
+    # Raw replay cannot manufacture Linux conntrack state: only a SYN passes.
     python3 - "$port" <<'PYEOF' || return 1
 import ipaddress, struct, sys
 
@@ -566,19 +577,42 @@ for writer in (ipv4, ipv6):
     writer("ack", 101, 0x10)
     writer("handshake", 101, 0x18, payload)
 PYEOF
-    local family packet retval
+    local family packet retval expected
     for family in 4 6; do
-        for packet in syn ack handshake handshake; do
+        for packet in syn ack handshake; do
+            expected=1
+            [[ "$packet" == syn ]] && expected=2
             retval=$(bpftool -j prog run pinned "$_PIN_DIR/prog" \
                 data_in "/tmp/axdp_mc${family}_${packet}" \
                 | python3 -c 'import json,sys; print(json.load(sys.stdin)["retval"])') || return 1
-            [[ "$retval" == 2 ]] || {
-                echo "Minecraft IPv${family} ${packet} returned XDP action ${retval}"
+            [[ "$retval" == "$expected" ]] || {
+                echo "Minecraft IPv${family} ${packet} returned XDP action ${retval}, expected ${expected}"
                 return 1
             }
         done
     done
     rm -f /tmp/axdp_mc4_{syn,ack,handshake} /tmp/axdp_mc6_{syn,ack,handshake}
+
+    # A client network namespace may own the skb's conntrack entry before it
+    # reaches the host-side veth, so this topology cannot always exercise a
+    # host-netns lookup. The verifier/raw checks above still cover fail-closed
+    # behavior; run the dialogue checks only when the host sees the probe CT.
+    _set_tcp_policy "$port" 1 0 0 0 || return 1
+    python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("0.0.0.0",25565)); s.listen(); c,_=s.accept(); time.sleep(0.5)' &
+    local probe_server=$!
+    sleep 0.1
+    ip netns exec "$_NS" python3 -c 'import socket,time; s=socket.create_connection(("10.99.0.1",25565)); time.sleep(0.4)' &
+    local probe_client=$!
+    sleep 0.2
+    if ! grep -q 'dport=25565' /proc/net/nf_conntrack; then
+        wait "$probe_client" "$probe_server" || true
+        echo "[SKIP] host-side veth has no host-netns conntrack entry"
+        tc filter del dev "$_VETH" egress pref 49153 handle 2 2>/dev/null || true
+        rm -f "$handler_obj" "$egress_obj"
+        return 0
+    fi
+    wait "$probe_client" "$probe_server" || return 1
+    _set_tcp_policy "$port" 1 1 11 22 || return 1
 
     rm -f "$result_file" "$ready_file" "$continue_file" "$ready_file2" \
         "$continue_file2" "$ready_file3" "$continue_file3"
@@ -597,6 +631,12 @@ def receive_verified(ready_path):
     old_payload = b""
     conn, _ = server.accept()
     conn.settimeout(2)
+    while b"Test" not in valid:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        valid += chunk
+    conn.sendall(b"\x01\x02")
     while b"PLAY" not in valid:
         chunk = conn.recv(4096)
         if not chunk:
@@ -623,6 +663,12 @@ status_payload = b""
 try:
     conn, _ = server.accept()
     conn.settimeout(1)
+    while len(status_payload) < 18:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        status_payload += chunk
+    conn.sendall(b"\x01\x00")
     while len(status_payload) < 28:
         chunk = conn.recv(4096)
         if not chunk:
@@ -660,10 +706,11 @@ import os, socket, sys, time
 
 s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+time.sleep(0.1)
 s.sendall(b"\x0f\x00\x2f\x09localhost\x63\xdd\x02")
 time.sleep(0.1)
 s.sendall(b"\x06\x00\x04Test")
-time.sleep(0.1)
+s.recv(2)
 s.sendall(b"PLAY")
 deadline = time.monotonic() + 3
 while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:
@@ -690,24 +737,12 @@ PYEOF
         echo "Minecraft flow did not reach verified state"
         return 1
     }
-    python3 - "$_PIN_DIR/profile_handlers/tcp/1/verified_mc" <<'PYEOF' || return 1
-import json, subprocess, sys
-
-path = sys.argv[1]
-rows = json.loads(subprocess.check_output(
-    ["bpftool", "-j", "map", "dump", "pinned", path], text=True
-))
-if len(rows) != 1:
-    raise SystemExit(f"expected one verified Minecraft flow, got {len(rows)}")
-key = [str(byte) for byte in rows[0]["key"]]
-value = list(rows[0]["value"])
-value[:8] = ["0x00"] * 8
-subprocess.run(
-    ["bpftool", "map", "update", "pinned", path, "key", "hex", *key,
-     "value", "hex", *(str(byte) for byte in value)],
-    check=True,
-)
-PYEOF
+    [[ "$(bpftool -j map dump pinned "$_PIN_DIR/mc_l7_pending" \
+        | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" == 0 ]] || {
+        echo "wire verification did not clear the bounded parser state"
+        return 1
+    }
+    _set_tcp_policy "$port" 1 1 11 23 || return 1
     : > "$continue_file"
     wait "$client_pid" || return 1
 
@@ -716,10 +751,11 @@ import os, socket, sys, time
 
 s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+time.sleep(0.1)
 s.sendall(b"\x10\x00\xfe\x05\x09localhost\x63\xdd\x02")
 time.sleep(0.1)
 s.sendall(b"\x16\x00\x04Test" + b"\x00" * 16)
-time.sleep(0.1)
+s.recv(2)
 s.sendall(b"PLAY")
 deadline = time.monotonic() + 3
 while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:
@@ -746,7 +782,7 @@ PYEOF
         echo "second Minecraft flow did not reach verified state"
         return 1
     }
-    _set_tcp_policy "$port" 1 1 12 22 || return 1
+    _set_tcp_policy "$port" 1 1 12 23 || return 1
     : > "$continue_file2"
     wait "$client_pid" || return 1
 
@@ -755,10 +791,11 @@ import os, socket, sys, time
 
 s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+time.sleep(0.1)
 s.sendall(b"\x0f\x00\x2f\x09localhost\x63\xdd\x02")
 time.sleep(0.1)
 s.sendall(b"\x06\x00\x04Test")
-time.sleep(0.1)
+s.recv(2)
 s.sendall(b"PLAY")
 deadline = time.monotonic() + 3
 while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:
@@ -785,7 +822,7 @@ PYEOF
         echo "third Minecraft flow did not reach verified state"
         return 1
     }
-    _set_tcp_policy "$port" 1 1 12 23 || return 1
+    _set_tcp_policy "$port" 1 1 12 24 || return 1
     : > "$continue_file3"
     wait "$client_pid" || return 1
 
@@ -794,10 +831,11 @@ import socket, sys, time
 
 s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+time.sleep(0.1)
 s.sendall(b"\x0f\x00\x2f\x09localhost\x63\xdd\x01")
 time.sleep(0.05)
 s.sendall(b"\x01\x00")
-time.sleep(0.05)
+s.recv(2)
 s.sendall(b"\x09\x01" + b"\x00" * 8)
 time.sleep(0.1)
 s.close()
@@ -812,7 +850,8 @@ PYEOF
 import socket, sys, time
 
 s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
-s.sendall(b"GET / HTTP/1.1\r\n\r\n")
+time.sleep(0.1)
+s.sendall(b"\x00BAD")
 time.sleep(0.1)
 s.close()
 PYEOF
@@ -837,11 +876,11 @@ if bytes.fromhex(lines[0]) != legacy or bytes.fromhex(lines[4]) != legacy:
 if bytes.fromhex(lines[2]) != modern:
     raise SystemExit("modern Minecraft flow mismatch")
 if lines[1]:
-    raise SystemExit("expired verified flow was accepted")
+    raise SystemExit("old connmark survived profile generation change")
 if lines[3]:
-    raise SystemExit("old verified flow survived policy generation change")
+    raise SystemExit("old connmark survived policy generation change")
 if lines[5]:
-    raise SystemExit("old verified flow survived profile generation change")
+    raise SystemExit("second old connmark survived profile generation change")
 if bytes.fromhex(lines[6]) != status:
     raise SystemExit("Minecraft status/ping flow mismatch")
 if lines[7]:
@@ -884,7 +923,8 @@ PYEOF
         echo "required profile tail-call miss did not fail closed"
         return 1
     }
-    rm -f "$handler_obj" "$result_file" "$ready_file" "$continue_file" \
+    tc filter del dev "$_VETH" egress pref 49153 handle 2 2>/dev/null || true
+    rm -f "$handler_obj" "$egress_obj" "$result_file" "$ready_file" "$continue_file" \
         "$ready_file2" "$continue_file2" "$ready_file3" "$continue_file3"
 }
 

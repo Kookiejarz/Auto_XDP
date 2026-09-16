@@ -283,6 +283,14 @@ compile_xdp_program() {
         warn "Failed to compile ${XDP_SRC}; XDP backend will be skipped."
         return 1
     fi
+    if ! stage_build_source "$MC_EGRESS_SRC" "$MC_EGRESS_SRC" "$MC_EGRESS_SRC" \
+            || ! compile_bpf_object \
+                "${_source_root}/${MC_EGRESS_SRC}" \
+                "${BUILD_STAGING_DIR}/${MC_EGRESS_OBJ}" \
+                "$_source_root"; then
+        warn "Required Minecraft egress observer failed to build."
+        return 1
+    fi
 
     if [[ $_handlers_ready -eq 1 && -d "$_handlers_dir" ]] && command -v make &>/dev/null; then
         if ! bpf_header_exists "linux/bpf.h" "/usr/include" "$ASM_INC"; then
@@ -382,7 +390,7 @@ cleanup_build_artifacts_step() {
     local _cleaned=()
 
     step_begin "Cleaning up build artifacts"
-    for _f in "$XDP_OBJ" "$SOCK_STATE_OBJ"; do
+    for _f in "$XDP_OBJ" "$MC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
         if [[ -f "$_f" ]]; then
             rm -f "$_f" && _cleaned+=("$_f")
         fi
