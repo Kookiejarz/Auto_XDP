@@ -521,13 +521,6 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
             raise ValueError(
                 f"subjects.{subject_name}.resolve.container_runtime requires container identity"
             )
-        if resolve:
-            for previous_name, previous_resolver in seen_resolvers:
-                if resolve == previous_resolver:
-                    raise ValueError(
-                        f"subjects.{subject_name}.resolve duplicates subjects.{previous_name}.resolve"
-                    )
-            seen_resolvers.append((str(subject_name), resolve))
         exposure = subject.get("exposure", {})
         if not isinstance(exposure, dict):
             raise ValueError(f"subjects.{subject_name}.exposure must be a table")
@@ -552,6 +545,25 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
                     raise ValueError(
                         f"subjects.{subject_name}.exposure.{zone_name}.{protocol}.ports must contain 1..65535"
                     ) from None
+        has_policy = any(
+            isinstance(zone_policy, dict)
+            and (
+                zone_policy.get("deny")
+                or any(
+                    isinstance(zone_policy.get(protocol), dict)
+                    and zone_policy[protocol].get("ports")
+                    for protocol in ("tcp", "udp", "sctp")
+                )
+            )
+            for zone_policy in exposure.values()
+        )
+        if resolve and has_policy:
+            for previous_name, previous_resolver in seen_resolvers:
+                if resolve == previous_resolver:
+                    raise ValueError(
+                        f"subjects.{subject_name}.resolve duplicates subjects.{previous_name}.resolve"
+                    )
+            seen_resolvers.append((str(subject_name), resolve))
         SUBJECTS[str(subject_name)] = copy.deepcopy(subject)
 
     raw_unknown = cfg.get("unknown_subjects", policy_cfg.get("unknown_subjects", {"public": "deny"}))

@@ -82,6 +82,18 @@ def _ports(values: list[int]) -> list[int]:
     return result
 
 
+def _has_exposure_policy(subject: object) -> bool:
+    if not isinstance(subject, dict):
+        return False
+    for zone in subject.get("exposure", {}).values():
+        if isinstance(zone, dict) and (
+            zone.get("deny")
+            or any(isinstance(zone.get(proto), dict) and zone[proto].get("ports") for proto in _PROTOCOLS)
+        ):
+            return True
+    return False
+
+
 def _validate_request(data: dict[str, Any], *, config: dict[str, Any]) -> None:
     subject = str(data.get("subject", ""))
     if not _SUBJECT_RE.fullmatch(subject):
@@ -123,6 +135,7 @@ def _validate_request(data: dict[str, Any], *, config: dict[str, Any]) -> None:
                 str(other_name) != subject
                 and isinstance(other, dict)
                 and other.get("resolve") == resolution
+                and _has_exposure_policy(other)
             ):
                 raise ValueError(f"resolver already belongs to subject {other_name}")
     if not resolution and not isinstance(existing.get("resolve"), dict):

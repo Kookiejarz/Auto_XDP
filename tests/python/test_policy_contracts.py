@@ -117,6 +117,26 @@ def test_service_aware_policy_requires_explicit_grant_and_runtime_owner() -> Non
     assert desired.exposure_decisions[0].protection_profile == ""
 
 
+def test_empty_subject_does_not_shadow_active_subject_with_same_resolver() -> None:
+    cfg.SUBJECTS = {
+        "revoked": {"resolve": {"systemd_unit": "nginx.service"}},
+        "website": {
+            "resolve": {"systemd_unit": "nginx.service"},
+            "exposure": {"public": {"tcp": {"ports": [443]}}},
+        },
+    }
+
+    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+        RuntimeEndpoint(
+            "tcp", "0.0.0.0", 443, "wildcard", "public",
+            "nginx.service", "exact", "systemd-cgroup",
+        ),
+    ]))
+
+    assert desired.tcp_ports == {443}
+    assert desired.exposure_decisions[0].subject == "website"
+
+
 def test_minecraft_profile_changes_desired_tcp_protection() -> None:
     cfg.ZONES = {"public": {"interfaces": []}}
     cfg.SUBJECTS = {
