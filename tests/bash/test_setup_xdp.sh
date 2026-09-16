@@ -347,6 +347,8 @@ test_backend_phase_defers_activation_for_audit_policy() (
     deploy_backend_step() { calls+="deploy|"; }
 
     run_backend_phase || return 1
+    assert_eq "$RUN_STATE_DIR" "/run/auto_xdp" || return 1
+    assert_eq "$NFT_FAMILY/$NFT_TABLE" "inet/auto_xdp" || return 1
     assert_eq "$POLICY_DEFERRED" "1" || return 1
     assert_eq "$ACTIVE_XDP_MODE" "none" || return 1
     assert_eq "$calls" "deactivate|sync|service|"
@@ -675,6 +677,24 @@ test_xdp_maps_ready_requires_all_expected_pins() (
     assert_eq "$status" "0"
 )
 
+test_xdp_maps_ready_rejects_endpoint_value_size_mismatch() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir map_name status
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir"
+    while IFS= read -r map_name; do
+        [[ -n "$map_name" ]] && touch "$tmpdir/$map_name"
+    done < <(xdp_required_map_names)
+    _map_value_size_ok() { [[ "$1" != "$BPF_PIN_DIR/tcp_whitelist" ]]; }
+    _xdp_map_abi_ready() { return 0; }
+
+    xdp_maps_ready >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1"
+)
+
 test_xdp_required_map_manifest_matches_program_maps() (
     local manifest="$REPO_ROOT/auto_xdp/xdp_required_maps.txt"
 
@@ -687,8 +707,10 @@ repo_root = Path(sys.argv[1])
 manifest_path = Path(sys.argv[2])
 sources = (
     repo_root / "bpf/include/common.h",
+    repo_root / "bpf/include/counters.h",
     repo_root / "bpf/include/maps.h",
     repo_root / "handlers/xdp_slot_ctx.h",
+    repo_root / "handlers/xdp_profile_ctx.h",
 )
 
 declared = set()
@@ -1754,6 +1776,7 @@ EOF_IP
 test_relay_service_security_directives() (
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RELAY_GROUP="${RELAY_GROUP:-auto-xdp}"' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RuntimeDirectoryMode=0750' || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RuntimeDirectoryPreserve=yes' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'UMask=0007' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RuntimeDirectory=auto_xdp' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'PartOf=${SERVICE_NAME}.service' || return 1

@@ -69,6 +69,7 @@ test ! -e /usr/local/bin/xdp_port_sync.py
 test ! -e /usr/local/bin/pkt_relay.py
 test -f /etc/auto_xdp/config.toml
 test -d /etc/auto_xdp/handlers
+test -f /etc/auto_xdp/handlers/minecraft_handler.o
 command -v clang >/dev/null
 command -v bpftool >/dev/null
 

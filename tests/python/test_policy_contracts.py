@@ -102,7 +102,6 @@ def test_service_aware_policy_requires_explicit_grant_and_runtime_owner() -> Non
         "website": {
             "resolve": {"systemd_unit": "nginx.service"},
             "exposure": {"public": {"tcp": {"ports": [443]}}},
-            "protection": {"profile": "web"},
         }
     }
     observed = ObservedState(endpoints=[
@@ -115,7 +114,7 @@ def test_service_aware_policy_requires_explicit_grant_and_runtime_owner() -> Non
 
     assert desired.tcp_ports == {443}
     assert [item.action for item in desired.exposure_decisions] == ["allow", "drop", "drop"]
-    assert desired.exposure_decisions[0].protection_profile == "web"
+    assert desired.exposure_decisions[0].protection_profile == ""
 
 
 def test_minecraft_profile_changes_desired_tcp_protection() -> None:
@@ -136,7 +135,65 @@ def test_minecraft_profile_changes_desired_tcp_protection() -> None:
     ]))
 
     assert desired.tcp_ports == {25565}
-    assert desired.tcp_protection_profiles == {25565: "minecraft"}
+    assert desired.tcp_protection_profiles == {("public", 25565): "minecraft"}
+
+
+def test_protection_profile_never_falls_back_to_unprotected_protocol() -> None:
+    cfg.ZONES = {"public": {"interfaces": []}}
+    cfg.SUBJECTS = {
+        "minecraft": {
+            "resolve": {"systemd_unit": "minecraft.service"},
+            "exposure": {"public": {"udp": {"ports": [25565]}}},
+            "protection": {"profile": "minecraft"},
+        }
+    }
+
+    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+        RuntimeEndpoint(
+            "udp", "0.0.0.0", 25565, "wildcard", "public",
+            "minecraft.service", "exact", "systemd-cgroup",
+        ),
+    ]))
+
+    assert desired.udp_ports == set()
+    assert desired.exposure_decisions[0].action == "drop"
+    assert "unavailable" in desired.exposure_decisions[0].reason
+
+
+def test_same_tcp_port_can_use_different_profiles_in_different_zones() -> None:
+    cfg.ZONES = {"public": {"interfaces": ["eth0"]}, "trusted": {"interfaces": ["wg0"]}}
+    cfg.SUBJECTS = {
+        "minecraft": {
+            "resolve": {"systemd_unit": "minecraft.service"},
+            "exposure": {"public": {"tcp": {"ports": [25565]}}},
+            "protection": {"profile": "minecraft"},
+        },
+        "trusted-console": {
+            "resolve": {"systemd_unit": "console.service"},
+            "exposure": {"trusted": {"tcp": {"ports": [25565]}}},
+        },
+    }
+    endpoints = [
+        RuntimeEndpoint(
+            "tcp", "203.0.113.10", 25565, "specific", "public",
+            "minecraft.service", "exact", "systemd-cgroup",
+        ),
+        RuntimeEndpoint(
+            "tcp", "10.0.0.10", 25565, "specific", "trusted",
+            "console.service", "exact", "systemd-cgroup",
+        ),
+    ]
+
+    decisions = policy.resolve_exposure_decisions(ObservedState(endpoints=endpoints))
+
+    assert {
+        (item.endpoint.ingress_zone, item.protection_profile, item.action)
+        for item in decisions
+    } == {
+        ("public", "minecraft", "allow"), ("trusted", "", "allow")
+    }
+    desired = policy.resolve_desired_state(ObservedState(endpoints=endpoints))
+    assert desired.tcp_protection_profiles == {("public", 25565): "minecraft"}
 
 
 def test_shared_port_with_incompatible_protection_is_closed() -> None:

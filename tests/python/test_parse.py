@@ -9,7 +9,7 @@ from tests.python.support import REPO_ROOT
 
 def _counter_enum() -> dict[str, int]:
     values: dict[str, int] = {}
-    for line in (REPO_ROOT / "bpf/include/common.h").read_text().splitlines():
+    for line in (REPO_ROOT / "bpf/include/counters.h").read_text().splitlines():
         stripped = line.strip()
         if not stripped.startswith("CNT_") or "=" not in stripped:
             continue
