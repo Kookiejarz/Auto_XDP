@@ -360,7 +360,10 @@ class XdpPortSyncTests(unittest.TestCase):
             command.assert_called_once_with("unload", 1)
             self.assertFalse(marker.exists())
 
-            with mock.patch.dict("os.environ", {"RUN_STATE_DIR": str(run_dir)}), \
+            with mock.patch.dict(
+                "os.environ",
+                {"PYTHON_LIB_DIR": str(install_dir / "python"), "RUN_STATE_DIR": str(run_dir)},
+            ), \
                  mock.patch.object(cfg, "BPF_PIN_DIR", str(pin_dir)), \
                  mock.patch.object(backend, "_pinned_program_id", return_value=77), \
                  mock.patch.object(backend, "_profile_command") as command:
@@ -1635,7 +1638,8 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             "office",
             "--log-level",
             "debug",
-        ]), mock.patch.object(cfg, "TRUSTED_SRC_IPS", trusted_ips), \
+        ]), mock.patch.object(cli_mod, "load_toml_config", return_value={}), \
+             mock.patch.object(cfg, "TRUSTED_SRC_IPS", trusted_ips), \
              mock.patch.object(cli_mod, "open_backend", return_value=backend) as open_backend, \
              mock.patch.object(cli_mod, "sync_once") as sync_once:
             cli_mod.main()
@@ -1645,6 +1649,15 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         backend.close.assert_called_once_with()
         self.assertEqual(trusted_ips, {"198.51.100.8/32": "office"})
 
+    def test_main_help_does_not_load_runtime_config(self):
+        with mock.patch.object(sys, "argv", ["xdp_port_sync.py", "--help"]), \
+             mock.patch.object(
+                 cli_mod, "load_toml_config", side_effect=AssertionError("config loaded")
+             ), self.assertRaises(SystemExit) as exited:
+            cli_mod.main()
+
+        self.assertEqual(exited.exception.code, 0)
+
     def test_main_watch_mode_delegates_to_watch(self):
         with mock.patch.object(sys, "argv", [
             "xdp_port_sync.py",
@@ -1652,7 +1665,8 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             "--dry-run",
             "--backend",
             "auto",
-        ]), mock.patch.object(cli_mod, "watch") as watch:
+        ]), mock.patch.object(cli_mod, "load_toml_config", return_value={}), \
+             mock.patch.object(cli_mod, "watch") as watch:
             cli_mod.main()
 
         watch.assert_called_once_with(
@@ -1701,7 +1715,8 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             "--watch",
             "--trusted-ip", "1.2.3.4", "myhost",
             "--trusted-ip", "10.0.0.0/8", "internal",
-        ]), mock.patch.object(cli_mod, "watch") as watch:
+        ]), mock.patch.object(cli_mod, "load_toml_config", return_value={}), \
+             mock.patch.object(cli_mod, "watch") as watch:
             cli_mod.main()
 
         watch.assert_called_once_with(

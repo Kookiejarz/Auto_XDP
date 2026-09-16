@@ -28,7 +28,8 @@ def main() -> None:
         metavar="PATH",
     )
     bootstrap_args, _ = bootstrap.parse_known_args(sys.argv[1:])
-    apply_toml_config(load_toml_config(bootstrap_args.config))
+    if not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        apply_toml_config(load_toml_config(bootstrap_args.config))
 
     def _parse_trusted_ip(ip_str: str) -> str:
         try:

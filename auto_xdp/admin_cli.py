@@ -1093,7 +1093,11 @@ def _iter_available_port_handler_files(handlers_dir: Path) -> list[Path]:
     for path in handlers_dir.iterdir():
         if not path.is_file() or path.suffix not in {".c", ".o"}:
             continue
-        if path.name in _BUILTIN_SLOT_ARTIFACTS or _CUSTOM_SLOT_ARTIFACT_RE.match(path.name):
+        if (
+            path.name in _BUILTIN_SLOT_ARTIFACTS
+            or path.stem == "minecraft_handler"
+            or _CUSTOM_SLOT_ARTIFACT_RE.match(path.name)
+        ):
             continue
 
         include = False
