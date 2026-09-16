@@ -1,7 +1,6 @@
 """Tests for auto_xdp.abuseipdb: fetch, map management, syncer lifecycle."""
 from __future__ import annotations
 
-import threading
 import unittest
 from unittest import mock
 from urllib.error import URLError

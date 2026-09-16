@@ -514,6 +514,80 @@ class AdminCliTests(unittest.TestCase):
             self.assertFalse(candidate_dir.exists())
             self.assertFalse(list(root.glob("443_rollback_*")))
 
+    def test_profile_handler_load_reuses_shared_maps_and_profile_array(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bpf_pin_dir = root / "bpf"
+            bpf_pin_dir.mkdir()
+            for name in (
+                "tcp_profile_handlers",
+                "slot_ctx_map",
+                "profile_ctx_map",
+                "hblk4",
+                "hblk6",
+                "pkt_counters",
+                "byte_counters",
+            ):
+                (bpf_pin_dir / name).touch()
+            handler = root / "minecraft_handler.o"
+            handler.touch()
+
+            with mock.patch.object(admin_cli, "_run_checked") as run, \
+                 mock.patch.object(admin_cli, "_transactional_dir_prog_swap") as swap:
+                rc = admin_cli.main(
+                    [
+                        "--config",
+                        str(root / "config.toml"),
+                        "--bpf-pin-dir",
+                        str(bpf_pin_dir),
+                        "profile-handler",
+                        "load",
+                        "3",
+                        str(handler),
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            command = run.call_args.args[0]
+            for name in (
+                "slot_ctx_map", "profile_ctx_map", "hblk4", "hblk6",
+                "pkt_counters", "byte_counters",
+            ):
+                self.assertIn(name, command)
+            self.assertEqual(swap.call_args.args[0], bpf_pin_dir / "tcp_profile_handlers")
+            self.assertEqual(swap.call_args.args[1], 3)
+            self.assertEqual(
+                swap.call_args.args[3],
+                bpf_pin_dir / "profile_handlers" / "tcp" / "3",
+            )
+
+    def test_profile_handler_unload_retains_pin_when_array_delete_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bpf_pin_dir = Path(tmpdir) / "bpf"
+            handler_map = bpf_pin_dir / "tcp_profile_handlers"
+            live_pin = bpf_pin_dir / "profile_handlers" / "tcp" / "3" / "prog"
+            live_pin.parent.mkdir(parents=True)
+            live_pin.touch()
+            handler_map.touch()
+
+            with mock.patch.object(admin_cli, "_pinned_program_id", return_value=42), \
+                 mock.patch.object(admin_cli, "_prog_array_entry_id", return_value=42), \
+                 mock.patch.object(admin_cli, "_prog_array_delete", return_value=False):
+                rc = admin_cli.main(
+                    [
+                        "--config",
+                        str(Path(tmpdir) / "config.toml"),
+                        "--bpf-pin-dir",
+                        str(bpf_pin_dir),
+                        "profile-handler",
+                        "unload",
+                        "3",
+                    ]
+                )
+
+            self.assertEqual(rc, 1)
+            self.assertTrue(live_pin.exists())
+
     def test_slot_list_excludes_port_handler_candidates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

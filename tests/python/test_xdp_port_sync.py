@@ -88,13 +88,38 @@ class FakePortMap:
     def active_ports(self):
         return set(self._active)
 
+    def value(self, port):
+        for op_port, value, dry_run in reversed(self.ops):
+            if op_port == port and not dry_run and isinstance(value, tuple):
+                return value
+        return None
+
     def set(self, port, val, dry_run=False):
         self.ops.append((port, val, dry_run))
-        if val:
+        active = val[0] if isinstance(val, tuple) else val
+        if active:
             self._active.add(port)
         else:
             self._active.discard(port)
         return True
+
+    def close(self):
+        self.closed = True
+
+
+class FakeProfileMap:
+    def __init__(self, program_id=None):
+        self.program_id = program_id
+        self.closed = False
+
+    def verify(self):
+        return 0
+
+    def refresh(self):
+        return None
+
+    def value(self, _profile_id):
+        return None if self.program_id is None else (self.program_id,)
 
     def close(self):
         self.closed = True
@@ -277,8 +302,23 @@ class DiscoveryDumpTests(unittest.TestCase):
 
 
 class XdpPortSyncTests(unittest.TestCase):
+    def test_bpf_endpoint_maps_reject_wrong_kernel_value_size(self):
+        patches = (
+            mock.patch.object(bpf_maps_mod, "obj_get", return_value=9),
+            mock.patch.object(bpf_maps_mod, "map_max_entries", return_value=65536),
+            mock.patch.object(bpf_maps_mod, "map_value_size", return_value=4),
+            mock.patch.object(bpf_maps_mod.os, "close"),
+        )
+        with patches[0], patches[1], patches[2], patches[3] as close:
+            with self.assertRaisesRegex(OSError, "value_size=4, expected 24"):
+                bpf_maps_mod.BpfArrayMap("/tmp/tcp_whitelist", "=IIQQ")
+            with self.assertRaisesRegex(OSError, "value_size=4, expected 24"):
+                bpf_maps_mod.BpfZonePortMap("/tmp/tcp_zone_whitelist", "=IIQQ")
+        self.assertEqual(close.call_count, 2)
+
     def test_minecraft_profile_handler_is_loaded_and_removed_with_workload(self):
         backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+        backend.tcp_profile_map = FakeProfileMap(42)
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)
             install_dir = root / "install"
@@ -295,16 +335,21 @@ class XdpPortSyncTests(unittest.TestCase):
                  mock.patch.object(backend, "_pinned_program_id", side_effect=[None, 42]), \
                  mock.patch.object(backend, "_profile_command", return_value=True) as command:
                 self.assertEqual(
-                    backend._ensure_profile_handlers({25565: "minecraft"}, dry_run=False),
+                    backend._ensure_profile_handlers({
+                        ("public", 25565): "minecraft",
+                        ("public", 25566): "minecraft",
+                    }, backend._profile_generation(object_path), dry_run=False)[0],
                     set(),
                 )
 
-            marker = run_dir / "profile-handlers" / "tcp" / "25565"
-            self.assertEqual(
-                json.loads(marker.read_text()),
-                {"profile": "minecraft", "program_id": 42},
-            )
-            command.assert_called_once_with("load", 25565, object_path.resolve())
+            marker = run_dir / "profile-handlers" / "tcp" / "minecraft"
+            marker_value = json.loads(marker.read_text())
+            self.assertEqual(marker_value["profile"], "minecraft")
+            self.assertEqual(marker_value["profile_id"], 1)
+            self.assertEqual(marker_value["program_id"], 42)
+            self.assertEqual(marker_value["profile_generation"], backend._profile_generation(object_path.resolve()))
+            command.assert_called_once_with("load", 1, object_path.resolve())
+            marker.unlink()
 
             with mock.patch.dict("os.environ", {"RUN_STATE_DIR": str(run_dir)}), \
                  mock.patch.object(cfg, "BPF_PIN_DIR", str(pin_dir)), \
@@ -312,7 +357,7 @@ class XdpPortSyncTests(unittest.TestCase):
                  mock.patch.object(backend, "_profile_command", return_value=True) as command:
                 self.assertEqual(backend._remove_stale_profile_handlers({}, dry_run=False), 0)
 
-            command.assert_called_once_with("unload", 25565)
+            command.assert_called_once_with("unload", 1)
             self.assertFalse(marker.exists())
 
             with mock.patch.dict("os.environ", {"RUN_STATE_DIR": str(run_dir)}), \
@@ -320,10 +365,168 @@ class XdpPortSyncTests(unittest.TestCase):
                  mock.patch.object(backend, "_pinned_program_id", return_value=77), \
                  mock.patch.object(backend, "_profile_command") as command:
                 self.assertEqual(
-                    backend._ensure_profile_handlers({25565: "minecraft"}, dry_run=False),
-                    {25565},
+                    backend._ensure_profile_handlers(
+                        {("public", 25565): "minecraft"},
+                        backend._profile_generation(object_path),
+                        dry_run=False,
+                    )[0],
+                    {("public", 25565)},
                 )
-            command.assert_not_called()
+            self.assertEqual([call.args[0] for call in command.call_args_list], ["load", "unload"])
+
+    def test_profile_command_uses_profile_handler_cli_contract(self):
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+        with mock.patch.object(cfg, "TOML_CONFIG_PATH", "/etc/auto_xdp/config.toml"), \
+             mock.patch.object(cfg, "BPF_PIN_DIR", "/sys/fs/bpf/xdp_fw"), \
+             mock.patch.object(backend, "_profile_install_dir", return_value=Path("/opt/auto_xdp")), \
+             mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertTrue(
+                backend._profile_command(
+                    "load", 1, Path("/opt/auto_xdp/handlers/minecraft_handler.o")
+                )
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[-4:], [
+            "profile-handler", "load", "1",
+            "/opt/auto_xdp/handlers/minecraft_handler.o",
+        ])
+        self.assertNotIn("--no-config-update", command)
+
+    def test_missing_profile_marker_is_rebuilt_from_official_object(self):
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+        backend.tcp_profile_map = FakeProfileMap(42)
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            install_dir = root / "install"
+            object_path = install_dir / "handlers" / "minecraft_handler.o"
+            object_path.parent.mkdir(parents=True)
+            object_path.write_bytes(b"profile-v1")
+
+            def command(action, _profile_id, _object_path=None):
+                if action == "load":
+                    backend.tcp_profile_map.program_id = 43
+                return True
+
+            with mock.patch.dict("os.environ", {
+                "PYTHON_LIB_DIR": str(install_dir / "python"),
+                "RUN_STATE_DIR": str(root / "run"),
+            }), mock.patch.object(cfg, "BPF_PIN_DIR", str(root / "bpf")), \
+                 mock.patch.object(backend, "_pinned_program_id", side_effect=[42, 43]), \
+                 mock.patch.object(backend, "_profile_command", side_effect=command):
+                failed, generation = backend._ensure_profile_handlers(
+                    {("public", 25565): "minecraft"},
+                    backend._profile_generation(object_path),
+                    dry_run=False,
+                )
+
+            self.assertEqual(failed, set())
+            self.assertGreater(generation, 0)
+            marker = root / "run" / "profile-handlers" / "tcp" / "minecraft"
+            self.assertEqual(json.loads(marker.read_text())["program_id"], 43)
+
+    def test_config_rejects_interface_shared_by_two_zones(self):
+        old_zones = cfg.ZONES
+        try:
+            with self.assertRaisesRegex(ValueError, "belongs to both zones"):
+                cfg.apply_toml_config({
+                    "zones": {
+                        "public": {"interfaces": ["eth0"]},
+                        "trusted": {"interfaces": ["eth0"]},
+                    }
+                })
+        finally:
+            cfg.ZONES = old_zones
+
+    def test_global_admission_installs_known_zone_deny_tombstones(self):
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+        backend._policy_generations = {}
+        desired = state_mod.DesiredState(tcp_ports={25565}, udp_ports={19132})
+
+        with mock.patch.object(cfg, "ZONES", {
+            "public": {"interfaces": []},
+            "trusted": {"interfaces": ["wg0"]},
+        }), mock.patch.object(socket, "if_nametoindex", return_value=7):
+            _, tcp_zone = backend._desired_tcp_values(desired, 0)
+            udp_zone = backend._desired_udp_zone_values(desired)
+
+        self.assertEqual(tcp_zone, {(7, 25565): (0, 0, 0, 0)})
+        self.assertEqual(udp_zone, {(7, 19132): 0})
+
+    def test_endpoint_generation_is_stable_then_bumps_after_deactivation(self):
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+        backend._policy_generations = {}
+        endpoint = state_mod.RuntimeEndpoint(
+            "tcp", "0.0.0.0", 25565, "wildcard", "public",
+            "minecraft.service", "exact", "systemd-cgroup",
+            instance_id="old-socket-inode",
+        )
+        decision = state_mod.ExposureDecision(
+            endpoint, "allow", "matched", "minecraft", "minecraft"
+        )
+        desired = state_mod.DesiredState(
+            tcp_ports={25565},
+            tcp_protection_profiles={("public", 25565): "minecraft"},
+            exposure_decisions=[decision],
+        )
+
+        first, _ = backend._desired_tcp_values(desired, 0)
+        unchanged, _ = backend._desired_tcp_values(desired, 0)
+        changed_policy = state_mod.DesiredState(
+            tcp_ports={25565},
+            tcp_syn_rate_limits={25565: 99},
+            tcp_protection_profiles={("public", 25565): "minecraft"},
+            exposure_decisions=[decision],
+        )
+        changed, _ = backend._desired_tcp_values(changed_policy, 0)
+        restarted = state_mod.DesiredState(
+            tcp_ports={25565},
+            tcp_syn_rate_limits={25565: 99},
+            tcp_protection_profiles={("public", 25565): "minecraft"},
+            exposure_decisions=[state_mod.ExposureDecision(
+                state_mod.RuntimeEndpoint(
+                    "tcp", "0.0.0.0", 25565, "wildcard", "public",
+                    "minecraft.service", "exact", "systemd-cgroup",
+                    instance_id="new-socket-inode",
+                ),
+                "allow", "matched", "minecraft", "minecraft",
+            )],
+        )
+        restarted_value, _ = backend._desired_tcp_values(restarted, 0)
+        backend._desired_tcp_values(state_mod.DesiredState(), 0)
+        reactivated, _ = backend._desired_tcp_values(desired, 0)
+
+        self.assertEqual(first[25565], unchanged[25565])
+        self.assertNotEqual(first[25565][2], changed[25565][2])
+        self.assertNotEqual(changed[25565][2], restarted_value[25565][2])
+        self.assertNotEqual(first[25565][2], reactivated[25565][2])
+
+    def test_generic_endpoint_does_not_allocate_policy_generation(self):
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+        backend._policy_generations = {}
+
+        global_values, _ = backend._desired_tcp_values(
+            state_mod.DesiredState(tcp_ports={8080}), 0
+        )
+
+        self.assertEqual(global_values[8080], (1, 0, 0, 0))
+        self.assertEqual(backend._policy_generations, {})
+
+    def test_policy_generation_state_survives_backend_restart(self):
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+        backend._policy_generations = {
+            ("public", 25565): ("policy-fingerprint", 123456789)
+        }
+        backend._persisted_policy_generations = {}
+
+        with tempfile.TemporaryDirectory() as root_raw, mock.patch.dict(
+            "os.environ", {"RUN_STATE_DIR": root_raw}
+        ):
+            backend._save_policy_generations()
+            restarted = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
+            restored = restarted._load_policy_generations()
+
+        self.assertEqual(restored, backend._policy_generations)
 
     def test_new_port_stays_closed_when_protection_setup_fails(self):
         backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
@@ -804,7 +1007,11 @@ class XdpPortSyncTests(unittest.TestCase):
              mock.patch.object(cfg, "TRUSTED_SRC_IPS", {"198.51.100.5/32": "office"}):
             backend.reconcile(desired, dry_run=False, observed_state=observed)
 
-        self.assertEqual(backend.tcp_map.ops, [(80, 0, False), (443, 1, False)])
+        self.assertEqual(backend.tcp_map.ops[0], (80, 0, False))
+        self.assertEqual(backend.tcp_map.ops[1][0], 443)
+        self.assertEqual(backend.tcp_map.ops[1][1][0:2], (1, 0))
+        self.assertEqual(backend.tcp_map.ops[1][1][2:], (0, 0))
+        self.assertEqual(backend.tcp_map.ops[1][1][3], 0)
         self.assertEqual(backend.udp_map.ops, [(9999, 0, False)])
         self.assertEqual(backend.sctp_map.ops, [(2905, 1, False), (9899, 0, False)])
         self.assertEqual(backend.trusted_map.set_ops, [("198.51.100.5/32", 1, False)])
@@ -1083,8 +1290,8 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         backend._policy_signature = None
         desired = state_mod.DesiredState(
             tcp_ports={443, 25565},
-            zone_tcp_ports={"public": {443, 25565}},
-            tcp_protection_profiles={25565: "minecraft"},
+            zone_tcp_ports={"public": {443, 25565}, "trusted": {25565}},
+            tcp_protection_profiles={("public", 25565): "minecraft"},
         )
 
         with mock.patch.object(backend, "_install_ruleset") as install, \
@@ -1097,7 +1304,10 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
 
         effective = install.call_args.args[0]
         self.assertEqual(effective.tcp_ports, {443})
-        self.assertEqual(effective.zone_tcp_ports, {"public": {443}})
+        self.assertEqual(
+            effective.zone_tcp_ports,
+            {"public": {443}, "trusted": {25565}},
+        )
         remember.assert_called_once_with(effective)
 
     def _resolve(self, **cfg_overrides):

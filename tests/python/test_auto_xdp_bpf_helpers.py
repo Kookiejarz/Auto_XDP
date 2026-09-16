@@ -1,5 +1,4 @@
 import io
-import struct
 import sys
 import unittest
 from contextlib import redirect_stderr

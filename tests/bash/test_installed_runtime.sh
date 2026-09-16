@@ -88,6 +88,7 @@ loader_pid=""
 relay_pid=""
 listener_pid=""
 event_monitor_pid=""
+approval_id=""
 e2e_ns="auto-xdp-runtime-e2e-$$"
 e2e_peer=""
 e2e_peer_moved=0
@@ -103,6 +104,9 @@ cleanup() {
     if [[ -n "$listener_pid" ]]; then
         kill -TERM "$listener_pid" 2>/dev/null || true
         wait "$listener_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$approval_id" ]]; then
+        "$AXDP_CMD" approval revoke "$approval_id" >/dev/null 2>&1 || true
     fi
     if [[ $e2e_peer_moved -eq 1 ]]; then
         ip netns exec "$e2e_ns" ip link set "$e2e_peer" netns 1 2>/dev/null || true
@@ -136,7 +140,8 @@ import json, sys
 try:
     value = json.load(sys.stdin).get("value", 0)
     if isinstance(value, list):
-        value = int.from_bytes(bytes(int(v, 0) if isinstance(v, str) else v for v in value), "little")
+        raw = bytes(int(v, 0) if isinstance(v, str) else v for v in value)
+        value = int.from_bytes(raw[:4], "little")
     elif isinstance(value, str):
         value = int(value, 0)
     print(int(value))
@@ -213,11 +218,11 @@ test_auto_port_sync_closed_loop() {
     ip netns exec "$e2e_ns" ip link set lo up
 
     e2e_listener_info=$(mktemp)
-    python3 - "$e2e_host_ip" <<'PY' >"$e2e_listener_info" 2>/tmp/auto-xdp-runtime-e2e-listener.log &
-import socket, sys, time
+    python3 - <<'PY' >"$e2e_listener_info" 2>/tmp/auto-xdp-runtime-e2e-listener.log &
+import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind((sys.argv[1], 0))
+s.bind(("0.0.0.0", 0))
 s.listen(8)
 print(s.getsockname()[1], flush=True)
 try:
@@ -238,6 +243,17 @@ PY
     [[ -s "$e2e_listener_info" ]] || fail "timed out waiting for E2E TCP listener"
     port=$(<"$e2e_listener_info")
     [[ "$port" =~ ^[0-9]+$ ]] || fail "invalid E2E listener port: $port"
+    local listener_comm approval_output
+    listener_comm=$(ps -p "$listener_pid" -o comm= | tr -d '[:space:]')
+    [[ -n "$listener_comm" ]] || fail "E2E listener process identity is unavailable"
+    approval_output=$("$AXDP_CMD" approval request runtime-e2e public tcp "$port" \
+        --process-name "$listener_comm" --reason "installed XDP runtime E2E" 2>&1) \
+        || fail "could not create E2E exposure approval: $approval_output"
+    approval_id=${approval_output##*#}
+    [[ "$approval_id" =~ ^[0-9]+$ ]] || fail "could not parse E2E approval id"
+    "$AXDP_CMD" approval approve "$approval_id" >/dev/null \
+        || fail "could not approve E2E exposure"
+    [[ -z "$loader_pid" ]] || kill -HUP "$loader_pid"
     key_hex=$(python3 - "$port" <<'PY'
 import struct, sys
 print(" ".join(f"{byte:02x}" for byte in struct.pack("<I", int(sys.argv[1]))))
@@ -302,6 +318,7 @@ PY
     kill -TERM "$listener_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
     listener_pid=""
+    [[ -z "$loader_pid" ]] || kill -HUP "$loader_pid"
     wait_for_tcp_policy "$port" 0
     _tcp_probe_from_netns "$e2e_ns" "$e2e_host_ip" "$port" \
         && fail "SYN to automatically closed TCP listener was not dropped"
@@ -316,6 +333,9 @@ PY
         event_monitor_pid=""
         rm -f "$event_log"
     fi
+    "$AXDP_CMD" approval revoke "$approval_id" >/dev/null \
+        || fail "could not revoke E2E exposure approval"
+    approval_id=""
     printf '[INFO] runtime-e2e: automatic TCP port sync opened and closed port %s\n' "$port"
 }
 
