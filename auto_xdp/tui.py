@@ -599,6 +599,26 @@ def _collect_audit_rows(config_path: str) -> list[dict[str, Any]]:
     )
 
 
+def _actionable_approval_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the workflow focused on requests that still have a TUI action."""
+    actionable = (row for row in rows if row.get("status") in {"pending", "approved"})
+    return sorted(
+        actionable,
+        key=lambda row: (row.get("status") != "pending", int(row["id"])),
+    )
+
+
+def _approve_tui_request(args: Any, request: dict[str, Any]) -> str:
+    request_id = int(request["id"])
+    if request.get("status") != "pending":
+        return f"request #{request_id} is {request.get('status')}; Enter only approves pending requests"
+    approvals.approve_request(
+        approvals.store_path(args.run_state_dir), args.config, request_id, actor="tui"
+    )
+    approvals.reload_daemon()
+    return f"approved request #{request_id}"
+
+
 def _audit_fingerprint(rows: list[dict[str, Any]]) -> str:
     payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -653,6 +673,7 @@ def _collect_snapshot(
     map_cache: MapUsageCache | None = None,
     *,
     fast: bool = False,
+    include_approvals: bool = False,
 ) -> tuple[TuiSnapshot, dict[str, tuple[int, int]], float]:
     ifaces = (args.iface or "").split() or []
     if not ifaces:
@@ -694,11 +715,14 @@ def _collect_snapshot(
         audit_rows = _collect_audit_rows(args.config)
     except Exception as exc:
         audit_error = f"audit: {exc}"
-    try:
-        approval_rows = approvals.list_requests(approvals.store_path(args.run_state_dir))
-    except Exception as exc:
-        approval_rows = []
-        audit_error = audit_error or f"approvals: {exc}"
+    approval_rows: list[dict[str, Any]] = []
+    if include_approvals:
+        try:
+            approval_rows = _actionable_approval_rows(
+                approvals.list_requests(approvals.store_path(args.run_state_dir))
+            )
+        except Exception as exc:
+            audit_error = audit_error or f"approvals: {exc}"
 
     snap = TuiSnapshot(
         backend=backend,
@@ -746,6 +770,7 @@ class SnapshotWorker:
         self._prev_ts = time.monotonic()
         self._map_cache = MapUsageCache()
         self._first_collect = True
+        self._include_approvals = False
 
     def start(self) -> None:
         self._thread.start()
@@ -757,6 +782,11 @@ class SnapshotWorker:
 
     def wakeup(self) -> None:
         self._wakeup.set()
+
+    def show_approvals(self, enabled: bool) -> None:
+        with self._lock:
+            self._include_approvals = enabled
+        self.wakeup()
 
     def get(self) -> tuple[TuiSnapshot, str]:
         with self._lock:
@@ -771,12 +801,15 @@ class SnapshotWorker:
         while not self._stop.is_set():
             started = time.monotonic()
             try:
+                with self._lock:
+                    include_approvals = self._include_approvals
                 snap, self._prev_stats, self._prev_ts = _collect_snapshot(
                     self._args,
                     self._prev_stats,
                     self._prev_ts,
                     self._map_cache,
                     fast=self._first_collect,
+                    include_approvals=include_approvals,
                 )
                 self._first_collect = False
                 snap.status = f"updated {_dt.datetime.now().strftime('%H:%M:%S')}"
@@ -1266,7 +1299,7 @@ def _draw(
         bot_h = fh - top_h
         top_win = full_win.derwin(top_h, fw, 0, 0)
         now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        title = f"Auto XDP TUI  top traffic  backend={snap.backend} mode={snap.attach_mode}  {now}  v:overview a:audit p:approvals q:quit"
+        title = f"Auto XDP TUI  top traffic  backend={snap.backend} mode={snap.attach_mode}  {now}  v:overview a:audit q:quit"
         _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
         if snap.under_attack:
             badge = " UNDER ATTACK "
@@ -1289,7 +1322,7 @@ def _draw(
         stdscr.refresh()
         return
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"Auto XDP TUI  backend={snap.backend} mode={snap.attach_mode} map={snap.map_id} ports={port_filter}  {now}  v:traffic a:audit p:approvals tab:focus t/u:filter enter:filter-events-by-port q:quit"
+    title = f"Auto XDP TUI  backend={snap.backend} mode={snap.attach_mode} map={snap.map_id} ports={port_filter}  {now}  v:traffic a:audit tab:focus t/u:filter enter:filter-events-by-port q:quit"
     _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
     if snap.under_attack:
         badge = " UNDER ATTACK "
@@ -1374,15 +1407,20 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             elif ch in (ord("a"), ord("A")):
                 page = "audit"
                 audit_scroll = 0
+                worker.show_approvals(False)
                 ui_dirty = True
-            elif ch in (ord("p"), ord("P")):
+            elif ch in (ord("p"), ord("P")) and page == "audit":
                 page = "approvals"
+                approval_cursor = 0
+                worker.show_approvals(True)
                 ui_dirty = True
             elif ch in (ord("o"), ord("O")):
                 page = "overview"
+                worker.show_approvals(False)
                 ui_dirty = True
             elif ch in (ord("v"), ord("V")):
                 page = "traffic" if page != "traffic" else "overview"
+                worker.show_approvals(False)
                 ui_dirty = True
             snap, worker_error = worker.get()
             last_error = ui_error or worker_error
@@ -1450,10 +1488,8 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                     selected = snap.approval_rows[approval_cursor]
                     request_id = int(selected["id"])
                     try:
-                        if ch in (10, 13, curses.KEY_ENTER) and selected.get("status") == "pending":
-                            approvals.approve_request(approvals.store_path(args.run_state_dir), args.config, request_id, actor="tui")
-                            approvals.reload_daemon()
-                            ui_error = f"approved request #{request_id}"
+                        if ch in (10, 13, curses.KEY_ENTER):
+                            ui_error = _approve_tui_request(args, selected)
                         elif ch in (ord("d"), ord("D")) and selected.get("status") == "pending":
                             reason = _tui_prompt(stdscr, "reject reason: ")
                             approvals.reject_request(approvals.store_path(args.run_state_dir), request_id, reason=reason, actor="tui")

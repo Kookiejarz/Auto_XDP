@@ -320,14 +320,22 @@ class TestSnapshotWorkerWakeup(unittest.TestCase):
 
     def _make_worker(self):
         worker = tui_mod.SnapshotWorker.__new__(tui_mod.SnapshotWorker)
+        worker._lock = threading.Lock()
         worker._stop = threading.Event()
         worker._wakeup = threading.Event()
+        worker._include_approvals = False
         return worker
 
     def test_wakeup_sets_event(self):
         worker = self._make_worker()
         self.assertFalse(worker._wakeup.is_set())
         worker.wakeup()
+        self.assertTrue(worker._wakeup.is_set())
+
+    def test_approval_query_is_opt_in(self):
+        worker = self._make_worker()
+        worker.show_approvals(True)
+        self.assertTrue(worker._include_approvals)
         self.assertTrue(worker._wakeup.is_set())
 
     def test_stop_also_sets_wakeup(self):

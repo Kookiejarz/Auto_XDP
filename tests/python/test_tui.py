@@ -2,6 +2,7 @@ import subprocess
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from auto_xdp.tui import (
@@ -19,6 +20,8 @@ from auto_xdp.tui import (
     _event_bottom_top,
     _event_window,
     _filter_port_rows,
+    _actionable_approval_rows,
+    _approve_tui_request,
     _audit_fingerprint,
     _audit_needs_review,
     _mark_audit_reviewed,
@@ -412,6 +415,44 @@ class TuiPortFilterTests(unittest.TestCase):
 
 
 class TuiAuditMarkerTests(unittest.TestCase):
+    def test_approval_workflow_hides_history_and_selects_pending_first(self):
+        rows = [
+            {"id": 1, "status": "approved"},
+            {"id": 2, "status": "rejected"},
+            {"id": 3, "status": "pending"},
+            {"id": 4, "status": "revoked"},
+            {"id": 5, "status": "pending"},
+        ]
+
+        self.assertEqual(
+            [row["id"] for row in _actionable_approval_rows(rows)],
+            [3, 5, 1],
+        )
+
+    def test_enter_approves_selected_pending_request(self):
+        args = SimpleNamespace(run_state_dir="/run/auto_xdp", config="/etc/auto_xdp/config.toml")
+        with mock.patch("auto_xdp.tui.approvals.approve_request") as approve, \
+             mock.patch("auto_xdp.tui.approvals.store_path", return_value=Path("/run/auto_xdp/approval_requests.json")), \
+             mock.patch("auto_xdp.tui.approvals.reload_daemon") as reload_daemon:
+            message = _approve_tui_request(args, {"id": 7, "status": "pending"})
+
+        approve.assert_called_once_with(
+            Path("/run/auto_xdp/approval_requests.json"),
+            "/etc/auto_xdp/config.toml",
+            7,
+            actor="tui",
+        )
+        reload_daemon.assert_called_once_with()
+        self.assertEqual(message, "approved request #7")
+
+    def test_enter_explains_non_pending_request(self):
+        args = SimpleNamespace(run_state_dir="/run/auto_xdp", config="/etc/auto_xdp/config.toml")
+        with mock.patch("auto_xdp.tui.approvals.approve_request") as approve:
+            message = _approve_tui_request(args, {"id": 8, "status": "approved"})
+
+        approve.assert_not_called()
+        self.assertIn("Enter only approves pending requests", message)
+
     def test_audit_marker_only_requests_first_or_changed_snapshot(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             marker = Path(tmpdir) / "audit.json"
