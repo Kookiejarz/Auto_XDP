@@ -432,12 +432,16 @@ class RelayServer:
             log.warning("Rejected unauthorized relay client")
             conn.close()
             return
-        conn.setblocking(False)
+        # The initial history can exceed the Unix socket send buffer.  Give
+        # sendall() a bounded blocking window, then switch live fan-out back
+        # to non-blocking mode.
+        conn.settimeout(1.0)
         self._trim_history()
         history_slice = list(self._history)[-self._max_history_send:]
         if not self._send_line(conn, {"type": "history", "events": history_slice}):
             conn.close()
             return
+        conn.setblocking(False)
         fd = conn.fileno()
         self._clients[fd] = conn
         log.debug("client connected fd=%d total=%d", fd, len(self._clients))

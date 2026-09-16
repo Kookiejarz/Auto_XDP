@@ -63,6 +63,11 @@ deploy_xdp_backend() {
     fi
 
     ACTIVE_XDP_MODE="$AUTO_XDP_SWITCH_MODE"
+    if ! load_minecraft_egress; then
+        XDP_FALLBACK_REASON="Minecraft Linux conntrack/TC capability unavailable"
+        XDP_FALLBACK_BLOCKED=1
+        return 1
+    fi
     load_sock_state_tracker || true
 
     # Old attachments on interfaces removed from IFACES are detached only after

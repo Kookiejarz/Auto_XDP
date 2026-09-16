@@ -198,6 +198,7 @@ ensure_xdp_loaded() {
             fi
         done
         [[ -f "$BPF_PIN_DIR/sock_state_link" ]] || load_sock_state_tracker || true
+        load_minecraft_egress || return 1
         load_port_handlers || true
         auto_tune_interface_parallelism || true
         [[ $_any_missing -eq 1 ]] && echo "[auto_xdp] re-attached XDP to missing interfaces" >&2
@@ -224,6 +225,7 @@ ensure_xdp_loaded() {
     fi
 
     load_sock_state_tracker || true
+    load_minecraft_egress || return 1
     auto_tune_interface_parallelism || true
     echo "$AUTO_XDP_SWITCH_MODE" > "${RUN_STATE_DIR}/xdp_mode"
     return 0
@@ -284,6 +286,8 @@ activate_nftables_backend() {
             detached=$((detached + 1))
         done
     fi
+
+    cleanup_minecraft_egress
 
     echo "nftables" > "${RUN_STATE_DIR}/backend"
     _auto_xdp_record_nft_state

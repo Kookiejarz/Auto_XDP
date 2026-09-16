@@ -105,6 +105,8 @@ IFACES=()
 ALL_IFACES=0
 XDP_SRC="bpf/xdp_firewall.c"
 XDP_OBJ="xdp_firewall.o"
+MC_EGRESS_SRC="bpf/minecraft_egress.c"
+MC_EGRESS_OBJ="minecraft_egress.o"
 
 INSTALL_ROOT="/usr/local/lib/auto_xdp"
 RELEASES_DIR="${INSTALL_ROOT}/releases"
@@ -133,6 +135,7 @@ RUNNER_SCRIPT="${CURRENT_LINK}/auto_xdp_start.sh"
 RUNNER_SRC="runtime/auto_xdp_start.sh"
 RUNTIME_COMMON_SRC="runtime/auto_xdp_runtime_common.sh"
 XDP_OBJ_INSTALLED="${INSTALL_DIR}/xdp_firewall.o"
+MC_EGRESS_OBJ_INSTALLED="${INSTALL_DIR}/minecraft_egress.o"
 SOCK_STATE_SRC="bpf/sock_state_track.c"
 SOCK_STATE_OBJ="sock_state_track.o"
 SOCK_STATE_OBJ_INSTALLED="${INSTALL_DIR}/sock_state_track.o"

@@ -65,6 +65,28 @@ class AdminCliTests(unittest.TestCase):
                 ["request", "approve", "deny"],
             )
 
+    def test_allow_container_shortcut_accepts_tcp_or_udp_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            run_dir = root / "run"
+            config_path.write_text("[zones.public]\ninterfaces = []\n[policy]\nmode = \"audit\"\n")
+
+            with mock.patch.object(admin_cli.os, "geteuid", return_value=0), \
+                 mock.patch.object(approvals, "reload_daemon"):
+                self.assertEqual(admin_cli.main([
+                    "--config", str(config_path), "--run-state-dir", str(run_dir),
+                    "allow", "--subject", "docker:a833cfc68335", "udp/19132",
+                ]), 0)
+
+            config = config_path.read_text()
+            self.assertIn('container_runtime = "docker"', config)
+            self.assertIn('container_id = "a833cfc68335"', config)
+            self.assertIn("ports = [19132]", config)
+
+    def test_admin_parser_reports_axdp_program_name(self):
+        self.assertEqual(admin_cli.build_parser().prog, "axdp")
+
     def test_policy_mode_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"
@@ -545,8 +567,7 @@ class AdminCliTests(unittest.TestCase):
                 "tcp_profile_handlers",
                 "slot_ctx_map",
                 "profile_ctx_map",
-                "hblk4",
-                "hblk6",
+                "mc_l7_pending",
                 "pkt_counters",
                 "byte_counters",
             ):
@@ -572,7 +593,7 @@ class AdminCliTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             command = run.call_args.args[0]
             for name in (
-                "slot_ctx_map", "profile_ctx_map", "hblk4", "hblk6",
+                "slot_ctx_map", "profile_ctx_map", "mc_l7_pending",
                 "pkt_counters", "byte_counters",
             ):
                 self.assertIn(name, command)

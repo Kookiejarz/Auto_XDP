@@ -60,6 +60,11 @@ XDP_OBJ_INSTALLED="$BUILD_STAGING_DIR/$XDP_OBJ"
     exit 1
 }
 
+[[ -s "$BUILD_STAGING_DIR/$MC_EGRESS_OBJ" ]] || {
+    echo "[ERROR] missing staged Minecraft egress object: $BUILD_STAGING_DIR/$MC_EGRESS_OBJ" >&2
+    exit 1
+}
+
 resolve_bpf_build_env || {
     echo "[ERROR] failed to resolve native BPF build environment" >&2
     exit 1

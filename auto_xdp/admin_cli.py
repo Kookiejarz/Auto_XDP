@@ -1436,7 +1436,7 @@ def _cmd_profile_handler_load(args: argparse.Namespace) -> int:
     shared_maps = [
         (name, bpf_pin_dir / name)
         for name in (
-            "slot_ctx_map", "profile_ctx_map", "hblk4", "hblk6",
+            "slot_ctx_map", "profile_ctx_map", "mc_l7_pending",
             "pkt_counters", "byte_counters",
         )
     ]
@@ -2241,6 +2241,30 @@ def _service_subject(unit: str, explicit: str) -> tuple[str, str]:
     return unit, subject
 
 
+def _allow_target(target: str, explicit_subject: str) -> tuple[str, dict[str, str]]:
+    if ":" not in target:
+        unit, subject = _service_subject(target, explicit_subject)
+        return subject, {"systemd_unit": unit}
+    runtime, identity = target.split(":", 1)
+    runtime = runtime.lower()
+    identity = identity.strip().lower()
+    if runtime not in {"docker", "podman"} or not re.fullmatch(r"[0-9a-f]{12,64}", identity):
+        raise ValueError("target must be a systemd service or docker:<12-64 hex id>")
+    subject = explicit_subject.strip() or f"{runtime}-{identity[:12]}"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", subject):
+        raise ValueError("subject must contain only letters, digits, _, ., or -")
+    return subject, {"container_runtime": runtime, "container_id": identity}
+
+
+def _allow_args(args: argparse.Namespace) -> tuple[str, str, str]:
+    target, endpoint, subject = args.service, args.endpoint, args.subject
+    if endpoint is None and target and subject.startswith(("docker:", "podman:")):
+        target, endpoint, subject = subject, target, ""
+    if not target or not endpoint:
+        raise ValueError(f"usage: axdp {args.command} TARGET PROTO/PORT")
+    return target, endpoint, subject
+
+
 def _service_endpoint(value: str) -> tuple[str, int]:
     try:
         protocol, raw_port = value.lower().split("/", 1)
@@ -2253,8 +2277,9 @@ def _service_endpoint(value: str) -> tuple[str, int]:
 
 
 def _cmd_allow(args: argparse.Namespace) -> int:
-    unit, subject = _service_subject(args.service, args.subject)
-    protocol, port = _service_endpoint(args.endpoint)
+    target, endpoint, explicit_subject = _allow_args(args)
+    subject, resolve = _allow_target(target, explicit_subject)
+    protocol, port = _service_endpoint(endpoint)
     profile = args.profile.strip().lower()
     if profile and profile != "minecraft":
         raise ValueError(f"unsupported protection profile: {profile}")
@@ -2268,7 +2293,7 @@ def _cmd_allow(args: argparse.Namespace) -> int:
         protocol=protocol,
         ports=[port],
         reason=args.reason,
-        systemd_unit=unit,
+        resolve=resolve,
         protection_profile=profile,
         actor=args.actor,
     )
@@ -2277,13 +2302,14 @@ def _cmd_allow(args: argparse.Namespace) -> int:
     )
     approvals.reload_daemon()
     profile_text = f" profile={profile}" if profile else ""
-    print(f"Allowed {unit} {protocol}/{port} zone={args.zone}{profile_text} (approval #{approved['id']})")
+    print(f"Allowed {target} {protocol}/{port} zone={args.zone}{profile_text} (approval #{approved['id']})")
     return 0
 
 
 def _cmd_deny(args: argparse.Namespace) -> int:
-    _unit, subject = _service_subject(args.service, args.subject)
-    protocol, port = _service_endpoint(args.endpoint)
+    target, endpoint, explicit_subject = _allow_args(args)
+    subject, _resolve = _allow_target(target, explicit_subject)
+    protocol, port = _service_endpoint(endpoint)
     denied = approvals.deny_grant(
         _approval_store(args),
         args.config,
@@ -2979,7 +3005,7 @@ def _cmd_tui(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin_cli")
+    parser = argparse.ArgumentParser(prog="axdp")
     parser.add_argument("--config", required=True)
     parser.add_argument("--bpf-pin-dir", default="/sys/fs/bpf/xdp_fw")
     parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp/current")
@@ -3151,8 +3177,8 @@ def build_parser() -> argparse.ArgumentParser:
     policy_mode.set_defaults(func=_cmd_policy_mode)
 
     allow = subparsers.add_parser("allow")
-    allow.add_argument("service", help="systemd service unit, for example paper.service")
-    allow.add_argument("endpoint", help="PROTO/PORT, for example tcp/25565")
+    allow.add_argument("service", metavar="TARGET", nargs="?", help="systemd unit or docker:<container-id>")
+    allow.add_argument("endpoint", nargs="?", help="PROTO/PORT, for example tcp/25565")
     allow.add_argument("--zone", default="public")
     allow.add_argument("--profile", default="")
     allow.add_argument("--subject", default="")
@@ -3161,8 +3187,8 @@ def build_parser() -> argparse.ArgumentParser:
     allow.set_defaults(func=_cmd_allow)
 
     deny = subparsers.add_parser("deny")
-    deny.add_argument("service", help="systemd service unit used by the grant")
-    deny.add_argument("endpoint", help="PROTO/PORT, for example tcp/25565")
+    deny.add_argument("service", metavar="TARGET", nargs="?", help="systemd unit or docker:<container-id>")
+    deny.add_argument("endpoint", nargs="?", help="PROTO/PORT, for example tcp/25565")
     deny.add_argument("--zone", default="public")
     deny.add_argument("--subject", default="")
     deny.add_argument("--reason", default="local administrator denial")

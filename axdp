@@ -55,8 +55,8 @@ Commands:
   stop                   Stop the controller (active data plane remains)
   restart                Restart the installed service
   status                 Show service status
-  allow SERVICE PROTO/PORT [options]  Persist and apply a service grant
-  deny SERVICE PROTO/PORT [options]   Remove a service grant
+  allow TARGET PROTO/PORT [options]   Grant a systemd unit or docker:<id>
+  deny TARGET PROTO/PORT [options]    Remove a service/container grant
   grants                 List service exposure grants
   mode [observe|audit|enforce]        Show or change activation mode
   enable [--force]       Validate and activate the configured policy
@@ -306,6 +306,9 @@ run_uninstall() {
         ip link set dev "$iface" xdp off >/dev/null 2>&1 || true
         ip link set dev "$iface" xdpgeneric off >/dev/null 2>&1 || true
         ip link set dev "$iface" xdpoffload off >/dev/null 2>&1 || true
+        if command -v tc >/dev/null 2>&1; then
+            tc filter del dev "$iface" egress pref 49153 handle 2 >/dev/null 2>&1 || true
+        fi
         if ip -d link show dev "$iface" 2>/dev/null \
                 | grep -Eq 'prog/xdp|xdpgeneric|xdpoffload|(^|[[:space:]])xdp([[:space:]]|$)'; then
             printf 'Failed to detach XDP from %s.\n' "$iface" >&2

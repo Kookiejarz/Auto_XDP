@@ -526,6 +526,7 @@ xdp_required_map_names() {
 	abuseipdb_v4
 	slot_ctx_map
 	profile_ctx_map
+	mc_l7_pending
 	EOF
 }
 
@@ -1101,6 +1102,90 @@ transactional_reload_xdp() {
         _auto_xdp_record_switch_mode "$mode"
     done
     AUTO_XDP_HANDLERS_PRELOADED=1
+    return 0
+}
+
+_auto_xdp_minecraft_profile_configured() {
+    local config_path="${TOML_CONFIG:-/etc/auto_xdp/config.toml}"
+    [[ -f "$config_path" ]] || return 1
+    "${PYTHON3_BIN:-python3}" - "$config_path" <<'PY'
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+raise SystemExit(not any(
+    str(subject.get("protection", {}).get("profile", "")).strip().lower() == "minecraft"
+    for subject in config.get("subjects", {}).values()
+    if isinstance(subject, dict)
+))
+PY
+}
+
+cleanup_minecraft_egress() {
+    local iface_var="" iface=""
+    command -v tc >/dev/null 2>&1 || return 0
+    iface_var=$(_auto_xdp_iface_var_name) || return 0
+    local -n cleanup_ifaces="$iface_var"
+    for iface in "${cleanup_ifaces[@]}"; do
+        tc filter del dev "$iface" egress pref 49153 handle 2 2>/dev/null || true
+    done
+    rm -f "${BPF_PIN_DIR}/minecraft_egress_prog" \
+          "${BPF_PIN_DIR}/minecraft_egress_next" 2>/dev/null || true
+}
+
+load_minecraft_egress() {
+    local object_path="" next_pin="${BPF_PIN_DIR}/minecraft_egress_next"
+    local live_pin="${BPF_PIN_DIR}/minecraft_egress_prog" iface_var="" iface=""
+    local -a switched=()
+
+    if ! _auto_xdp_minecraft_profile_configured; then
+        cleanup_minecraft_egress
+        return 0
+    fi
+    command -v tc >/dev/null 2>&1 || {
+        _auto_xdp_warn "tc is required for the Minecraft dialogue profile."
+        return 1
+    }
+    object_path=$(_auto_xdp_first_value MC_EGRESS_OBJ_PATH MC_EGRESS_OBJ_INSTALLED) || object_path=""
+    [[ -f "$object_path" ]] || {
+        _auto_xdp_warn "Minecraft egress observer object not found."
+        return 1
+    }
+    rm -f "$next_pin"
+    if ! bpftool prog load "$object_path" "$next_pin" type classifier \
+            map name tcp_whitelist pinned "${BPF_PIN_DIR}/tcp_whitelist" \
+            map name tcp_zone_whitelist pinned "${BPF_PIN_DIR}/tcp_zone_whitelist" \
+            map name mc_l7_pending pinned "${BPF_PIN_DIR}/mc_l7_pending" >/dev/null 2>&1; then
+        _auto_xdp_warn "Kernel rejected the Linux-conntrack Minecraft egress observer."
+        return 1
+    fi
+    iface_var=$(_auto_xdp_iface_var_name) || { rm -f "$next_pin"; return 1; }
+    local -n egress_ifaces="$iface_var"
+    for iface in "${egress_ifaces[@]}"; do
+        tc qdisc add dev "$iface" clsact 2>/dev/null || true
+        if tc filter replace dev "$iface" egress pref 49153 handle 2 \
+                bpf direct-action object-pinned "$next_pin" >/dev/null 2>&1; then
+            switched+=("$iface")
+            continue
+        fi
+        for iface in "${switched[@]}"; do
+            if [[ -e "$live_pin" ]]; then
+                tc filter replace dev "$iface" egress pref 49153 handle 2 \
+                    bpf direct-action object-pinned "$live_pin" >/dev/null 2>&1 || true
+            else
+                tc filter del dev "$iface" egress pref 49153 handle 2 2>/dev/null || true
+            fi
+        done
+        rm -f "$next_pin"
+        _auto_xdp_warn "Failed to attach the Minecraft egress observer on $iface."
+        return 1
+    done
+    rm -f "$live_pin"
+    mv "$next_pin" "$live_pin"
+    _auto_xdp_info "Minecraft egress observer attached on ${egress_ifaces[*]}."
     return 0
 }
 
