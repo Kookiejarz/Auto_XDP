@@ -247,6 +247,7 @@ class AdminCliTests(unittest.TestCase):
             config_path.write_text(
                 "[zones.public]\ninterfaces = []\n"
                 "[subjects.web.resolve]\nsystemd_unit = \"nginx.service\"\n"
+                "[subjects.web.exposure.public.tcp]\nports = [80]\n"
             )
 
             with self.assertRaisesRegex(ValueError, "resolver already belongs to subject web"):

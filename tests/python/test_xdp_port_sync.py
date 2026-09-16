@@ -674,8 +674,14 @@ class XdpPortSyncTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicates subjects.web.resolve"):
             cfg.apply_toml_config({
                 "subjects": {
-                    "web": {"resolve": {"systemd_unit": "nginx.service"}},
-                    "website": {"resolve": {"systemd_unit": "nginx.service"}},
+                    "web": {
+                        "resolve": {"systemd_unit": "nginx.service"},
+                        "exposure": {"public": {"tcp": {"ports": [80]}}},
+                    },
+                    "website": {
+                        "resolve": {"systemd_unit": "nginx.service"},
+                        "exposure": {"public": {"tcp": {"ports": [443]}}},
+                    },
                 },
             })
 

@@ -199,12 +199,27 @@ def _container_resolver_matches(endpoint: RuntimeEndpoint, resolve: dict) -> boo
     return not label or _container_label_match(label, endpoint.container_labels)
 
 
+def _has_exposure_policy(subject: dict) -> bool:
+    for zone in subject.get("exposure", {}).values():
+        if isinstance(zone, dict) and (
+            zone.get("deny")
+            or any(
+                isinstance(zone.get(proto), dict) and zone[proto].get("ports")
+                for proto in ("tcp", "udp", "sctp")
+            )
+        ):
+            return True
+    return False
+
+
 def _subject_for_endpoint(endpoint: RuntimeEndpoint) -> tuple[str, dict] | None:
     """Resolve runtime evidence to an explicitly configured policy subject."""
     if endpoint.attribution_state in {"unknown", "ambiguous"} or not endpoint.subject:
         return None
     for name, spec in cfg.SUBJECTS.items():
-        resolve = spec.get("resolve", {}) if isinstance(spec, dict) else {}
+        if not isinstance(spec, dict) or not _has_exposure_policy(spec):
+            continue
+        resolve = spec.get("resolve", {})
         if not isinstance(resolve, dict):
             continue
         if _container_resolver_matches(endpoint, resolve):
