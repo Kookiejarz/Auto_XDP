@@ -670,6 +670,15 @@ class XdpPortSyncTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported exposure configuration"):
             cfg.apply_toml_config({"permanent_ports": {"tcp": [22]}})
 
+    def test_duplicate_subject_resolver_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "duplicates subjects.web.resolve"):
+            cfg.apply_toml_config({
+                "subjects": {
+                    "web": {"resolve": {"systemd_unit": "nginx.service"}},
+                    "website": {"resolve": {"systemd_unit": "nginx.service"}},
+                },
+            })
+
     def test_udp_malformed_drop_only_rejects_port_zero(self):
         source = (Path(__file__).resolve().parents[2] / "bpf" / "include" / "parse.h").read_text()
         self.assertRegex(
