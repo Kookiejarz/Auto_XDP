@@ -1,6 +1,7 @@
 """Port discovery: SOCK_DIAG netlink on Linux, psutil fallback elsewhere."""
 from __future__ import annotations
 
+import importlib
 import ipaddress
 import json
 import logging
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from types import ModuleType
 
 from auto_xdp import config as cfg
 from auto_xdp.state import ObservedState, RuntimeEndpoint
@@ -23,10 +25,11 @@ _IS_LINUX = sys.platform == "linux"
 
 # psutil (non-Linux fallback)
 
+psutil: ModuleType | None
 try:
-    import psutil
+    psutil = importlib.import_module("psutil")
 except ImportError:
-    psutil = None  # type: ignore[assignment]
+    psutil = None
 
 # Kept for backward-compat import by external callers.
 _net_connections = None
@@ -333,6 +336,8 @@ def _addr_str(family: int, raw: bytes) -> str:
 # shared helpers (used by both paths)
 
 def _resolve_pid_name(pid: int, cache: dict[int, str]) -> str:
+    if psutil is None:
+        return ""
     if pid not in cache:
         try:
             cache[pid] = psutil.Process(pid).name()
