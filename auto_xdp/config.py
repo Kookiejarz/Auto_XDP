@@ -378,7 +378,10 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     RATE_MAP_ENTRIES_V4 = _RATE_MAP_TEMPLATE_ENTRIES_V4
     RATE_MAP_ENTRIES_V6 = _RATE_MAP_TEMPLATE_ENTRIES_V6
 
-    if "permanent_ports" in cfg:
+    legacy_ports = cfg.get("permanent_ports")
+    if legacy_ports and (
+        not isinstance(legacy_ports, dict) or any(legacy_ports.values())
+    ):
         raise ValueError("unsupported exposure configuration; use subjects.*.exposure grants")
 
     for cidr, label in cfg.get("trusted_ips", {}).items():

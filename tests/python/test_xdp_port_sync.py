@@ -662,6 +662,14 @@ class XdpPortSyncTests(unittest.TestCase):
             cfg.XDP_RATE_WINDOW_SECONDS = old_values["xdp_rate_window_seconds"]
             cfg.XDP_UDP_GLOBAL_BYTE_RATE = old_values["xdp_udp_global_byte_rate"]
 
+    def test_empty_legacy_permanent_ports_do_not_block_upgrade(self):
+        cfg.apply_toml_config({
+            "permanent_ports": {"tcp": [], "udp": [], "sctp": []},
+        })
+
+        with self.assertRaisesRegex(ValueError, "unsupported exposure configuration"):
+            cfg.apply_toml_config({"permanent_ports": {"tcp": [22]}})
+
     def test_udp_malformed_drop_only_rejects_port_zero(self):
         source = (Path(__file__).resolve().parents[2] / "bpf" / "include" / "parse.h").read_text()
         self.assertRegex(
