@@ -240,6 +240,27 @@ class AdminCliTests(unittest.TestCase):
                     reason="missing resolver",
                 )
 
+    def test_approval_rejects_resolver_owned_by_another_subject(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                "[zones.public]\ninterfaces = []\n"
+                "[subjects.web.resolve]\nsystemd_unit = \"nginx.service\"\n"
+            )
+
+            with self.assertRaisesRegex(ValueError, "resolver already belongs to subject web"):
+                approvals.create_request(
+                    root / "approval.json",
+                    config_path,
+                    subject="website",
+                    zone="public",
+                    protocol="tcp",
+                    ports=[443],
+                    reason="duplicate resolver",
+                    systemd_unit="nginx.service",
+                )
+
     def test_approval_commands_are_root_only(self):
         parser = admin_cli.build_parser()
         self.assertEqual(parser.parse_args(["--config", "/tmp/c.toml", "approval", "list"]).command, "approval")

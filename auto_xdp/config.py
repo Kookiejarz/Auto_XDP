@@ -490,6 +490,7 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     raw_subjects = cfg.get("subjects", {})
     if not isinstance(raw_subjects, dict):
         raise ValueError("subjects must be a table")
+    seen_resolvers: list[tuple[str, dict]] = []
     for subject_name, subject in raw_subjects.items():
         if not isinstance(subject, dict):
             raise ValueError(f"subjects.{subject_name} must be a table")
@@ -520,6 +521,13 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
             raise ValueError(
                 f"subjects.{subject_name}.resolve.container_runtime requires container identity"
             )
+        if resolve:
+            for previous_name, previous_resolver in seen_resolvers:
+                if resolve == previous_resolver:
+                    raise ValueError(
+                        f"subjects.{subject_name}.resolve duplicates subjects.{previous_name}.resolve"
+                    )
+            seen_resolvers.append((str(subject_name), resolve))
         exposure = subject.get("exposure", {})
         if not isinstance(exposure, dict):
             raise ValueError(f"subjects.{subject_name}.exposure must be a table")

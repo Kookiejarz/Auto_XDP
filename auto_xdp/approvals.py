@@ -117,6 +117,14 @@ def _validate_request(data: dict[str, Any], *, config: dict[str, Any]) -> None:
     existing = config.get("subjects", {}).get(subject, {})
     if not isinstance(existing, dict):
         existing = {}
+    if resolution:
+        for other_name, other in config.get("subjects", {}).items():
+            if (
+                str(other_name) != subject
+                and isinstance(other, dict)
+                and other.get("resolve") == resolution
+            ):
+                raise ValueError(f"resolver already belongs to subject {other_name}")
     if not resolution and not isinstance(existing.get("resolve"), dict):
         raise ValueError("new subjects require --systemd-unit or --process-name")
     profile = str(data.get("protection_profile", "")).strip()
