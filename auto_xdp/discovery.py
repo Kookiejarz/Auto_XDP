@@ -26,7 +26,7 @@ _IS_LINUX = sys.platform == "linux"
 try:
     import psutil
 except ImportError:
-    psutil = None
+    psutil = None  # type: ignore[assignment]
 
 # Kept for backward-compat import by external callers.
 _net_connections = None

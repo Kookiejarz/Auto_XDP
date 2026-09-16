@@ -76,7 +76,7 @@ struct mc_verified_val {
 
 struct mc_varint {
     __s32 value;
-    __u32 bytes;
+    __u8 bytes;
 };
 
 static __always_inline int profile_drop(struct xdp_md *ctx)
@@ -332,12 +332,11 @@ static __always_inline struct mc_varint mc_varint_fail(void)
     do {                                                                      \
         if ((max) < (idx))                                                    \
             goto mc_varint_error;                                            \
-        if ((const void *)(ptr) >= (const void *)(dend))                     \
-            goto mc_varint_error;                                            \
-        barrier_var(ptr);                                                     \
         if ((const void *)(ptr) >= (const void *)(pend))                     \
             goto mc_varint_error;                                            \
         barrier_var(ptr);                                                     \
+        if ((const void *)((ptr) + 1) > (const void *)(dend))                \
+            goto mc_varint_error;                                            \
         __u8 _b = *(ptr)++;                                                   \
         (result) |= ((__s32)(_b & 0x7F) << (shift));                         \
         if (!(_b & 0x80))                                                     \
@@ -363,12 +362,11 @@ static __always_inline bool read_byte(__u8 **ptr, const __u8 *end, const void *d
 {
     __u8 *p = *ptr;
 
-    if ((const void *)p >= data_end)
-        return false;
-    barrier_var(p);
     if (p >= end)
         return false;
     barrier_var(p);
+    if ((const void *)(p + 1) > data_end)
+        return false;
     *out = *p;
     *ptr = p + 1;
     return true;
@@ -380,12 +378,11 @@ static __always_inline bool consume_bytes(__u8 **ptr, const __u8 *end, __u32 n, 
 
     n &= 0x1FFF;
     barrier_var(n);
-    if ((const void *)(p + n) > data_end)
-        return false;
-    barrier_var(p);
     if (p + n > end)
         return false;
     barrier_var(p);
+    if ((const void *)(p + n) > data_end)
+        return false;
     *ptr = p + n;
     return true;
 }
@@ -435,11 +432,13 @@ static __always_inline bool inspect_login_packet(
     __u32 packet_len;
 
     v = read_varint(start, end, MC_MAX_PACKET_LEN_BYTES, data_end);
-    if (!v.bytes || v.value < 2 || v.value > (MC_MAX_PACKET_ID_BYTES + MC_LOGIN_NAME_MAX + 4096))
+    if (!v.bytes || v.value < 2)
         return false;
     start += v.bytes;
     packet_len = (__u32)v.value;
     barrier_var(packet_len);
+    if (packet_len > (MC_MAX_PACKET_ID_BYTES + MC_LOGIN_NAME_MAX + 4096))
+        return false;
     packet_end = start + packet_len;
     if ((const void *)packet_end > data_end || packet_end != end)
         return false;
@@ -523,11 +522,13 @@ static __always_inline __s32 inspect_handshake(
         return MC_LEGACY_PING;
 
     v = read_varint(start, end, MC_MAX_PACKET_LEN_BYTES, data_end);
-    if (!v.bytes || v.value < 4 || v.value > (MC_MAX_PACKET_ID_BYTES + MC_HANDSHAKE_HOST_MAX + 16))
+    if (!v.bytes || v.value < 4)
         return 0;
     start += v.bytes;
     packet_len = (__u32)v.value;
     barrier_var(packet_len);
+    if (packet_len > (MC_MAX_PACKET_ID_BYTES + MC_HANDSHAKE_HOST_MAX + 16))
+        return 0;
     packet_end = start + packet_len;
     if ((const void *)packet_end > data_end || packet_end > end)
         return 0;
