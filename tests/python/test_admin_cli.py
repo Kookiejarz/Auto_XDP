@@ -625,10 +625,14 @@ class AdminCliTests(unittest.TestCase):
             config_path = root / "config.toml"
             bpf_pin_dir = root / "bpf"
             handlers_dir = root / "handlers"
+            builtin_handlers_dir = root / "install" / "handlers"
             handlers_dir.mkdir()
             bpf_pin_dir.mkdir()
+            builtin_handlers_dir.mkdir(parents=True)
             (handlers_dir / "gre_handler.o").touch()
             (handlers_dir / "custom_47_demo.o").touch()
+            (builtin_handlers_dir / "minecraft_handler.c").write_text("hblk4", encoding="ascii")
+            (builtin_handlers_dir / "minecraft_handler.o").touch()
             stdout = StringIO()
             with mock.patch("sys.stdout", stdout):
                 rc = admin_cli.main(
@@ -639,6 +643,8 @@ class AdminCliTests(unittest.TestCase):
                         str(bpf_pin_dir),
                         "--handlers-dir",
                         str(handlers_dir),
+                        "--install-dir",
+                        str(root / "install"),
                         "port-handler",
                         "list",
                     ]
