@@ -5,11 +5,11 @@ variant	status	static_insns	processed_insns	max_states_per_insn	total_states	pea
 baseline	passed	13481	282798	27	11892	4610	1556784	288
 shared-inline	passed	13273	255442	20	11492	4420	1367501	288
 shared-static-subprog	passed	11393	259940	20	11695	4536	1330792	288
-shared-global-subprog	verifier_failed							
+shared-global-subprog	verifier_failed
 no-l3	passed	11787	222688	22	10411	3651	1131976	280
 no-l4	passed	10400	185965	22	8792	3307	888841	280
 no-l5	passed	12020	227967	22	10758	3791	1212698	280
 no-accounting	passed	6920	124823	20	7102	2048	583829	256
 family-split	passed	13447	279987	27	11830	4578	1592266	304
 accounting-static-subprog	passed	12141	677592	20	25230	7259	3853823	296
-accounting-global-subprog	verifier_failed							
+accounting-global-subprog	verifier_failed
