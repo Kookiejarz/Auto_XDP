@@ -63,4 +63,3 @@ changes that reuse the existing CLI, relay, and BPF maps.
       deployment requires them.
 - [ ] Pluggable threat-intelligence feeds with provenance, freshness, and
       conflict handling; never let a failed refresh erase the last good state.
-
