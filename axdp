@@ -559,8 +559,22 @@ run_enable() {
         echo "Enable failed; policy returned to audit mode." >&2
         return 1
     fi
+    # Service managers return before the launcher finishes attaching the data plane.
+    local deadline=$((SECONDS + 40)) backend_report
+    until backend_report=$(run_backend 2>&1); do
+        if (( SECONDS >= deadline )); then
+            printf 'Enable failed: backend did not become healthy within 40 seconds.\n%s\n' \
+                "$backend_report" >&2
+            run_service_cmd status >&2 || true
+            if ! run_disable audit; then
+                echo "Automatic rollback failed; check axdp status before retrying." >&2
+            fi
+            return 1
+        fi
+        sleep 0.2
+    done
     echo "Auto XDP enforcement enabled."
-    run_backend
+    printf '%s\n' "$backend_report"
 }
 
 run_disable() {

@@ -769,7 +769,16 @@ class AdminCliTests(unittest.TestCase):
                     ]
                 )
 
+                runtime_state.write_text(runtime_state.read_text().replace('"healthy":true', '"healthy":false'))
+                degraded_rc = admin_main.main([
+                    "--env-config", str(env_config),
+                    "--bpf-pin-dir", str(bpf_pin_dir),
+                    "--run-state-dir", str(run_state_dir),
+                    "backend", "--json",
+                ])
+
             self.assertEqual(rc, 0)
+            self.assertEqual(degraded_rc, 1)
             output = "".join(call.args[0] for call in write_mock.call_args_list).strip()
             self.assertIn('"backend": "xdp"', output)
             self.assertIn('"interfaces": ["eth9"]', output)

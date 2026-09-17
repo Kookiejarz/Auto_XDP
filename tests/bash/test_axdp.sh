@@ -161,6 +161,58 @@ test_enable_failure_restores_audit_discovery() (
     assert_eq "$calls" "config:policy mode enforce|service:restart|config:policy mode audit|service:start|"
 )
 
+test_enable_waits_for_health_and_rolls_back_on_timeout() (
+    local scenario
+    for scenario in xdp nftables timeout; do
+        (
+            source "$REPO_ROOT/axdp"
+            set +e
+            local tmpdir attempts=0 output status
+            tmpdir=$(mktemp -d)
+            trap 'rm -rf "$tmpdir"' EXIT
+            TOML_CONFIG="$tmpdir/config.toml"
+            touch "$TOML_CONFIG"
+            require_root() { :; }
+            remote_access_is_granted() { return 0; }
+            run_admin_config() {
+                printf 'config:%s\n' "$*" >> "$tmpdir/calls"
+                [[ "$*" != 'policy mode' ]] || printf 'enforce\n'
+            }
+            run_service_cmd() { printf 'service:%s\n' "$*" >> "$tmpdir/calls"; }
+            run_admin_runtime() { printf 'runtime:%s\n' "$*" >> "$tmpdir/calls"; }
+            run_backend() {
+                if (( attempts == 0 )); then
+                    printf 'No active Auto XDP backend detected.\n' >&2
+                    return 1
+                fi
+                if (( attempts == 1 )) || [[ "$scenario" == timeout ]]; then
+                    printf 'Health    : degraded\n'
+                    return 1
+                fi
+                printf 'Backend   : %s\nHealth    : healthy\n' "$scenario"
+            }
+            sleep() {
+                attempts=$((attempts + 1))
+                [[ "$scenario" != timeout ]] || SECONDS=$((SECONDS + 40))
+            }
+            output=$(run_enable --force 2>&1)
+            status=$?
+            if [[ "$scenario" == timeout ]]; then
+                assert_eq "$status" 1 "$output" || exit 1
+                [[ "$output" != *'Auto XDP enforcement enabled.'* ]] || exit 1
+                assert_contains "$output" 'Health    : degraded' || exit 1
+                assert_file_contains "$tmpdir/calls" $'config:policy mode audit\nservice:stop\nruntime:deactivate\nservice:start' || exit 1
+            else
+                assert_eq "$status" 0 "$output" || exit 1
+                assert_contains "$output" "Backend   : $scenario" || exit 1
+                assert_contains "$output" 'Auto XDP enforcement enabled.' || exit 1
+                [[ "$output" != *'No active'* && "$output" != *degraded* ]] || exit 1
+                assert_eq "$(cat "$tmpdir/calls")" $'config:policy mode enforce\nservice:restart' || exit 1
+            fi
+        ) || { printf 'enable scenario failed: %s\n' "$scenario"; return 1; }
+    done
+)
+
 test_status_combines_service_and_backend_health() (
     source "$REPO_ROOT/axdp"
     set +e
