@@ -504,7 +504,7 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
         goto parse_login_start;
     }
     if (pending->state == MC_L7_STATUS_REQUEST) {
-parse_status_request:
+parse_status_request: ;
         enum mc_parse_result result = parse_empty_packet(payload, payload_end, 0, data_end);
         if (result == MC_PARSE_NEED_MORE) return profile_result(ctx, inner_off, XDP_PASS);
         if (result != MC_PARSE_MATCH ||
@@ -531,7 +531,7 @@ parse_status_request:
         return profile_result(ctx, inner_off, XDP_DROP);
     }
     if (pending->state == MC_L7_LOGIN_START) {
-parse_login_start:
+parse_login_start: ;
         enum mc_parse_result result = parse_login_start(
             payload, payload_end, pending->protocol_version, data_end);
         if (result == MC_PARSE_NEED_MORE) {
