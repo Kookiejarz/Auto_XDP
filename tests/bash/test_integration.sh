@@ -973,17 +973,6 @@ test_minecraft_profile_syncer_lifecycle() (
         "${include_args[@]}" -c "$REPO_ROOT/handlers/minecraft_handler.c" \
         -o "$install_dir/handlers/minecraft_handler.o" || return 1
 
-    {
-        printf '[firewall]\nbogon_filter = false\n'
-        printf '[policy]\nmode = "enforce"\n'
-        printf '[zones.public]\ninterfaces = []\n'
-        printf '[unknown_subjects]\npublic = "deny"\n'
-        printf '[subjects.minecraft.resolve]\nprocess_name = "python3"\n'
-        printf '[subjects.minecraft.exposure.public.tcp]\nports = [%d]\n' "$port"
-        printf '[subjects.minecraft.protection]\nprofile = "minecraft"\n'
-        printf '[xdp]\nbpf_pin_dir = "%s"\n' "$_PIN_DIR"
-    } >"$config_path"
-
     sync_policy() {
         env PYTHONPATH="$REPO_ROOT" PYTHON_LIB_DIR="$install_dir/python" \
             RUN_STATE_DIR="$run_dir" XDP_OBJ_PATH="$_XDP_OBJ" \
@@ -1014,6 +1003,18 @@ PYEOF
     }
 
     start_listener || return 1
+    local resolver_key resolver_value
+    read -r resolver_key resolver_value < <(listener_resolver "$listener_pid") || return 1
+    {
+        printf '[firewall]\nbogon_filter = false\n'
+        printf '[policy]\nmode = "enforce"\n'
+        printf '[zones.public]\ninterfaces = []\n'
+        printf '[unknown_subjects]\npublic = "deny"\n'
+        printf '[subjects.minecraft.resolve]\n%s = "%s"\n' "$resolver_key" "$resolver_value"
+        printf '[subjects.minecraft.exposure.public.tcp]\nports = [%d]\n' "$port"
+        printf '[subjects.minecraft.protection]\nprofile = "minecraft"\n'
+        printf '[xdp]\nbpf_pin_dir = "%s"\n' "$_PIN_DIR"
+    } >"$config_path"
     sync_policy || return 1
     read -r allow profile_id first_generation profile_generation \
         <<<"$(_get_tcp_policy "$port")"

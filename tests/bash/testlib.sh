@@ -5,6 +5,26 @@ set -uo pipefail
 TESTS_RUN=0
 TESTS_FAILED=0
 
+listener_resolver() {
+    # A runner's child process inherits its service cgroup; use that identity
+    # before falling back to the process name, as runtime discovery does.
+    python3 - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+process = Path('/proc') / str(int(sys.argv[1]))
+for line in (process / 'cgroup').read_text().splitlines():
+    for component in reversed(line.rsplit(':', 1)[-1].split('/')):
+        if component.endswith('.service'):
+            print('systemd_unit', component)
+            raise SystemExit(0)
+name = (process / 'comm').read_text().strip()
+if not name:
+    raise SystemExit('listener process identity is unavailable')
+print('process_name', name)
+PY
+}
+
 test_log_info() {
     printf '[INFO] %s\n' "$*"
 }
