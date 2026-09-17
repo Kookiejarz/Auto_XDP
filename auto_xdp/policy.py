@@ -1,12 +1,14 @@
 """Rate-limit policy resolution helpers for port sync and firewall rules."""
 
 from dataclasses import replace
+from typing import Callable, TypeVar
 
 from auto_xdp import config as cfg
 from auto_xdp.services import service_name
 from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
 
 _NS_PER_SECOND = 1_000_000_000
+_LimitT = TypeVar("_LimitT")
 
 
 def _seconds_to_ns(value: float) -> int:
@@ -112,6 +114,30 @@ def _syn_aggregate_rate_limit(port: int, proc: str = "") -> int:
     return cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE
 
 
+def _syncookie_mode(port: int, proc: str = "") -> str:
+    if not cfg.SYNCOOKIE_ENABLED:
+        return cfg.SYNCOOKIE_MODE_OFF
+    if port in cfg._SYNCOOKIE_BY_PORT:
+        return cfg._SYNCOOKIE_BY_PORT[port]
+    if proc and proc in cfg._SYNCOOKIE_BY_PROC:
+        return cfg._SYNCOOKIE_BY_PROC[proc]
+    svc = service_name(port, "tcp")
+    if svc and svc in cfg._SYNCOOKIE_BY_SERVICE:
+        return cfg._SYNCOOKIE_BY_SERVICE[svc]
+    return cfg.SYNCOOKIE_DEFAULT_MODE
+
+
+def _syncookie_port_rate_limit(port: int, proc: str = "") -> int:
+    if port in cfg._SYNCOOKIE_PORT_RATE_BY_PORT:
+        return cfg._SYNCOOKIE_PORT_RATE_BY_PORT[port]
+    if proc and proc in cfg._SYNCOOKIE_PORT_RATE_BY_PROC:
+        return cfg._SYNCOOKIE_PORT_RATE_BY_PROC[proc]
+    svc = service_name(port, "tcp")
+    if svc and svc in cfg._SYNCOOKIE_PORT_RATE_BY_SERVICE:
+        return cfg._SYNCOOKIE_PORT_RATE_BY_SERVICE[svc]
+    return cfg.SYNCOOKIE_PORT_RATE_DEFAULT or _port_rate_limit(port, proc)
+
+
 def rate_map_entries_v6(_v4_entries: int) -> int:
     """Return the fixed v6 capacity required by the compiled map template."""
     return cfg.RATE_MAP_ENTRIES_V6
@@ -145,8 +171,8 @@ def _udp_aggregate_byte_limit(port: int, proc: str = "") -> int:
 def _resolve_port_limits(
     ports: set[int],
     process_names: dict[int, str],
-    resolver,
-) -> dict[int, int]:
+    resolver: Callable[[int, str], _LimitT],
+) -> dict[int, _LimitT]:
     """Return resolver(port, proc) for every port — including 0 (pin off).
 
     Pre-default-on, this filtered out 0 to keep the desired-state map small.
@@ -387,6 +413,11 @@ def _desired_state_for_ports(observed: ObservedState) -> DesiredState:
     udp_rate_limits = _resolve_port_limits(
         udp_ports, observed.udp_processes, _udp_port_rate_limit
     )
+    tcp_syncookie_modes = {
+        port: mode for port, mode in _resolve_port_limits(
+            tcp_ports, observed.tcp_processes, _syncookie_mode
+        ).items() if mode != cfg.SYNCOOKIE_MODE_OFF
+    }
     tcp_rate_map_entries = {
         port: _rate_map_entries(port, observed.tcp_processes.get(port, ""))
         for port, rate in tcp_syn_rate_limits.items() if rate > 0
@@ -405,6 +436,12 @@ def _desired_state_for_ports(observed: ObservedState) -> DesiredState:
         tcp_syn_agg_rate_limits=_resolve_port_limits(
             tcp_ports, observed.tcp_processes, _syn_aggregate_rate_limit
         ),
+        tcp_syncookie_modes=tcp_syncookie_modes,
+        tcp_syncookie_rate_limits={
+            port: _syncookie_port_rate_limit(
+                port, observed.tcp_processes.get(port, "")
+            ) for port in tcp_syncookie_modes
+        },
         udp_rate_limits=udp_rate_limits,
         tcp_rate_map_entries=tcp_rate_map_entries,
         udp_rate_map_entries=udp_rate_map_entries,

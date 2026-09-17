@@ -7,3 +7,11 @@ synag4 49152
 synag6 16384
 udpag4 49152
 udpag6 16384
+tcp_synck_policy array 4 4 65536
+sync_run_cfg array 4 24 1
+sync_port_rate array 4 24 65536
+sync_port_state array 4 16 65536
+sync_port_limit array 4 4 65536
+syncookie_prog_array prog_array 4 4 1
+sync_handoff4 lru_hash 12 20 65536
+sync_handoff6 lru_hash 36 20 65536

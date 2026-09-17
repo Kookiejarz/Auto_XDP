@@ -327,6 +327,7 @@ _setup_reattach_test_env() {
     # stubs for functions from auto_xdp_runtime_common.sh (not loaded in tests)
     ensure_bpffs() { return 0; }
     load_sock_state_tracker() { return 0; }
+    load_syncookie_program() { return 0; }
     load_minecraft_egress() { return 0; }
     xdp_maps_ready() { return 0; }
     load_port_handlers() { return 0; }
@@ -462,6 +463,23 @@ test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails() (
     ensure_xdp_loaded >/dev/null 2>&1 || return 1
     assert_eq "$(cat "$tmpdir/recovery.log")" $'resume\nrestore' || return 1
     [[ ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
+test_ensure_xdp_blocks_fallback_when_required_syncookie_is_unavailable() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+    _IFACES=(eth0)
+    _auto_xdp_verify_iface_program() { return 0; }
+    ip() { printf '\n'; }
+    load_syncookie_program() { return 1; }
+
+    ensure_xdp_loaded >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "2"
 )
 
 test_select_backend_refuses_nftables_while_xdp_remains_attached() (

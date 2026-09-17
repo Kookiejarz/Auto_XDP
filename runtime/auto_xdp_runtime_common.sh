@@ -394,6 +394,14 @@ _map_max_entries_ok() {
     [[ -z "$_got" || "$_got" == "$_want" ]]
 }
 
+_map_abi_shape_ok() {
+    local path="$1" type="$2" key="$3" value="$4" info=""
+    info=$(bpftool map show pinned "$path" 2>/dev/null) || return 0
+    [[ "$info" =~ (^|[[:space:]])$type[[:space:]]+name[[:space:]] ]] || return 1
+    [[ "$info" =~ key[[:space:]]${key}B([[:space:]]|$) ]] || return 1
+    [[ "$info" =~ value[[:space:]]${value}B([[:space:]]|$) ]]
+}
+
 _xdp_map_abi_file() {
     local candidate=""
     for candidate in \
@@ -410,15 +418,21 @@ _xdp_map_abi_file() {
 }
 
 _xdp_map_abi_ready() {
-    local abi_file="" map_name="" expected=""
+    local abi_file="" map_name="" field2="" field3="" field4="" field5=""
     abi_file=$(_xdp_map_abi_file) || {
         _auto_xdp_warn "XDP map ABI manifest is missing; forcing runtime reload"
         return 1
     }
-    while read -r map_name expected; do
+    while read -r map_name field2 field3 field4 field5; do
         [[ -z "$map_name" || "$map_name" == \#* ]] && continue
-        [[ "$expected" =~ ^[0-9]+$ ]] || return 1
-        _map_max_entries_ok "${BPF_PIN_DIR}/${map_name}" "$expected" || {
+        if [[ -n "$field5" ]]; then
+            [[ "$field3" =~ ^[0-9]+$ && "$field4" =~ ^[0-9]+$ && "$field5" =~ ^[0-9]+$ ]] || return 1
+            _map_abi_shape_ok "${BPF_PIN_DIR}/${map_name}" "$field2" "$field3" "$field4" || return 1
+            _map_max_entries_ok "${BPF_PIN_DIR}/${map_name}" "$field5" || return 1
+            continue
+        fi
+        [[ "$field2" =~ ^[0-9]+$ ]] || return 1
+        _map_max_entries_ok "${BPF_PIN_DIR}/${map_name}" "$field2" || {
             _auto_xdp_warn "${map_name} max_entries mismatch; forcing XDP reload"
             return 1
         }
@@ -501,6 +515,13 @@ xdp_required_map_names() {
 	udp_global_rl
 	udp_percpu_acc
 	tcp_port_policies
+	tcp_synck_policy
+	sync_run_cfg
+	sync_port_rate
+	sync_port_state
+	sync_port_limit
+	sync_handoff4
+	sync_handoff6
 	syn4
 	syn6
 	udp_port_policies
@@ -519,6 +540,7 @@ xdp_required_map_names() {
 	tcp_profile_handlers
 	tcp_port_handlers
 	udp_port_handlers
+	syncookie_prog_array
 	hblk4
 	hblk6
 	udp_hv4
@@ -970,6 +992,149 @@ _auto_xdp_report_xdp_load_failure() {
 
     _auto_xdp_warn "BPF verifier rejected candidate program; bpftool log follows."
     cat "$log_path" >&2
+}
+
+syncookie_sysctl_state_path() {
+    printf '%s\n' "${SYNCOOKIE_SYSCTL_STATE:-${RUN_STATE_DIR:-/run/auto_xdp}/syncookie-sysctl.json}"
+}
+
+syncookie_sysctl_acquire() {
+    local state_path
+    state_path=$(syncookie_sysctl_state_path)
+    "${PYTHON3_BIN:-python3}" - "$state_path" <<'PY'
+import sys
+from auto_xdp.bpf.syncookie import acquire_sysctl
+acquire_sysctl(sys.argv[1])
+PY
+}
+
+syncookie_sysctl_release() {
+    local state_path
+    state_path=$(syncookie_sysctl_state_path)
+    [[ -f "$state_path" ]] || return 0
+    "${PYTHON3_BIN:-python3}" - "$state_path" <<'PY'
+import sys
+from auto_xdp.bpf.syncookie import release_sysctl
+raise SystemExit(0 if release_sysctl(sys.argv[1]) else 1)
+PY
+}
+
+cleanup_syncookie_handoff() {
+    local iface_var="" iface=""
+    if iface_var=$(_auto_xdp_iface_var_name); then
+        local -n cookie_ifaces="$iface_var"
+        for iface in "${cookie_ifaces[@]}"; do
+            tc filter del dev "$iface" ingress pref 49151 handle 2 2>/dev/null || true
+        done
+    fi
+    rm -f "${BPF_PIN_DIR}/syncookie_prog" \
+          "${BPF_PIN_DIR}/tc_syncookie_handoff_prog" 2>/dev/null || true
+    [[ ${1:-0} -eq 0 ]] || syncookie_sysctl_release || true
+}
+
+load_syncookie_program() {
+    local xdp_obj="" tc_obj="" capability="" enabled="0" strict="0"
+    local acquired_sysctl=0 sysctl_state=""
+    xdp_obj=$(_auto_xdp_first_value SYNCOOKIE_OBJ_PATH SYNCOOKIE_OBJ_INSTALLED) || true
+    tc_obj=$(_auto_xdp_first_value TC_SYNCOOKIE_OBJ_PATH TC_SYNCOOKIE_OBJ_INSTALLED) || true
+    readarray -t cookie_config < <("${PYTHON3_BIN:-python3}" - "$TOML_CONFIG" <<'PY'
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+try:
+    with open(sys.argv[1], "rb") as handle:
+        cfg = tomllib.load(handle).get("syncookie", {})
+    modes = [cfg.get("default_mode", "auto")]
+    for scope in ("by_proc", "by_service", "by_port"):
+        values = cfg.get(scope, {})
+        if isinstance(values, dict):
+            modes.extend(values.values())
+    print("1" if cfg.get("enabled", False) else "0")
+    print("1" if any(str(mode).lower() == "always" for mode in modes) else "0")
+except (OSError, ValueError):
+    print("0")
+    print("0")
+PY
+    )
+    enabled=${cookie_config[0]:-0}
+    strict=${cookie_config[1]:-0}
+    if [[ "$enabled" != 1 ]]; then
+        cleanup_syncookie_handoff
+        syncookie_sysctl_release || true
+        return 0
+    fi
+
+    capability=$("${PYTHON3_BIN:-python3}" - <<'PY'
+from auto_xdp.bpf.syncookie import probe_syncookie_capability
+cap = probe_syncookie_capability()
+print("2" if cap.helpers and cap.reqsk_handoff else str(cap.level))
+PY
+    ) || capability=0
+    if [[ "$capability" != 2 || ! -f "$xdp_obj" || ! -f "$tc_obj" ]]; then
+        _auto_xdp_warn "Full SYN-cookie listener handoff requires Linux 6.11+ and both optional objects."
+        [[ "$strict" != 1 ]]
+        return
+    fi
+    sysctl_state=$(syncookie_sysctl_state_path)
+    [[ -f "$sysctl_state" ]] || acquired_sysctl=1
+    syncookie_sysctl_acquire || {
+        _auto_xdp_warn "Cannot enable net.ipv4.tcp_syncookies."
+        [[ "$strict" != 1 ]]
+        return
+    }
+
+    local xdp_pin="${BPF_PIN_DIR}/syncookie_prog"
+    local tc_pin="${BPF_PIN_DIR}/tc_syncookie_handoff_prog"
+    rm -f "$xdp_pin" "$tc_pin"
+    bpftool prog load "$xdp_obj" "$xdp_pin" type xdp \
+        map name slot_ctx_map pinned "${BPF_PIN_DIR}/slot_ctx_map" \
+        map name pkt_counters pinned "${BPF_PIN_DIR}/pkt_counters" \
+        map name byte_counters pinned "${BPF_PIN_DIR}/byte_counters" \
+        map name tcp_synck_policy pinned "${BPF_PIN_DIR}/tcp_synck_policy" \
+        map name sync_run_cfg pinned "${BPF_PIN_DIR}/sync_run_cfg" \
+        map name sync_handoff4 pinned "${BPF_PIN_DIR}/sync_handoff4" \
+        map name sync_handoff6 pinned "${BPF_PIN_DIR}/sync_handoff6" \
+        >/dev/null 2>&1 || {
+        _auto_xdp_warn "Kernel rejected the optional SYN-cookie XDP program."
+        cleanup_syncookie_handoff "$acquired_sysctl"
+        [[ "$strict" != 1 ]]
+        return
+    }
+    bpftool prog load "$tc_obj" "$tc_pin" type classifier \
+        map name sync_handoff4 pinned "${BPF_PIN_DIR}/sync_handoff4" \
+        map name sync_handoff6 pinned "${BPF_PIN_DIR}/sync_handoff6" \
+        >/dev/null 2>&1 || {
+        _auto_xdp_warn "Kernel rejected the SYN-cookie reqsk handoff program."
+        cleanup_syncookie_handoff "$acquired_sysctl"
+        [[ "$strict" != 1 ]]
+        return
+    }
+
+    local iface_var="" iface=""
+    iface_var=$(_auto_xdp_iface_var_name) || {
+        cleanup_syncookie_handoff "$acquired_sysctl"
+        return 1
+    }
+    local -n cookie_ifaces="$iface_var"
+    for iface in "${cookie_ifaces[@]}"; do
+        tc qdisc add dev "$iface" clsact 2>/dev/null || true
+        tc filter replace dev "$iface" ingress pref 49151 handle 2 \
+            bpf direct-action object-pinned "$tc_pin" >/dev/null 2>&1 || {
+            _auto_xdp_warn "Cannot attach SYN-cookie handoff on $iface."
+            cleanup_syncookie_handoff "$acquired_sysctl"
+            [[ "$strict" != 1 ]]
+            return
+        }
+    done
+    bpftool map update pinned "${BPF_PIN_DIR}/syncookie_prog_array" \
+        key 0 0 0 0 value pinned "$xdp_pin" >/dev/null 2>&1 || {
+        cleanup_syncookie_handoff "$acquired_sysctl"
+        [[ "$strict" != 1 ]]
+        return
+    }
+    _auto_xdp_info "SYN-cookie Level 2 enabled on ${cookie_ifaces[*]}."
 }
 
 transactional_reload_xdp() {

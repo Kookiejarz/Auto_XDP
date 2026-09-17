@@ -210,6 +210,94 @@ static __always_inline int syn_agg_rate_check(struct flow_key *key, __u64 now,
     WINDOW_RATE_CHECK(&synag6, rkey, struct prefix_rate_val, now, window_ns, 1ULL, rate_max);
 }
 
+static __always_inline int syncookie_port_count(
+    __u32 dest_port, __u64 now, struct xdp_runtime_cfg *cfg)
+{
+    struct syncookie_port_rate_val *value =
+        bpf_map_lookup_elem(&sync_port_rate, &dest_port);
+    if (!value)
+        return -1;
+    bpf_spin_lock(&value->lock);
+    if (!value->window_start_ns ||
+        now - value->window_start_ns >= cfg_rate_window_ns(cfg)) {
+        value->window_start_ns = now;
+        value->count = 1;
+    } else if (value->count < 0xFFFFFFFFULL) {
+        value->count++;
+    }
+    __u64 count_value = value->count;
+    bpf_spin_unlock(&value->lock);
+    return count_value > 0x7FFFFFFFULL ? 0x7FFFFFFF : (__u32)count_value;
+}
+
+static __attribute__((noinline)) enum syncookie_guard_verdict
+syncookie_guard_check(__u64 now, __u32 dest_port,
+                      struct xdp_runtime_cfg *cfg)
+{
+    __u32 zero = 0;
+    struct syncookie_runtime_cfg *runtime =
+        bpf_map_lookup_elem(&sync_run_cfg, &zero);
+    if (!runtime || !runtime->enabled)
+        return SYN_GUARD_ALLOW;
+    __u32 *mode = bpf_map_lookup_elem(&tcp_synck_policy, &dest_port);
+    if (!mode || !*mode)
+        return SYN_GUARD_ALLOW;
+    __u32 *configured = bpf_map_lookup_elem(&sync_port_limit, &dest_port);
+    struct tcp_port_policy_cfg *policy =
+        bpf_map_lookup_elem(&tcp_port_policies, &dest_port);
+    __u32 base = configured && *configured ? *configured :
+        (policy ? policy->syn_rate_max : 0);
+    if (!base)
+        return *mode == 2 ? SYN_GUARD_DROP : SYN_GUARD_ALLOW;
+
+    int port_count = syncookie_port_count(dest_port, now, cfg);
+    if (port_count < 0)
+        return SYN_GUARD_DROP;
+    __u64 observed = (__u32)port_count;
+    __u64 hard = *mode == 2 ? base :
+        ((__u64)base * runtime->auto_max_percent) / 100;
+    __u64 activation = ((__u64)base * runtime->activation_percent) / 100;
+    struct syncookie_port_state *state =
+        bpf_map_lookup_elem(&sync_port_state, &dest_port);
+
+    if (observed >= hard) {
+        if (state && state->state != 2) {
+            state->state = 2;
+            count(CNT_SYN_GUARD_SHED_ENTER);
+        }
+        if (state)
+            state->cooldown_until_ns = now + runtime->cooldown_ns;
+        return SYN_GUARD_DROP;
+    }
+    if (*mode == 2 || observed >= activation) {
+        if (state) {
+            state->state = 1;
+            state->cooldown_until_ns = now + runtime->cooldown_ns;
+        }
+        return SYN_GUARD_COOKIE;
+    }
+    if (state && state->state != 0 && now < state->cooldown_until_ns)
+        return state->state == 2 ? SYN_GUARD_DROP : SYN_GUARD_COOKIE;
+    if (state)
+        state->state = 0;
+    return SYN_GUARD_ALLOW;
+}
+
+static __always_inline bool syncookie_ack_enabled(__u32 dest_port)
+{
+    __u32 zero = 0;
+    struct syncookie_runtime_cfg *runtime =
+        bpf_map_lookup_elem(&sync_run_cfg, &zero);
+    __u32 *mode = bpf_map_lookup_elem(&tcp_synck_policy, &dest_port);
+    if (!runtime || !runtime->enabled || !mode || !*mode)
+        return false;
+    if (*mode == 2)
+        return true;
+    struct syncookie_port_state *state =
+        bpf_map_lookup_elem(&sync_port_state, &dest_port);
+    return state && state->state == 1;
+}
+
 static __always_inline int udp_rate_check(struct flow_key *key, __u64 now,
                                           __u32 dest_port, __u32 rate_max,
                                           __u32 prefix_v4, __u32 prefix_v6,

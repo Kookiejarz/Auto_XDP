@@ -15,7 +15,7 @@
 
 static __always_inline int check_tcp_policy(
     struct xdp_md *ctx, struct flow_key *key, __u8 tcp_flags,
-    __u32 dest_port, __u16 l3_off, __u16 inner_off)
+    bool pure_ack, __u32 dest_port, __u16 l3_off, __u16 inner_off)
 {
     __u64 now = bpf_ktime_get_ns();
     struct xdp_runtime_cfg *cfg = runtime_cfg();
@@ -36,6 +36,16 @@ static __always_inline int check_tcp_policy(
         }
         if (is_handler_blocked(key))
             goto drop;
+        if (!bypass_rate) {
+            enum syncookie_guard_verdict cookie =
+                syncookie_guard_check(now, dest_port, cfg);
+            if (cookie == SYN_GUARD_COOKIE)
+                return dispatch_syncookie(ctx, key, l3_off, inner_off);
+            if (cookie == SYN_GUARD_DROP) {
+                count(CNT_SYN_COOKIE_BUDGET_DROP);
+                goto drop;
+            }
+        }
         if (precheck_new_tcp_syn(key, dest_port, bypass_rate, now, cfg) == XDP_DROP)
             return XDP_DROP;
         if (endpoint_policy.profile_id)
@@ -47,6 +57,9 @@ static __always_inline int check_tcp_policy(
                    key->sport, key->dport, (__u8)CNT_TCP_NEW_ALLOW, now);
         return XDP_PASS;
     }
+
+    if (pure_ack && syncookie_ack_enabled(dest_port))
+        return dispatch_syncookie(ctx, key, l3_off, inner_off);
 
     if (endpoint_policy.profile_id)
         return dispatch_tcp_profile(
@@ -87,6 +100,8 @@ static __always_inline int check_tcp_ipv4(
 
     __u8  tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
+    __u32 l4_len = (__u32)bpf_ntohs(ip->tot_len) - (inner_off - l3_off);
+    bool pure_ack = tcp_flags == TCP_FLAG_ACK && l4_len == (__u32)tcp->doff * 4U;
     fill_flow_key_v4(&key, ip->saddr, ip->daddr, tcp->source, tcp->dest);
 
     // Malformed-packet check already ran above; fragments dropped before we arrive.
@@ -95,7 +110,8 @@ static __always_inline int check_tcp_ipv4(
         // The shared TCP path below remains the authorization boundary.
     }
 
-    return check_tcp_policy(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
+    return check_tcp_policy(ctx, &key, tcp_flags, pure_ack,
+                            dest_port, l3_off, inner_off);
 }
 
 static __always_inline int check_tcp_ipv6(
@@ -124,6 +140,9 @@ static __always_inline int check_tcp_ipv6(
 
     __u8 tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
+    __u32 l4_len = (__u32)bpf_ntohs(ipv6->payload_len) -
+                   (inner_off - l3_off - sizeof(*ipv6));
+    bool pure_ack = tcp_flags == TCP_FLAG_ACK && l4_len == (__u32)tcp->doff * 4U;
     fill_flow_key_v6(&key, &ipv6->saddr, &ipv6->daddr, tcp->source, tcp->dest);
 
     // Malformed-packet check already ran above; fragments dropped before we arrive.
@@ -132,7 +151,8 @@ static __always_inline int check_tcp_ipv6(
         // The shared TCP path below remains the authorization boundary.
     }
 
-    return check_tcp_policy(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
+    return check_tcp_policy(ctx, &key, tcp_flags, pure_ack,
+                            dest_port, l3_off, inner_off);
 }
 
 static __always_inline int check_udp_ipv4(

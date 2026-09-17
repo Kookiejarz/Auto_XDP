@@ -2,6 +2,7 @@
 #include "keys.h"
 #include "map_sizes.h"
 #include "minecraft.h"
+#include "syncookie_maps.h"
 
 /* Note: pkt_counters (PERCPU_ARRAY) and pkt_ringbuf (RINGBUF) are declared
  * in common.h alongside the count() and emit_drop() helpers that use them.
@@ -97,6 +98,43 @@ struct {
     __type(key, __u32);  // dest port (host byte order)
     __type(value, struct tcp_port_policy_cfg);
 } tcp_port_policies SEC(".maps");
+
+/* Optional per-port SYN-cookie policy. Helper-bearing code lives in a
+ * separately loaded tail-call object so older kernels can load the firewall. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, __u32); /* 0=off, 1=auto, 2=always */
+} tcp_synck_policy SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct syncookie_runtime_cfg);
+} sync_run_cfg SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, struct syncookie_port_rate_val);
+} sync_port_rate SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, struct syncookie_port_state);
+} sync_port_state SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, __u32);
+} sync_port_limit SEC(".maps");
 
 /* Per-port rate-limit isolation: outer array indexed directly by dport.
  * Each occupied slot holds a per-port LRU created by userspace with metadata
@@ -263,6 +301,13 @@ struct {
     __type(key, __u32);
     __type(value, __u32);
 } udp_port_handlers SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} syncookie_prog_array SEC(".maps");
 
 // Handler-blocked source IPs: src → blocked_until_ns (ktime).
 // Port handlers write here on DROP verdict; the main program checks this after

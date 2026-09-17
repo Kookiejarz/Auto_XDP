@@ -106,6 +106,31 @@ exclude_bind_cidrs = []
 source_cidr_v4 = 32
 source_cidr_v6 = 128
 
+[syncookie]
+# Optional per-service XDP SYN-cookie challenge. Full listener handoff requires
+# Linux 6.11+; unsupported kernels keep this path disabled.
+enabled = false
+default_mode = "auto"
+activation_percent = 90
+auto_max_percent = 200
+challenge_cooldown_seconds = 5
+invalid_ack_rate_pps = 1000
+port_rate_default = 0
+
+[syncookie.by_proc]
+
+[syncookie.by_service]
+
+[syncookie.by_port]
+# "25565" = "always"
+
+[syncookie.port_rate_by_proc]
+
+[syncookie.port_rate_by_service]
+
+[syncookie.port_rate_by_port]
+# "25565" = 1000
+
 [rate_limits.syn_by_proc]
 # Key: process name as seen on the local host.
 # Value: allowed new SYN packets per second per source IP for ports owned by that process.

@@ -77,6 +77,24 @@ XDP_UDP_GLOBAL_WINDOW_SECONDS = 1.0
 XDP_RATE_WINDOW_SECONDS = 1.0
 XDP_UDP_GLOBAL_BYTE_RATE = 0
 
+SYNCOOKIE_MODE_OFF = "off"
+SYNCOOKIE_MODE_AUTO = "auto"
+SYNCOOKIE_MODE_ALWAYS = "always"
+SYNCOOKIE_MODES = frozenset({SYNCOOKIE_MODE_OFF, SYNCOOKIE_MODE_AUTO, SYNCOOKIE_MODE_ALWAYS})
+SYNCOOKIE_ENABLED = False
+SYNCOOKIE_DEFAULT_MODE = SYNCOOKIE_MODE_AUTO
+SYNCOOKIE_ACTIVATION_PERCENT = 90
+SYNCOOKIE_AUTO_MAX_PERCENT = 200
+SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS = 5.0
+SYNCOOKIE_INVALID_ACK_RATE_PPS = 1000
+SYNCOOKIE_PORT_RATE_DEFAULT = 0
+_SYNCOOKIE_BY_PROC: dict[str, str] = {}
+_SYNCOOKIE_BY_SERVICE: dict[str, str] = {}
+_SYNCOOKIE_BY_PORT: dict[int, str] = {}
+_SYNCOOKIE_PORT_RATE_BY_PROC: dict[str, int] = {}
+_SYNCOOKIE_PORT_RATE_BY_SERVICE: dict[str, int] = {}
+_SYNCOOKIE_PORT_RATE_BY_PORT: dict[int, int] = {}
+
 NFT_FAMILY = _NFT_FAMILY
 NFT_TABLE = _NFT_TABLE
 NFT_TCP_SET = "tcp_ports"
@@ -111,6 +129,14 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "trusted_ipv4",
     "trusted_ipv6",
     "tcp_port_policies",
+    "tcp_synck_policy",
+    "sync_run_cfg",
+    "sync_port_rate",
+    "sync_port_state",
+    "sync_port_limit",
+    "sync_handoff4",
+    "sync_handoff6",
+    "syncookie_prog_array",
     "udp_port_policies",
     "udp_global_rl",
     "xdp_runtime_cfg",
@@ -179,6 +205,9 @@ SCTP_MAP_PATH = ""
 TRUSTED_IPS_MAP_PATH4 = ""
 TRUSTED_IPS_MAP_PATH6 = ""
 TCP_PORT_POLICY_MAP_PATH = ""
+TCP_SYNCOOKIE_POLICY_MAP_PATH = ""
+SYNCOOKIE_RUNTIME_CFG_MAP_PATH = ""
+SYNCOOKIE_PORT_RATE_MAP_PATH = ""
 UDP_PORT_POLICY_MAP_PATH = ""
 TCP_PROFILE_HANDLER_MAP_PATH = ""
 UDP_GLOBAL_RL_MAP_PATH = ""
@@ -201,6 +230,8 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     global TCP_MAP_PATH, UDP_MAP_PATH, TCP_ZONE_MAP_PATH, UDP_ZONE_MAP_PATH, SCTP_MAP_PATH
     global TRUSTED_IPS_MAP_PATH4, TRUSTED_IPS_MAP_PATH6
     global TCP_PORT_POLICY_MAP_PATH, UDP_PORT_POLICY_MAP_PATH, TCP_PROFILE_HANDLER_MAP_PATH
+    global TCP_SYNCOOKIE_POLICY_MAP_PATH, SYNCOOKIE_RUNTIME_CFG_MAP_PATH
+    global SYNCOOKIE_PORT_RATE_MAP_PATH
     global UDP_GLOBAL_RL_MAP_PATH, XDP_RUNTIME_CFG_MAP_PATH
     global TCP_ACL_MAP_PATH4, TCP_ACL_MAP_PATH6
     global UDP_ACL_MAP_PATH4, UDP_ACL_MAP_PATH6
@@ -217,6 +248,9 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     TRUSTED_IPS_MAP_PATH4 = f"{pin_dir}/trusted_ipv4"
     TRUSTED_IPS_MAP_PATH6 = f"{pin_dir}/trusted_ipv6"
     TCP_PORT_POLICY_MAP_PATH = f"{pin_dir}/tcp_port_policies"
+    TCP_SYNCOOKIE_POLICY_MAP_PATH = f"{pin_dir}/tcp_synck_policy"
+    SYNCOOKIE_RUNTIME_CFG_MAP_PATH = f"{pin_dir}/sync_run_cfg"
+    SYNCOOKIE_PORT_RATE_MAP_PATH = f"{pin_dir}/sync_port_limit"
     UDP_PORT_POLICY_MAP_PATH = f"{pin_dir}/udp_port_policies"
     TCP_PROFILE_HANDLER_MAP_PATH = f"{pin_dir}/tcp_profile_handlers"
     UDP_GLOBAL_RL_MAP_PATH = f"{pin_dir}/udp_global_rl"
@@ -311,6 +345,27 @@ def _coerce_positive_int(value: object, path: str, default: int) -> int:
     return parsed
 
 
+def _coerce_nonnegative_int(value: object, path: str, default: int) -> int:
+    try:
+        parsed = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        log.warning("Invalid %s %r; using %s", path, value, default)
+        return default
+    if parsed < 0:
+        log.warning("Invalid %s %r; using %s", path, value, default)
+        return default
+    return parsed
+
+
+def _coerce_percent(value: object, path: str, default: int,
+                    minimum: int, maximum: int) -> int:
+    parsed = _coerce_nonnegative_int(value, path, default)
+    if parsed < minimum or parsed > maximum:
+        log.warning("Invalid %s %r; using %s", path, value, default)
+        return default
+    return parsed
+
+
 def _coerce_nonnegative_float(value: object, path: str, default: float) -> float:
     try:
         parsed = float(value)  # type: ignore[arg-type]  # runtime-coerce arbitrary TOML value
@@ -347,6 +402,9 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     global XDP_ICMP_BURST_PACKETS, XDP_ICMP_RATE_PPS
     global XDP_UDP_GLOBAL_WINDOW_SECONDS, XDP_RATE_WINDOW_SECONDS
     global XDP_UDP_GLOBAL_BYTE_RATE
+    global SYNCOOKIE_ENABLED, SYNCOOKIE_DEFAULT_MODE, SYNCOOKIE_ACTIVATION_PERCENT
+    global SYNCOOKIE_AUTO_MAX_PERCENT, SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS
+    global SYNCOOKIE_INVALID_ACK_RATE_PPS, SYNCOOKIE_PORT_RATE_DEFAULT
     global NFT_FAMILY, NFT_TABLE
     global POLICY_MODE, ZONES, SUBJECTS, UNKNOWN_SUBJECTS
     global XDP_SENSITIVE_PORT_THRESHOLD
@@ -367,6 +425,12 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     _UDP_AGG_BYTES_BY_SERVICE.clear()
     _RATE_MAP_ENTRIES_BY_PROC.clear()
     _RATE_MAP_ENTRIES_BY_SERVICE.clear()
+    _SYNCOOKIE_BY_PROC.clear()
+    _SYNCOOKIE_BY_SERVICE.clear()
+    _SYNCOOKIE_BY_PORT.clear()
+    _SYNCOOKIE_PORT_RATE_BY_PROC.clear()
+    _SYNCOOKIE_PORT_RATE_BY_SERVICE.clear()
+    _SYNCOOKIE_PORT_RATE_BY_PORT.clear()
     DISCOVERY_EXCLUDE_BIND_CIDRS.clear()
     DISCOVERY_EXCLUDE_PORTS.clear()
     ZONES = {}
@@ -433,6 +497,88 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
         raise ValueError(
             "rate-limit inner map capacities are fixed by the compiled XDP map ABI"
         )
+
+    syncookie = cfg.get("syncookie", {})
+    if not isinstance(syncookie, dict):
+        raise ValueError("syncookie must be a table")
+    SYNCOOKIE_ENABLED = bool(syncookie.get("enabled", False))
+    SYNCOOKIE_DEFAULT_MODE = str(syncookie.get("default_mode", "auto")).lower()
+    if SYNCOOKIE_DEFAULT_MODE not in SYNCOOKIE_MODES:
+        raise ValueError("syncookie.default_mode must be off, auto, or always")
+    SYNCOOKIE_ACTIVATION_PERCENT = _coerce_percent(
+        syncookie.get("activation_percent", 90),
+        "syncookie.activation_percent", 90, 1, 99,
+    )
+    SYNCOOKIE_AUTO_MAX_PERCENT = _coerce_percent(
+        syncookie.get("auto_max_percent", 200),
+        "syncookie.auto_max_percent", 200, 100, 10000,
+    )
+    if SYNCOOKIE_AUTO_MAX_PERCENT <= SYNCOOKIE_ACTIVATION_PERCENT:
+        raise ValueError("syncookie.auto_max_percent must exceed activation_percent")
+    SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS = _coerce_nonnegative_float(
+        syncookie.get("challenge_cooldown_seconds", 5),
+        "syncookie.challenge_cooldown_seconds", 5.0,
+    )
+    SYNCOOKIE_INVALID_ACK_RATE_PPS = _coerce_positive_int(
+        syncookie.get("invalid_ack_rate_pps", 1000),
+        "syncookie.invalid_ack_rate_pps", 1000,
+    )
+    SYNCOOKIE_PORT_RATE_DEFAULT = _coerce_nonnegative_int(
+        syncookie.get("port_rate_default", 0),
+        "syncookie.port_rate_default", 0,
+    )
+    for scope, target in (
+        ("port_rate_by_proc", _SYNCOOKIE_PORT_RATE_BY_PROC),
+        ("port_rate_by_service", _SYNCOOKIE_PORT_RATE_BY_SERVICE),
+    ):
+        values = syncookie.get(scope, {})
+        if not isinstance(values, dict):
+            raise ValueError(f"syncookie.{scope} must be a table")
+        for name, value in values.items():
+            target[str(name)] = _coerce_nonnegative_int(
+                value, f"syncookie.{scope}.{name}", 0
+            )
+    port_rates = syncookie.get("port_rate_by_port", {})
+    if not isinstance(port_rates, dict):
+        raise ValueError("syncookie.port_rate_by_port must be a table")
+    for raw_port, value in port_rates.items():
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "syncookie.port_rate_by_port keys must be ports"
+            ) from exc
+        if not 1 <= port <= 65535:
+            raise ValueError("syncookie.port_rate_by_port keys must be ports")
+        _SYNCOOKIE_PORT_RATE_BY_PORT[port] = _coerce_nonnegative_int(
+            value, f"syncookie.port_rate_by_port.{port}", 0
+        )
+    for scope, mode_target in (
+        ("by_proc", _SYNCOOKIE_BY_PROC),
+        ("by_service", _SYNCOOKIE_BY_SERVICE),
+    ):
+        values = syncookie.get(scope, {})
+        if not isinstance(values, dict):
+            raise ValueError(f"syncookie.{scope} must be a table")
+        for name, raw_mode in values.items():
+            mode = str(raw_mode).lower()
+            if mode not in SYNCOOKIE_MODES:
+                raise ValueError(f"syncookie.{scope}.{name} has invalid mode")
+            mode_target[str(name)] = mode
+    by_port = syncookie.get("by_port", {})
+    if not isinstance(by_port, dict):
+        raise ValueError("syncookie.by_port must be a table")
+    for raw_port, raw_mode in by_port.items():
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "syncookie.by_port entries require port and valid mode"
+            ) from exc
+        mode = str(raw_mode).lower()
+        if not 1 <= port <= 65535 or mode not in SYNCOOKIE_MODES:
+            raise ValueError("syncookie.by_port entries require port and valid mode")
+        _SYNCOOKIE_BY_PORT[port] = mode
 
     BOGON_FILTER_ENABLED = bool(cfg.get("firewall", {}).get("bogon_filter", True))
     ISATTACK = cfg.get("under_attack", {})
