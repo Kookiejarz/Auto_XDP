@@ -7,6 +7,8 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]:-}")/../.." && pwd)
 # shellcheck source=tests/bash/diagnostics.sh
 source "$REPO_ROOT/tests/bash/diagnostics.sh"
 enable_test_error_diagnostics
+# shellcheck source=tests/bash/testlib.sh
+source "$REPO_ROOT/tests/bash/testlib.sh"
 
 CONFIG_FILE="${CONFIG_FILE:-/etc/auto_xdp/auto_xdp.env}"
 AXDP_CMD="${AXDP_CMD:-/usr/local/bin/axdp}"
@@ -243,11 +245,11 @@ PY
     [[ -s "$e2e_listener_info" ]] || fail "timed out waiting for E2E TCP listener"
     port=$(<"$e2e_listener_info")
     [[ "$port" =~ ^[0-9]+$ ]] || fail "invalid E2E listener port: $port"
-    local listener_comm approval_output
-    listener_comm=$(ps -p "$listener_pid" -o comm= | tr -d '[:space:]')
-    [[ -n "$listener_comm" ]] || fail "E2E listener process identity is unavailable"
+    local resolver_key resolver_value approval_output
+    read -r resolver_key resolver_value < <(listener_resolver "$listener_pid") \
+        || fail "E2E listener process identity is unavailable"
     approval_output=$("$AXDP_CMD" approval request runtime-e2e public tcp "$port" \
-        --process-name "$listener_comm" --reason "installed XDP runtime E2E" 2>&1) \
+        "--${resolver_key//_/-}" "$resolver_value" --reason "installed XDP runtime E2E" 2>&1) \
         || fail "could not create E2E exposure approval: $approval_output"
     approval_id=${approval_output##*#}
     [[ "$approval_id" =~ ^[0-9]+$ ]] || fail "could not parse E2E approval id"

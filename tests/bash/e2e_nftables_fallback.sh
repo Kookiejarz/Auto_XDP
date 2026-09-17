@@ -6,6 +6,8 @@
 set -Eeuo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)
+# shellcheck source=tests/bash/testlib.sh
+source "$REPO_ROOT/tests/bash/testlib.sh"
 
 fail() {
     printf '[ERROR] nftables-fallback-e2e: %s\n' "$*" >&2
@@ -276,11 +278,11 @@ while [[ ! -s "$LISTENER_READY" ]] && (( SECONDS < deadline )); do sleep 0.1; do
 [[ -s "$LISTENER_READY" ]] || fail "listener failed to start"
 LISTENER_PORT=$(<"$LISTENER_READY")
 [[ "$LISTENER_PORT" =~ ^[0-9]+$ ]] || fail "listener returned an invalid port"
-LISTENER_COMM=$(ps -p "$LISTENER_PID" -o comm= | tr -d '[:space:]')
-[[ -n "$LISTENER_COMM" ]] || fail "listener process identity is unavailable"
+read -r resolver_key resolver_value < <(listener_resolver "$LISTENER_PID") \
+    || fail "listener process identity is unavailable"
 
 approval_output=$("$AXDP_CMD" approval request nft-fallback-e2e public tcp \
-    "$LISTENER_PORT" --process-name "$LISTENER_COMM" \
+    "$LISTENER_PORT" "--${resolver_key//_/-}" "$resolver_value" \
     --reason "installed nftables fallback E2E" 2>&1) \
     || { printf '%s\n' "$approval_output" >&2; fail "approval request failed"; }
 APPROVAL_ID=${approval_output##*#}
