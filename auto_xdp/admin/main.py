@@ -29,7 +29,7 @@ def _cmd_backend(args: argparse.Namespace) -> int:
         print(render_backend_json(report))
     else:
         print(render_backend_text(report))
-    return 0
+    return 0 if report.healthy else 1
 
 
 def _cmd_deactivate(args: argparse.Namespace) -> int:
