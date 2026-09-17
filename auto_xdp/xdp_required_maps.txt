@@ -14,6 +14,13 @@ icmp_tb
 udp_global_rl
 udp_percpu_acc
 tcp_port_policies
+tcp_synck_policy
+sync_run_cfg
+sync_port_rate
+sync_port_state
+sync_port_limit
+sync_handoff4
+sync_handoff6
 syn4
 syn6
 udp_port_policies
@@ -32,6 +39,7 @@ proto_handlers
 tcp_profile_handlers
 tcp_port_handlers
 udp_port_handlers
+syncookie_prog_array
 hblk4
 hblk6
 udp_hv4

@@ -22,6 +22,12 @@ LIMIT_TABLES = (
     "_SYN_AGG_RATE_BY_SERVICE",
     "_RATE_MAP_ENTRIES_BY_PROC",
     "_RATE_MAP_ENTRIES_BY_SERVICE",
+    "_SYNCOOKIE_BY_PROC",
+    "_SYNCOOKIE_BY_SERVICE",
+    "_SYNCOOKIE_BY_PORT",
+    "_SYNCOOKIE_PORT_RATE_BY_PROC",
+    "_SYNCOOKIE_PORT_RATE_BY_SERVICE",
+    "_SYNCOOKIE_PORT_RATE_BY_PORT",
 )
 
 
@@ -38,6 +44,9 @@ def isolated_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cfg, "ZONES", {"public": {"interfaces": [], "cidrs": []}})
     monkeypatch.setattr(cfg, "SUBJECTS", {})
     monkeypatch.setattr(cfg, "UNKNOWN_SUBJECTS", {"public": "deny"})
+    monkeypatch.setattr(cfg, "SYNCOOKIE_ENABLED", False)
+    monkeypatch.setattr(cfg, "SYNCOOKIE_DEFAULT_MODE", "auto")
+    monkeypatch.setattr(cfg, "SYNCOOKIE_PORT_RATE_DEFAULT", 0)
     monkeypatch.setattr(
         policy,
         "service_name",
@@ -94,6 +103,26 @@ def test_every_observed_port_receives_default_policy() -> None:
         )
     )
     assert desired.tcp_syn_rate_limits == {8080: 100, 9000: 100}
+
+
+def test_syncookie_port_overrides_process_and_service() -> None:
+    cfg.SYNCOOKIE_ENABLED = True
+    cfg._SYNCOOKIE_BY_SERVICE["ssh"] = "auto"
+    cfg._SYNCOOKIE_BY_PROC["sshd"] = "off"
+    cfg._SYNCOOKIE_BY_PORT[22] = "always"
+    cfg._SYNCOOKIE_PORT_RATE_BY_PORT[22] = 900
+
+    desired = policy._desired_state_for_ports(
+        ObservedState(tcp={22}, tcp_processes={22: "sshd"})
+    )
+
+    assert desired.tcp_syncookie_modes == {22: "always"}
+    assert desired.tcp_syncookie_rate_limits == {22: 900}
+
+
+def test_syncookie_config_rejects_invalid_port_table() -> None:
+    with pytest.raises(ValueError, match="port_rate_by_port must be a table"):
+        cfg.apply_toml_config({"syncookie": {"port_rate_by_port": 42}})
 
 
 def test_service_aware_policy_requires_explicit_grant_and_runtime_owner() -> None:

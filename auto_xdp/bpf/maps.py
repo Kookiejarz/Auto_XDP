@@ -187,6 +187,9 @@ class BpfArrayMap(CacheVerifyMixin, BpfFdMap):
     def active_ports(self) -> set[int]:
         return set(self._cache)
 
+    def active_values(self) -> dict[int, int]:
+        return {port: value[0] for port, value in self._cache.items()}
+
     def map_id(self) -> int:
         return _map_id(self.fd)
 
@@ -211,6 +214,9 @@ class BpfArrayMap(CacheVerifyMixin, BpfFdMap):
         except OSError as exc:
             log.warning("BPF update failed port=%d: %s", port, exc)
             return False
+
+    def delete(self, port: int, dry_run: bool = False) -> bool:
+        return self.set(port, 0, dry_run)
 
 
 class BpfZonePortMap(CacheVerifyMixin, BpfFdMap):
@@ -386,6 +392,53 @@ class BpfRuntimeConfigMap(BpfFdMap):
             return True
         except OSError as exc:
             log.warning("BPF runtime config update failed path=%s: %s", self.path, exc)
+            return False
+
+
+class BpfSyncookieRuntimeMap(BpfFdMap):
+    _STRUCT_FMT = "=IIIIQ"
+    _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self._key = ctypes.create_string_buffer(4)
+        self._val = ctypes.create_string_buffer(self._STRUCT_SIZE)
+        self._update_attr = ctypes.create_string_buffer(128)
+        self._lookup_attr = ctypes.create_string_buffer(128)
+        key_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        val_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
+        struct.pack_into("=I4xQQQ", self._update_attr, 0,
+                         self.fd, key_ptr, val_ptr, 0)
+        struct.pack_into("=I4xQQ", self._lookup_attr, 0,
+                         self.fd, key_ptr, val_ptr)
+
+    def get(self) -> tuple[int, int, int, int, int] | None:
+        try:
+            struct.pack_into("=I", self._key, 0, 0)
+            bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+            return struct.unpack_from(self._STRUCT_FMT, self._val, 0)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                log.warning("BPF SYN-cookie runtime lookup failed path=%s: %s",
+                            self.path, exc)
+            return None
+
+    def set(self, enabled: bool, activation: int, auto_max: int,
+            invalid_pps: int, cooldown_ns: int,
+            dry_run: bool = False) -> bool:
+        if dry_run:
+            log.info("[DRY] %s syncookie enabled=%s activation=%d auto_max=%d",
+                     self.path, enabled, activation, auto_max)
+            return True
+        try:
+            struct.pack_into("=I", self._key, 0, 0)
+            struct.pack_into(self._STRUCT_FMT, self._val, 0, int(enabled),
+                             activation, auto_max, invalid_pps, cooldown_ns)
+            bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
+            return True
+        except OSError as exc:
+            log.warning("BPF SYN-cookie runtime update failed path=%s: %s",
+                        self.path, exc)
             return False
 
 

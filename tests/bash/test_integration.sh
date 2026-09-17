@@ -20,6 +20,10 @@ readonly _PIN_DIR="/sys/fs/bpf/axdp_integ"
 readonly _DEBUG_PIN_DIR="/sys/fs/bpf/axdp_integ_debug"
 readonly _RUN_DIR="/run/axdp_integ"
 readonly _XDP_OBJ="/tmp/axdp_integ_fw.o"
+readonly _SYNCOOKIE_OBJ="/tmp/axdp_integ_syncookie.o"
+readonly _TC_SYNCOOKIE_OBJ="/tmp/axdp_integ_tc_syncookie.o"
+readonly _VMLINUX_DIR="/tmp/axdp_integ_btf"
+_SYNCOOKIE_LEVEL2=0
 
 # ---------------------------------------------------------------------------
 # Prerequisites
@@ -66,6 +70,21 @@ if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
     -c "$_src" -o "$_XDP_OBJ"; then
     test_log_error "XDP compile failed"
     exit 1
+fi
+if bpftool btf dump file /sys/kernel/btf/vmlinux format raw 2>/dev/null \
+        | grep -F bpf_sk_assign_tcp_reqsk >/dev/null; then
+    rm -rf "$_VMLINUX_DIR"
+    mkdir -p "$_VMLINUX_DIR"
+    bpftool btf dump file /sys/kernel/btf/vmlinux format c \
+        >"$_VMLINUX_DIR/vmlinux.h" || _kernel_unavailable "cannot generate vmlinux.h"
+    clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+        "${_include_args[@]}" -c "$REPO_ROOT/bpf/xdp_syncookie.c" \
+        -o "$_SYNCOOKIE_OBJ" || _kernel_unavailable "SYN-cookie XDP compile failed"
+    clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+        -DAUTO_XDP_VMLINUX_H -I "$_VMLINUX_DIR" \
+        "${_include_args[@]}" -c "$REPO_ROOT/bpf/tc_syncookie_handoff.c" \
+        -o "$_TC_SYNCOOKIE_OBJ" || _kernel_unavailable "SYN-cookie TC compile failed"
+    _SYNCOOKIE_LEVEL2=1
 fi
 # ---------------------------------------------------------------------------
 # Runtime common (xdp_required_map_names, xdp_maps_ready, etc.)
@@ -1380,6 +1399,117 @@ PYEOF
     return 0
 }
 
+test_syncookie_listener_handoff() {
+    [[ $_SYNCOOKIE_LEVEL2 -eq 1 ]] || {
+        echo "SKIP: kernel lacks bpf_sk_assign_tcp_reqsk"
+        return 0
+    }
+    local port=7710 value_hex ready_file recv_file listener_pid old_sysctl
+    ready_file=$(mktemp)
+    recv_file=$(mktemp)
+    old_sysctl=$(< /proc/sys/net/ipv4/tcp_syncookies)
+    echo 1 > /proc/sys/net/ipv4/tcp_syncookies || return 1
+    ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_timestamps=1
+    ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_window_scaling=1
+    ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_sack=1
+    ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_ecn=1
+
+    bpftool prog load "$_SYNCOOKIE_OBJ" "$_PIN_DIR/syncookie_prog" type xdp \
+        map name slot_ctx_map pinned "$_PIN_DIR/slot_ctx_map" \
+        map name pkt_counters pinned "$_PIN_DIR/pkt_counters" \
+        map name byte_counters pinned "$_PIN_DIR/byte_counters" \
+        map name tcp_synck_policy pinned "$_PIN_DIR/tcp_synck_policy" \
+        map name sync_run_cfg pinned "$_PIN_DIR/sync_run_cfg" \
+        map name sync_handoff4 pinned "$_PIN_DIR/sync_handoff4" \
+        map name sync_handoff6 pinned "$_PIN_DIR/sync_handoff6" || return 1
+    bpftool prog load "$_TC_SYNCOOKIE_OBJ" \
+        "$_PIN_DIR/tc_syncookie_handoff_prog" type classifier \
+        map name sync_handoff4 pinned "$_PIN_DIR/sync_handoff4" \
+        map name sync_handoff6 pinned "$_PIN_DIR/sync_handoff6" || return 1
+    tc qdisc add dev "$_VETH" clsact 2>/dev/null || true
+    tc filter replace dev "$_VETH" ingress pref 49151 handle 2 \
+        bpf direct-action object-pinned "$_PIN_DIR/tc_syncookie_handoff_prog" || return 1
+    bpftool map update pinned "$_PIN_DIR/syncookie_prog_array" \
+        key hex 00 00 00 00 value pinned "$_PIN_DIR/syncookie_prog" || return 1
+
+    _set_tcp_policy "$port" 1 || return 1
+    bpftool map update pinned "$_PIN_DIR/tcp_synck_policy" \
+        key hex $(_u32le "$port") value hex 02 00 00 00 || return 1
+    bpftool map update pinned "$_PIN_DIR/sync_port_limit" \
+        key hex $(_u32le "$port") value hex $(_u32le 1000) || return 1
+    value_hex=$(python3 -c '
+import struct
+print(" ".join(f"{b:02x}" for b in struct.pack("<IIIIQ", 1, 90, 200, 1000, 5_000_000_000)))
+') || return 1
+    bpftool map update pinned "$_PIN_DIR/sync_run_cfg" \
+        key hex 00 00 00 00 value hex $value_hex || return 1
+
+    python3 - "$port" "$ready_file" "$recv_file" <<'PYEOF' &
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("10.99.0.1", int(sys.argv[1])))
+s.listen()
+open(sys.argv[2], "w").write("ready")
+s.settimeout(3)
+c, _ = s.accept()
+payload = c.recv(32)
+open(sys.argv[3], "wb").write(payload)
+c.sendall(b"ok")
+PYEOF
+    listener_pid=$!
+    for _ in {1..50}; do
+        [[ -s "$ready_file" ]] && break
+        sleep 0.02
+    done
+    ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" <<'PYEOF' || {
+import socket, sys
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.sendall(b"cookie")
+raise SystemExit(0 if s.recv(2) == b"ok" else 1)
+PYEOF
+        python3 - "$_PIN_DIR" <<'PYEOF' || true
+import json, subprocess, sys
+for key in range(38, 46):
+    row = json.loads(subprocess.check_output([
+        "bpftool", "-j", "map", "lookup", "pinned", sys.argv[1] + "/pkt_counters",
+        "key", "hex", *key.to_bytes(4, "little").hex(" ").split()], text=True))
+    values = row.get("values", [])
+    total = sum(int.from_bytes(bytes(int(x, 0) if isinstance(x, str) else x
+                                     for x in item["value"]), "little")
+                for item in values)
+    print(f"cookie_counter[{key}]={total}")
+PYEOF
+        bpftool map dump pinned "$_PIN_DIR/sync_handoff4" || true
+        kill "$listener_pid" 2>/dev/null || true
+        wait "$listener_pid" 2>/dev/null || true
+        return 1
+    }
+    wait "$listener_pid" || return 1
+    [[ $(<"$recv_file") == cookie ]] || return 1
+    echo "$old_sysctl" > /proc/sys/net/ipv4/tcp_syncookies
+
+    python3 - "$_PIN_DIR" <<'PYEOF'
+import json, subprocess, sys
+def counter(key):
+    raw = json.loads(subprocess.check_output([
+        "bpftool", "-j", "map", "lookup", "pinned", sys.argv[1] + "/pkt_counters",
+        "key", "hex", *key.to_bytes(4, "little").hex(" ").split()], text=True))
+    def scalar(value):
+        if isinstance(value, list):
+            data = bytes(int(x, 0) if isinstance(x, str) else x for x in value)
+            return int.from_bytes(data, "little")
+        return int(value, 0) if isinstance(value, str) else int(value)
+    values = raw.get("values", raw.get("value", []))
+    if values and isinstance(values[0], dict):
+        return sum(scalar(item["value"]) for item in values)
+    return scalar(values) if values else 0
+sent = counter(39)
+if not sent:
+    raise SystemExit("SYN-cookie sent counter did not advance")
+PYEOF
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1395,6 +1525,12 @@ _run_kernel_test() {
 }
 
 trap - EXIT
+if [[ "${ONLY_SYNCOOKIE:-0}" == 1 ]]; then
+    _run_kernel_test syncookie_listener_handoff test_syncookie_listener_handoff
+    _teardown
+    finish_tests
+    exit
+fi
 while IFS= read -r function_name; do
     [[ -n "$function_name" ]] || continue
     _run_kernel_test "${function_name#test_}" "$function_name"

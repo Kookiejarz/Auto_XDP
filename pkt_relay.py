@@ -102,6 +102,8 @@ _REASON_NAMES: dict[int, str] = {
     32: "RESERVED_32",
     33: "RESERVED_33",
     34: "ABUSEIPDB_DROP",
+    42: "SYN_COOKIE_BUDGET_DROP",
+    44: "SYN_COOKIE_TAILCALL_MISS",
 }
 
 _PKT_EVENT_SIZE = 48   # sizeof(struct pkt_event)

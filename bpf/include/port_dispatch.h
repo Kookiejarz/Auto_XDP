@@ -111,6 +111,29 @@ static __always_inline int dispatch_tcp_profile(
     return XDP_DROP;
 }
 
+static __always_inline int dispatch_syncookie(
+    struct xdp_md *ctx, const struct flow_key *ct,
+    __u16 l3_off, __u16 inner_off)
+{
+    __u32 zero = 0;
+    struct xdp_slot_ctx *sc = bpf_map_lookup_elem(&slot_ctx_map, &zero);
+    if (sc) {
+        sc->family = ct->family;
+        sc->ip_proto = IPPROTO_TCP;
+        sc->l3_offset = l3_off;
+        sc->inner_offset = inner_off;
+        sc->sport = ct->sport;
+        sc->dport = ct->dport;
+        sc->_pad = 0;
+        __builtin_memcpy(sc->saddr, ct->saddr, sizeof(sc->saddr));
+        __builtin_memcpy(sc->daddr, ct->daddr, sizeof(sc->daddr));
+    }
+    bpf_tail_call(ctx, &syncookie_prog_array, 0);
+    count(CNT_SYN_COOKIE_TAILCALL_MISS);
+    count(CNT_TCP_DROP);
+    return XDP_DROP;
+}
+
 /* Same as try_tcp_port_dispatch but for UDP. */
 static __always_inline void try_udp_port_dispatch(
     struct xdp_md *ctx,

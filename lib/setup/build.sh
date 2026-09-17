@@ -31,6 +31,11 @@ compile_bpf_object() {
     local src_path="$1"
     local obj_path="$2"
     local include_root="${3:-.}"
+    local vmlinux_dir="${4:-}"
+    local -a vmlinux_flags=()
+    if [[ -n "$vmlinux_dir" ]]; then
+        vmlinux_flags=(-DAUTO_XDP_VMLINUX_H "-I${vmlinux_dir}")
+    fi
 
     if ! clang -O3 -g \
         -target bpf \
@@ -44,10 +49,21 @@ compile_bpf_object() {
         -I/usr/include/bpf \
         -I"${include_root}/bpf/include" \
         -I"$include_root" \
+        "${vmlinux_flags[@]}" \
         -c "$src_path" -o "$obj_path"; then
         return 1
     fi
     return 0
+}
+
+target_vmlinux_header() {
+    local out_dir="$1"
+    [[ -r /sys/kernel/btf/vmlinux ]] || return 1
+    command -v bpftool &>/dev/null || return 1
+    mkdir -p "$out_dir"
+    bpftool btf dump file /sys/kernel/btf/vmlinux format c \
+        >"${out_dir}/vmlinux.h" || return 1
+    [[ -s "${out_dir}/vmlinux.h" ]]
 }
 
 generate_xdp_map_abi() {
@@ -70,6 +86,14 @@ synag4 ${rate4}
 synag6 ${rate6}
 udpag4 ${rate4}
 udpag6 ${rate6}
+tcp_synck_policy array 4 4 65536
+sync_run_cfg array 4 24 1
+sync_port_rate array 4 24 65536
+sync_port_state array 4 16 65536
+sync_port_limit array 4 4 65536
+syncookie_prog_array prog_array 4 4 1
+sync_handoff4 lru_hash 12 20 65536
+sync_handoff6 lru_hash 36 20 65536
 EOF
 }
 
@@ -283,6 +307,22 @@ compile_xdp_program() {
         warn "Failed to compile ${XDP_SRC}; XDP backend will be skipped."
         return 1
     fi
+    if stage_build_source "$SYNCOOKIE_SRC" "$SYNCOOKIE_SRC" "$SYNCOOKIE_SRC"; then
+        compile_bpf_object "${_source_root}/${SYNCOOKIE_SRC}" \
+            "${BUILD_STAGING_DIR}/${SYNCOOKIE_OBJ}" "$_source_root" || \
+            warn "SYN-cookie XDP object unavailable on this build host."
+    fi
+    local _vmlinux_dir=""
+    if target_vmlinux_header "${BUILD_STAGING_DIR}/btf"; then
+        _vmlinux_dir="${BUILD_STAGING_DIR}/btf"
+    fi
+    if [[ -n "$_vmlinux_dir" ]] && \
+            stage_build_source "$TC_SYNCOOKIE_SRC" "$TC_SYNCOOKIE_SRC" "$TC_SYNCOOKIE_SRC"; then
+        compile_bpf_object "${_source_root}/${TC_SYNCOOKIE_SRC}" \
+            "${BUILD_STAGING_DIR}/${TC_SYNCOOKIE_OBJ}" "$_source_root" \
+            "$_vmlinux_dir" || \
+            warn "Level 2 SYN-cookie listener handoff unavailable."
+    fi
     if ! stage_build_source "$MC_EGRESS_SRC" "$MC_EGRESS_SRC" "$MC_EGRESS_SRC" \
             || ! compile_bpf_object \
                 "${_source_root}/${MC_EGRESS_SRC}" \
@@ -390,7 +430,8 @@ cleanup_build_artifacts_step() {
     local _cleaned=()
 
     step_begin "Cleaning up build artifacts"
-    for _f in "$XDP_OBJ" "$MC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
+    for _f in "$XDP_OBJ" "$SYNCOOKIE_OBJ" "$TC_SYNCOOKIE_OBJ" \
+              "$MC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
         if [[ -f "$_f" ]]; then
             rm -f "$_f" && _cleaned+=("$_f")
         fi

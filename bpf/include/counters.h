@@ -44,7 +44,15 @@ enum xdp_counter_idx {
     CNT_PROFILE_UNAVAILABLE_DROP = 35,
     CNT_PROFILE_ALLOW            = 36,
     CNT_PROFILE_DROP             = 37,
-    CNT_MAX                      = 38,
+    CNT_SYN_COOKIE_CHALLENGE     = 38,
+    CNT_SYN_COOKIE_SENT          = 39,
+    CNT_SYN_COOKIE_VALID         = 40,
+    CNT_SYN_COOKIE_INVALID       = 41,
+    CNT_SYN_COOKIE_BUDGET_DROP   = 42,
+    CNT_SYN_COOKIE_HELPER_ERROR  = 43,
+    CNT_SYN_COOKIE_TAILCALL_MISS = 44,
+    CNT_SYN_GUARD_SHED_ENTER     = 45,
+    CNT_MAX                      = 46,
 };
 
 struct {

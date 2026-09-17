@@ -96,6 +96,33 @@ struct syn_rate_val {
     __u64 state; /* upper 32 bits: window tick; lower 32 bits: count */
 };
 
+struct syncookie_runtime_cfg {
+    __u32 enabled;
+    __u32 activation_percent;
+    __u32 auto_max_percent;
+    __u32 invalid_ack_pps;
+    __u64 cooldown_ns;
+};
+
+struct syncookie_port_state {
+    __u32 state; /* 0=NORMAL, 1=CHALLENGE, 2=SHED */
+    __u32 _pad;
+    __u64 cooldown_until_ns;
+};
+
+struct syncookie_port_rate_val {
+    struct bpf_spin_lock lock;
+    __u32 _pad;
+    __u64 window_start_ns;
+    __u64 count;
+};
+
+enum syncookie_guard_verdict {
+    SYN_GUARD_ALLOW = 0,
+    SYN_GUARD_COOKIE = 1,
+    SYN_GUARD_DROP = 2,
+};
+
 struct prefix_rate_key_v4 {
     __be32 addr;
     __u32 dest_port;

@@ -27,6 +27,7 @@ from auto_xdp.bpf.maps import (
     BpfPortPolicyViewMap,
     BpfRateOuterMap,
     BpfRuntimeConfigMap,
+    BpfSyncookieRuntimeMap,
     BpfSit4EndpointsMap,
     BpfSynRatePortsMap,
     BpfTrustedMaps,
@@ -167,6 +168,9 @@ class XdpBackend(PortBackend):
         self.udp_agg_rate_map: RateLimitMap | None = None
         self.acl_maps: BpfAclMaps | None = None
         self.runtime_config_map: BpfRuntimeConfigMap | None = None
+        self.tcp_syncookie_mode_map: BpfArrayMap | None = None
+        self.tcp_syncookie_rate_map: BpfArrayMap | None = None
+        self.syncookie_runtime_map: BpfSyncookieRuntimeMap | None = None
         self.global_rl_map: BpfGlobalRlMap | None = None
         self.sctp_map: BpfArrayMap | None = None
         try:
@@ -196,6 +200,27 @@ class XdpBackend(PortBackend):
             log.debug("xdp_runtime_cfg map opened; runtime tuning active.")
         except OSError as exc:
             log.debug("xdp_runtime_cfg map unavailable (%s); runtime tuning inactive.", exc)
+        try:
+            self.tcp_syncookie_mode_map = BpfArrayMap(
+                cfg.TCP_SYNCOOKIE_POLICY_MAP_PATH
+            )
+            self.tcp_syncookie_rate_map = BpfArrayMap(
+                cfg.SYNCOOKIE_PORT_RATE_MAP_PATH
+            )
+            self.syncookie_runtime_map = BpfSyncookieRuntimeMap(
+                cfg.SYNCOOKIE_RUNTIME_CFG_MAP_PATH
+            )
+            log.debug("SYN-cookie policy maps opened.")
+        except OSError as exc:
+            log.debug("SYN-cookie policy maps unavailable (%s).", exc)
+            for map_obj in (self.tcp_syncookie_mode_map,
+                            self.tcp_syncookie_rate_map,
+                            self.syncookie_runtime_map):
+                if map_obj is not None:
+                    map_obj.close()
+            self.tcp_syncookie_mode_map = None
+            self.tcp_syncookie_rate_map = None
+            self.syncookie_runtime_map = None
         try:
             self.global_rl_map = BpfGlobalRlMap(cfg.UDP_GLOBAL_RL_MAP_PATH)
             log.debug("udp_global_rl map opened; global UDP rate limit control active.")
@@ -310,6 +335,8 @@ class XdpBackend(PortBackend):
             tuple(cfg.ZONES.get(zone, {}).get("interfaces", [])),
             desired.tcp_syn_rate_limits.get(port),
             desired.tcp_syn_agg_rate_limits.get(port),
+            desired.tcp_syncookie_modes.get(port),
+            desired.tcp_syncookie_rate_limits.get(port),
             endpoint_acl,
             desired.bogon_filter_enabled,
             sorted(material),
@@ -695,6 +722,11 @@ class XdpBackend(PortBackend):
             self.acl_maps.close()
         if self.runtime_config_map is not None:
             self.runtime_config_map.close()
+        for map_obj in (getattr(self, "tcp_syncookie_mode_map", None),
+                        getattr(self, "tcp_syncookie_rate_map", None),
+                        getattr(self, "syncookie_runtime_map", None)):
+            if map_obj is not None:
+                map_obj.close()
         if self.global_rl_map is not None:
             self.global_rl_map.close()
         if self.sctp_map is not None:
@@ -719,6 +751,17 @@ class XdpBackend(PortBackend):
             trusted_cidrs=self.trusted_map.active_keys(),
             tcp_syn_rate_limits=self.syn_rate_map.active() if self.syn_rate_map is not None else {},
             tcp_syn_agg_rate_limits=self.syn_agg_rate_map.active() if self.syn_agg_rate_map is not None else {},
+            tcp_syncookie_modes={
+                port: {1: "auto", 2: "always"}.get(value, "off")
+                for port, value in (
+                    getattr(self, "tcp_syncookie_mode_map").active_values().items()
+                    if getattr(self, "tcp_syncookie_mode_map", None) is not None else ()
+                )
+            },
+            tcp_syncookie_rate_limits=(
+                getattr(self, "tcp_syncookie_rate_map").active_values()
+                if getattr(self, "tcp_syncookie_rate_map", None) is not None else {}
+            ),
             udp_rate_limits=self.udp_rate_map.active() if self.udp_rate_map is not None else {},
             udp_agg_rate_limits=self.udp_agg_rate_map.active() if self.udp_agg_rate_map is not None else {},
             acl_rules=self.acl_maps.active_entries() if self.acl_maps is not None else {},
@@ -768,6 +811,12 @@ class XdpBackend(PortBackend):
         for outer in (self.syn4_outer, self.syn6_outer, self.udprt4_outer, self.udprt6_outer):
             if outer is not None:
                 total += outer.verify()
+        for cookie_map in (
+            getattr(self, "tcp_syncookie_mode_map", None),
+            getattr(self, "tcp_syncookie_rate_map", None),
+        ):
+            if cookie_map is not None:
+                total += cookie_map.verify()
         if total:
             log.warning(
                 "Kernel state verification found %d drifted map entr%s; caches repaired, corrective sync recommended.",
@@ -839,6 +888,39 @@ class XdpBackend(PortBackend):
                 dry_run,
                 "tcp_syn_agg",
             )
+
+        cookie_mode_map = getattr(self, "tcp_syncookie_mode_map", None)
+        if cookie_mode_map is not None:
+            mode_values = {"off": 0, "auto": 1, "always": 2}
+            for port, mode in sorted(plan.tcp_syncookie_modes_to_upsert.items()):
+                self._ok(cookie_mode_map.set(
+                    port, mode_values[mode], dry_run
+                ))
+            for port in sorted(plan.tcp_syncookie_modes_to_remove):
+                self._ok(cookie_mode_map.delete(port, dry_run))
+
+        cookie_rate_map = getattr(self, "tcp_syncookie_rate_map", None)
+        if cookie_rate_map is not None:
+            for port, rate in sorted(
+                plan.tcp_syncookie_rate_limits_to_upsert.items()
+            ):
+                self._ok(cookie_rate_map.set(port, rate, dry_run))
+            for port in sorted(plan.tcp_syncookie_rate_limits_to_remove):
+                self._ok(cookie_rate_map.delete(port, dry_run))
+
+        cookie_runtime_map = getattr(self, "syncookie_runtime_map", None)
+        if cookie_runtime_map is not None:
+            active = cfg.SYNCOOKIE_ENABLED and (
+                Path(cfg.BPF_PIN_DIR) / "syncookie_prog"
+            ).exists()
+            self._ok(cookie_runtime_map.set(
+                active,
+                cfg.SYNCOOKIE_ACTIVATION_PERCENT,
+                cfg.SYNCOOKIE_AUTO_MAX_PERCENT,
+                cfg.SYNCOOKIE_INVALID_ACK_RATE_PPS,
+                int(cfg.SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS * 1_000_000_000),
+                dry_run,
+            ))
 
         if self.udp_rate_map is not None:
             self._apply_rate_map_delta(

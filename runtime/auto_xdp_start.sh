@@ -198,6 +198,10 @@ ensure_xdp_loaded() {
             fi
         done
         [[ -f "$BPF_PIN_DIR/sock_state_link" ]] || load_sock_state_tracker || true
+        # A non-zero result means an operator requested mode="always" on a
+        # kernel without the complete listener handoff. Keep XDP attached and
+        # forbid a silent nftables downgrade.
+        load_syncookie_program || return 2
         load_minecraft_egress || return 1
         load_port_handlers || true
         auto_tune_interface_parallelism || true
@@ -225,6 +229,7 @@ ensure_xdp_loaded() {
     fi
 
     load_sock_state_tracker || true
+    load_syncookie_program || return 2
     load_minecraft_egress || return 1
     auto_tune_interface_parallelism || true
     echo "$AUTO_XDP_SWITCH_MODE" > "${RUN_STATE_DIR}/xdp_mode"
