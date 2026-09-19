@@ -378,6 +378,48 @@ wait_for_path "$BPF_PIN_DIR/sock_state_prog"
 wait_for_path "$BPF_PIN_DIR/sock_state_rb"
 wait_for_socket "$socket_path"
 
+# Pinned maps and the relay socket can precede tracepoint attachment. Confirm
+# a fresh event before opening the listener whose complete lifecycle we assert.
+if [[ "${REQUIRE_SOCK_STATE_EVENT:-0}" == "1" ]]; then
+    python3 - "$socket_path" "$RUNTIME_E2E_WAIT_SECONDS" <<'PYREADY'
+import json, socket, sys, time
+
+started = time.monotonic_ns()
+deadline = time.monotonic() + float(sys.argv[2])
+ports = set()
+pending = b""
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.settimeout(0.2)
+    client.connect(sys.argv[1])
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            ports.add(probe.getsockname()[1])
+            probe.listen(1)
+        try:
+            chunk = client.recv(65536)
+        except socket.timeout:
+            continue
+        if not chunk:
+            raise SystemExit("relay disconnected while waiting for socket tracking")
+        pending += chunk
+        while b"\n" in pending:
+            raw, pending = pending.split(b"\n", 1)
+            if not raw:
+                continue
+            message = json.loads(raw)
+            events = message.get("events", []) if message.get("type") == "history" else [message]
+            if any(event.get("type") == "port_change"
+                   and event.get("proto") == "tcp"
+                   and event.get("action") == "open"
+                   and event.get("port") in ports
+                   and event.get("ts_ns", 0) >= started for event in events):
+                print("[INFO] runtime-e2e: socket tracking is ready")
+                raise SystemExit(0)
+raise SystemExit("timed out waiting for real socket tracking events")
+PYREADY
+fi
+
 test_auto_port_sync_closed_loop
 
 if [[ $systemd_mode -eq 1 ]]; then

@@ -41,9 +41,23 @@ if [[ $EUID -ne 0 ]]; then
     _kernel_unavailable "must run as root"
 fi
 
-for _cmd in clang bpftool ip python3 tc; do
+for _cmd in clang bpftool ip python3 tc nft unshare mount; do
     command -v "$_cmd" &>/dev/null || _kernel_unavailable "$_cmd not found"
 done
+
+# Isolate the listener and XDP/TC hooks from runner NAT, which can discard
+# the request socket assigned by the SYN-cookie handoff. Keep test mounts
+# private so BPF pins and named client namespaces cannot affect the runner.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    exec unshare --mount --net --propagation private bash -euc '
+        mount -t sysfs sysfs /sys
+        mount -t bpf bpf /sys/fs/bpf
+        mkdir -p /run/netns
+        mount -t tmpfs tmpfs /run/netns
+        set +e
+        source "$1"
+    ' bash "$REPO_ROOT/tests/bash/test_integration.sh"
+fi
 
 ip netns add "${_NS}_chk" 2>/dev/null || true
 if ! ip netns exec "${_NS}_chk" true 2>/dev/null; then

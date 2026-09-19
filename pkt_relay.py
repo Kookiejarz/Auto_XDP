@@ -374,9 +374,12 @@ class RelayServer:
         max_events: int = MAX_EVENTS,
         max_history_send: int = MAX_HISTORY_SEND,
         sock_state_reader: SockStateReader | None = None,
+        sock_state_pin_path: str | None = None,
     ) -> None:
         self._rb = ringbuf
         self._ss = sock_state_reader
+        self._ss_pin = sock_state_pin_path
+        self._ss_perf_fds: list[int] = []
         self._sock_path = sock_path
         self._retention_ns = int(retention_seconds * 1e9)
         self._history: collections.deque[dict] = collections.deque(maxlen=max_events)
@@ -473,11 +476,31 @@ class RelayServer:
 
     # main loop
 
+    def _connect_sock_state(self) -> None:
+        if self._ss is not None or self._ss_pin is None:
+            return
+        try:
+            rb = RingBufReader(self._ss_pin, SOCK_STATE_RB_MAX_ENTRIES, SOCK_STATE_EVENT_SIZE)
+        except OSError:
+            return
+        if not os.path.exists(SOCK_STATE_LINK_PIN_PATH):
+            self._ss_perf_fds = attach_tracepoint(SOCK_STATE_PROG_PIN_PATH, SOCK_STATE_TRACEPOINT)
+            if not self._ss_perf_fds:
+                rb.close()
+                return
+        self._ss = SockStateReader(rb)
+        log.info("sock_state_rb opened; port_change events enabled.")
+
     def _reader_loop(self) -> None:
-        watch_fds = [self._rb.fileno()]
-        if self._ss is not None:
-            watch_fds.append(self._ss.fileno())
+        next_retry = 0.0
         while self._running:
+            now = time.monotonic()
+            if self._ss is None and now >= next_retry:
+                self._connect_sock_state()
+                next_retry = now + 1.0
+            watch_fds = [self._rb.fileno()]
+            if self._ss is not None:
+                watch_fds.append(self._ss.fileno())
             try:
                 select.select(watch_fds, [], [], 0.5)
             except (ValueError, OSError):
@@ -550,6 +573,12 @@ class RelayServer:
         self._running = False
 
     def _cleanup(self) -> None:
+        if self._ss is not None:
+            self._ss.close()
+            self._ss = None
+        for fd in self._ss_perf_fds:
+            os.close(fd)
+        self._ss_perf_fds.clear()
         for conn in list(self._clients.values()):
             try:
                 conn.close()
@@ -670,32 +699,6 @@ def main() -> None:
             )
             time.sleep(max(args.retry_interval, 0.1))
 
-    # If sock_state_rb is pinned but no bpftool link was created, attach the
-    # tracepoint ourselves so the ring buffer actually receives events.
-    _perf_fds: list[int] = []
-    if (
-        not os.path.exists(SOCK_STATE_LINK_PIN_PATH)
-        and os.path.exists(args.sock_state_rb)
-        and os.path.exists(SOCK_STATE_PROG_PIN_PATH)
-    ):
-        _perf_fds = attach_tracepoint(SOCK_STATE_PROG_PIN_PATH, SOCK_STATE_TRACEPOINT)
-        if _perf_fds:
-            log.info("sock_state tracepoint attached via perf_event_open (%d CPUs).", len(_perf_fds))
-        else:
-            log.info("perf_event_open attachment failed; port_change events disabled.")
-
-    ss_reader: SockStateReader | None = None
-    try:
-        ss_rb = RingBufReader(
-            args.sock_state_rb,
-            SOCK_STATE_RB_MAX_ENTRIES,
-            SOCK_STATE_EVENT_SIZE,
-        )
-        ss_reader = SockStateReader(ss_rb)
-        log.info("sock_state_rb opened; port_change events enabled.")
-    except (OSError, FileNotFoundError):
-        log.info("sock_state_rb not found; port_change events disabled.")
-
     max_history_send = cfg.get("max_history_send", MAX_HISTORY_SEND)
 
     relay = RelayServer(
@@ -704,7 +707,7 @@ def main() -> None:
         retention_seconds=float(retention),
         max_events=int(max_events),
         max_history_send=int(max_history_send),
-        sock_state_reader=ss_reader,
+        sock_state_pin_path=args.sock_state_rb,
     )
 
     def _on_signal(signum: int, _frame: object) -> None:
@@ -721,11 +724,7 @@ def main() -> None:
     finally:
         _remove_pid(args.pid_file, pid_fd)
         rb.close()
-        for _pfd in _perf_fds:
-            try:
-                os.close(_pfd)
-            except OSError:
-                pass
+
 
 
 if __name__ == "__main__":
