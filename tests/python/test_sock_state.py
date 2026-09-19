@@ -364,3 +364,31 @@ class TestSnapshotWorkerWakeup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_relay_retries_late_socket_tracker_and_closes_owned_resources(monkeypatch):
+    import pkt_relay
+
+    packet_ring, socket_ring = mock.Mock(), mock.Mock()
+    server = pkt_relay.RelayServer(packet_ring, sock_state_pin_path="/late/sock_state_rb")
+    open_ring = mock.Mock(side_effect=[FileNotFoundError(), socket_ring, socket_ring])
+    attach = mock.Mock(side_effect=[[], [42]])
+    monkeypatch.setattr(pkt_relay, "RingBufReader", open_ring)
+    monkeypatch.setattr(pkt_relay, "attach_tracepoint", attach)
+    monkeypatch.setattr(pkt_relay.os.path, "exists", lambda _path: False)
+    server._connect_sock_state()  # Neither the map nor the program is ready.
+    assert server._ss is None
+    server._connect_sock_state()  # Map published, attachment still unavailable.
+    assert server._ss is None
+    socket_ring.close.assert_called_once()
+    socket_ring.reset_mock()
+    server._connect_sock_state()
+    assert server._ss is not None
+    server._connect_sock_state()  # Never attach the same tracker twice.
+    assert open_ring.call_count == 3
+    assert attach.call_count == 2
+    with mock.patch.object(pkt_relay.os, "close") as close, \
+         mock.patch.object(pkt_relay.os, "unlink"):
+        server._cleanup()
+    socket_ring.close.assert_called_once()
+    close.assert_called_once_with(42)
