@@ -7,7 +7,8 @@ import tempfile
 import pytest
 
 from auto_xdp import config as cfg
-from auto_xdp import discovery, policy
+from auto_xdp import policy
+from auto_xdp.discovery import listeners as discovery
 from auto_xdp import approvals
 from auto_xdp.state import ObservedState, RuntimeEndpoint
 

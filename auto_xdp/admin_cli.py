@@ -21,7 +21,8 @@ from typing import Any
 
 from auto_xdp import config as cfg
 from auto_xdp import approvals
-from auto_xdp import discovery, policy
+from auto_xdp import policy
+from auto_xdp.discovery import listeners as discovery
 from auto_xdp.admin.detect import detect_backend as _detect_backend
 from auto_xdp.bpf.syscall import (
     BPF_MAP_DELETE_ELEM,
@@ -33,7 +34,7 @@ from auto_xdp.bpf.syscall import (
     map_value_size,
     obj_get,
 )
-from auto_xdp.discovery import _build_systemd_socket_map
+from auto_xdp.discovery.listeners import _build_systemd_socket_map
 
 try:
     import tomllib  # Python 3.11+

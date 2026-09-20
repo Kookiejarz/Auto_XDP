@@ -29,7 +29,7 @@ from auto_xdp.admin_cli import (
 from auto_xdp import approvals
 from auto_xdp.bpf.maps import BpfGlobalRlMap, BpfPortPolicyMap
 from auto_xdp.config import apply_toml_config, load_toml_config
-from auto_xdp.discovery import get_listening_ports
+from auto_xdp.discovery.listeners import get_listening_ports
 from auto_xdp.policy import resolve_desired_state
 
 

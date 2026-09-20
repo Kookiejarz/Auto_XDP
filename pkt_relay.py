@@ -32,7 +32,7 @@ import time
 
 from auto_xdp.bpf.syscall import obj_get
 from auto_xdp.config import load_toml_config
-from auto_xdp.sock_state import SOCK_STATE_EVENT_SIZE, SockStateReader
+from auto_xdp.discovery.sock_state import SOCK_STATE_EVENT_SIZE, SockStateReader
 
 # paths & defaults
 

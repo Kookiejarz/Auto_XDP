@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from auto_xdp.discovery import (
+from auto_xdp.discovery.listeners import (
     DiscoveryError,
     _bind_ip_is_exposed,
     _discovery_exclude_networks,
@@ -22,12 +22,12 @@ import auto_xdp.backends as backends_mod
 import auto_xdp.backends.xdp as xdp_backend_mod
 import auto_xdp.backends.nftables as nftables_mod
 import auto_xdp.bpf.maps as bpf_maps_mod
-import auto_xdp.proc_events as proc_events_mod
+import auto_xdp.discovery.proc_events as proc_events_mod
 import auto_xdp.syncer as syncer_mod
-import auto_xdp.discovery as discovery_mod
+import auto_xdp.discovery.listeners as discovery_mod
 import auto_xdp.cli as cli_mod
 import auto_xdp.policy as policy_mod
-import auto_xdp.services as services_mod
+import auto_xdp.discovery.services as services_mod
 import auto_xdp.state as state_mod
 
 
@@ -820,9 +820,9 @@ class XdpPortSyncTests(unittest.TestCase):
 
         # Force the psutil fallback path; on Linux the netlink fast path would
         # read the real host sockets and ignore these fakes.
-        with mock.patch("auto_xdp.discovery._IS_LINUX", False), \
-             mock.patch("auto_xdp.discovery.psutil", fake_psutil), \
-             mock.patch("auto_xdp.discovery._net_connections", return_value=fake_connections), \
+        with mock.patch("auto_xdp.discovery.listeners._IS_LINUX", False), \
+             mock.patch("auto_xdp.discovery.listeners.psutil", fake_psutil), \
+             mock.patch("auto_xdp.discovery.listeners._net_connections", return_value=fake_connections), \
              mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_LOOPBACK", True), \
              mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_BIND_CIDRS", ["10.0.0.0/8", "fd00::/8"]):
             state = discovery_mod.get_listening_ports()
@@ -853,9 +853,9 @@ class XdpPortSyncTests(unittest.TestCase):
                 raddr=None,
             ),
         ]
-        with mock.patch("auto_xdp.discovery._IS_LINUX", False), \
-             mock.patch("auto_xdp.discovery.psutil", fake_psutil), \
-             mock.patch("auto_xdp.discovery._net_connections", return_value=fake_connections), \
+        with mock.patch("auto_xdp.discovery.listeners._IS_LINUX", False), \
+             mock.patch("auto_xdp.discovery.listeners.psutil", fake_psutil), \
+             mock.patch("auto_xdp.discovery.listeners._net_connections", return_value=fake_connections), \
              mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_PORTS", {8080, 53}):
             state = discovery_mod.get_listening_ports()
         self.assertEqual(state.tcp, {22})
