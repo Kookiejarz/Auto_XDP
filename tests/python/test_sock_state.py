@@ -4,8 +4,8 @@ import unittest
 
 import pytest
 
-import auto_xdp.sock_state as sock_state_mod
-from auto_xdp.sock_state import SockStateReader, SOCK_STATE_EVENT_SIZE
+import auto_xdp.discovery.sock_state as sock_state_mod
+from auto_xdp.discovery.sock_state import SockStateReader, SOCK_STATE_EVENT_SIZE
 
 _STRUCT = struct.Struct("<QHBBB3x")
 _AF_INET  = 2

@@ -38,7 +38,7 @@ from auto_xdp.bpf.maps import (
     XDP_CFG_FLAG_SLOT_DROP,
 )
 from auto_xdp.policy import rate_map_entries_v6
-from auto_xdp.services import service_name
+from auto_xdp.discovery.services import service_name
 from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcilePlan
 
 log = logging.getLogger(__name__)

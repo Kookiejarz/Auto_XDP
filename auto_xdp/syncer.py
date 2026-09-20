@@ -12,9 +12,9 @@ from collections.abc import Callable
 from auto_xdp import config as cfg
 from auto_xdp.backends import NftablesBackend, PortBackend, XdpBackend
 from auto_xdp.config import apply_toml_config, load_toml_config
-from auto_xdp.discovery import DiscoveryError, get_listening_ports
+from auto_xdp.discovery.listeners import DiscoveryError, get_listening_ports
 from auto_xdp.policy import resolve_desired_state
-from auto_xdp.proc_events import drain_proc_events, open_proc_connector
+from auto_xdp.discovery.proc_events import drain_proc_events, open_proc_connector
 
 log = logging.getLogger(__name__)
 

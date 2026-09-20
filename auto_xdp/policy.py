@@ -4,7 +4,7 @@ from dataclasses import replace
 from typing import Callable, TypeVar
 
 from auto_xdp import config as cfg
-from auto_xdp.services import service_name
+from auto_xdp.discovery.services import service_name
 from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
 
 _NS_PER_SECOND = 1_000_000_000
