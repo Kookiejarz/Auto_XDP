@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""BPF ring buffer relay daemon for auto_xdp DROP events.
+"""BPF event transport, bounded history, and relay health reporting.
 
 Consumes pkt_ringbuf, maintains a configurable retention window,
-and fans out to Textual TUI clients via a Unix domain socket.
+and fans out to TUI clients via a Unix domain socket.
 
 Protocol: line-delimited JSON.
   On connect: {"type":"history","events":[...]}  (up to max_history_on_connect)
   Live:       {"type":"event",...}
+  Health:     {"type":"telemetry_status",...} (once per second)
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import ctypes
 import ctypes.util
 import fcntl
 import json
+import itertools
 import logging
 import mmap
 import os
@@ -29,10 +31,18 @@ import struct
 import sys
 import threading
 import time
+import uuid
 
 from auto_xdp.bpf.syscall import obj_get
 from auto_xdp.config import load_toml_config
 from auto_xdp.discovery.sock_state import SOCK_STATE_EVENT_SIZE, SockStateReader
+from auto_xdp.telemetry.events import (
+    PACKET_EVENT_SIZES,
+    PACKET_EVENT_V1_SIZE,
+    PROTO_NAMES as _PROTO_NAMES,
+    REASON_NAMES as _REASON_NAMES,
+    decode_event,
+)
 
 # paths & defaults
 
@@ -53,6 +63,10 @@ RETENTION_SECONDS  = 300
 MAX_EVENTS         = 100_000
 MAX_HISTORY_SEND   = 5_000      # cap history batch sent on client connect
 EVENT_QUEUE_MAX    = 20_000     # reader→broadcaster queue depth before dropping
+EVENT_BROADCAST_BATCH = 256
+# ponytail: replay is a bounded sample; use incremental replay only if a full
+# retained history becomes a requirement. Fits the client's bounded poll loop.
+MAX_HISTORY_BYTES = 512 * 1024
 
 PAGE_SIZE = mmap.PAGESIZE
 
@@ -62,51 +76,7 @@ _BUSY_BIT    = 1 << 31
 _DISCARD_BIT = 1 << 30
 _HDR_SZ      = 8               # u32 hdr + u32 pad
 
-# event decoding tables
-
-_PROTO_NAMES: dict[int, str] = {
-    1:   "ICMP",
-    6:   "TCP",
-    17:  "UDP",
-    58:  "ICMPv6",
-    132: "SCTP",
-}
-
-# xdp_counter_idx values that appear as the reason field
-_REASON_NAMES: dict[int, str] = {
-    0:  "TCP_NEW_ALLOW",
-    2:  "TCP_DROP",
-    4:  "UDP_DROP",
-    7:  "FRAG_DROP",
-    9:  "TCP_RESERVED",
-    10: "ICMP_DROP",
-    11: "SYN_RATE_DROP",
-    12: "UDP_RATE_DROP",
-    13: "UDP_GLOBAL_RATE_DROP",
-    14: "TCP_MALFORM_NULL",
-    15: "TCP_MALFORM_XMAS",
-    16: "TCP_MALFORM_SYN_FIN",
-    17: "TCP_MALFORM_SYN_RST",
-    18: "TCP_MALFORM_RST_FIN",
-    19: "TCP_MALFORM_DOFF",
-    20: "TCP_MALFORM_PORT0",
-    21: "VLAN_DROP",
-    24: "SLOT_DROP",
-    25: "UDP_MALFORM_PORT0",
-    26: "UDP_MALFORM_LEN",
-    27: "BOGON_DROP",
-    28: "RESERVED_28",
-    29: "SYN_AGG_RATE_DROP",
-    30: "UDP_AGG_RATE_DROP",
-    31: "HANDLER_BLOCK_DROP",
-    32: "RESERVED_32",
-    33: "RESERVED_33",
-    34: "ABUSEIPDB_DROP",
-    42: "SYN_COOKIE_BUDGET_DROP",
-    44: "SYN_COOKIE_TAILCALL_MISS",
-}
-
-_PKT_EVENT_SIZE = 48   # sizeof(struct pkt_event)
+_PKT_EVENT_SIZE = PACKET_EVENT_V1_SIZE  # retained import compatibility
 _AF_INET        = 2
 _AF_INET6       = 10
 
@@ -254,46 +224,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# event decoder
-
-_DECODE_STRUCT = struct.Struct("<Q16s16sHHBBBB")
-
-def decode_event(raw: bytes) -> dict | None:
-    if len(raw) < _PKT_EVENT_SIZE:
-        return None
-    ts_ns, src_raw, dst_raw, src_port, dst_port, proto, family, verdict, reason = \
-        _DECODE_STRUCT.unpack_from(raw, 0)
-    src_port = socket.ntohs(src_port)
-    dst_port = socket.ntohs(dst_port)
-
-    if family == _AF_INET:
-        src_ip = socket.inet_ntoa(src_raw[0:4])
-        dst_ip = socket.inet_ntoa(dst_raw[0:4])
-        ip_ver = 4
-    else:
-        try:
-            src_ip = socket.inet_ntop(socket.AF_INET6, bytes(src_raw))
-            dst_ip = socket.inet_ntop(socket.AF_INET6, bytes(dst_raw))
-        except Exception:
-            src_ip = src_raw.hex()
-            dst_ip = dst_raw.hex()
-        ip_ver = 6
-
-    return {
-        "ts_ns":     ts_ns,
-        "src":       src_ip,
-        "dst":       dst_ip,
-        "sport":     src_port,
-        "dport":     dst_port,
-        "proto":     _PROTO_NAMES.get(proto, str(proto)),
-        "family":    ip_ver,
-        "verdict":   "ALLOW" if verdict == 2 else "DROP",
-        "verdict_id": verdict,
-        "reason":    _REASON_NAMES.get(reason, str(reason)),
-        "reason_id": reason,
-    }
-
-
 # ring buffer reader
 
 class RingBufReader:
@@ -303,11 +233,12 @@ class RingBufReader:
         self,
         pin_path: str,
         max_entries: int = RINGBUF_MAX_ENTRIES,
-        event_size: int = _PKT_EVENT_SIZE,
+        event_size: int | tuple[int, ...] = PACKET_EVENT_SIZES,
     ) -> None:
         self._max = max_entries
         self._mask = max_entries - 1
         self._event_size = event_size
+        self.invalid_records = 0
         self._fd = obj_get(pin_path)
 
         # Consumer page: read+write — we store the consumer position here.
@@ -344,8 +275,12 @@ class RingBufReader:
                 break
 
             data_len = hdr & ~(_BUSY_BIT | _DISCARD_BIT)
-            if not (hdr & _DISCARD_BIT) and data_len == self._event_size:
-                yield bytes(self._data[off + _HDR_SZ: off + _HDR_SZ + data_len])
+            if not (hdr & _DISCARD_BIT):
+                sizes = self._event_size if isinstance(self._event_size, tuple) else (self._event_size,)
+                if data_len in sizes:
+                    yield bytes(self._data[off + _HDR_SZ: off + _HDR_SZ + data_len])
+                else:
+                    self.invalid_records = getattr(self, "invalid_records", 0) + 1
 
             cpos += _HDR_SZ + ((data_len + 7) & ~7)
             self._set_cpos(cpos)
@@ -376,6 +311,10 @@ class RelayServer:
         sock_state_reader: SockStateReader | None = None,
         sock_state_pin_path: str | None = None,
     ) -> None:
+        if type(max_events) is not int or max_events < 1:
+            raise ValueError("max_events must be a positive integer")
+        if type(max_history_send) is not int or max_history_send < 0:
+            raise ValueError("max_history_send must be a non-negative integer")
         self._rb = ringbuf
         self._ss = sock_state_reader
         self._ss_pin = sock_state_pin_path
@@ -388,6 +327,13 @@ class RelayServer:
         self._server: socket.socket | None = None
         self._running = False
         self._queue: queue.Queue[dict] = queue.Queue(maxsize=EVENT_QUEUE_MAX)
+        self._session_id = uuid.uuid4().hex
+        self._seq = 0
+        self._decoded_events = 0
+        self._queue_dropped = 0
+        self._port_events_dropped = 0
+        self._invalid_records = 0
+        self._client_disconnects = 0
 
     # internal helpers
 
@@ -442,8 +388,12 @@ class RelayServer:
         # to non-blocking mode.
         conn.settimeout(1.0)
         self._trim_history()
-        history_slice = list(self._history)[-self._max_history_send:]
-        if not self._send_line(conn, {"type": "history", "events": history_slice}):
+        if not self._send_line(conn, self._history_message()):
+            self._client_disconnects += 1
+            conn.close()
+            return
+        if not self._send_line(conn, self._health_status()):
+            self._client_disconnects += 1
             conn.close()
             return
         conn.setblocking(False)
@@ -451,9 +401,28 @@ class RelayServer:
         self._clients[fd] = conn
         log.debug("client connected fd=%d total=%d", fd, len(self._clients))
 
+    def _history_message(self) -> dict:
+        """Newest events, bounded by both count and serialized wire bytes."""
+        message = {"type": "history", "session_id": self._session_id,
+                   "events": [], "available_events": len(self._history),
+                   "truncated": False}
+        # 'false' is longer than 'true'; initial overhead includes the newline.
+        size = len(json.dumps(message, separators=(",", ":")).encode()) + 1
+        events: list[dict] = []
+        for event in itertools.islice(reversed(self._history), self._max_history_send):
+            event_size = len(json.dumps(event, separators=(",", ":")).encode()) + bool(events)
+            if size + event_size > MAX_HISTORY_BYTES:
+                break
+            events.append(event)
+            size += event_size
+        message["events"] = list(reversed(events))
+        message["truncated"] = len(events) < len(self._history)
+        return message
+
     def _drop_client(self, fd: int) -> None:
         conn = self._clients.pop(fd, None)
         if conn:
+            self._client_disconnects += 1
             try:
                 conn.close()
             except OSError:
@@ -475,6 +444,48 @@ class RelayServer:
             self._drop_client(fd)
 
     # main loop
+
+    def _enqueue(self, event: dict) -> None:
+        """Reader-thread only: assign identity even when the queue is full."""
+        self._seq += 1
+        event.update(session_id=self._session_id, seq=self._seq)
+        event.setdefault("seen_at", time.time())
+        self._decoded_events += 1
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            if event.get("type") == "port_change":
+                self._port_events_dropped += 1
+            else:
+                self._queue_dropped += 1
+
+    def _health_status(self) -> dict:
+        """Cumulative relay counters, independent of retained packet samples."""
+        rejected = getattr(self._rb, "invalid_records", 0)
+        # In-process test adapters need not expose a ring-reader counter.
+        rejected = rejected if isinstance(rejected, int) else 0
+        return {
+            "type": "telemetry_status", "session_id": self._session_id,
+            "decoded_events": self._decoded_events,
+            "queue_dropped": self._queue_dropped,
+            "port_events_dropped": self._port_events_dropped,
+            "invalid_records": self._invalid_records + rejected,
+            "client_disconnects": self._client_disconnects,
+            "retained_events": len(self._history), "queue_depth": self._queue.qsize(),
+        }
+
+    def _flush_batch(self) -> int:
+        """Bound work so continuous input cannot starve health and new clients."""
+        sent = 0
+        for _ in range(EVENT_BROADCAST_BATCH):
+            try:
+                event = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._history.append(event)
+            self._broadcast(event)
+            sent += 1
+        return sent
 
     def _connect_sock_state(self) -> None:
         if self._ss is not None or self._ss_pin is None:
@@ -508,17 +519,12 @@ class RelayServer:
             for raw in self._rb.drain():
                 ev = decode_event(raw)
                 if ev:
-                    ev["seen_at"] = time.time()
-                    try:
-                        self._queue.put_nowait(ev)
-                    except queue.Full:
-                        pass
+                    self._enqueue(ev)
+                else:
+                    self._invalid_records += 1
             if self._ss is not None:
                 for ev in self._ss.drain():
-                    try:
-                        self._queue.put_nowait(ev)
-                    except queue.Full:
-                        pass
+                    self._enqueue(ev)
 
     def run(self) -> None:
         self._open_server()
@@ -536,7 +542,7 @@ class RelayServer:
             while self._running:
                 rfds: list[int] = [srv_fd, *self._clients.keys()]
                 try:
-                    readable, _, _ = select.select(rfds, [], [], 0.05)
+                    readable, _, _ = select.select(rfds, [], [], 0 if not self._queue.empty() else 0.05)
                 except (InterruptedError, ValueError):
                     readable = []
 
@@ -553,19 +559,15 @@ class RelayServer:
                             if not data:
                                 self._drop_client(rfd)
 
-                while True:
-                    try:
-                        ev = self._queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    self._history.append(ev)
-                    self._broadcast(ev)
+                self._flush_batch()
 
                 now = time.monotonic()
                 if now - last_trim >= 1.0:
                     self._trim_history()
+                    self._broadcast(self._health_status())
                     last_trim = now
         finally:
+            self._running = False
             reader.join(timeout=2.0)
             self._cleanup()
 
