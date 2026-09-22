@@ -54,3 +54,65 @@ def test_reason_aliases_are_shared_and_cookie_validation_is_not_acceptance():
     event = decode_event(packet(reason=40, verdict=2))
     assert event["source_evidence"] == "cookie_validated"
     assert "not prove application" in event["reason_detail"]
+
+
+def relay():
+    reader = Mock(invalid_records=0)
+    return pkt_relay.RelayServer(reader, max_events=10)
+
+
+def test_relay_counts_pressure_and_keeps_sequence_gaps_visible():
+    server = relay()
+    server._queue = queue.Queue(maxsize=1)
+    server._enqueue({"reason": "PORT_NOT_AUTHORIZED"})
+    server._enqueue({"reason": "PORT_NOT_AUTHORIZED"})
+    server._enqueue({"type": "port_change"})
+    first = server._queue.get_nowait()
+    server._enqueue({"reason": "PORT_NOT_AUTHORIZED"})
+    last = server._queue.get_nowait()
+    assert first["session_id"] == last["session_id"]
+    assert (first["seq"], last["seq"]) == (1, 4)
+    health = server._health_status()
+    assert (health["decoded_events"], health["queue_dropped"], health["port_events_dropped"]) == (4, 1, 1)
+    assert health["type"] == "telemetry_status"
+
+
+def test_relay_flush_is_bounded_and_history_retains_wire_identity(monkeypatch):
+    server = relay()
+    monkeypatch.setattr(pkt_relay, "EVENT_BROADCAST_BATCH", 2)
+    for _ in range(3):
+        server._enqueue({"verdict": "DROP"})
+    assert server._flush_batch() == 2
+    assert server._queue.qsize() == 1
+    assert [event["seq"] for event in server._history] == [1, 2]
+    assert server._health_status()["retained_events"] == 2
+
+
+def test_ring_reader_accepts_mixed_versions_and_counts_unsupported_records():
+    records = [packet(), packet(version=2), b"invalid!"]
+    wire = b"".join(struct.pack("<II", len(raw), 0) + raw + b"\0" * (-len(raw) % 8)
+                    for raw in records)
+    reader = pkt_relay.RingBufReader.__new__(pkt_relay.RingBufReader)
+    reader._mask = 255
+    reader._event_size = (48, 64)
+    reader._consumer = bytearray(8)
+    reader._producer = bytearray(struct.pack("<Q", len(wire)))
+    reader._data = wire + bytes(512 - len(wire))
+    assert list(reader.drain()) == records[:2]
+    assert reader.invalid_records == 1
+    assert reader._cpos() == len(wire)
+
+
+def test_history_replay_has_wire_byte_limit_and_zero_means_no_history():
+    server = pkt_relay.RelayServer(Mock(), max_events=30000, max_history_send=20000)
+    for seq in range(20000):
+        server._history.append(dict(decode_event(packet(family=10, version=2)), seq=seq))
+    message = server._history_message()
+    assert len((json.dumps(message, separators=(",", ":")) + "\n").encode()) <= pkt_relay.MAX_HISTORY_BYTES
+    assert message["truncated"] and message["available_events"] == 20000
+    assert message["events"][-1]["seq"] == 19999
+    assert message["events"][0]["seq"] > 0
+    server._max_history_send = 0
+    assert server._history_message()["events"] == []
+    with pytest.raises(ValueError):
+        pkt_relay.RelayServer(Mock(), max_history_send=-1)
