@@ -78,6 +78,14 @@ max_history_send = 5000
 # TUI-side event scrollback kept in the local client process.
 tui_max_events = 500
 
+# Optional local IP information for the TUI; no online lookup or auto-download.
+# Install the geoip extra in the Python environment used by axdp tui.
+[geoip]
+enabled = false
+country_db = "" # e.g. /usr/share/GeoIP/GeoLite2-Country.mmdb
+asn_db = ""     # e.g. /usr/share/GeoIP/GeoLite2-ASN.mmdb
+cache_size = 4096 # bounded cache, 1..65536; restart TUI after updating databases
+
 [discovery]
 # Exclude loopback-only listeners from exposure discovery.
 # When true, listeners bound only to 127.0.0.0/8 or ::1 are ignored.
