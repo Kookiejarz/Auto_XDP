@@ -17,6 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+geoip = ["maxminddb>=2.7"]
 dev = [
     "mypy>=1.8",
     "PyYAML>=6.0",
