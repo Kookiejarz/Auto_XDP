@@ -187,7 +187,7 @@ def create_request(
 ) -> dict[str, Any]:
     if not reason.strip():
         raise ValueError("approval reason is required")
-    from auto_xdp.admin_cli import _load_toml
+    from auto_xdp.admin.config_file import load_toml as _load_toml
 
     config = _load_toml(Path(config_path))
     request: dict[str, Any] = {
@@ -244,7 +244,7 @@ def list_history(path: Path) -> tuple[int, list[dict[str, Any]]]:
 
 
 def list_grants(config_path: str | Path) -> list[dict[str, Any]]:
-    from auto_xdp.admin_cli import _load_toml
+    from auto_xdp.admin.config_file import load_toml as _load_toml
 
     config = _load_toml(Path(config_path))
     rows: list[dict[str, Any]] = []
@@ -300,7 +300,7 @@ def _apply_grant(config: dict[str, Any], request: dict[str, Any]) -> list[int]:
 
 
 def approve_request(path: Path, config_path: str | Path, request_id: int, *, actor: str | None = None) -> dict[str, Any]:
-    from auto_xdp.admin_cli import _load_toml, _write_toml
+    from auto_xdp.admin.config_file import load_toml as _load_toml, write_toml as _write_toml
 
     with _locked(path) as state:
         request = _request(state, request_id)
@@ -339,7 +339,7 @@ def reject_request(path: Path, request_id: int, *, reason: str, actor: str | Non
 
 
 def revoke_request(path: Path, config_path: str | Path, request_id: int, *, actor: str | None = None) -> dict[str, Any]:
-    from auto_xdp.admin_cli import _load_toml, _write_toml
+    from auto_xdp.admin.config_file import load_toml as _load_toml, write_toml as _write_toml
 
     with _locked(path) as state:
         request = _request(state, request_id)
@@ -377,7 +377,7 @@ def deny_grant(
     actor: str | None = None,
 ) -> dict[str, Any]:
     """Remove selected ports while retaining the same audit trail as approvals."""
-    from auto_xdp.admin_cli import _load_toml, _write_toml
+    from auto_xdp.admin.config_file import load_toml as _load_toml, write_toml as _write_toml
 
     requested_ports = _ports(ports)
     protocol = protocol.lower()

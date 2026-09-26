@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from auto_xdp import config as cfg
+from auto_xdp.admin import config_file
 from auto_xdp import approvals
 from auto_xdp import policy
 from auto_xdp.discovery import listeners as discovery
@@ -45,7 +46,6 @@ except ImportError:
         tomllib = None
 
 
-_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _LOG_LEVELS = {"debug", "info", "warning", "error"}
 _IPPROTO_BY_NAME = {
     "gre": 47,
@@ -88,201 +88,6 @@ _BUILTIN_SLOT_ARTIFACTS = {
 _CUSTOM_SLOT_ARTIFACT_RE = re.compile(r"^custom_\d+_.+\.(?:c|o)$")
 _CUSTOM_PORT_ARTIFACT_RE = re.compile(r"^custom_(?:tcp|udp)_\d+_.+\.(?:c|o)$")
 _PORT_HANDLER_MARKERS = ("udp_hv4", "udp_hv6", "hblk4", "hblk6")
-
-
-def _default_config_template() -> str:
-    try:
-        return resources.files("auto_xdp").joinpath("default_config.toml").read_text()
-    except (FileNotFoundError, ModuleNotFoundError):
-        return (Path(__file__).resolve().parents[1] / "config.toml").read_text()
-
-
-def _load_toml(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    if tomllib is not None:
-        with path.open("rb") as fh:
-            return tomllib.load(fh)
-    return _parse_toml_fallback(path.read_text())
-
-
-def _parse_toml_fallback(text: str) -> dict[str, Any]:
-    def split_items(raw: str) -> list[str]:
-        items: list[str] = []
-        cur: list[str] = []
-        depth = 0
-        in_str = False
-        escape = False
-        string_char: str | None = None
-        for ch in raw[1:-1]:
-            if escape:
-                cur.append(ch)
-                escape = False
-                continue
-            if ch == "\\" and in_str:
-                cur.append(ch)
-                escape = True
-                continue
-            if ch in ('"', "'") and not in_str:
-                in_str = True
-                string_char = ch
-                cur.append(ch)
-                continue
-            if ch == string_char and in_str:
-                in_str = False
-                string_char = None
-                cur.append(ch)
-                continue
-            if not in_str:
-                if ch in ("[", "{"):
-                    depth += 1
-                elif ch in ("]", "}"):
-                    depth -= 1
-                elif ch == "," and depth == 0:
-                    item = "".join(cur).strip()
-                    if item:
-                        items.append(item)
-                    cur = []
-                    continue
-            cur.append(ch)
-        item = "".join(cur).strip()
-        if item:
-            items.append(item)
-        return items
-
-    def parse_value(raw: str) -> Any:
-        raw = raw.strip()
-        if raw.startswith('"'):
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                if not raw.endswith('"') or len(raw) < 2:
-                    raise ValueError(f"Malformed string value in config: {raw!r}")
-                return raw[1:-1]
-        if raw.startswith("'"):
-            if not raw.endswith("'") or len(raw) < 2:
-                raise ValueError(f"Malformed string value in config: {raw!r}")
-            return raw[1:-1]
-        if raw == "true":
-            return True
-        if raw == "false":
-            return False
-        if raw.startswith("["):
-            return [parse_value(item) for item in split_items(raw)]
-        if raw.startswith("{"):
-            return {
-                key.strip(): parse_value(value)
-                for key, sep, value in (part.partition("=") for part in split_items(raw))
-                if sep
-            }
-        try:
-            return int(raw)
-        except ValueError:
-            pass
-        try:
-            return float(raw)
-        except ValueError:
-            return raw
-
-    root: dict[str, Any] = {}
-    current: dict[str, Any] = root
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        table_match = re.match(r"^\[([^\[\]]+)\]$", line)
-        if table_match:
-            current = root
-            for key in table_match.group(1).split("."):
-                current = current.setdefault(key.strip(), {})
-            continue
-        key_match = re.match(r"^([A-Za-z0-9_-]+)\s*=\s*(.+)$", line)
-        if key_match:
-            current[key_match.group(1)] = parse_value(key_match.group(2).strip())
-    return root
-
-
-def _fmt_key(key: Any) -> str:
-    key = str(key)
-    return key if _BARE_KEY_RE.match(key) else json.dumps(key)
-
-
-def _fmt_path(parts: list[Any]) -> str:
-    return ".".join(_fmt_key(part) for part in parts)
-
-
-def _is_array_of_tables(value: Any) -> bool:
-    return isinstance(value, list) and bool(value) and all(isinstance(item, dict) for item in value)
-
-
-def _fmt_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            raise ValueError("TOML does not support NaN or infinity")
-        return repr(value)
-    if isinstance(value, str):
-        return json.dumps(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(_fmt_value(item) for item in value) + "]"
-    if isinstance(value, dict):
-        inner = ", ".join(f"{_fmt_key(k)} = {_fmt_value(v)}" for k, v in value.items())
-        return "{ " + inner + " }"
-    raise TypeError(f"unsupported TOML value: {type(value).__name__}")
-
-
-def _emit_table_body(table: dict[str, Any], path_parts: list[Any]) -> list[str]:
-    lines: list[str] = []
-    scalar_items: list[tuple[str, Any]] = []
-    array_table_items: list[tuple[str, list[dict[str, Any]]]] = []
-    table_items: list[tuple[str, dict[str, Any]]] = []
-
-    for key, value in table.items():
-        if _is_array_of_tables(value):
-            array_table_items.append((key, value))
-        elif isinstance(value, dict):
-            table_items.append((key, value))
-        else:
-            scalar_items.append((key, value))
-
-    for key, value in scalar_items:
-        lines.append(f"{_fmt_key(key)} = {_fmt_value(value)}")
-
-    for key, value in array_table_items:
-        if lines:
-            lines.append("")
-        child_path = path_parts + [key]
-        for idx, item in enumerate(value):
-            if idx > 0:
-                lines.append("")
-            lines.append(f"[[{_fmt_path(child_path)}]]")
-            lines.extend(_emit_table_body(item, child_path))
-
-    for key, value in table_items:
-        if lines:
-            lines.append("")
-        child_path = path_parts + [key]
-        lines.append(f"[{_fmt_path(child_path)}]")
-        lines.extend(_emit_table_body(value, child_path))
-
-    return lines
-
-
-def _write_toml(path: Path, data: dict[str, Any]) -> None:
-    lines = _emit_table_body(data, [])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as tmp:
-        tmp.write("\n".join(lines).rstrip() + "\n")
-        tmp_path = Path(tmp.name)
-    tmp_path.replace(path)
-
-
-def _load_config(path: str) -> tuple[Path, dict[str, Any]]:
-    config_path = Path(path)
-    return config_path, _load_toml(config_path)
 
 
 def _write_stdout(text: str) -> None:
@@ -545,13 +350,6 @@ def _slot_prog_name(pin_path: Path) -> str:
         return "custom"
     match = re.search(r"\bname\s+(\S+)", result.stdout)
     return match.group(1) if match else "custom"
-
-
-def _ensure_config_exists(path: Path) -> None:
-    if path.exists():
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_default_config_template())
 
 
 def _resolve_target_arch() -> tuple[str, str]:
@@ -871,18 +669,18 @@ def _cleanup_existing_port_handler(bpf_pin_dir: Path, proto: str, port: int) -> 
 
 
 def _port_handler_config_update(config_path: Path, proto: str, port: int, path: str | None) -> None:
-    cfg_path, data = _load_config(str(config_path))
+    cfg_path, data = config_file.load_config(str(config_path))
     port_handlers = data.setdefault("port_handlers", {})
     table = port_handlers.setdefault(proto, {})
     if path is None:
         table.pop(str(port), None)
     else:
         table[str(port)] = path
-    _write_toml(cfg_path, data)
+    config_file.write_toml(cfg_path, data)
 
 
 def _iter_configured_port_handlers(config_path: Path) -> list[tuple[str, int, str]]:
-    _, data = _load_config(str(config_path))
+    _, data = config_file.load_config(str(config_path))
     port_handlers = data.get("port_handlers", {})
     results: list[tuple[str, int, str]] = []
     for proto in ("tcp", "udp"):
@@ -912,13 +710,16 @@ def _cmd_config_init(args: argparse.Namespace) -> int:
         print(f"Config already exists: {path}  (use 'axdp config show' to view)")
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_default_config_template())
+    path.write_text(config_file.default_config_template())
+    path.chmod(0o600)
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        os.chown(path, 0, 0)
     print(f"Created: {path}")
     return 0
 
 
 def _cmd_log_level(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     if not args.level:
         print(str(data.get("daemon", {}).get("log_level", "warning")).lower())
         return 0
@@ -931,13 +732,13 @@ def _cmd_log_level(args: argparse.Namespace) -> int:
 
     daemon = data.setdefault("daemon", {})
     daemon["log_level"] = level
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     print(f"daemon.log_level={level}")
     return 0
 
 
 def _cmd_under_attack(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     under_attack = data.setdefault("under_attack", {})
 
     if not args.mode:
@@ -953,13 +754,13 @@ def _cmd_under_attack(args: argparse.Namespace) -> int:
 
     enabled = mode == "on"
     under_attack["enabled"] = enabled
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     print(f"under_attack.enabled={'true' if enabled else 'false'}")
     return 0
 
 
 def _cmd_trust_list(args: argparse.Namespace) -> int:
-    _, data = _load_config(args.config)
+    _, data = config_file.load_config(args.config)
     trusted = data.get("trusted_ips", {})
     if not trusted:
         print("  (none)")
@@ -971,25 +772,25 @@ def _cmd_trust_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_trust_add(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     cidr = _normalize_cidr(args.cidr)
     data.setdefault("trusted_ips", {})[cidr] = args.label
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     print(f"Added trusted: {cidr} ({args.label})")
     return 0
 
 
 def _cmd_trust_del(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     cidr = _normalize_cidr(args.cidr)
     data.setdefault("trusted_ips", {}).pop(cidr, None)
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     print(f"Removed trusted: {cidr}")
     return 0
 
 
 def _cmd_acl_list(args: argparse.Namespace) -> int:
-    _, data = _load_config(args.config)
+    _, data = config_file.load_config(args.config)
     rules = data.get("acl", [])
     if not rules:
         print("  (none)")
@@ -1007,7 +808,7 @@ def _cmd_acl_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_acl_add(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     cidr = _normalize_cidr(args.cidr)
     ports = _normalize_ports(args.ports)
     rules = data.setdefault("acl", [])
@@ -1021,13 +822,13 @@ def _cmd_acl_add(args: argparse.Namespace) -> int:
     ]
     rules.append({"proto": args.proto, "cidr": cidr, "ports": ports})
     data["acl"] = rules
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     print(f"Added ACL: {args.proto} {cidr} ports {' '.join(str(port) for port in ports)}")
     return 0
 
 
 def _cmd_acl_del(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     cidr = _normalize_cidr(args.cidr)
     data["acl"] = [
         rule
@@ -1037,34 +838,34 @@ def _cmd_acl_del(args: argparse.Namespace) -> int:
             and _normalize_cidr(str(rule.get("cidr"))) == cidr
         )
     ]
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     print(f"Removed ACL: {args.proto} {cidr}")
     return 0
 
 
 def _cmd_slot_enable_builtin(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     slots = data.setdefault("slots", {})
     enabled = slots.setdefault("enabled", [])
     if args.name not in enabled:
         enabled.append(args.name)
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     return 0
 
 
 def _cmd_slot_enable_custom(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     slots = data.setdefault("slots", {})
     enabled = slots.setdefault("enabled", [])
     enabled = [entry for entry in enabled if not (isinstance(entry, dict) and entry.get("proto") == args.proto)]
     enabled.append({"proto": args.proto, "path": args.path})
     slots["enabled"] = enabled
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     return 0
 
 
 def _cmd_slot_disable(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     builtin_name = _BUILTIN_SLOT_PROTO.get(args.proto)
     slots = data.setdefault("slots", {})
     enabled = slots.get("enabled", [])
@@ -1074,7 +875,7 @@ def _cmd_slot_disable(args: argparse.Namespace) -> int:
         if not (isinstance(entry, str) and entry == builtin_name)
         and not (isinstance(entry, dict) and int(entry.get("proto", -1)) == args.proto)
     ]
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     return 0
 
 
@@ -1249,7 +1050,7 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
         return 1
 
     print(f"Loaded handler for proto {proto} from {obj_path}")
-    _ensure_config_exists(path)
+    config_file.ensure_config_exists(path)
     if builtin_name:
         _cmd_slot_enable_builtin(argparse.Namespace(config=str(path), name=builtin_name))
     else:
@@ -1422,7 +1223,7 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
         _flush_udp_validated_for_port(bpf_pin_dir, port)
 
     if not args.no_config_update:
-        _ensure_config_exists(path)
+        config_file.ensure_config_exists(path)
         _port_handler_config_update(path, proto, port, str(obj_path))
     print(f"Loaded {proto.upper()} handler for port {port} from {obj_path}")
     if not args.no_config_update:
@@ -1902,7 +1703,7 @@ def _cmd_ports(args: argparse.Namespace) -> int:
 
 
 def _policy_snapshot(args: argparse.Namespace):
-    cfg.apply_toml_config(_load_toml(Path(args.config)))
+    cfg.apply_toml_config(config_file.load_toml(Path(args.config)))
     observed = discovery.get_listening_ports()
     return observed, policy.resolve_desired_state(observed)
 
@@ -2047,7 +1848,7 @@ def _cmd_explain(args: argparse.Namespace) -> int:
 
 
 def _cmd_exclude_list(args: argparse.Namespace) -> int:
-    _, data = _load_config(args.config)
+    _, data = config_file.load_config(args.config)
     discovery = data.get("discovery", {})
     ports = sorted({int(p) for p in discovery.get("exclude_ports", [])})
     cidrs = sorted(_normalize_cidr(c) for c in discovery.get("exclude_bind_cidrs", []))
@@ -2062,45 +1863,45 @@ def _cmd_exclude_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_exclude_port_add(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     new_ports = _normalize_ports(args.ports)
     discovery = data.setdefault("discovery", {})
     existing = sorted({int(p) for p in discovery.get("exclude_ports", [])} | set(new_ports))
     discovery["exclude_ports"] = existing
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     for port in new_ports:
         print(f"Excluded port: {port}")
     return 0
 
 
 def _cmd_exclude_port_del(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     del_ports = set(_normalize_ports(args.ports))
     discovery = data.setdefault("discovery", {})
     existing = sorted({int(p) for p in discovery.get("exclude_ports", [])} - del_ports)
     discovery["exclude_ports"] = existing
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     for port in sorted(del_ports):
         print(f"Un-excluded port: {port}")
     return 0
 
 
 def _cmd_exclude_src_add(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     new_cidrs = [_normalize_cidr(c) for c in args.cidrs]
     discovery = data.setdefault("discovery", {})
     existing = sorted(
         set(_normalize_cidr(c) for c in discovery.get("exclude_bind_cidrs", [])) | set(new_cidrs)
     )
     discovery["exclude_bind_cidrs"] = existing
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     for cidr in new_cidrs:
         print(f"Excluded src: {cidr}")
     return 0
 
 
 def _cmd_exclude_src_del(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     del_cidrs = {_normalize_cidr(c) for c in args.cidrs}
     discovery = data.setdefault("discovery", {})
     existing = sorted(
@@ -2109,7 +1910,7 @@ def _cmd_exclude_src_del(args: argparse.Namespace) -> int:
         if _normalize_cidr(c) not in del_cidrs
     )
     discovery["exclude_bind_cidrs"] = existing
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     for cidr in sorted(del_cidrs):
         print(f"Un-excluded src: {cidr}")
     return 0
@@ -2218,14 +2019,14 @@ def _cmd_policy_grants(args: argparse.Namespace) -> int:
 
 
 def _cmd_policy_mode(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
+    path, data = config_file.load_config(args.config)
     policy_config = data.setdefault("policy", {})
     current = str(policy_config.get("mode", "audit")).lower()
     if args.mode is None:
         print(current)
         return 0
     policy_config["mode"] = args.mode
-    _write_toml(path, data)
+    config_file.write_toml(path, data)
     print(f"policy.mode={args.mode}")
     return 0
 
