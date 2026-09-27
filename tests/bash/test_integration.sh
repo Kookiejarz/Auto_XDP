@@ -1116,9 +1116,9 @@ test_port_sync() {
     assert_eq "$lookup_val" "1" "whitelist enabled" || return 1
     PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" "$port" <<'PYEOF' || return 1
 import sys
-from auto_xdp.admin_cli import _read_xdp_ports
+from auto_xdp.admin.ports import read_xdp_ports
 
-tcp_ports, _ = _read_xdp_ports(sys.argv[1])
+tcp_ports, _ = read_xdp_ports(sys.argv[1])
 if int(sys.argv[2]) not in tcp_ports:
     raise SystemExit("admin reader missed enabled TCP endpoint policy")
 PYEOF

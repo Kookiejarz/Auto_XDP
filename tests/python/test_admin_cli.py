@@ -1,3 +1,4 @@
+from auto_xdp.admin import ports
 from auto_xdp.admin import formatting
 import subprocess
 import tempfile
@@ -702,15 +703,15 @@ class AdminCliTests(unittest.TestCase):
             self.assertNotIn(str(handlers_dir / "gre_handler.o"), output)
 
     def test_display_proc_name_resolves_systemd_socket_unit(self):
-        with mock.patch("auto_xdp.admin_cli._build_systemd_socket_map", return_value={50168: "ssh"}):
-            name, systemd_map = admin_cli._display_proc_name("systemd", 50168, None)
+        with mock.patch("auto_xdp.admin.ports._build_systemd_socket_map", return_value={50168: "ssh"}):
+            name, systemd_map = ports._display_proc_name("systemd", 50168, None)
 
         self.assertEqual(name, "ssh")
         self.assertEqual(systemd_map, {50168: "ssh"})
 
     def test_display_proc_name_keeps_systemd_when_socket_unit_unknown(self):
-        with mock.patch("auto_xdp.admin_cli._build_systemd_socket_map", return_value={}):
-            name, systemd_map = admin_cli._display_proc_name("systemd", 50168, None)
+        with mock.patch("auto_xdp.admin.ports._build_systemd_socket_map", return_value={}):
+            name, systemd_map = ports._display_proc_name("systemd", 50168, None)
 
         self.assertEqual(name, "systemd")
         self.assertEqual(systemd_map, {})
