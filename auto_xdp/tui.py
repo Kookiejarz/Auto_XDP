@@ -17,13 +17,13 @@ from typing import Any
 
 from auto_xdp.admin.formatting import human_bytes as _human_bytes
 from auto_xdp.admin.formatting import format_rate as _format_rate
+from auto_xdp.admin.ports import read_xdp_ports as _read_xdp_ports
+from auto_xdp.admin.ports import lookup_port_procs as _lookup_port_procs
+from auto_xdp.admin.ports import collect_ports as _collect_ports
 from auto_xdp.admin_cli import (
-    _collect_ports,
     _collect_stats_rows,
     _detect_backend,
-    _lookup_port_procs,
     _read_xdp_map_id,
-    _read_xdp_ports,
     _autodetect_iface,
 )
 from auto_xdp import approvals
