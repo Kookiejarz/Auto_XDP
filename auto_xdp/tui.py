@@ -15,12 +15,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from auto_xdp.admin.formatting import human_bytes as _human_bytes
+from auto_xdp.admin.formatting import format_rate as _format_rate
 from auto_xdp.admin_cli import (
     _collect_ports,
     _collect_stats_rows,
     _detect_backend,
-    _format_rate,
-    _human_bytes,
     _lookup_port_procs,
     _read_xdp_map_id,
     _read_xdp_ports,

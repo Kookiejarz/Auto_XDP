@@ -1,3 +1,4 @@
+from auto_xdp.admin import formatting
 import subprocess
 import tempfile
 import unittest
@@ -352,13 +353,13 @@ class AdminCliTests(unittest.TestCase):
     def test_human_format_helpers_render_expected_output(self):
         # Migrated from the removed bash helpers (human_bytes / human_bps /
         # format_rate) after axdp delegated stats formatting to admin_cli.
-        self.assertEqual(admin_cli._human_bytes(1536), "1.50 KiB")
-        self.assertEqual(admin_cli._human_bytes(-1), "-")
-        self.assertEqual(admin_cli._human_bytes(512), "512 B")
-        self.assertEqual(admin_cli._human_bps(1500), "1.50 Kbps")
-        self.assertEqual(admin_cli._human_bps(-1), "-")
-        self.assertEqual(admin_cli._format_rate(10, 125, 1), "10.00 pps / 1.00 Kbps")
-        self.assertEqual(admin_cli._format_rate(-1, 125, 1), "-")
+        self.assertEqual(formatting.human_bytes(1536), "1.50 KiB")
+        self.assertEqual(formatting.human_bytes(-1), "-")
+        self.assertEqual(formatting.human_bytes(512), "512 B")
+        self.assertEqual(formatting.human_bps(1500), "1.50 Kbps")
+        self.assertEqual(formatting.human_bps(-1), "-")
+        self.assertEqual(formatting.format_rate(10, 125, 1), "10.00 pps / 1.00 Kbps")
+        self.assertEqual(formatting.format_rate(-1, 125, 1), "-")
 
     def test_stats_parser_sets_expected_flags(self):
         parser = admin_cli.build_parser()
