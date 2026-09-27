@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from auto_xdp import config as cfg
+from auto_xdp.admin import formatting
 from auto_xdp.admin import config_file
 from auto_xdp import approvals
 from auto_xdp import policy
@@ -2199,44 +2200,6 @@ _XDP_DROP_INDEXES = {
 }
 
 
-def _human_bytes(value: int) -> str:
-    if value == -1:
-        return "-"
-    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
-    val = float(value)
-    idx = 0
-    while val >= 1024 and idx < len(units) - 1:
-        val /= 1024
-        idx += 1
-    if idx == 0:
-        return f"{val:.0f} {units[idx]}"
-    return f"{val:.2f} {units[idx]}"
-
-
-def _human_bps(value: int) -> str:
-    if value == -1:
-        return "-"
-    units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"]
-    val = float(value)
-    idx = 0
-    while val >= 1000 and idx < len(units) - 1:
-        val /= 1000
-        idx += 1
-    if idx == 0:
-        return f"{val:.0f} {units[idx]}"
-    return f"{val:.2f} {units[idx]}"
-
-
-def _format_rate(packet_delta: int, byte_delta: int, elapsed: float) -> str:
-    if packet_delta == -1 or elapsed == 0:
-        return "-"
-    pps = packet_delta / elapsed
-    if byte_delta == -1:
-        return f"{pps:.2f} pps / -"
-    bps = int(byte_delta * 8 / elapsed)
-    return f"{pps:.2f} pps / {_human_bps(bps)}"
-
-
 def _read_byte_counters(bpf_pin_dir: str) -> tuple[int, int, int, int]:
     """Return (total_bytes, drop_bytes, total_pkts, drop_pkts); -1 when unavailable."""
     map_path = Path(bpf_pin_dir) / "byte_counters"
@@ -2682,7 +2645,7 @@ def _render_stats(
         if prev_packets >= 0 and packets < prev_packets:
             reset_hints.append(f"{name}:{prev_packets}->{packets}")
 
-        line = f"{name:<12}  {packets:<15}  {_human_bytes(b):<12}"
+        line = f"{name:<12}  {packets:<15}  {formatting.human_bytes(b):<12}"
 
         if show_rates:
             if prev_packets >= 0:
@@ -2695,7 +2658,7 @@ def _render_stats(
                     byte_delta = b - prev_bytes
                     if byte_delta < 0:
                         byte_delta = -1
-                rate = _format_rate(packet_delta, byte_delta, elapsed)
+                rate = formatting.format_rate(packet_delta, byte_delta, elapsed)
             else:
                 rate = "-"
             line += f"  {rate:<24}"
