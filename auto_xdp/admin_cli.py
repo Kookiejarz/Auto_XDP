@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from auto_xdp import config as cfg
+from auto_xdp.admin import handlers
 from auto_xdp.admin import ports
 from auto_xdp.admin import formatting
 from auto_xdp.admin import config_file
@@ -49,47 +50,6 @@ except ImportError:
 
 
 _LOG_LEVELS = {"debug", "info", "warning", "error"}
-_IPPROTO_BY_NAME = {
-    "gre": 47,
-    "esp": 50,
-    "sctp": 132,
-}
-
-
-def _slot_handler_name(path: Path) -> str:
-    return path.name.removesuffix("_handler.c")
-
-
-def _discover_builtin_slot_info() -> dict[str, tuple[int, str]]:
-    info: dict[str, tuple[int, str]] = {}
-    handlers_dir = Path(__file__).resolve().parents[1] / "handlers"
-    if not handlers_dir.is_dir():
-        return {
-            name: (proto, f"{name}_handler.o")
-            for name, proto in _IPPROTO_BY_NAME.items()
-        }
-    for source in sorted(handlers_dir.glob("*_handler.c")):
-        text = source.read_text(encoding="utf-8", errors="ignore")
-        if "SEC(\"xdp/" not in text:
-            continue
-        name = _slot_handler_name(source)
-        proto = _IPPROTO_BY_NAME.get(name)
-        if proto is None:
-            continue
-        info[name] = (proto, f"{name}_handler.o")
-    return info
-
-
-_BUILTIN_SLOT_INFO = _discover_builtin_slot_info()
-_BUILTIN_SLOT_PROTO = {proto: name for name, (proto, _obj) in _BUILTIN_SLOT_INFO.items()}
-_BUILTIN_SLOT_ARTIFACTS = {
-    artifact
-    for name, (_proto, obj_name) in _BUILTIN_SLOT_INFO.items()
-    for artifact in (f"{name}_handler.c", obj_name)
-}
-_CUSTOM_SLOT_ARTIFACT_RE = re.compile(r"^custom_\d+_.+\.(?:c|o)$")
-_CUSTOM_PORT_ARTIFACT_RE = re.compile(r"^custom_(?:tcp|udp)_\d+_.+\.(?:c|o)$")
-_PORT_HANDLER_MARKERS = ("udp_hv4", "udp_hv6", "hblk4", "hblk6")
 
 
 def _write_stdout(text: str) -> None:
@@ -125,576 +85,6 @@ def _slot_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
 
 def _builtin_handlers_dir(args: argparse.Namespace) -> Path:
     return Path(args.install_dir) / "handlers"
-
-
-def _run_checked(cmd: list[str], fail_msg: str) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        if detail:
-            print(detail, file=sys.stderr)
-        raise RuntimeError(fail_msg)
-    return result
-
-
-def _bpf_key_u32(value: int) -> list[str]:
-    return [str((value >> shift) & 0xFF) for shift in (0, 8, 16, 24)]
-
-
-def _json_u32(value: object) -> int:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, list) and len(value) >= 4:
-        raw = bytes(int(item, 0) if isinstance(item, str) else int(item) for item in value[:4])
-        return int.from_bytes(raw, byteorder="little")
-    if isinstance(value, dict):
-        for key in ("id", "value"):
-            if key in value:
-                return _json_u32(value[key])
-    if isinstance(value, str):
-        return int(value, 0)
-    raise ValueError(f"cannot decode BPF u32 value: {value!r}")
-
-
-def _pinned_program_id(pin_path: Path) -> int:
-    result = _run_checked(
-        ["bpftool", "-j", "prog", "show", "pinned", str(pin_path)],
-        f"Failed to inspect candidate program pin {pin_path}",
-    )
-    try:
-        payload = json.loads(result.stdout)
-        if isinstance(payload, list):
-            payload = payload[0]
-        if not isinstance(payload, dict):
-            raise ValueError("program JSON is not an object")
-        return int(payload["id"])
-    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Could not read program ID from {pin_path}") from exc
-
-
-def _prog_array_entry_id(map_path: Path, key: int) -> int | None:
-    result = subprocess.run(
-        [
-            "bpftool",
-            "-j",
-            "map",
-            "lookup",
-            "pinned",
-            str(map_path),
-            "key",
-            *_bpf_key_u32(key),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return None
-    try:
-        payload = json.loads(result.stdout)
-        if not isinstance(payload, dict):
-            return None
-        return _json_u32(payload["value"])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def _prog_array_update(map_path: Path, key: int, prog_pin: Path) -> None:
-    _run_checked(
-        [
-            "bpftool",
-            "map",
-            "update",
-            "pinned",
-            str(map_path),
-            "key",
-            *_bpf_key_u32(key),
-            "value",
-            "pinned",
-            str(prog_pin),
-        ],
-        f"Failed to update program-array entry {key}",
-    )
-
-
-def _prog_array_delete(map_path: Path, key: int) -> bool:
-    result = subprocess.run(
-        [
-            "bpftool",
-            "map",
-            "delete",
-            "pinned",
-            str(map_path),
-            "key",
-            *_bpf_key_u32(key),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
-
-
-def _verify_prog_array_entry(map_path: Path, key: int, expected_id: int) -> None:
-    actual_id = _prog_array_entry_id(map_path, key)
-    if actual_id != expected_id:
-        raise RuntimeError(
-            f"Program-array verification failed for entry {key}: "
-            f"expected program ID {expected_id}, got {actual_id!r}"
-        )
-
-
-def _rollback_prog_array_entry(
-    map_path: Path,
-    key: int,
-    old_pin: Path | None,
-    old_id: int | None,
-) -> None:
-    if old_pin is None or old_id is None:
-        if not _prog_array_delete(map_path, key) and _prog_array_entry_id(map_path, key) is not None:
-            raise RuntimeError(f"Failed to remove candidate program-array entry {key}")
-        return
-    _prog_array_update(map_path, key, old_pin)
-    _verify_prog_array_entry(map_path, key, old_id)
-
-
-def _transactional_file_prog_swap(
-    map_path: Path,
-    key: int,
-    candidate_pin: Path,
-    live_pin: Path,
-) -> None:
-    """Atomically switch a PROG_ARRAY entry, then commit its canonical pin.
-
-    The old program remains pinned until the kernel lookup confirms the new
-    program ID.  Any failure before the final cleanup restores the old entry
-    and pin name.
-    """
-    try:
-        candidate_id = _pinned_program_id(candidate_pin)
-        old_exists = live_pin.exists()
-        old_id = _pinned_program_id(live_pin) if old_exists else None
-        active_id = _prog_array_entry_id(map_path, key)
-        if old_id is None and active_id is not None:
-            raise RuntimeError(
-                f"Program-array entry {key} is active but its rollback pin {live_pin} is missing"
-            )
-        if old_id is not None and active_id not in {None, old_id}:
-            raise RuntimeError(
-                f"Program-array entry {key} does not match its rollback pin {live_pin}"
-            )
-    except (OSError, RuntimeError):
-        if candidate_pin.exists():
-            try:
-                candidate_pin.unlink()
-            except OSError:
-                pass
-        raise
-    backup_pin = live_pin.with_name(f"{live_pin.name}_rollback_{secrets.token_hex(4)}")
-    old_pin_for_rollback: Path | None = live_pin if old_exists else None
-    switched = False
-    moved_old = False
-    moved_candidate = False
-    try:
-        _prog_array_update(map_path, key, candidate_pin)
-        switched = True
-        _verify_prog_array_entry(map_path, key, candidate_id)
-
-        if old_exists:
-            live_pin.rename(backup_pin)
-            moved_old = True
-            old_pin_for_rollback = backup_pin
-        candidate_pin.rename(live_pin)
-        moved_candidate = True
-        _verify_prog_array_entry(map_path, key, candidate_id)
-        if _pinned_program_id(live_pin) != candidate_id:
-            raise RuntimeError(f"Committed pin {live_pin} does not reference the candidate program")
-
-        if moved_old:
-            backup_pin.unlink()
-    except (OSError, RuntimeError) as exc:
-        rollback_error: Exception | None = None
-        if switched:
-            try:
-                _rollback_prog_array_entry(map_path, key, old_pin_for_rollback, old_id)
-            except (OSError, RuntimeError) as rollback_exc:
-                rollback_error = rollback_exc
-
-        if moved_candidate and live_pin.exists():
-            try:
-                live_pin.rename(candidate_pin)
-            except OSError:
-                pass
-        if moved_old and backup_pin.exists() and not live_pin.exists():
-            try:
-                backup_pin.rename(live_pin)
-            except OSError:
-                pass
-
-        if rollback_error is not None:
-            raise RuntimeError(
-                f"Handler switch failed ({exc}); rollback also failed ({rollback_error}). "
-                "Candidate and rollback pins were retained."
-            ) from exc
-        if candidate_pin.exists():
-            try:
-                candidate_pin.unlink()
-            except OSError:
-                pass
-        raise RuntimeError(f"Handler switch failed; previous program restored: {exc}") from exc
-
-
-def _slot_prog_name(pin_path: Path) -> str:
-    result = subprocess.run(
-        ["bpftool", "prog", "show", "pinned", str(pin_path)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return "custom"
-    match = re.search(r"\bname\s+(\S+)", result.stdout)
-    return match.group(1) if match else "custom"
-
-
-def _resolve_target_arch() -> tuple[str, str]:
-    machine = os.uname().machine
-    if machine == "x86_64":
-        return "x86", "-D__x86_64__"
-    if machine in {"aarch64", "arm64"}:
-        return "arm64", "-D__aarch64__"
-    if machine.startswith("armv7") or machine.startswith("armv6") or machine == "arm":
-        return "arm", "-D__arm__"
-    return machine, ""
-
-
-def _resolve_asm_include(target_arch: str) -> str | None:
-    candidates: list[str] = []
-    result = subprocess.run(["gcc", "-print-multiarch"], capture_output=True, text=True)
-    multiarch = result.stdout.strip() if result.returncode == 0 else ""
-    if multiarch:
-        candidates.append(f"/usr/include/{multiarch}")
-
-    if target_arch == "x86":
-        candidates.append("/usr/include/x86_64-linux-gnu")
-    elif target_arch == "arm64":
-        candidates.append("/usr/include/aarch64-linux-gnu")
-    elif target_arch == "arm":
-        candidates.append("/usr/include/arm-linux-gnueabihf")
-
-    candidates.extend(
-        [
-            f"/usr/src/linux-headers-{os.uname().release}/arch/{target_arch}/include/generated",
-            "/usr/include",
-        ]
-    )
-    for candidate in candidates:
-        if os.path.isdir(candidate) and (os.path.isdir(os.path.join(candidate, "asm")) or candidate == "/usr/include"):
-            return candidate
-    return "/usr/include"
-
-
-def _compile_handler_source(
-    source_path: Path,
-    proto: int | str,
-    handlers_dir: Path,
-    port: int | None = None,
-    *,
-    sdk_dir: Path | None = None,
-) -> Path:
-    if not source_path.is_file():
-        raise RuntimeError(f"Handler source not found: {source_path}")
-    if source_path.suffix != ".c":
-        raise RuntimeError(f"Unsupported handler source type: {source_path}")
-
-    handlers_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"custom_{proto}_{port}_{source_path.stem}.o" if port is not None else f"custom_{proto}_{source_path.stem}.o"
-    output_path = handlers_dir / stem
-    target_arch, host_arch_flag = _resolve_target_arch()
-    asm_inc = _resolve_asm_include(target_arch)
-    if asm_inc is None:
-        raise RuntimeError("ASM headers not found; cannot compile handler source.")
-
-    cmd = [
-        "clang",
-        "-O3",
-        "-g",
-        "-target",
-        "bpf",
-        "-mcpu=v3",
-        f"-D__TARGET_ARCH_{target_arch}",
-    ]
-    if host_arch_flag:
-        cmd.append(host_arch_flag)
-    cmd.extend(
-        [
-            "-fno-stack-protector",
-            "-Wall",
-            "-Wno-unused-value",
-            "-I/usr/include",
-            f"-I{asm_inc}",
-            "-I/usr/include/bpf",
-            f"-I{handlers_dir}",
-            *([f"-I{sdk_dir}"] if sdk_dir is not None else []),
-            f"-I{source_path.parent}",
-            "-c",
-            str(source_path),
-            "-o",
-            str(output_path),
-        ]
-    )
-    _run_checked(cmd, f"Failed to compile {source_path}")
-    return output_path
-
-
-def _normalize_handler_port(value: int) -> int:
-    if value <= 0 or value > 65535:
-        raise ValueError(f"invalid port: {value}")
-    return value
-
-
-def _normalize_profile_id(value: int) -> int:
-    if value <= 0 or value > 255:
-        raise ValueError(f"invalid profile ID: {value}")
-    return value
-
-
-def _port_handler_map_path(bpf_pin_dir: Path, proto: str) -> Path:
-    return bpf_pin_dir / ("tcp_port_handlers" if proto == "tcp" else "udp_port_handlers")
-
-
-def _port_handler_dir(bpf_pin_dir: Path, proto: str, port: int) -> Path:
-    return bpf_pin_dir / "port_handlers" / proto / str(port)
-
-
-def _transactional_dir_prog_swap(
-    map_path: Path,
-    key: int,
-    candidate_dir: Path,
-    live_dir: Path,
-) -> None:
-    candidate_pin = candidate_dir / "prog"
-    live_pin = live_dir / "prog"
-    try:
-        candidate_id = _pinned_program_id(candidate_pin)
-        old_exists = live_pin.exists()
-        old_id = _pinned_program_id(live_pin) if old_exists else None
-        active_id = _prog_array_entry_id(map_path, key)
-        if old_id is None and active_id is not None:
-            raise RuntimeError(
-                f"Program-array entry {key} is active but its rollback pin {live_pin} is missing"
-            )
-        if old_id is not None and active_id not in {None, old_id}:
-            raise RuntimeError(
-                f"Program-array entry {key} does not match its rollback pin {live_pin}"
-            )
-    except (OSError, RuntimeError):
-        shutil.rmtree(candidate_dir, ignore_errors=True)
-        raise
-
-    backup_dir = live_dir.with_name(f"{live_dir.name}_rollback_{secrets.token_hex(4)}")
-    old_pin_for_rollback: Path | None = live_pin if old_exists else None
-    switched = False
-    moved_old = False
-    moved_candidate = False
-    try:
-        _prog_array_update(map_path, key, candidate_pin)
-        switched = True
-        _verify_prog_array_entry(map_path, key, candidate_id)
-
-        if live_dir.exists():
-            live_dir.rename(backup_dir)
-            moved_old = True
-            old_pin_for_rollback = backup_dir / "prog" if old_exists else None
-        candidate_dir.rename(live_dir)
-        moved_candidate = True
-        _verify_prog_array_entry(map_path, key, candidate_id)
-        if _pinned_program_id(live_dir / "prog") != candidate_id:
-            raise RuntimeError(f"Committed pin {live_dir / 'prog'} does not reference the candidate program")
-    except (OSError, RuntimeError) as exc:
-        rollback_error: Exception | None = None
-        if switched:
-            try:
-                _rollback_prog_array_entry(map_path, key, old_pin_for_rollback, old_id)
-            except (OSError, RuntimeError) as rollback_exc:
-                rollback_error = rollback_exc
-
-        if moved_candidate and live_dir.exists():
-            try:
-                live_dir.rename(candidate_dir)
-            except OSError:
-                pass
-        if moved_old and backup_dir.exists() and not live_dir.exists():
-            try:
-                backup_dir.rename(live_dir)
-            except OSError:
-                pass
-
-        if rollback_error is not None:
-            raise RuntimeError(
-                f"Handler switch failed ({exc}); rollback also failed ({rollback_error}). "
-                "Candidate and rollback generations were retained."
-            ) from exc
-        if candidate_dir.exists():
-            shutil.rmtree(candidate_dir, ignore_errors=True)
-        raise RuntimeError(f"Handler switch failed; previous program restored: {exc}") from exc
-
-    if moved_old:
-        try:
-            shutil.rmtree(backup_dir)
-        except OSError as exc:
-            # Traffic already uses the verified candidate. Retaining the old
-            # generation is safer than treating cleanup as a failed switch.
-            print(f"Warning: old handler generation retained at {backup_dir}: {exc}", file=sys.stderr)
-
-
-def _load_handler_object(
-    handler_map: Path,
-    key: int,
-    obj_path: Path,
-    pin_dir: Path,
-    shared_maps: list[tuple[str, Path]],
-) -> None:
-    pin_dir.parent.mkdir(parents=True, exist_ok=True)
-    candidate_dir = Path(
-        tempfile.mkdtemp(prefix=f"{key}_next_", dir=str(pin_dir.parent))
-    )
-    load_cmd = [
-        "bpftool", "prog", "load", str(obj_path), str(candidate_dir / "prog"),
-        "type", "xdp", "pinmaps", str(candidate_dir),
-    ]
-    for name, map_path in shared_maps:
-        load_cmd.extend(["map", "name", name, "pinned", str(map_path)])
-    try:
-        _run_checked(load_cmd, f"Failed to load {obj_path}")
-    except RuntimeError:
-        shutil.rmtree(candidate_dir, ignore_errors=True)
-        raise
-    _transactional_dir_prog_swap(handler_map, key, candidate_dir, pin_dir)
-
-
-class _BpfUdpValidationMap:
-    """Small iterator used only to purge handler-specific UDP validation state."""
-
-    def __init__(self, path: Path, key_len: int) -> None:
-        self.path = path
-        self.fd = obj_get(str(path))
-        self._key = bytearray(key_len)
-        self._next_key = bytearray(key_len)
-        self._value = bytearray(4)
-        self._lookup_attr = bytearray(128)
-        self._delete_attr = bytearray(128)
-        self._next_attr = bytearray(128)
-        self._key_buf = memoryview(self._key)
-        self._next_key_buf = memoryview(self._next_key)
-        key_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._key))
-        next_key_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._next_key))
-        value_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._value))
-        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, key_ptr, value_ptr)
-        struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, key_ptr)
-        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_key_ptr)
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __enter__(self) -> _BpfUdpValidationMap:
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    def _iter_keys(self) -> list[bytes]:
-        result: list[bytes] = []
-        current_ptr = 0
-        while True:
-            next_key_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._next_key))
-            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr, next_key_ptr)
-            try:
-                bpf(BPF_MAP_GET_NEXT_KEY, self._next_attr)
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    break
-                raise
-            key_raw = bytes(self._next_key_buf)
-            result.append(key_raw)
-            self._key_buf[:] = key_raw
-            current_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._key))
-        return result
-
-    def delete_key_port(self, dest_port: int, dport_offset: int = 2) -> int:
-        deleted = 0
-        for key_raw in self._iter_keys():
-            if struct.unpack_from("!H", key_raw, dport_offset)[0] != dest_port:
-                continue
-            self._key_buf[:] = key_raw
-            try:
-                bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
-                deleted += 1
-            except OSError as exc:
-                if exc.errno != errno.ENOENT:
-                    raise
-        return deleted
-
-
-def _flush_udp_validated_for_port(bpf_pin_dir: Path, port: int) -> int:
-    deleted = 0
-    for name, key_len in (("udp_hv4", 12), ("udp_hv6", 36)):
-        map_path = bpf_pin_dir / name
-        if not map_path.exists():
-            continue
-        with _BpfUdpValidationMap(map_path, key_len) as validated:
-            deleted += validated.delete_key_port(port)
-    return deleted
-
-
-def _cleanup_existing_port_handler(bpf_pin_dir: Path, proto: str, port: int) -> None:
-    map_path = _port_handler_map_path(bpf_pin_dir, proto)
-    subprocess.run(
-        [
-            "bpftool",
-            "map",
-            "delete",
-            "pinned",
-            str(map_path),
-            "key",
-            str(port),
-            "0",
-            "0",
-            "0",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if proto == "udp":
-        _flush_udp_validated_for_port(bpf_pin_dir, port)
-    pin_dir = _port_handler_dir(bpf_pin_dir, proto, port)
-    shutil.rmtree(pin_dir, ignore_errors=True)
-
-
-def _port_handler_config_update(config_path: Path, proto: str, port: int, path: str | None) -> None:
-    cfg_path, data = config_file.load_config(str(config_path))
-    port_handlers = data.setdefault("port_handlers", {})
-    table = port_handlers.setdefault(proto, {})
-    if path is None:
-        table.pop(str(port), None)
-    else:
-        table[str(port)] = path
-    config_file.write_toml(cfg_path, data)
-
-
-def _iter_configured_port_handlers(config_path: Path) -> list[tuple[str, int, str]]:
-    _, data = config_file.load_config(str(config_path))
-    port_handlers = data.get("port_handlers", {})
-    results: list[tuple[str, int, str]] = []
-    for proto in ("tcp", "udp"):
-        table = port_handlers.get(proto, {})
-        if not isinstance(table, dict):
-            continue
-        for raw_port, raw_path in table.items():
-            port = _normalize_handler_port(int(raw_port))
-            path = str(raw_path)
-            if path:
-                results.append((proto, port, path))
-    return sorted(results, key=lambda item: (item[0], item[1]))
 
 
 def _cmd_config_show(args: argparse.Namespace) -> int:
@@ -868,7 +258,7 @@ def _cmd_slot_enable_custom(args: argparse.Namespace) -> int:
 
 def _cmd_slot_disable(args: argparse.Namespace) -> int:
     path, data = config_file.load_config(args.config)
-    builtin_name = _BUILTIN_SLOT_PROTO.get(args.proto)
+    builtin_name = handlers.BUILTIN_SLOT_PROTO.get(args.proto)
     slots = data.setdefault("slots", {})
     enabled = slots.get("enabled", [])
     slots["enabled"] = [
@@ -879,49 +269,6 @@ def _cmd_slot_disable(args: argparse.Namespace) -> int:
     ]
     config_file.write_toml(path, data)
     return 0
-
-
-def _looks_like_port_handler_source(path: Path) -> bool:
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return False
-    return any(marker in text for marker in _PORT_HANDLER_MARKERS)
-
-
-def _iter_available_port_handler_files(handlers_dir: Path) -> list[Path]:
-    if not handlers_dir.is_dir():
-        return []
-
-    candidates: dict[str, Path] = {}
-    for path in handlers_dir.iterdir():
-        if not path.is_file() or path.suffix not in {".c", ".o"}:
-            continue
-        if (
-            path.name in _BUILTIN_SLOT_ARTIFACTS
-            or path.stem == "minecraft_handler"
-            or _CUSTOM_SLOT_ARTIFACT_RE.match(path.name)
-        ):
-            continue
-
-        include = False
-        if _CUSTOM_PORT_ARTIFACT_RE.match(path.name):
-            include = True
-        elif path.suffix == ".c":
-            include = _looks_like_port_handler_source(path)
-        else:
-            source_peer = path.with_suffix(".c")
-            include = source_peer.is_file() and _looks_like_port_handler_source(source_peer)
-
-        if not include:
-            continue
-
-        key = path.stem
-        current = candidates.get(key)
-        if current is None or (current.suffix != ".o" and path.suffix == ".o"):
-            candidates[key] = path
-
-    return [candidates[key] for key in sorted(candidates)]
 
 
 def _cmd_slot_list(args: argparse.Namespace) -> int:
@@ -939,15 +286,15 @@ def _cmd_slot_list(args: argparse.Namespace) -> int:
             if not pin.is_file():
                 continue
             proto = pin.name.removeprefix("proto_")
-            name = _slot_prog_name(pin)
+            name = handlers.slot_prog_name(pin)
             print(f"  proto {proto:<5} {name}")
             found = True
         if not found:
             print("  (none)")
         print("")
     print("Available handlers:")
-    for name in _BUILTIN_SLOT_INFO:
-        proto_num, obj_name = _BUILTIN_SLOT_INFO[name]
+    for name in handlers.BUILTIN_SLOT_INFO:
+        proto_num, obj_name = handlers.BUILTIN_SLOT_INFO[name]
         obj_path = handlers_dir / obj_name
         pin_path = slot_pin_dir / f"proto_{proto_num}"
         if obj_path.exists():
@@ -969,9 +316,9 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
     slot_pin_dir = bpf_pin_dir / "handlers"
 
     builtin_name = ""
-    if args.name_or_proto in _BUILTIN_SLOT_INFO:
+    if args.name_or_proto in handlers.BUILTIN_SLOT_INFO:
         builtin_name = args.name_or_proto
-        proto, obj_name = _BUILTIN_SLOT_INFO[builtin_name]
+        proto, obj_name = handlers.BUILTIN_SLOT_INFO[builtin_name]
         obj_path = builtin_handlers_dir / obj_name
     elif args.name_or_proto.isdigit():
         proto = int(args.name_or_proto)
@@ -981,7 +328,7 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
         custom_path = Path(args.path)
         if custom_path.suffix == ".c":
             try:
-                obj_path = _compile_handler_source(
+                obj_path = handlers.compile_handler_source(
                     custom_path, proto, handlers_dir, sdk_dir=builtin_handlers_dir
                 )
             except RuntimeError as exc:
@@ -1038,7 +385,7 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
         )
 
     try:
-        _run_checked(load_cmd, f"Failed to load {obj_path}")
+        handlers.run_checked(load_cmd, f"Failed to load {obj_path}")
     except RuntimeError as exc:
         if candidate_pin.exists():
             candidate_pin.unlink()
@@ -1046,7 +393,7 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        _transactional_file_prog_swap(proto_handlers, proto, candidate_pin, pin_path)
+        handlers.transactional_file_prog_swap(proto_handlers, proto, candidate_pin, pin_path)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1075,7 +422,7 @@ def _cmd_slot_unload(args: argparse.Namespace) -> int:
         for pin in sorted(slot_pin_dir.glob("proto_*")):
             if not pin.is_file():
                 continue
-            name = _slot_prog_name(pin)
+            name = handlers.slot_prog_name(pin)
             if name == target or f"_{target}_" in name or name.endswith(f"_{target}"):
                 proto = int(pin.name.removeprefix("proto_"))
                 break
@@ -1113,11 +460,11 @@ def _cmd_slot_unload(args: argparse.Namespace) -> int:
 def _cmd_port_handler_list(args: argparse.Namespace) -> int:
     bpf_pin_dir, _, handlers_dir = _slot_paths(args)
     base_dir = bpf_pin_dir / "port_handlers"
-    configured = _iter_configured_port_handlers(Path(args.config))
+    configured = handlers.iter_configured_port_handlers(Path(args.config))
     available_by_path = {
         str(path): path
         for directory in (_builtin_handlers_dir(args), handlers_dir)
-        for path in _iter_available_port_handler_files(directory)
+        for path in handlers.iter_available_port_handler_files(directory)
     }
     available = [available_by_path[key] for key in sorted(available_by_path)]
 
@@ -1134,7 +481,7 @@ def _cmd_port_handler_list(args: argparse.Namespace) -> int:
             prog_pin = port_dir / "prog"
             if not prog_pin.exists():
                 continue
-            name = _slot_prog_name(prog_pin)
+            name = handlers.slot_prog_name(prog_pin)
             print(f"  {proto.upper():<3}  {port_dir.name:<5}  {name}")
             found = True
     if not found:
@@ -1162,14 +509,14 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
     path = Path(args.config)
     bpf_pin_dir, _, handlers_dir = _slot_paths(args)
     proto = str(args.proto).lower()
-    port = _normalize_handler_port(int(args.port))
+    port = handlers.normalize_handler_port(int(args.port))
     slot_ctx_map = bpf_pin_dir / "slot_ctx_map"
-    handler_map = _port_handler_map_path(bpf_pin_dir, proto)
+    handler_map = handlers.port_handler_map_path(bpf_pin_dir, proto)
 
     source_path = Path(args.path)
     if source_path.suffix == ".c":
         try:
-            obj_path = _compile_handler_source(
+            obj_path = handlers.compile_handler_source(
                 source_path,
                 proto,
                 handlers_dir,
@@ -1211,9 +558,9 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
         print(f"XDP not loaded completely (missing pinned maps: {', '.join(missing)}).", file=sys.stderr)
         return 1
 
-    pin_dir = _port_handler_dir(bpf_pin_dir, proto, port)
+    pin_dir = handlers.port_handler_dir(bpf_pin_dir, proto, port)
     try:
-        _load_handler_object(handler_map, port, obj_path, pin_dir, shared_maps)
+        handlers.load_handler_object(handler_map, port, obj_path, pin_dir, shared_maps)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1222,11 +569,11 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
     # replacement. Flush only after the new program is committed so a failed
     # candidate never mutates the active handler's state.
     if proto == "udp":
-        _flush_udp_validated_for_port(bpf_pin_dir, port)
+        handlers.flush_udp_validated_for_port(bpf_pin_dir, port)
 
     if not args.no_config_update:
         config_file.ensure_config_exists(path)
-        _port_handler_config_update(path, proto, port, str(obj_path))
+        handlers.port_handler_config_update(path, proto, port, str(obj_path))
     print(f"Loaded {proto.upper()} handler for port {port} from {obj_path}")
     if not args.no_config_update:
         print(f"  config: {path}")
@@ -1235,7 +582,7 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
 
 def _cmd_profile_handler_load(args: argparse.Namespace) -> int:
     bpf_pin_dir, _, _ = _slot_paths(args)
-    profile_id = _normalize_profile_id(int(args.profile_id))
+    profile_id = handlers.normalize_profile_id(int(args.profile_id))
     handler_map = bpf_pin_dir / "tcp_profile_handlers"
     shared_maps = [
         (name, bpf_pin_dir / name)
@@ -1262,7 +609,7 @@ def _cmd_profile_handler_load(args: argparse.Namespace) -> int:
 
     pin_dir = bpf_pin_dir / "profile_handlers" / "tcp" / str(profile_id)
     try:
-        _load_handler_object(handler_map, profile_id, obj_path, pin_dir, shared_maps)
+        handlers.load_handler_object(handler_map, profile_id, obj_path, pin_dir, shared_maps)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1273,7 +620,7 @@ def _cmd_profile_handler_load(args: argparse.Namespace) -> int:
 
 def _cmd_profile_handler_unload(args: argparse.Namespace) -> int:
     bpf_pin_dir, _, _ = _slot_paths(args)
-    profile_id = _normalize_profile_id(int(args.profile_id))
+    profile_id = handlers.normalize_profile_id(int(args.profile_id))
     handler_map = bpf_pin_dir / "tcp_profile_handlers"
     pin_dir = bpf_pin_dir / "profile_handlers" / "tcp" / str(profile_id)
     live_pin = pin_dir / "prog"
@@ -1282,7 +629,7 @@ def _cmd_profile_handler_unload(args: argparse.Namespace) -> int:
         print(f"XDP not loaded ({handler_map.name} map not found).", file=sys.stderr)
         return 1
 
-    active_id = _prog_array_entry_id(handler_map, profile_id)
+    active_id = handlers.prog_array_entry_id(handler_map, profile_id)
     if not live_pin.exists():
         if active_id is not None:
             print(
@@ -1294,7 +641,7 @@ def _cmd_profile_handler_unload(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        pinned_id = _pinned_program_id(live_pin)
+        pinned_id = handlers.pinned_program_id(live_pin)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1305,13 +652,13 @@ def _cmd_profile_handler_unload(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    if not _prog_array_delete(handler_map, profile_id):
+    if not handlers.prog_array_delete(handler_map, profile_id):
         print(
             f"Failed to remove profile handler {profile_id}; retaining its pins.",
             file=sys.stderr,
         )
         return 1
-    if _prog_array_entry_id(handler_map, profile_id) is not None:
+    if handlers.prog_array_entry_id(handler_map, profile_id) is not None:
         print(
             f"Profile handler {profile_id} deletion could not be verified; retaining its pins.",
             file=sys.stderr,
@@ -1904,12 +1251,12 @@ def _cmd_port_handler_unload(args: argparse.Namespace) -> int:
     path = Path(args.config)
     bpf_pin_dir, _, _ = _slot_paths(args)
     proto = str(args.proto).lower()
-    port = _normalize_handler_port(int(args.port))
+    port = handlers.normalize_handler_port(int(args.port))
 
-    _cleanup_existing_port_handler(bpf_pin_dir, proto, port)
+    handlers.cleanup_existing_port_handler(bpf_pin_dir, proto, port)
     print(f"Unloaded {proto.upper()} handler for port {port}")
     if not args.no_config_update and path.exists():
-        _port_handler_config_update(path, proto, port, None)
+        handlers.port_handler_config_update(path, proto, port, None)
         print(f"  config: {path}")
     return 0
 
