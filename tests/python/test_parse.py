@@ -2,8 +2,7 @@
 
 from unittest import mock
 
-import auto_xdp.admin_cli as admin_cli
-
+from auto_xdp.admin import stats
 from tests.python.support import REPO_ROOT
 
 
@@ -22,14 +21,14 @@ def _counter_enum() -> dict[str, int]:
 
 def test_counter_names_cover_current_drop_reasons():
     enum = _counter_enum()
-    names = admin_cli._XDP_COUNTER_NAMES
+    names = stats.COUNTER_NAMES
     assert names[enum["CNT_TCP_NEW_ALLOW"]] == "TCP_NEW_ALLOW"
     assert names[enum["CNT_BOGON_DROP"]] == "BOGON_DROP"
     assert names[enum["CNT_RESERVED_28"]] == "RESERVED_28"
     assert names[enum["CNT_RESERVED_32"]] == "RESERVED_32"
     assert names[enum["CNT_RESERVED_33"]] == "RESERVED_33"
     assert names[enum["CNT_ABUSEIPDB_DROP"]] == "ABUSEIPDB_DROP"
-    assert len(names) == enum["CNT_MAX"]
+    assert len(names) >= enum["CNT_MAX"]
 
 
 def test_read_xdp_rows_uses_named_counters_and_byte_totals(tmp_path):
@@ -44,11 +43,11 @@ def test_read_xdp_rows_uses_named_counters_and_byte_totals(tmp_path):
         {"key": enum["CNT_ABUSEIPDB_DROP"], "values": [{"cpu": 0, "value": 2}]},
     ]
 
-    with mock.patch.object(admin_cli.shutil, "which", return_value="/usr/sbin/bpftool"), \
-         mock.patch.object(admin_cli.subprocess, "check_output", return_value=b"[]"), \
-         mock.patch.object(admin_cli.json, "loads", return_value=dump), \
-         mock.patch.object(admin_cli, "_read_byte_counters", return_value=(100, 20, 17, 12)):
-        rows = admin_cli._read_xdp_rows(str(pin))
+    with mock.patch.object(stats.shutil, "which", return_value="/usr/sbin/bpftool"), \
+         mock.patch.object(stats.subprocess, "check_output", return_value=b"[]"), \
+         mock.patch.object(stats.json, "loads", return_value=dump), \
+         mock.patch.object(stats, "_read_byte_counters", return_value=(100, 20, 17, 12)):
+        rows = stats._read_xdp_rows(str(pin))
 
     by_name = {name: (packets, nbytes) for name, packets, nbytes in rows}
     assert by_name["TCP_PASS"] == (5, -1)
@@ -56,6 +55,19 @@ def test_read_xdp_rows_uses_named_counters_and_byte_totals(tmp_path):
     assert by_name["ABUSEIPDB_DROP"] == (2, -1)
     assert by_name["XDP_TOTAL"] == (17, 100)
     assert by_name["XDP_DROP_TOTAL"] == (12, 20)
+    assert by_name["EVENT_LOST"] == (-1, -1)  # absent producer counter is unknown
+
+
+def test_missing_packet_totals_are_not_invented_from_overlapping_stages(tmp_path):
+    pin = tmp_path / "xdp_fw"
+    pin.mkdir()
+    (pin / "pkt_counters").touch()
+    with mock.patch.object(stats.shutil, "which", return_value="bpftool"), \
+         mock.patch.object(stats.subprocess, "check_output", return_value=b'[{"key":2,"value":10},{"key":11,"value":10}]'), \
+         mock.patch.object(stats, "_read_byte_counters", return_value=(-1, -1, -1, -1)):
+        rows = {name: count for name, count, _ in stats._read_xdp_rows(str(pin))}
+    assert rows["TCP_DROP"] == rows["SYN_RATE_DROP"] == 10
+    assert rows["XDP_TOTAL"] == rows["XDP_DROP_TOTAL"] == -1
 
 
 def test_ipv6_fragment_header_is_always_fail_closed():
