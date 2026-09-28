@@ -20,10 +20,10 @@ from auto_xdp.admin.formatting import format_rate as _format_rate
 from auto_xdp.admin.ports import read_xdp_ports as _read_xdp_ports
 from auto_xdp.admin.ports import lookup_port_procs as _lookup_port_procs
 from auto_xdp.admin.ports import collect_ports as _collect_ports
+from auto_xdp.admin.stats import read_xdp_map_id as _read_xdp_map_id
+from auto_xdp.admin.stats import collect_stats_rows as _collect_stats_rows
 from auto_xdp.admin_cli import (
-    _collect_stats_rows,
     _detect_backend,
-    _read_xdp_map_id,
     _autodetect_iface,
 )
 from auto_xdp import approvals

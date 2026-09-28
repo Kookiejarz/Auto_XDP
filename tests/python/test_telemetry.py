@@ -8,6 +8,8 @@ from unittest.mock import Mock
 import pytest
 
 import pkt_relay
+import auto_xdp.admin_cli as admin_cli
+from auto_xdp.admin import stats
 from auto_xdp.telemetry.events import decode_event, describe_reason, reason_info
 
 
@@ -116,3 +118,16 @@ def test_history_replay_has_wire_byte_limit_and_zero_means_no_history():
     assert server._history_message()["events"] == []
     with pytest.raises(ValueError):
         pkt_relay.RelayServer(Mock(), max_history_send=-1)
+
+
+def test_unknown_totals_do_not_modify_accumulator_or_report_a_reset(tmp_path, capsys):
+    state = tmp_path / "stats.json"
+    known = [("XDP_TOTAL", 100, 10000), ("XDP_DROP_TOTAL", 20, 2000)]
+    stats._apply_xdp_accumulator(known, "xdp", "eth0", "1", state)
+    baseline = state.read_bytes()
+    unknown = [("XDP_TOTAL", -1, -1), ("XDP_DROP_TOTAL", -1, -1)]
+    assert stats._apply_xdp_accumulator(unknown, "xdp", "eth0", "1", state) == unknown
+    assert state.read_bytes() == baseline
+    admin_cli._render_stats(unknown, {"XDP_TOTAL": (100, 10000)}, "xdp", "eth0", "1", True, 1)
+    rendered = capsys.readouterr().out
+    assert "unknown" in rendered and "ResetHint" not in rendered
