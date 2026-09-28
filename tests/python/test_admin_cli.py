@@ -1,3 +1,4 @@
+from auto_xdp.admin import handlers
 from auto_xdp.admin import ports
 from auto_xdp.admin import formatting
 import subprocess
@@ -438,7 +439,7 @@ class AdminCliTests(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
 
             with mock.patch("auto_xdp.admin_cli.subprocess.run", side_effect=fake_run), \
-                 mock.patch("auto_xdp.admin_cli._transactional_file_prog_swap") as swap:
+                 mock.patch("auto_xdp.admin.handlers.transactional_file_prog_swap") as swap:
                 rc = admin_cli.main(
                     [
                         "--config",
@@ -485,10 +486,10 @@ class AdminCliTests(unittest.TestCase):
                 operations.append(f"update:{pin.read_text()}")
                 active[key] = prog_id(pin)
 
-            with mock.patch.object(admin_cli, "_pinned_program_id", side_effect=prog_id), \
-                 mock.patch.object(admin_cli, "_prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
-                 mock.patch.object(admin_cli, "_prog_array_update", side_effect=update):
-                admin_cli._transactional_file_prog_swap(map_path, 47, candidate_pin, live_pin)
+            with mock.patch.object(handlers, "pinned_program_id", side_effect=prog_id), \
+                 mock.patch.object(handlers, "prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
+                 mock.patch.object(handlers, "prog_array_update", side_effect=update):
+                handlers.transactional_file_prog_swap(map_path, 47, candidate_pin, live_pin)
 
             self.assertEqual(active[47], 2)
             self.assertEqual(live_pin.read_text(), "new")
@@ -516,12 +517,12 @@ class AdminCliTests(unittest.TestCase):
                 updates.append(active[key])
 
             verifies = [RuntimeError("candidate mismatch"), None]
-            with mock.patch.object(admin_cli, "_pinned_program_id", side_effect=prog_id), \
-                 mock.patch.object(admin_cli, "_prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
-                 mock.patch.object(admin_cli, "_prog_array_update", side_effect=update), \
-                 mock.patch.object(admin_cli, "_verify_prog_array_entry", side_effect=verifies):
+            with mock.patch.object(handlers, "pinned_program_id", side_effect=prog_id), \
+                 mock.patch.object(handlers, "prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
+                 mock.patch.object(handlers, "prog_array_update", side_effect=update), \
+                 mock.patch.object(handlers, "verify_prog_array_entry", side_effect=verifies):
                 with self.assertRaisesRegex(RuntimeError, "previous program restored"):
-                    admin_cli._transactional_file_prog_swap(map_path, 50, candidate_pin, live_pin)
+                    handlers.transactional_file_prog_swap(map_path, 50, candidate_pin, live_pin)
 
             self.assertEqual(active[50], 1)
             self.assertEqual(updates, [2, 1])
@@ -549,10 +550,10 @@ class AdminCliTests(unittest.TestCase):
             def update(_map: Path, key: int, pin: Path) -> None:
                 active[key] = prog_id(pin)
 
-            with mock.patch.object(admin_cli, "_pinned_program_id", side_effect=prog_id), \
-                 mock.patch.object(admin_cli, "_prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
-                 mock.patch.object(admin_cli, "_prog_array_update", side_effect=update):
-                admin_cli._transactional_dir_prog_swap(map_path, 443, candidate_dir, live_dir)
+            with mock.patch.object(handlers, "pinned_program_id", side_effect=prog_id), \
+                 mock.patch.object(handlers, "prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
+                 mock.patch.object(handlers, "prog_array_update", side_effect=update):
+                handlers.transactional_dir_prog_swap(map_path, 443, candidate_dir, live_dir)
 
             self.assertEqual(active[443], 20)
             self.assertEqual((live_dir / "prog").read_text(), "new")
@@ -577,8 +578,8 @@ class AdminCliTests(unittest.TestCase):
             handler = root / "minecraft_handler.o"
             handler.touch()
 
-            with mock.patch.object(admin_cli, "_run_checked") as run, \
-                 mock.patch.object(admin_cli, "_transactional_dir_prog_swap") as swap:
+            with mock.patch.object(handlers, "run_checked") as run, \
+                 mock.patch.object(handlers, "transactional_dir_prog_swap") as swap:
                 rc = admin_cli.main(
                     [
                         "--config",
@@ -615,9 +616,9 @@ class AdminCliTests(unittest.TestCase):
             live_pin.touch()
             handler_map.touch()
 
-            with mock.patch.object(admin_cli, "_pinned_program_id", return_value=42), \
-                 mock.patch.object(admin_cli, "_prog_array_entry_id", return_value=42), \
-                 mock.patch.object(admin_cli, "_prog_array_delete", return_value=False):
+            with mock.patch.object(handlers, "pinned_program_id", return_value=42), \
+                 mock.patch.object(handlers, "prog_array_entry_id", return_value=42), \
+                 mock.patch.object(handlers, "prog_array_delete", return_value=False):
                 rc = admin_cli.main(
                     [
                         "--config",
