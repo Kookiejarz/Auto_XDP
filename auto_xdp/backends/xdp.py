@@ -551,7 +551,7 @@ class XdpBackend(PortBackend):
         command = [
             sys.executable,
             "-m",
-            "auto_xdp.admin_cli",
+            "auto_xdp.admin.cli",
             "--config",
             cfg.TOML_CONFIG_PATH,
             "--bpf-pin-dir",

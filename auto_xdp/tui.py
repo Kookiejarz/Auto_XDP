@@ -15,17 +15,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from auto_xdp.admin.formatting import human_bytes as _human_bytes
-from auto_xdp.admin.formatting import format_rate as _format_rate
-from auto_xdp.admin.ports import read_xdp_ports as _read_xdp_ports
-from auto_xdp.admin.ports import lookup_port_procs as _lookup_port_procs
-from auto_xdp.admin.ports import collect_ports as _collect_ports
-from auto_xdp.admin.stats import read_xdp_map_id as _read_xdp_map_id
-from auto_xdp.admin.stats import collect_stats_rows as _collect_stats_rows
-from auto_xdp.admin_cli import (
-    _detect_backend,
-    _autodetect_iface,
+from auto_xdp.admin.ports import (
+    collect_ports as _collect_ports, lookup_port_procs as _lookup_port_procs,
+    read_xdp_ports as _read_xdp_ports,
 )
+from auto_xdp.admin.stats import (
+    collect_stats_rows as _collect_stats_rows, read_xdp_map_id as _read_xdp_map_id,
+)
+from auto_xdp.admin.detect import detect_backend as _detect_backend, autodetect_iface as _autodetect_iface
+from auto_xdp.admin.formatting import format_rate as _format_rate, human_bytes as _human_bytes
 from auto_xdp.admin import approvals
 from auto_xdp.bpf.maps import BpfGlobalRlMap, BpfPortPolicyMap
 from auto_xdp.config import apply_toml_config, load_toml_config

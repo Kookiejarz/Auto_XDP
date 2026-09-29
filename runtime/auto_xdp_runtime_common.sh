@@ -1583,7 +1583,7 @@ for proto, port, path in sorted(entries):
     cmd = [
         sys.executable,
         "-m",
-        "auto_xdp.admin_cli",
+        "auto_xdp.admin.cli",
         "--config",
         config_path,
         "--bpf-pin-dir",

@@ -408,7 +408,7 @@ import sys
 sys.path[:] = [p for p in sys.path if p]
 
 try:
-    from auto_xdp import admin_cli
+    from auto_xdp.admin import cli as admin_cli
     parser = admin_cli.build_parser()
 except Exception:
     raise SystemExit(1)
@@ -435,7 +435,7 @@ if sys.argv[1] not in choices:
 }
 
 run_admin_config() {
-    run_py_module auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin.cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
@@ -496,7 +496,7 @@ run_ports() {
         [[ "$arg" == "watch" ]] && arg="--watch"
         args+=("$arg")
     done
-    run_py_module auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin.cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
@@ -618,7 +618,7 @@ run_mode() {
 run_stats() {
     require_admin_cli_runtime stats
 
-    run_py_module auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin.cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
@@ -632,7 +632,7 @@ run_stats() {
 run_tui() {
     require_admin_cli_runtime tui
 
-    run_py_module auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin.cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
