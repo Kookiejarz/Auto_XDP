@@ -26,7 +26,7 @@ from auto_xdp.admin_cli import (
     _detect_backend,
     _autodetect_iface,
 )
-from auto_xdp import approvals
+from auto_xdp.admin import approvals
 from auto_xdp.bpf.maps import BpfGlobalRlMap, BpfPortPolicyMap
 from auto_xdp.config import apply_toml_config, load_toml_config
 from auto_xdp.discovery.listeners import get_listening_ports

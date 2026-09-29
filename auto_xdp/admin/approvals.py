@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from auto_xdp.admin.config_file import load_toml, write_toml
+
 
 APPROVAL_SCHEMA = 1
 _SUBJECT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -187,9 +189,7 @@ def create_request(
 ) -> dict[str, Any]:
     if not reason.strip():
         raise ValueError("approval reason is required")
-    from auto_xdp.admin.config_file import load_toml as _load_toml
-
-    config = _load_toml(Path(config_path))
+    config = load_toml(Path(config_path))
     request: dict[str, Any] = {
         "subject": subject,
         "zone": zone,
@@ -244,9 +244,7 @@ def list_history(path: Path) -> tuple[int, list[dict[str, Any]]]:
 
 
 def list_grants(config_path: str | Path) -> list[dict[str, Any]]:
-    from auto_xdp.admin.config_file import load_toml as _load_toml
-
-    config = _load_toml(Path(config_path))
+    config = load_toml(Path(config_path))
     rows: list[dict[str, Any]] = []
     for subject, spec in sorted(config.get("subjects", {}).items()):
         if not isinstance(spec, dict):
@@ -300,17 +298,15 @@ def _apply_grant(config: dict[str, Any], request: dict[str, Any]) -> list[int]:
 
 
 def approve_request(path: Path, config_path: str | Path, request_id: int, *, actor: str | None = None) -> dict[str, Any]:
-    from auto_xdp.admin.config_file import load_toml as _load_toml, write_toml as _write_toml
-
     with _locked(path) as state:
         request = _request(state, request_id)
         if request.get("status") != "pending":
             raise ValueError(f"approval request {request_id} is {request.get('status')}")
         config_path = Path(config_path)
-        config = _load_toml(config_path)
+        config = load_toml(config_path)
         _validate_request(dict(request), config=config)
         added = _apply_grant(config, request)
-        _write_toml(config_path, config)
+        write_toml(config_path, config)
         request.update({
             "status": "approved",
             "approver": _actor(actor),
@@ -339,14 +335,12 @@ def reject_request(path: Path, request_id: int, *, reason: str, actor: str | Non
 
 
 def revoke_request(path: Path, config_path: str | Path, request_id: int, *, actor: str | None = None) -> dict[str, Any]:
-    from auto_xdp.admin.config_file import load_toml as _load_toml, write_toml as _write_toml
-
     with _locked(path) as state:
         request = _request(state, request_id)
         if request.get("status") != "approved":
             raise ValueError(f"approval request {request_id} is {request.get('status')}")
         config_path = Path(config_path)
-        config = _load_toml(config_path)
+        config = load_toml(config_path)
         protocol_spec = (
             config.get("subjects", {})
             .get(request["subject"], {})
@@ -357,7 +351,7 @@ def revoke_request(path: Path, config_path: str | Path, request_id: int, *, acto
         if isinstance(protocol_spec, dict):
             keep = set(int(port) for port in protocol_spec.get("ports", [])) - set(request.get("applied_ports", []))
             protocol_spec["ports"] = sorted(keep)
-            _write_toml(config_path, config)
+            write_toml(config_path, config)
         request.update({"status": "revoked", "revoker": _actor(actor), "revoked_at": time.time()})
         state["revision"] = int(state["revision"]) + 1
         _history(state, request, "revoke", request["revoker"])
@@ -377,8 +371,6 @@ def deny_grant(
     actor: str | None = None,
 ) -> dict[str, Any]:
     """Remove selected ports while retaining the same audit trail as approvals."""
-    from auto_xdp.admin.config_file import load_toml as _load_toml, write_toml as _write_toml
-
     requested_ports = _ports(ports)
     protocol = protocol.lower()
     if protocol not in _PROTOCOLS:
@@ -388,7 +380,7 @@ def deny_grant(
 
     with _locked(path) as state:
         config_path = Path(config_path)
-        config = _load_toml(config_path)
+        config = load_toml(config_path)
         protocol_spec = (
             config.get("subjects", {})
             .get(subject, {})
@@ -403,7 +395,7 @@ def deny_grant(
         if not removed:
             raise ValueError(f"none of the requested ports are granted to {subject}")
         protocol_spec["ports"] = sorted(current - set(removed))
-        _write_toml(config_path, config)
+        write_toml(config_path, config)
 
         who = _actor(actor)
         request_id = int(state["next_id"])
@@ -449,7 +441,7 @@ def reload_daemon() -> None:
 def run_api(config_path: str | Path, run_state_dir: str | Path, socket_path: str | Path) -> int:
     if os.geteuid() != 0:
         raise PermissionError("approval API requires root")
-    from auto_xdp.approval_api import serve
+    from auto_xdp.admin.approval_api import serve
 
     serve(Path(config_path), store_path(run_state_dir), Path(socket_path))
     return 0
