@@ -15,7 +15,7 @@ import auto_xdp.admin.main as admin_main
 import auto_xdp.admin.detect as admin_detect
 import auto_xdp.admin.runtime as admin_runtime
 import auto_xdp.admin_cli as admin_cli
-from auto_xdp import approvals
+from auto_xdp.admin import approvals
 from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
 
 

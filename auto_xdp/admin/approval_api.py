@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
-from auto_xdp import approvals
+from auto_xdp.admin import approvals
 
 
 class _UnixHTTPServer(socketserver.UnixStreamServer):

@@ -25,7 +25,7 @@ from auto_xdp.admin import handlers
 from auto_xdp.admin import ports
 from auto_xdp.admin import formatting
 from auto_xdp.admin import config_file
-from auto_xdp import approvals
+from auto_xdp.admin import approvals
 from auto_xdp import policy
 from auto_xdp.discovery import listeners as discovery
 from auto_xdp.admin.detect import detect_backend as _detect_backend
