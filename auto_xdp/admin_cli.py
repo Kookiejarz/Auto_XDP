@@ -1071,7 +1071,21 @@ def _cmd_approval_history(args: argparse.Namespace) -> int:
     else:
         for item in history:
             when = _dt.datetime.fromtimestamp(float(item["at"])).isoformat(timespec="seconds")
-            print(f"  r{item['revision']} #{item['request_id']} {item['action']:<7} {item['status']:<8} {item['actor']} {when}")
+            ports = ",".join(str(port) for port in item.get("ports", [])) or "-"
+            protocol = str(item.get("protocol", "-")).upper()
+            reason = str(item.get("reason", "")) or "-"
+            print(
+                f"  r{item['revision']} #{item['request_id']} {item['action']:<7} "
+                f"{item['status']:<8} changed_by={item.get('actor', '-')} {when}"
+            )
+            print(
+                f"      service={item.get('service') or '-'} "
+                f"subject={item.get('subject') or '-'} zone={item.get('zone') or '-'} "
+                f"endpoint={protocol}/{ports}"
+            )
+            print(f"      reason={reason}")
+            if item.get("decision_reason"):
+                print(f"      decision_reason={item['decision_reason']}")
     return 0
 
 
