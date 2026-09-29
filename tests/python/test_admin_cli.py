@@ -23,6 +23,40 @@ pytestmark = pytest.mark.component
 
 
 class AdminCliTests(unittest.TestCase):
+    def test_approval_history_renders_request_context_and_actor(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            store_path = root / "run" / "approval_requests.json"
+            config_path.write_text(
+                "[zones.public]\ninterfaces = []\n"
+                "[subjects.web.resolve]\nsystemd_unit = \"nginx.service\"\n"
+            )
+            request = approvals.create_request(
+                store_path,
+                config_path,
+                subject="web",
+                zone="public",
+                protocol="tcp",
+                ports=[443],
+                reason="publish the website",
+                actor="requester",
+            )
+            approvals.approve_request(store_path, config_path, request["id"], actor="approver")
+            args = mock.Mock(run_state_dir=str(store_path.parent), json=False)
+
+            with mock.patch("sys.stdout", new=StringIO()) as output:
+                self.assertEqual(admin_cli._cmd_approval_history(args), 0)
+
+            history = output.getvalue()
+            self.assertIn("changed_by=requester", history)
+            self.assertIn("changed_by=approver", history)
+            self.assertIn("service=nginx.service", history)
+            self.assertIn("subject=web", history)
+            self.assertIn("zone=public", history)
+            self.assertIn("endpoint=TCP/443", history)
+            self.assertIn("reason=publish the website", history)
+
     def test_approval_store_supports_persistent_axdp_path(self):
         with mock.patch.dict(
             "os.environ", {"AUTO_XDP_APPROVAL_STORE": "/etc/auto_xdp/approvals.json"}

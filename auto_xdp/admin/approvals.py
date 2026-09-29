@@ -77,6 +77,38 @@ def _actor(value: str | None) -> str:
     return value or f"uid:{os.getuid()}"
 
 
+def _request_service(request: dict[str, Any]) -> str:
+    resolve = request.get("resolve", {})
+    if not isinstance(resolve, dict):
+        return str(request.get("subject", ""))
+    systemd_unit = str(resolve.get("systemd_unit", "")).strip()
+    if systemd_unit:
+        return systemd_unit
+    process_name = str(resolve.get("process_name", "")).strip()
+    if process_name:
+        return process_name
+    runtime = str(resolve.get("container_runtime", "")).strip()
+    for key in ("container_name", "container_id", "container_label"):
+        value = resolve.get(key)
+        if value:
+            rendered = json.dumps(value, sort_keys=True) if isinstance(value, dict) else str(value)
+            return f"{runtime}:{rendered}" if runtime else rendered
+    return str(request.get("subject", ""))
+
+
+def _history_context(request: dict[str, Any]) -> dict[str, Any]:
+    raw_ports = request.get("ports", [])
+    ports = [int(port) for port in raw_ports] if isinstance(raw_ports, list) else []
+    return {
+        "subject": str(request.get("subject", "")),
+        "service": _request_service(request),
+        "zone": str(request.get("zone", "")),
+        "protocol": str(request.get("protocol", "")).lower(),
+        "ports": ports,
+        "reason": str(request.get("reason", "")),
+    }
+
+
 def _ports(values: list[int]) -> list[int]:
     result = sorted({int(value) for value in values})
     if not result or any(port < 1 or port > 65535 for port in result):
@@ -149,16 +181,18 @@ def _validate_request(data: dict[str, Any], *, config: dict[str, Any]) -> None:
 
 
 def _history(data: dict[str, Any], request: dict[str, Any], action: str, actor: str) -> None:
-    data["history"].append(
-        {
-            "revision": data["revision"],
-            "request_id": request["id"],
-            "action": action,
-            "actor": actor,
-            "at": time.time(),
-            "status": request["status"],
-        }
-    )
+    entry = {
+        "revision": data["revision"],
+        "request_id": request["id"],
+        "action": action,
+        "actor": actor,
+        "at": time.time(),
+        "status": request["status"],
+    }
+    entry.update(_history_context(request))
+    if request.get("rejection_reason"):
+        entry["decision_reason"] = str(request["rejection_reason"])
+    data["history"].append(entry)
 
 
 def _request(data: dict[str, Any], request_id: int) -> dict[str, Any]:
@@ -208,6 +242,11 @@ def create_request(
     }
     if resolve is not None:
         request["resolve"] = dict(resolve)
+    if not request["resolve"]:
+        existing = config.get("subjects", {}).get(subject, {})
+        existing_resolve = existing.get("resolve", {}) if isinstance(existing, dict) else {}
+        if isinstance(existing_resolve, dict):
+            request["resolve"] = dict(existing_resolve)
     _validate_request(request, config=config)
     request["requester"] = _actor(actor)
     request["requested_at"] = time.time()
@@ -240,7 +279,25 @@ def list_requests(path: Path, status: str = "all") -> list[dict[str, Any]]:
 
 def list_history(path: Path) -> tuple[int, list[dict[str, Any]]]:
     with _locked(path) as state:
-        return int(state["revision"]), [dict(item) for item in state["history"]]
+        requests = {
+            int(item["id"]): item
+            for item in state["requests"]
+            if isinstance(item, dict) and "id" in item
+        }
+        history = []
+        for item in state["history"]:
+            entry = dict(item)
+            try:
+                request = requests.get(int(item["request_id"]))
+            except (KeyError, TypeError, ValueError):
+                request = None
+            if request is not None:
+                for key, value in _history_context(request).items():
+                    entry.setdefault(key, value)
+                if request.get("rejection_reason"):
+                    entry.setdefault("decision_reason", str(request["rejection_reason"]))
+            history.append(entry)
+        return int(state["revision"]), history
 
 
 def list_grants(config_path: str | Path) -> list[dict[str, Any]]:
@@ -381,9 +438,9 @@ def deny_grant(
     with _locked(path) as state:
         config_path = Path(config_path)
         config = load_toml(config_path)
+        subject_spec = config.get("subjects", {}).get(subject, {})
         protocol_spec = (
-            config.get("subjects", {})
-            .get(subject, {})
+            subject_spec
             .get("exposure", {})
             .get(zone, {})
             .get(protocol, {})
@@ -407,6 +464,9 @@ def deny_grant(
             "ports": requested_ports,
             "applied_ports": removed,
             "reason": reason.strip(),
+            "resolve": dict(subject_spec.get("resolve", {}))
+            if isinstance(subject_spec, dict) and isinstance(subject_spec.get("resolve", {}), dict)
+            else {},
             "requester": who,
             "revoker": who,
             "requested_at": time.time(),
