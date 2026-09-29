@@ -503,14 +503,14 @@ test_handler_transactional_hot_swap() {
         -c "$REPO_ROOT/handlers/gre_handler.c" -o "$handler_obj" || return 1
     printf '[slots]\nenabled = []\n' > "$config_path"
 
-    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin_cli \
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin.cli \
         --config "$config_path" \
         --bpf-pin-dir "$_PIN_DIR" \
         --handlers-dir /tmp \
         slot load 47 "$handler_obj" >/dev/null || return 1
     old_id=$(_pinned_prog_id "$_PIN_DIR/handlers/proto_47") || return 1
 
-    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin_cli \
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin.cli \
         --config "$config_path" \
         --bpf-pin-dir "$_PIN_DIR" \
         --handlers-dir /tmp \
@@ -563,7 +563,7 @@ test_minecraft_profile_dataplane() {
     clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
         "${include_args[@]}" -I "$REPO_ROOT" \
         -c "$REPO_ROOT/bpf/minecraft_egress.c" -o "$egress_obj" || return 1
-    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin_cli \
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin.cli \
         --config /tmp/axdp_integ_missing.toml \
         --bpf-pin-dir "$_PIN_DIR" \
         --install-dir "$REPO_ROOT" \

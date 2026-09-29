@@ -147,7 +147,7 @@ if { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; } \
     "$AXDP_CMD" enable --force >"$WORK_DIR/enable.log" 2>&1 \
         || { cat "$WORK_DIR/enable.log" >&2; fail "axdp enable failed"; }
 else
-    PYTHONPATH="$PYTHON_LIB_DIR" "$PYTHON3_BIN" -m auto_xdp.admin_cli \
+    PYTHONPATH="$PYTHON_LIB_DIR" "$PYTHON3_BIN" -m auto_xdp.admin.cli \
         --config "$TOML_CONFIG" policy mode enforce >"$WORK_DIR/enable.log" 2>&1 \
         || { cat "$WORK_DIR/enable.log" >&2; fail "policy activation failed"; }
 fi

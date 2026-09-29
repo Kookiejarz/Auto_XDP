@@ -14,7 +14,7 @@ import pytest
 import auto_xdp.admin.main as admin_main
 import auto_xdp.admin.detect as admin_detect
 import auto_xdp.admin.runtime as admin_runtime
-import auto_xdp.admin_cli as admin_cli
+import auto_xdp.admin.cli as admin_cli
 from auto_xdp.admin import approvals
 from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
 
@@ -423,7 +423,7 @@ class AdminCliTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue(config_path.exists())
             text = config_path.read_text()
-            expected = (Path(admin_cli.__file__).with_name("default_config.toml")).read_text()
+            expected = (Path(admin_cli.__file__).parents[1] / "default_config.toml").read_text()
             self.assertEqual(text, expected)
             self.assertIn("[daemon]", text)
             self.assertIn("[slots]", text)
@@ -472,7 +472,7 @@ class AdminCliTests(unittest.TestCase):
                 calls.append(list(cmd))
                 return subprocess.CompletedProcess(cmd, 0, "", "")
 
-            with mock.patch("auto_xdp.admin_cli.subprocess.run", side_effect=fake_run), \
+            with mock.patch("auto_xdp.admin.cli.subprocess.run", side_effect=fake_run), \
                  mock.patch("auto_xdp.admin.handlers.transactional_file_prog_swap") as swap:
                 rc = admin_cli.main(
                     [

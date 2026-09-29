@@ -75,3 +75,21 @@ def detect_backend(
     if pkt_counters.exists():
         return "xdp"
     raise RuntimeError("No active Auto XDP backend detected.")
+
+
+def autodetect_iface() -> str:
+    """Return the default-route interface name, or raise RuntimeError."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "show", "default"], stderr=subprocess.DEVNULL, text=True
+        )
+    except (subprocess.CalledProcessError, OSError):
+        out = ""
+    for line in out.splitlines():
+        parts = line.split()
+        # format: default via ... dev IFACE ...
+        if "dev" in parts:
+            idx = parts.index("dev")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    raise RuntimeError("Could not detect interface. Use --iface IFACE.")

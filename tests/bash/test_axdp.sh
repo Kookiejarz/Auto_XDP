@@ -295,14 +295,14 @@ test_main_reports_stale_admin_cli_for_tui() (
     # Keep a real installed /etc/auto_xdp/auto_xdp.env from overriding the fake
     # PYTHON_LIB_DIR when this suite runs on a host with Auto XDP installed.
     CONFIG_FILE="$tmpdir/absent.env"
-    mkdir -p "$PYTHON_LIB_DIR/auto_xdp"
+    mkdir -p "$PYTHON_LIB_DIR/auto_xdp/admin"
     touch "$PYTHON_LIB_DIR/auto_xdp/__init__.py"
-    cat >"$PYTHON_LIB_DIR/auto_xdp/admin_cli.py" <<'EOF_PY'
+    cat >"$PYTHON_LIB_DIR/auto_xdp/admin/cli.py" <<'EOF_PY'
 import argparse
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin_cli")
+    parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin.cli")
     parser.add_argument("--config", required=True)
     parser.add_argument("--bpf-pin-dir", default="/sys/fs/bpf/xdp_fw")
     parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp/current")

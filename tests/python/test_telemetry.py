@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 import pkt_relay
-import auto_xdp.admin_cli as admin_cli
+from auto_xdp.admin import cli as admin_cli
 from auto_xdp.admin import stats
 from auto_xdp.telemetry.events import decode_event, describe_reason, reason_info
 
