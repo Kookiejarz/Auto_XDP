@@ -250,7 +250,7 @@ int tc_minecraft_egress(struct __sk_buff *skb)
     __builtin_memcpy(wire_key.saddr, key.daddr, sizeof(wire_key.saddr));
     __builtin_memcpy(wire_key.daddr, key.saddr, sizeof(wire_key.daddr));
     linux_ct_fill_tuple(&tuple, &wire_key);
-    opts = linux_ct_opts();
+    opts = linux_ct_opts(IPPROTO_TCP);
     ct = bpf_skb_ct_lookup(skb, &tuple, linux_ct_tuple_size(&wire_key), &opts, sizeof(opts));
     if (!ct)
         return TC_ACT_OK;

@@ -13,7 +13,12 @@ struct bpf_ct_opts___local {
     __s32 error;
     __u8 l4proto;
     __u8 dir;
-} __attribute__((preserve_access_index));
+    __u8 reserved[2]; /* Kernel validates these bytes; padding is not zeroed. */
+};
+
+/* This is the fixed 12-byte options ABI, not a relocatable kernel snapshot.
+ * New kernels place their extended reserved field at a different offset. */
+_Static_assert(sizeof(struct bpf_ct_opts___local) == 12, "conntrack options ABI");
 
 struct ip_ct_tcp___local {
     __u8 state;
@@ -76,11 +81,11 @@ static __always_inline __u32 linux_ct_tuple_size(const struct flow_key *key)
         : sizeof(((struct bpf_sock_tuple *)0)->ipv6);
 }
 
-static __always_inline struct bpf_ct_opts___local linux_ct_opts(void)
+static __always_inline struct bpf_ct_opts___local linux_ct_opts(__u8 l4proto)
 {
     return (struct bpf_ct_opts___local) {
         .netns_id = BPF_F_CURRENT_NETNS_LOCAL,
-        .l4proto = IPPROTO_TCP,
+        .l4proto = l4proto,
     };
 }
 

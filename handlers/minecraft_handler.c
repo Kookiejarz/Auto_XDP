@@ -412,7 +412,7 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
         return profile_result(ctx, inner_off, XDP_PASS);
     }
     linux_ct_fill_tuple(&tuple, &key);
-    opts = linux_ct_opts();
+    opts = linux_ct_opts(IPPROTO_TCP);
     ct = bpf_xdp_ct_lookup(ctx, &tuple, linux_ct_tuple_size(&key), &opts, sizeof(opts));
     if (!ct) return profile_result(ctx, inner_off, XDP_DROP);
     linux_ct_snapshot(ct, opts.dir, &snapshot);
@@ -565,7 +565,7 @@ parse_login_start: ;
     if (pending->state == MC_L7_ENCRYPTED_PROBATION &&
         (pending->flags & MC_F_SERVER_AFTER_CHALLENGE) &&
         now - pending->challenge_at_ns >= MC_POST_CHALLENGE_MIN_NS) {
-        opts = linux_ct_opts();
+        opts = linux_ct_opts(IPPROTO_TCP);
         ct = bpf_xdp_ct_lookup(ctx, &tuple, linux_ct_tuple_size(&key), &opts, sizeof(opts));
         if (!ct) return profile_result(ctx, inner_off, XDP_DROP);
         linux_ct_snapshot(ct, opts.dir, &snapshot);
