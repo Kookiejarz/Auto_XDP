@@ -18,7 +18,7 @@ static __always_inline bool syncookie_linux_established(
     __builtin_memcpy(key.daddr, sc->daddr, sizeof(key.daddr));
     struct bpf_sock_tuple tuple;
     linux_ct_fill_tuple(&tuple, &key);
-    struct bpf_ct_opts___local opts = linux_ct_opts();
+    struct bpf_ct_opts___local opts = linux_ct_opts(IPPROTO_TCP);
     struct nf_conn *ct = bpf_xdp_ct_lookup(
         ctx, &tuple, linux_ct_tuple_size(&key), &opts, sizeof(opts));
     if (!ct)

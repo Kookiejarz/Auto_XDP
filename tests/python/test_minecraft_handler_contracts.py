@@ -1,7 +1,26 @@
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="production BPF headers require Linux")
+def test_native_minecraft_session_proof(tmp_path: Path) -> None:
+    compiler = shutil.which("clang") or shutil.which("cc")
+    if compiler is None or not Path("/usr/include/bpf/bpf_helpers.h").exists():
+        pytest.skip("native C compiler and libbpf development headers required")
+    binary = tmp_path / "minecraft-session-contract"
+    subprocess.run(
+        [compiler, "-O2", "-Wall", "-Werror", "-Wno-unknown-attributes", f"-I{ROOT}",
+         str(ROOT / "tests/c/minecraft_session_contract.c"), "-o", str(binary)],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
 def test_minecraft_transport_state_belongs_to_linux_conntrack() -> None:
