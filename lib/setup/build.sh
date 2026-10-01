@@ -69,15 +69,19 @@ target_vmlinux_header() {
 generate_xdp_map_abi() {
     local source_root="$1"
     local header="${source_root}/bpf/include/map_sizes.h"
-    local rate4 rate6
+    local rate4 rate6 counters
 
     [[ -f "$header" ]] || return 1
     rate4=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V4" { print $3; exit }' "$header")
     rate6=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V6" { print $3; exit }' "$header")
+    counters=$(awk '$1 == "CNT_MAX" { gsub(/,/, "", $3); print $3; exit }' \
+        "${source_root}/bpf/include/counters.h")
     [[ "$rate4" =~ ^[0-9]+$ && "$rate6" =~ ^[0-9]+$ ]] || return 1
+    [[ "$counters" =~ ^[0-9]+$ ]] || return 1
 
     cat >"${BUILD_STAGING_DIR}/xdp_map_abi.txt" <<EOF
-# Map capacities derived from bpf/include/map_sizes.h.
+# Map capacities derived from bpf/include/map_sizes.h and counters.h.
+pkt_counters percpu_array 4 8 ${counters}
 hblk4 ${rate4}
 hblk6 ${rate6}
 udp_hv4 ${rate4}

@@ -1,6 +1,8 @@
 #pragma once
+#ifndef AUTO_XDP_VMLINUX_H
 #include <linux/bpf.h>
 #include <linux/types.h>
+#endif
 #include <stdbool.h>
 #include <bpf/bpf_helpers.h>
 
@@ -52,7 +54,27 @@ enum xdp_counter_idx {
     CNT_SYN_COOKIE_HELPER_ERROR  = 43,
     CNT_SYN_COOKIE_TAILCALL_MISS = 44,
     CNT_SYN_GUARD_SHED_ENTER     = 45,
-    CNT_MAX                      = 46,
+    CNT_PORT_NOT_AUTHORIZED          = 46,
+    CNT_SYN_COOKIE_PORT_BUDGET_DROP  = 47,
+    CNT_SYN_COOKIE_ACK_BUDGET_DROP   = 48,
+    CNT_PACKET_TRUNCATED             = 49,
+    CNT_IP_HEADER_INVALID            = 50,
+    CNT_IPV6_EXTENSION_INVALID       = 51,
+    CNT_SYN_COOKIE_PACKET_INVALID    = 52,
+    CNT_SYN_COOKIE_ADJUST_ERROR      = 53,
+    CNT_SYN_COOKIE_STATE_STORE_ERROR = 54,
+    CNT_TUNNEL_ENDPOINT_NOT_AUTHORIZED = 55,
+    CNT_EVENT_EMITTED                = 56,
+    CNT_EVENT_LOST                   = 57,
+    CNT_EVENT_SUPPRESSED             = 58,
+    CNT_SYN_COOKIE_HANDOFF_ATTEMPT   = 59,
+    CNT_SYN_COOKIE_HANDOFF_SUCCESS   = 60,
+    CNT_SYN_COOKIE_HANDOFF_NO_LISTENER = 61,
+    CNT_SYN_COOKIE_HANDOFF_ERROR     = 62,
+    CNT_GRE_VERSION_INVALID          = 63,
+    CNT_ESP_SPI_RESERVED             = 64,
+    CNT_SCTP_PORT_NOT_AUTHORIZED      = 65,
+    CNT_MAX                          = 66,
 };
 
 struct {

@@ -708,6 +708,7 @@ manifest_path = Path(sys.argv[2])
 sources = (
     repo_root / "bpf/include/common.h",
     repo_root / "bpf/include/counters.h",
+    repo_root / "bpf/include/telemetry.h",
     repo_root / "bpf/include/maps.h",
     repo_root / "bpf/include/minecraft.h",
     repo_root / "bpf/include/syncookie_maps.h",

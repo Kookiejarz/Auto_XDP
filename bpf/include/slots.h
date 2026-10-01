@@ -47,7 +47,7 @@ static __always_inline int dispatch_to_slot(
         struct xdp_runtime_cfg *cfg = runtime_cfg();
         if (cfg && (cfg->cfg_flags & XDP_CFG_FLAG_SLOT_DROP)) {
             count(CNT_SLOT_DROP);
-            emit_drop(ip_proto, family, saddr, daddr, 0, 0, (__u8)CNT_SLOT_DROP, bpf_ktime_get_ns());
+            emit_drop(ctx, ip_proto, family, saddr, daddr, 0, 0, (__u8)CNT_SLOT_DROP, bpf_ktime_get_ns());
             return XDP_DROP;
         }
     }

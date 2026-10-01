@@ -1,4 +1,5 @@
-# Map capacities derived from bpf/include/map_sizes.h.
+# Map capacities derived from bpf/include/map_sizes.h and counters.h.
+pkt_counters percpu_array 4 8 66
 hblk4 49152
 hblk6 16384
 udp_hv4 49152
