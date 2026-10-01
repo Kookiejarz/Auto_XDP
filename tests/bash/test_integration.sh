@@ -434,6 +434,14 @@ test_attach() {
     }
 }
 
+test_packet_event_v2_kernel() {
+    # Exercise the actual loaded program with controlled kernel test-run input;
+    # detach only this fixture's veth to make byte/counter deltas exact.
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_telemetry.py" \
+        events "$_PIN_DIR" "$_VETH"
+}
+
 _header_define() {
     awk -v name="$2" '$1 == "#define" && $2 == name { print $3; exit }' "$1"
 }

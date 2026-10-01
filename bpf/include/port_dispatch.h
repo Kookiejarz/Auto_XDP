@@ -105,7 +105,7 @@ static __always_inline int dispatch_tcp_profile(
     }
 
     count(CNT_PROFILE_UNAVAILABLE_DROP);
-    emit_drop(IPPROTO_TCP, ct->family, ct->saddr, ct->daddr,
+    emit_drop(ctx, IPPROTO_TCP, ct->family, ct->saddr, ct->daddr,
               ct->sport, ct->dport, (__u8)CNT_PROFILE_UNAVAILABLE_DROP,
               bpf_ktime_get_ns());
     return XDP_DROP;
@@ -131,6 +131,9 @@ static __always_inline int dispatch_syncookie(
     bpf_tail_call(ctx, &syncookie_prog_array, 0);
     count(CNT_SYN_COOKIE_TAILCALL_MISS);
     count(CNT_TCP_DROP);
+    emit_drop(ctx, IPPROTO_TCP, ct->family, ct->saddr, ct->daddr,
+              ct->sport, ct->dport, CNT_SYN_COOKIE_TAILCALL_MISS,
+              bpf_ktime_get_ns());
     return XDP_DROP;
 }
 

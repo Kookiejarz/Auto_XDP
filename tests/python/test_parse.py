@@ -28,7 +28,7 @@ def test_counter_names_cover_current_drop_reasons():
     assert names[enum["CNT_RESERVED_32"]] == "RESERVED_32"
     assert names[enum["CNT_RESERVED_33"]] == "RESERVED_33"
     assert names[enum["CNT_ABUSEIPDB_DROP"]] == "ABUSEIPDB_DROP"
-    assert len(names) >= enum["CNT_MAX"]
+    assert len(names) == enum["CNT_MAX"]
 
 
 def test_read_xdp_rows_uses_named_counters_and_byte_totals(tmp_path):

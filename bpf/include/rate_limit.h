@@ -350,7 +350,7 @@ static __always_inline int udp_agg_rate_check(struct flow_key *key, __u64 now,
     return XDP_PASS;
 }
 
-static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest_port,
+static __always_inline int precheck_new_tcp_syn(struct xdp_md *ctx, struct flow_key *key, __u32 dest_port,
                                                 bool bypass_rate, __u64 now,
                                                 struct xdp_runtime_cfg *cfg)
 {
@@ -364,7 +364,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
         if (syn_rate_check(key, now, dest_port, syn_rate_max, source_prefix_v4, source_prefix_v6, cfg) == XDP_DROP) {
             count(CNT_SYN_RATE_DROP);
             count(CNT_TCP_DROP);
-            emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
+            emit_drop(ctx, IPPROTO_TCP, key->family, key->saddr, key->daddr,
                       key->sport, key->dport, (__u8)CNT_SYN_RATE_DROP, now);
             return XDP_DROP;
         }
@@ -372,7 +372,7 @@ static __always_inline int precheck_new_tcp_syn(struct flow_key *key, __u32 dest
         if (syn_agg_rate_check(key, now, dest_port, syn_agg_rate_max, source_prefix_v4, source_prefix_v6, cfg) == XDP_DROP) {
             count(CNT_SYN_AGG_RATE_DROP);
             count(CNT_TCP_DROP);
-            emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
+            emit_drop(ctx, IPPROTO_TCP, key->family, key->saddr, key->daddr,
                       key->sport, key->dport, (__u8)CNT_SYN_AGG_RATE_DROP, now);
             return XDP_DROP;
         }

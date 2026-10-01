@@ -5,7 +5,7 @@
 #include "syncookie_maps.h"
 
 /* Note: pkt_counters (PERCPU_ARRAY) and pkt_ringbuf (RINGBUF) are declared
- * in common.h alongside the count() and emit_drop() helpers that use them.
+ * in counters.h and telemetry.h alongside the helpers that use them.
  * All other SEC(".maps") map definitions are below. */
 
 struct {
