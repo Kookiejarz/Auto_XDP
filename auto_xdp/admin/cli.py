@@ -339,6 +339,14 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
         str(slot_ctx_map),
     ]
 
+    if builtin_name:
+        for name in ("pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg"):
+            shared_path = bpf_pin_dir / name
+            if not shared_path.exists():
+                print(f"XDP not loaded completely ({name} map not found).", file=sys.stderr)
+                return 1
+            load_cmd.extend(["map", "name", name, "pinned", str(shared_path)])
+
     if proto == 132 and builtin_name == "sctp":
         sctp_whitelist = bpf_pin_dir / "sctp_whitelist"
         if not sctp_whitelist.exists():
@@ -558,7 +566,7 @@ def _cmd_profile_handler_load(args: argparse.Namespace) -> int:
         (name, bpf_pin_dir / name)
         for name in (
             "slot_ctx_map", "profile_ctx_map", "mc_l7_pending",
-            "pkt_counters", "byte_counters",
+            "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg",
         )
     ]
 

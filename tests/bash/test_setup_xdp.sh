@@ -2515,5 +2515,57 @@ test_main_orders_basic_info_checks_then_summary() (
     done
 )
 
+test_install_slot_handler_sdk_preserves_shared_include_layout() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir sdk_source mode header
+    tmpdir=$(mktemp -d)
+    sdk_source="$tmpdir/sdk source"
+    mkdir -p "$sdk_source/handlers" "$sdk_source/bpf/include"
+    cp "$REPO_ROOT"/handlers/*.h "$sdk_source/handlers/" || return 1
+    cp "$REPO_ROOT/handlers/gre_handler.c" "$sdk_source/handlers/" || return 1
+    cp "$REPO_ROOT"/bpf/include/*.h "$sdk_source/bpf/include/" || return 1
+    PREFER_REMOTE_SOURCES=0
+
+    for mode in staged source; do
+        BUILD_STAGING_DIR="$tmpdir/missing-stage"
+        SOURCE_ROOT="$tmpdir/missing-source"
+        if [[ "$mode" == staged ]]; then
+            BUILD_STAGING_DIR="$sdk_source"
+        else
+            SOURCE_ROOT="$sdk_source"
+        fi
+        INSTALL_DIR="$tmpdir/install-$mode"
+        install_slot_handler_sdk || return 1
+        cmp "$sdk_source/handlers/gre_handler.c" "$INSTALL_DIR/handlers/gre_handler.c" || return 1
+        for header in common.h counters.h telemetry.h flow_keys.h; do
+            cmp "$sdk_source/bpf/include/$header" "$INSTALL_DIR/bpf/include/$header" || return 1
+        done
+        [[ -f "$INSTALL_DIR/bpf/include/../../handlers/xdp_slot_ctx.h" ]] || return 1
+    done
+)
+
+test_install_slot_handler_sdk_remote_includes_shared_headers() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BUILD_STAGING_DIR="$tmpdir/missing-stage"
+    SOURCE_ROOT="$tmpdir/missing-source"
+    INSTALL_DIR="$tmpdir/install"
+    PREFER_REMOTE_SOURCES=1
+    curl() {
+        printf '%s\n' '{"tree":[{"path":"handlers/gre_handler.c"},{"path":"handlers/xdp_slot_ctx.h"},{"path":"bpf/include/common.h"},{"path":"bpf/include/telemetry.h"},{"path":"bpf/xdp_firewall.c"},{"path":"README.md"}]}'
+    }
+    fetch_local_or_remote() { place_file "$REPO_ROOT/$1" "$3"; }
+
+    install_slot_handler_sdk || return 1
+    cmp "$REPO_ROOT/bpf/include/telemetry.h" "$INSTALL_DIR/bpf/include/telemetry.h" || return 1
+    [[ -f "$INSTALL_DIR/handlers/gre_handler.c" && -f "$INSTALL_DIR/bpf/include/common.h" ]] || return 1
+    [[ ! -e "$INSTALL_DIR/bpf/xdp_firewall.c" && ! -e "$INSTALL_DIR/README.md" ]]
+)
+
 run_discovered_tests "${BASH_SOURCE[0]}" "setup_xdp"
 finish_tests

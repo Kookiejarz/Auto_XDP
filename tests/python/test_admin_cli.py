@@ -1,7 +1,6 @@
-from auto_xdp.admin import handlers
-from auto_xdp.admin import ports
-from auto_xdp.admin import formatting
 import subprocess
+import stat
+import sys
 import tempfile
 import unittest
 import json
@@ -16,6 +15,7 @@ import auto_xdp.admin.detect as admin_detect
 import auto_xdp.admin.runtime as admin_runtime
 import auto_xdp.admin.cli as admin_cli
 from auto_xdp.admin import approvals
+from auto_xdp.admin import config_file, formatting, handlers, ports
 from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
 
 
@@ -23,39 +23,18 @@ pytestmark = pytest.mark.component
 
 
 class AdminCliTests(unittest.TestCase):
-    def test_approval_history_renders_request_context_and_actor(self):
+    def test_handler_source_compile_includes_installed_shared_bpf_headers(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            config_path = root / "config.toml"
-            store_path = root / "run" / "approval_requests.json"
-            config_path.write_text(
-                "[zones.public]\ninterfaces = []\n"
-                "[subjects.web.resolve]\nsystemd_unit = \"nginx.service\"\n"
-            )
-            request = approvals.create_request(
-                store_path,
-                config_path,
-                subject="web",
-                zone="public",
-                protocol="tcp",
-                ports=[443],
-                reason="publish the website",
-                actor="requester",
-            )
-            approvals.approve_request(store_path, config_path, request["id"], actor="approver")
-            args = mock.Mock(run_state_dir=str(store_path.parent), json=False)
-
-            with mock.patch("sys.stdout", new=StringIO()) as output:
-                self.assertEqual(admin_cli._cmd_approval_history(args), 0)
-
-            history = output.getvalue()
-            self.assertIn("changed_by=requester", history)
-            self.assertIn("changed_by=approver", history)
-            self.assertIn("service=nginx.service", history)
-            self.assertIn("subject=web", history)
-            self.assertIn("zone=public", history)
-            self.assertIn("endpoint=TCP/443", history)
-            self.assertIn("reason=publish the website", history)
+            source = root / "handler.c"
+            source.write_text("/* compile command contract */\n")
+            sdk = root / "install" / "handlers"
+            with mock.patch.object(handlers, "run_checked") as run, \
+                 mock.patch.object(handlers, "_resolve_target_arch", return_value=("x86", None)), \
+                 mock.patch.object(handlers, "_resolve_asm_include", return_value="/usr/include"):
+                handlers.compile_handler_source(source, 47, root / "output", sdk_dir=sdk)
+            self.assertIn(f"-I{sdk}", run.call_args.args[0])
+            self.assertIn(f"-I{sdk.parent / 'bpf' / 'include'}", run.call_args.args[0])
 
     def test_approval_store_supports_persistent_axdp_path(self):
         with mock.patch.dict(
@@ -82,6 +61,7 @@ class AdminCliTests(unittest.TestCase):
             config_path.write_text("[zones.public]\ninterfaces = []\n[policy]\nmode = \"audit\"\n")
 
             with mock.patch.object(admin_cli.os, "geteuid", return_value=0), \
+                 mock.patch.object(admin_cli.os, "chown"), \
                  mock.patch.object(approvals, "reload_daemon"):
                 self.assertEqual(admin_cli.main([
                     "--config", str(config_path), "--run-state-dir", str(run_dir),
@@ -110,6 +90,7 @@ class AdminCliTests(unittest.TestCase):
             config_path.write_text("[zones.public]\ninterfaces = []\n[policy]\nmode = \"audit\"\n")
 
             with mock.patch.object(admin_cli.os, "geteuid", return_value=0), \
+                 mock.patch.object(admin_cli.os, "chown"), \
                  mock.patch.object(approvals, "reload_daemon"):
                 self.assertEqual(admin_cli.main([
                     "--config", str(config_path), "--run-state-dir", str(run_dir),
@@ -129,7 +110,8 @@ class AdminCliTests(unittest.TestCase):
             config_path = Path(tmpdir) / "config.toml"
             config_path.write_text("[firewall]\nbogon_filter = false\n[policy]\nmode = \"audit\"\n")
 
-            with mock.patch.object(admin_cli.os, "geteuid", return_value=0):
+            with mock.patch.object(admin_cli.os, "geteuid", return_value=0), \
+                 mock.patch.object(admin_cli.os, "chown"):
                 self.assertEqual(
                     admin_cli.main(["--config", str(config_path), "policy", "mode", "enforce"]),
                     0,
@@ -208,6 +190,7 @@ class AdminCliTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unsafe BPF pin path"):
             admin_runtime.deactivate_runtime(context)
 
+
     def test_deactivate_runtime_refuses_foreign_xdp(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -282,6 +265,49 @@ class AdminCliTests(unittest.TestCase):
             state = json.loads(store_path.read_text())
             self.assertEqual(state["revision"], 3)
             self.assertEqual([item["action"] for item in state["history"]], ["request", "approve", "revoke"])
+
+    def test_approval_history_renders_request_context_and_actor(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            store_path = root / "run" / "approval_requests.json"
+            config_path.write_text(
+                "[zones.public]\ninterfaces = []\n"
+                "[subjects.web.resolve]\nsystemd_unit = \"nginx.service\"\n"
+            )
+            request = approvals.create_request(
+                store_path,
+                config_path,
+                subject="web",
+                zone="public",
+                protocol="tcp",
+                ports=[443],
+                reason="publish the website",
+                actor="requester",
+            )
+            approvals.approve_request(store_path, config_path, request["id"], actor="approver")
+            args = mock.Mock(run_state_dir=str(store_path.parent), json=False)
+
+            with mock.patch("sys.stdout", new=StringIO()) as output:
+                self.assertEqual(admin_cli._cmd_approval_history(args), 0)
+
+            history = output.getvalue()
+            self.assertIn("changed_by=requester", history)
+            self.assertIn("changed_by=approver", history)
+            self.assertIn("service=nginx.service", history)
+            self.assertIn("subject=web", history)
+            self.assertIn("zone=public", history)
+            self.assertIn("endpoint=TCP/443", history)
+            self.assertIn("reason=publish the website", history)
+
+    def test_config_files_are_created_and_rewritten_root_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            self.assertEqual(admin_cli.main(["--config", str(config_path), "config", "init"]), 0)
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+
+            config_file.write_toml(config_path, {"policy": {"mode": "enforce"}})
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
 
     def test_approval_new_subject_requires_runtime_identity(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -388,7 +414,7 @@ class AdminCliTests(unittest.TestCase):
 
     def test_human_format_helpers_render_expected_output(self):
         # Migrated from the removed bash helpers (human_bytes / human_bps /
-        # format_rate) after axdp delegated stats formatting to admin_cli.
+        # format_rate) shared by the CLI and TUI.
         self.assertEqual(formatting.human_bytes(1536), "1.50 KiB")
         self.assertEqual(formatting.human_bytes(-1), "-")
         self.assertEqual(formatting.human_bytes(512), "512 B")
@@ -462,6 +488,10 @@ class AdminCliTests(unittest.TestCase):
                 bpf_pin_dir / "slot_ctx_map",
                 bpf_pin_dir / "sctp_whitelist",
                 bpf_pin_dir / "proto_handlers",
+                bpf_pin_dir / "pkt_counters",
+                bpf_pin_dir / "byte_counters",
+                bpf_pin_dir / "pkt_ringbuf",
+                bpf_pin_dir / "xdp_runtime_cfg",
             ):
                 path.touch()
             (handlers_dir / "sctp_handler.o").touch()
@@ -494,6 +524,8 @@ class AdminCliTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertIn("slot_ctx_map", calls[0])
             self.assertIn("sctp_whitelist", calls[0])
+            for name in ("pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg"):
+                self.assertIn(name, calls[0])
             swap.assert_called_once()
             self.assertEqual(swap.call_args.args[0], bpf_pin_dir / "proto_handlers")
             self.assertEqual(swap.call_args.args[1], 132)
@@ -607,6 +639,8 @@ class AdminCliTests(unittest.TestCase):
                 "mc_l7_pending",
                 "pkt_counters",
                 "byte_counters",
+                "pkt_ringbuf",
+                "xdp_runtime_cfg",
             ):
                 (bpf_pin_dir / name).touch()
             handler = root / "minecraft_handler.o"
@@ -631,7 +665,7 @@ class AdminCliTests(unittest.TestCase):
             command = run.call_args.args[0]
             for name in (
                 "slot_ctx_map", "profile_ctx_map", "mc_l7_pending",
-                "pkt_counters", "byte_counters",
+                "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg",
             ):
                 self.assertIn(name, command)
             self.assertEqual(swap.call_args.args[0], bpf_pin_dir / "tcp_profile_handlers")

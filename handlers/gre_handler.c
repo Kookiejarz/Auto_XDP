@@ -5,15 +5,14 @@
 #include <linux/types.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include "xdp_slot_ctx.h"
+#include "common.h"
 
 struct gre_hdr {
     __be16 flags;
     __be16 proto;
 };
 
-SEC("xdp/gre")
-int xdp_gre_handler(struct xdp_md *ctx)
+static __always_inline int check_gre(struct xdp_md *ctx)
 {
     struct xdp_slot_ctx *sc = get_slot_ctx(ctx);
     if (!sc)
@@ -33,10 +32,24 @@ int xdp_gre_handler(struct xdp_md *ctx)
     __u16 flags_host = bpf_ntohs(gre->flags);
 
     /* Drop non-zero GRE version (version 1 = PPTP, not standard GRE) */
-    if ((flags_host & 0x7) != 0)
+    if ((flags_host & 0x7) != 0) {
+        count(CNT_GRE_VERSION_INVALID);
+        emit_drop(ctx, IPPROTO_GRE, sc->family, sc->saddr, sc->daddr,
+                  0, 0, CNT_GRE_VERSION_INVALID, bpf_ktime_get_ns());
         return XDP_DROP;
+    }
 
     return XDP_PASS;
+}
+
+SEC("xdp/gre")
+int xdp_gre_handler(struct xdp_md *ctx)
+{
+    __u32 pkt_len = packet_length(ctx);
+    int action = check_gre(ctx);
+    count(action == XDP_DROP ? CNT_SLOT_DROP : CNT_SLOT_PASS);
+    count_bytes(action == XDP_DROP, pkt_len);
+    return action;
 }
 
 char _license[] SEC("license") = "GPL";

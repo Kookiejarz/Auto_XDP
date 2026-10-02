@@ -11,7 +11,7 @@
 #include <bpf/bpf_helpers.h>
 #include "xdp_slot_ctx.h"
 #include "xdp_profile_ctx.h"
-#include "counters.h"
+#include "common.h"
 #include "flow_keys.h"
 #include "map_sizes.h"
 #include "minecraft.h"
@@ -46,6 +46,17 @@ MC_RATE_MAP(mc_status_rate6, struct mc_rate_key_v6, RATE_MAP_MAX_ENTRIES_V6);
 MC_RATE_MAP(mc_login_rate4, struct mc_rate_key_v4, RATE_MAP_MAX_ENTRIES_V4);
 MC_RATE_MAP(mc_login_rate6, struct mc_rate_key_v6, RATE_MAP_MAX_ENTRIES_V6);
 
+static __always_inline void emit_profile_drop(struct xdp_md *ctx, __u32 pkt_len)
+{
+    __u32 zero = 0;
+    struct xdp_slot_ctx *sc = bpf_map_lookup_elem(&slot_ctx_map, &zero);
+    __u32 unknown[4] = {};
+    emit_packet_event(ctx, pkt_len, IPPROTO_TCP, sc ? sc->family : 0,
+                      sc ? sc->saddr : unknown, sc ? sc->daddr : unknown,
+                      sc ? sc->sport : 0, sc ? sc->dport : 0,
+                      1, CNT_PROFILE_DROP, bpf_ktime_get_ns());
+}
+
 static __always_inline int profile_result(struct xdp_md *ctx, __u16 inner_off, int action)
 {
     __u32 pkt_len = (__u32)((char *)(long)ctx->data_end -
@@ -54,6 +65,8 @@ static __always_inline int profile_result(struct xdp_md *ctx, __u16 inner_off, i
         action = XDP_DROP;
     count(action == XDP_PASS ? CNT_PROFILE_ALLOW : CNT_PROFILE_DROP);
     count_bytes(action == XDP_DROP, pkt_len);
+    if (action == XDP_DROP)
+        emit_profile_drop(ctx, pkt_len);
     return action;
 }
 
@@ -63,6 +76,7 @@ static __always_inline int profile_drop(struct xdp_md *ctx)
                             (char *)(long)ctx->data);
     count(CNT_PROFILE_DROP);
     count_bytes(true, pkt_len);
+    emit_profile_drop(ctx, pkt_len);
     return XDP_DROP;
 }
 
