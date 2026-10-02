@@ -1092,6 +1092,8 @@ PY
         map name slot_ctx_map pinned "${BPF_PIN_DIR}/slot_ctx_map" \
         map name pkt_counters pinned "${BPF_PIN_DIR}/pkt_counters" \
         map name byte_counters pinned "${BPF_PIN_DIR}/byte_counters" \
+        map name pkt_ringbuf pinned "${BPF_PIN_DIR}/pkt_ringbuf" \
+        map name xdp_runtime_cfg pinned "${BPF_PIN_DIR}/xdp_runtime_cfg" \
         map name tcp_synck_policy pinned "${BPF_PIN_DIR}/tcp_synck_policy" \
         map name sync_run_cfg pinned "${BPF_PIN_DIR}/sync_run_cfg" \
         map name sync_handoff4 pinned "${BPF_PIN_DIR}/sync_handoff4" \
@@ -1103,6 +1105,7 @@ PY
         return
     }
     bpftool prog load "$tc_obj" "$tc_pin" type classifier \
+        map name pkt_counters pinned "${BPF_PIN_DIR}/pkt_counters" \
         map name sync_handoff4 pinned "${BPF_PIN_DIR}/sync_handoff4" \
         map name sync_handoff6 pinned "${BPF_PIN_DIR}/sync_handoff6" \
         >/dev/null 2>&1 || {

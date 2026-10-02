@@ -49,3 +49,15 @@ def test_native_event_helpers(tmp_path: Path) -> None:
         check=True, capture_output=True, text=True,
     )
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+def test_cookie_telemetry_uses_the_main_pinned_maps() -> None:
+    runtime = (ROOT / "runtime/auto_xdp_runtime_common.sh").read_text()
+    xdp = runtime.split('bpftool prog load "$xdp_obj"', 1)[1].split(
+        ">/dev/null 2>&1", 1
+    )[0]
+    tc = runtime.split('bpftool prog load "$tc_obj"', 1)[1].split(
+        ">/dev/null 2>&1", 1
+    )[0]
+    for name in ("pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg"):
+        assert f'map name {name} pinned "${{BPF_PIN_DIR}}/{name}"' in xdp
+    assert 'map name pkt_counters pinned "${BPF_PIN_DIR}/pkt_counters"' in tc
