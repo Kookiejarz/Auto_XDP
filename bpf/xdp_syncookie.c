@@ -232,7 +232,7 @@ static __always_inline bool invalid_budget_v6(
 
 static __always_inline int syncookie_v4(
     struct xdp_md *ctx, struct xdp_slot_ctx *sc,
-    void *data, void *data_end)
+    void *data, void *data_end, __u8 *reason)
 {
     __u16 l3_offset = sc->l3_offset;
     __u16 inner_offset = sc->inner_offset;
@@ -262,24 +262,26 @@ static __always_inline int syncookie_v4(
         if (runtime && invalid_budget_v4(&invalid_key, bpf_ktime_get_ns(),
                                          runtime->invalid_ack_pps)) {
             count(CNT_SYN_COOKIE_BUDGET_DROP);
-            count_bytes(true, (__u32)(data_end - data));
+            *reason = CNT_SYN_COOKIE_ACK_BUDGET_DROP;
             return XDP_DROP;
         }
         if (bpf_tcp_raw_check_syncookie_ipv4(ip, tcp)) {
-            count(CNT_SYN_COOKIE_INVALID);
-            count_bytes(true, (__u32)(data_end - data));
+            *reason = CNT_SYN_COOKIE_INVALID;
             return XDP_DROP;
         }
         count(CNT_SYN_COOKIE_VALID);
-        count_bytes(false, (__u32)(data_end - data));
+        *reason = CNT_SYN_COOKIE_VALID;
+
         return XDP_PASS;
     }
 
     tcp_len = tcp->doff * 4;
     count(CNT_SYN_COOKIE_CHALLENGE);
     /* The helper requires verifier-visible room for the maximum TCP header. */
-    if (bpf_xdp_adjust_tail(ctx, 60 - tcp_len))
+    if (bpf_xdp_adjust_tail(ctx, 60 - tcp_len)) {
+        *reason = CNT_SYN_COOKIE_ADJUST_ERROR;
         return XDP_DROP;
+    }
     data = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
     ip = data + l3_offset;
@@ -288,8 +290,7 @@ static __always_inline int syncookie_v4(
         return XDP_DROP;
     generated = bpf_tcp_raw_gen_syncookie_ipv4(ip, tcp, tcp_len);
     if (generated < 0) {
-        count(CNT_SYN_COOKIE_HELPER_ERROR);
-        count_bytes(true, (__u32)(data_end - data));
+        *reason = CNT_SYN_COOKIE_HELPER_ERROR;
         return XDP_DROP;
     }
     old_seq = bpf_ntohl(tcp->seq);
@@ -311,7 +312,8 @@ static __always_inline int syncookie_v4(
             .sport = tcp->source, .dport = tcp->dest,
             .saddr = ip->saddr, .daddr = ip->daddr,
         };
-        bpf_map_update_elem(&sync_handoff4, &handoff_key, &attrs, BPF_ANY);
+        if (bpf_map_update_elem(&sync_handoff4, &handoff_key, &attrs, BPF_ANY))
+            count(CNT_SYN_COOKIE_STATE_STORE_ERROR);
     }
 
     /* Move TCP to a plain IPv4 header when IPv4 options were present. */
@@ -366,16 +368,18 @@ static __always_inline int syncookie_v4(
         bpf_csum_diff(0, 0, &ip->saddr, 8,
                       bpf_htons(IPPROTO_TCP) + bpf_htons(tcp_len))));
     new_len = l3_offset + sizeof(*ip) + tcp_len;
-    if (bpf_xdp_adjust_tail(ctx, new_len - (int)(data_end - data)))
+    if (bpf_xdp_adjust_tail(ctx, new_len - (int)(data_end - data))) {
+        *reason = CNT_SYN_COOKIE_ADJUST_ERROR;
         return XDP_DROP;
+    }
     count(CNT_SYN_COOKIE_SENT);
-    count_bytes(false, (__u32)(data_end - data));
+
     return XDP_TX;
 }
 
 static __always_inline int syncookie_v6(
     struct xdp_md *ctx, struct xdp_slot_ctx *sc,
-    void *data, void *data_end)
+    void *data, void *data_end, __u8 *reason)
 {
     __u16 l3_offset = sc->l3_offset;
     __u16 inner_offset = sc->inner_offset;
@@ -405,23 +409,25 @@ static __always_inline int syncookie_v6(
         if (runtime && invalid_budget_v6(&invalid_key, bpf_ktime_get_ns(),
                                          runtime->invalid_ack_pps)) {
             count(CNT_SYN_COOKIE_BUDGET_DROP);
-            count_bytes(true, (__u32)(data_end - data));
+            *reason = CNT_SYN_COOKIE_ACK_BUDGET_DROP;
             return XDP_DROP;
         }
         if (bpf_tcp_raw_check_syncookie_ipv6(ip, tcp)) {
-            count(CNT_SYN_COOKIE_INVALID);
-            count_bytes(true, (__u32)(data_end - data));
+            *reason = CNT_SYN_COOKIE_INVALID;
             return XDP_DROP;
         }
         count(CNT_SYN_COOKIE_VALID);
-        count_bytes(false, (__u32)(data_end - data));
+        *reason = CNT_SYN_COOKIE_VALID;
+
         return XDP_PASS;
     }
 
     tcp_len = tcp->doff * 4;
     count(CNT_SYN_COOKIE_CHALLENGE);
-    if (bpf_xdp_adjust_tail(ctx, 60 - tcp_len))
+    if (bpf_xdp_adjust_tail(ctx, 60 - tcp_len)) {
+        *reason = CNT_SYN_COOKIE_ADJUST_ERROR;
         return XDP_DROP;
+    }
     data = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
     ip = data + l3_offset;
@@ -430,8 +436,7 @@ static __always_inline int syncookie_v6(
         return XDP_DROP;
     generated = bpf_tcp_raw_gen_syncookie_ipv6(ip, tcp, tcp_len);
     if (generated < 0) {
-        count(CNT_SYN_COOKIE_HELPER_ERROR);
-        count_bytes(true, (__u32)(data_end - data));
+        *reason = CNT_SYN_COOKIE_HELPER_ERROR;
         return XDP_DROP;
     }
     old_seq = bpf_ntohl(tcp->seq);
@@ -454,7 +459,8 @@ static __always_inline int syncookie_v6(
         };
         __builtin_memcpy(handoff_key.saddr, &ip->saddr, sizeof(handoff_key.saddr));
         __builtin_memcpy(handoff_key.daddr, &ip->daddr, sizeof(handoff_key.daddr));
-        bpf_map_update_elem(&sync_handoff6, &handoff_key, &attrs, BPF_ANY);
+        if (bpf_map_update_elem(&sync_handoff6, &handoff_key, &attrs, BPF_ANY))
+            count(CNT_SYN_COOKIE_STATE_STORE_ERROR);
     }
     if (inner_offset != l3_offset + sizeof(*ip)) {
         struct tcphdr *new_tcp = (void *)ip + sizeof(*ip);
@@ -503,10 +509,12 @@ static __always_inline int syncookie_v6(
         bpf_csum_diff(0, 0, (__be32 *)&ip->saddr, 32,
                       bpf_htons(IPPROTO_TCP) + bpf_htons(tcp_len))));
     new_len = l3_offset + sizeof(*ip) + tcp_len;
-    if (bpf_xdp_adjust_tail(ctx, new_len - (int)(data_end - data)))
+    if (bpf_xdp_adjust_tail(ctx, new_len - (int)(data_end - data))) {
+        *reason = CNT_SYN_COOKIE_ADJUST_ERROR;
         return XDP_DROP;
+    }
     count(CNT_SYN_COOKIE_SENT);
-    count_bytes(false, (__u32)(data_end - data));
+
     return XDP_TX;
 }
 
@@ -515,20 +523,35 @@ int xdp_syncookie(struct xdp_md *ctx)
 {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
+    __u32 pkt_len = packet_length(ctx);
     __u32 zero = 0;
+    __u8 reason = CNT_SYN_COOKIE_PACKET_INVALID;
+    int verdict = XDP_DROP;
     struct xdp_slot_ctx *sc = bpf_map_lookup_elem(&slot_ctx_map, &zero);
-    if (!sc)
-        return XDP_DROP;
-    /* Bound offsets copied from the validated main parser before using them as
-     * packet-pointer arithmetic; this is required by the XDP verifier. */
-    if (sc->l3_offset > 256 || sc->inner_offset > 512 ||
-        sc->inner_offset < sc->l3_offset)
-        return XDP_DROP;
-    if (sc->family == CT_FAMILY_IPV4)
-        return syncookie_v4(ctx, sc, data, data_end);
-    if (sc->family == CT_FAMILY_IPV6)
-        return syncookie_v6(ctx, sc, data, data_end);
-    return XDP_DROP;
+
+    /* Bound validated main-parser offsets before packet-pointer arithmetic. */
+    if (sc && sc->l3_offset <= 256 && sc->inner_offset <= 512 &&
+        sc->inner_offset >= sc->l3_offset) {
+        if (sc->family == CT_FAMILY_IPV4)
+            verdict = syncookie_v4(ctx, sc, data, data_end, &reason);
+        else if (sc->family == CT_FAMILY_IPV6)
+            verdict = syncookie_v6(ctx, sc, data, data_end, &reason);
+    }
+
+    /* Tail calls do not return to the main accounting wrapper.  Capture the
+     * ingress size above: cookie generation resizes and reverses the packet. */
+    count_bytes(verdict == XDP_DROP, pkt_len);
+    if (verdict == XDP_DROP)
+        count(reason);
+    if (verdict == XDP_DROP || reason == CNT_SYN_COOKIE_VALID) {
+        __u32 unknown[4] = {};
+        emit_packet_event(ctx, pkt_len, sc ? sc->ip_proto : 0,
+                          sc ? sc->family : 0,
+                          sc ? sc->saddr : unknown, sc ? sc->daddr : unknown,
+                          sc ? sc->sport : 0, sc ? sc->dport : 0,
+                          verdict == XDP_DROP ? 1 : 2, reason, bpf_ktime_get_ns());
+    }
+    return verdict;
 }
 
 char LICENSE[] SEC("license") = "GPL";

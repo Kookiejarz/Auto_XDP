@@ -77,6 +77,8 @@ static __always_inline __u8 skip_ipv6_exthdr(void **p, void *end,
 #include "syncookie_maps.h"
 #endif
 
+#include "counters.h"
+
 #ifndef BPF_TCP_LISTEN
 #define BPF_TCP_LISTEN 10
 #endif
@@ -104,6 +106,7 @@ static __always_inline int handoff_v4(struct __sk_buff *skb,
         bpf_map_lookup_elem(&sync_handoff4, &key);
     if (!attrs || bpf_tcp_raw_check_syncookie_ipv4(ip, tcp))
         return TC_ACT_OK;
+    count(CNT_SYN_COOKIE_HANDOFF_ATTEMPT);
 
     struct bpf_sock_tuple tuple = {};
     tuple.ipv4.saddr = ip->saddr;
@@ -113,20 +116,26 @@ static __always_inline int handoff_v4(struct __sk_buff *skb,
     struct bpf_sock *skc = bpf_skc_lookup_tcp(
         skb, &tuple, sizeof(tuple.ipv4), BPF_F_CURRENT_NETNS, 0);
     if (!skc || skc->state != BPF_TCP_LISTEN) {
+        count(CNT_SYN_COOKIE_HANDOFF_NO_LISTENER);
         if (skc)
             bpf_sk_release(skc);
         return TC_ACT_OK;
     }
     struct tcp_sock *tcp_sk = bpf_skc_to_tcp_sock(skc);
     if (!tcp_sk) {
+        count(CNT_SYN_COOKIE_HANDOFF_ERROR);
         bpf_sk_release(skc);
         return TC_ACT_OK;
     }
     int ret = bpf_sk_assign_tcp_reqsk(
         skb, (struct sock *)tcp_sk, attrs, sizeof(*attrs));
     bpf_sk_release(skc);
-    if (!ret)
+    if (!ret) {
+        count(CNT_SYN_COOKIE_HANDOFF_SUCCESS);
         bpf_map_delete_elem(&sync_handoff4, &key);
+    } else {
+        count(CNT_SYN_COOKIE_HANDOFF_ERROR);
+    }
     return TC_ACT_OK;
 }
 
@@ -143,6 +152,7 @@ static __always_inline int handoff_v6(struct __sk_buff *skb,
         bpf_map_lookup_elem(&sync_handoff6, &key);
     if (!attrs || bpf_tcp_raw_check_syncookie_ipv6(ip, tcp))
         return TC_ACT_OK;
+    count(CNT_SYN_COOKIE_HANDOFF_ATTEMPT);
 
     struct bpf_sock_tuple tuple = {};
     __builtin_memcpy(tuple.ipv6.saddr, &ip->saddr, sizeof(tuple.ipv6.saddr));
@@ -152,20 +162,26 @@ static __always_inline int handoff_v6(struct __sk_buff *skb,
     struct bpf_sock *skc = bpf_skc_lookup_tcp(
         skb, &tuple, sizeof(tuple.ipv6), BPF_F_CURRENT_NETNS, 0);
     if (!skc || skc->state != BPF_TCP_LISTEN) {
+        count(CNT_SYN_COOKIE_HANDOFF_NO_LISTENER);
         if (skc)
             bpf_sk_release(skc);
         return TC_ACT_OK;
     }
     struct tcp_sock *tcp_sk = bpf_skc_to_tcp_sock(skc);
     if (!tcp_sk) {
+        count(CNT_SYN_COOKIE_HANDOFF_ERROR);
         bpf_sk_release(skc);
         return TC_ACT_OK;
     }
     int ret = bpf_sk_assign_tcp_reqsk(
         skb, (struct sock *)tcp_sk, attrs, sizeof(*attrs));
     bpf_sk_release(skc);
-    if (!ret)
+    if (!ret) {
+        count(CNT_SYN_COOKIE_HANDOFF_SUCCESS);
         bpf_map_delete_elem(&sync_handoff6, &key);
+    } else {
+        count(CNT_SYN_COOKIE_HANDOFF_ERROR);
+    }
     return TC_ACT_OK;
 }
 
