@@ -764,6 +764,10 @@ test_slot_load_sctp_reuses_shared_maps() (
         "$BPF_PIN_DIR/slot_ctx_map" \
         "$BPF_PIN_DIR/sctp_whitelist" \
         "$BPF_PIN_DIR/proto_handlers" \
+        "$BPF_PIN_DIR/pkt_counters" \
+        "$BPF_PIN_DIR/byte_counters" \
+        "$BPF_PIN_DIR/pkt_ringbuf" \
+        "$BPF_PIN_DIR/xdp_runtime_cfg" \
         "$INSTALL_DIR/handlers/sctp_handler.o"
     cat >"$TOML_CONFIG" <<'EOF_CFG'
 [slots]
@@ -792,6 +796,10 @@ EOF_BPFSH
 
     assert_file_contains "$tmpdir/bpftool.log" "map name slot_ctx_map pinned $BPF_PIN_DIR/slot_ctx_map" || return 1
     assert_file_contains "$tmpdir/bpftool.log" "map name sctp_whitelist pinned $BPF_PIN_DIR/sctp_whitelist" || return 1
+    local map_name
+    for map_name in pkt_counters byte_counters pkt_ringbuf xdp_runtime_cfg; do
+        assert_file_contains "$tmpdir/bpftool.log" "map name $map_name pinned $BPF_PIN_DIR/$map_name" || return 1
+    done
 )
 
 test_slot_load_custom_c_compiles_and_persists_object_path() (

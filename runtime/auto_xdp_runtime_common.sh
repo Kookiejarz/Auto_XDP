@@ -1489,6 +1489,14 @@ for entry in enabled:
         "type", "xdp",
         "map", "name", "slot_ctx_map", "pinned", ctx_map,
     ]
+    if isinstance(entry, str):
+        telemetry_maps = ("pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg")
+        if any(not os.path.exists(os.path.join(bpf_pin_dir, name)) for name in telemetry_maps):
+            print("  [WARN] Shared telemetry maps not pinned; skipping built-in handler", file=sys.stderr)
+            failures += 1
+            continue
+        for name in telemetry_maps:
+            load_cmd.extend(["map", "name", name, "pinned", os.path.join(bpf_pin_dir, name)])
     if proto == 132:
         sctp_whitelist = os.path.join(bpf_pin_dir, "sctp_whitelist")
         if not os.path.exists(sctp_whitelist):

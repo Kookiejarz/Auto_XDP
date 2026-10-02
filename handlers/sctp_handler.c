@@ -5,7 +5,7 @@
 #include <linux/types.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include "xdp_slot_ctx.h"
+#include "common.h"
 
 struct sctp_hdr {
     __be16 sport;
@@ -21,8 +21,7 @@ struct {
     __type(value, __u32);
 } sctp_whitelist SEC(".maps");
 
-SEC("xdp/sctp")
-int xdp_sctp_handler(struct xdp_md *ctx)
+static __always_inline int check_sctp(struct xdp_md *ctx)
 {
     struct xdp_slot_ctx *sc = get_slot_ctx(ctx);
     if (!sc)
@@ -45,7 +44,20 @@ int xdp_sctp_handler(struct xdp_md *ctx)
     if (allowed && *allowed == 1)
         return XDP_PASS;
 
+    count(CNT_SCTP_PORT_NOT_AUTHORIZED);
+    emit_drop(ctx, IPPROTO_SCTP, sc->family, sc->saddr, sc->daddr,
+              sctp->sport, sctp->dport, CNT_SCTP_PORT_NOT_AUTHORIZED, bpf_ktime_get_ns());
     return XDP_DROP;
+}
+
+SEC("xdp/sctp")
+int xdp_sctp_handler(struct xdp_md *ctx)
+{
+    __u32 pkt_len = packet_length(ctx);
+    int action = check_sctp(ctx);
+    count(action == XDP_DROP ? CNT_SLOT_DROP : CNT_SLOT_PASS);
+    count_bytes(action == XDP_DROP, pkt_len);
+    return action;
 }
 
 char _license[] SEC("license") = "GPL";

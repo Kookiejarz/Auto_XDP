@@ -24,7 +24,8 @@ OBJS := $(SRCS:.c=.o)
 
 all: $(OBJS)
 
-%.o: %.c xdp_slot_ctx.h xdp_profile_ctx.h ../bpf/include/map_sizes.h
+%.o: %.c xdp_slot_ctx.h xdp_profile_ctx.h ../bpf/include/map_sizes.h \
+     ../bpf/include/common.h ../bpf/include/counters.h ../bpf/include/telemetry.h
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 minecraft_handler.o: ../bpf/include/counters.h ../bpf/include/flow_keys.h \

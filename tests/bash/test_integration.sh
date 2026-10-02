@@ -503,7 +503,10 @@ test_handler_transactional_hot_swap() {
     local asm_inc multiarch_inc old_id new_id map_id
     asm_inc=$(clang -print-file-name=include) || return 1
     multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
-    local -a include_args=(-I "$REPO_ROOT/handlers" -I /usr/include -I /usr/include/bpf -I "$asm_inc")
+    local -a include_args=(
+        -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include"
+        -I /usr/include -I /usr/include/bpf -I "$asm_inc"
+    )
     [[ ! -d "$multiarch_inc" ]] || include_args+=(-I "$multiarch_inc")
 
     clang -O2 -g -target bpf -mcpu=v3 \

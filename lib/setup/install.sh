@@ -321,22 +321,26 @@ PY
 install_slot_handler_sdk() {
     local handlers_root="${INSTALL_DIR}/handlers"
     local -a handler_files=()
-    local rel=""
+    local rel="" sdk_root=""
 
     priv_mkdir "$handlers_root"
 
-    if [[ -n "${BUILD_STAGING_DIR:-}" && -d "${BUILD_STAGING_DIR}/handlers" ]]; then
+    for sdk_root in "${BUILD_STAGING_DIR:-}" "${SOURCE_ROOT:-${BOOTSTRAP_LOCAL_ROOT:-.}}"; do
+        [[ -n "$sdk_root" && -d "${sdk_root}/handlers" && -d "${sdk_root}/bpf/include" ]] || continue
         local _staged=()
-        mapfile -t -d '' _staged < <(find "${BUILD_STAGING_DIR}/handlers" -maxdepth 1 \
-            -type f \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) -print0)
+        mapfile -t -d '' _staged < <(
+            find "${sdk_root}/handlers" -maxdepth 1 \
+                -type f \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) -print0
+            find "${sdk_root}/bpf/include" -maxdepth 1 -type f -name '*.h' -print0
+        )
         if [[ ${#_staged[@]} -gt 0 ]]; then
             local _sf
             for _sf in "${_staged[@]}"; do
-                place_file "$_sf" "${handlers_root}/$(basename "$_sf")"
+                place_file "$_sf" "${INSTALL_DIR}/${_sf#"${sdk_root}/"}" || return 1
             done
             return 0
         fi
-    fi
+    done
 
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
         local api_url
@@ -350,19 +354,15 @@ install_slot_handler_sdk() {
 import json, sys
 for e in json.load(sys.stdin).get('tree', []):
     p = e['path']
+    if p.startswith('bpf/include/') and p.endswith('.h'):
+        print(p)
+        continue
     if not p.startswith('handlers/'):
         continue
     tail = p.split('/')[-1]
     if tail == 'Makefile' or p.endswith('.c') or p.endswith('.h'):
         print(p)
 " | sort
-        )
-    else
-        local handler_root="${SOURCE_ROOT:-${BOOTSTRAP_LOCAL_ROOT:-.}}/handlers"
-        mapfile -t handler_files < <(
-            find "$handler_root" -maxdepth 1 -type f \
-                \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) \
-                | sort
         )
     fi
 
@@ -372,7 +372,7 @@ for e in json.load(sys.stdin).get('tree', []):
     fi
 
     for rel in "${handler_files[@]}"; do
-        if ! fetch_local_or_remote "$rel" "$rel" "${handlers_root}/${rel#handlers/}"; then
+        if ! fetch_local_or_remote "$rel" "$rel" "${INSTALL_DIR}/${rel}"; then
             die "Failed to install ${rel}"
         fi
     done
