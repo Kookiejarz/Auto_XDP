@@ -233,15 +233,36 @@ int tc_minecraft_egress(struct __sk_buff *skb)
     policy = mc_service_policy(skb, source_port);
     if (!policy)
         return TC_ACT_OK;
+    __u64 payload_offset = (__u8 *)tcp + tcp_len - (__u8 *)data;
+    barrier_var(payload_offset);
+    /* The bounded VLAN/IPv6/TCP parsers cannot exceed 16 KiB of headers. */
+    if (payload_offset > 0x3fff || payload_offset > skb->len)
+        return TC_ACT_OK;
+    payload_len = skb->len - payload_offset;
+    if (!payload_len && (tcp->fin || tcp->rst)) {
+        bpf_map_delete_elem(&mc_l7_pending, &key);
+        bpf_map_delete_elem(&mc_verified, &key);
+        return TC_ACT_OK;
+    }
     pending = bpf_map_lookup_elem(&mc_l7_pending, &key);
     if (!pending || pending->policy_generation != policy->policy_generation ||
         pending->profile_generation != policy->profile_generation)
         return TC_ACT_OK;
-
-    payload = (void *)tcp + tcp_len;
-    payload_len = (__u32)((__u8 *)data_end - payload);
     if (!payload_len || pending->egress_bytes >= MC_PREVERIFY_BYTES ||
         payload_len > MC_PREVERIFY_BYTES - pending->egress_bytes)
+        return TC_ACT_OK;
+
+    /* TCP sendmsg may place even a two-byte reply in non-linear fragments.
+     * Pull only the bounded control frame, not an entire large GSO packet. */
+    __u32 inspect_len = payload_len;
+    if (inspect_len > MC_SERVER_FRAME_MAX + MC_SERVER_PACKET_LEN_MAX)
+        inspect_len = MC_SERVER_FRAME_MAX + MC_SERVER_PACKET_LEN_MAX;
+    if (bpf_skb_pull_data(skb, payload_offset + inspect_len))
+        return TC_ACT_OK;
+    data = (void *)(long)skb->data;
+    data_end = (void *)(long)skb->data_end;
+    payload = data + payload_offset;
+    if ((void *)payload > data_end)
         return TC_ACT_OK;
 
     wire_key.family = key.family;
@@ -286,9 +307,11 @@ int tc_minecraft_egress(struct __sk_buff *skb)
         pending->proof_level = MC_PROOF_SERVER_PROGRESS;
         pending->hard_deadline_ns = pending->first_seen_ns + MC_CHALLENGE_DEADLINE_NS;
     } else if (packet_id == 2 && pending->intention != 1) {
-        mc_mark_conn(ct, policy->profile_generation, MC_PROOF_WIRE_VERIFIED);
+        bool admitted = mc_mark_conn(ct, &key, policy->policy_generation,
+                                    policy->profile_generation, MC_PROOF_WIRE_VERIFIED);
         bpf_ct_release(ct);
-        bpf_map_delete_elem(&mc_l7_pending, &key);
+        if (admitted)
+            bpf_map_delete_elem(&mc_l7_pending, &key);
         return TC_ACT_OK;
     } else if (packet_id == 3 && pending->intention != 1) {
         pending->flags |= MC_F_COMPRESSION_ENABLED;

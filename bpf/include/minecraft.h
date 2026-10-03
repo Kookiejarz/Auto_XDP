@@ -75,6 +75,24 @@ struct {
     __type(value, struct mc_l7_pending_val);
 } mc_l7_pending SEC(".maps");
 
+struct mc_verified_val {
+    __u64 policy_generation;
+    __u64 profile_generation;
+    __u32 mark;
+    __u32 pad;
+};
+
+/* ponytail: bounded LRU; eviction revokes proof. Raise capacity if needed. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, MC_VERIFIED_MAX_ENTRIES);
+    __type(key, struct flow_key);
+    __type(value, struct mc_verified_val);
+} mc_verified SEC(".maps");
+
+_Static_assert(sizeof(struct flow_key) == 40, "Minecraft session key ABI");
+_Static_assert(sizeof(struct mc_verified_val) == 24, "Minecraft session value ABI");
+
 static __always_inline __u8 mc_epoch(__u64 profile_generation)
 {
     __u8 epoch = (__u8)profile_generation;
@@ -97,9 +115,30 @@ static __always_inline bool mc_mark_valid(
            ((mark & MC_MARK_PROOF_MASK) >> MC_MARK_PROOF_SHIFT) >= minimum_proof;
 }
 
-static __always_inline void mc_mark_conn(
-    struct nf_conn *ct, __u64 profile_generation, __u8 proof)
+static __always_inline bool mc_verified_matches(
+    const struct mc_verified_val *verified, __u32 mark,
+    __u64 policy_generation, __u64 profile_generation)
 {
+    return verified && verified->policy_generation == policy_generation &&
+           verified->profile_generation == profile_generation &&
+           verified->mark == (mark & MC_MARK_MASK) &&
+           mc_mark_valid(mark, profile_generation, MC_PROOF_WIRE_VERIFIED);
+}
+
+static __always_inline bool mc_mark_conn(
+    struct nf_conn *ct, const struct flow_key *key,
+    __u64 policy_generation, __u64 profile_generation, __u8 proof)
+{
+    struct mc_verified_val verified = {
+        .policy_generation = policy_generation,
+        .profile_generation = profile_generation,
+        .mark = mc_mark_encode(profile_generation, proof),
+    };
+    /* Publish the full proof before its CT hint. A partial publication can
+     * only cause a temporary DROP, never grant admission. */
+    if (bpf_map_update_elem(&mc_verified, key, &verified, BPF_ANY))
+        return false;
     __u32 old_mark = ct->mark;
-    ct->mark = (old_mark & ~MC_MARK_MASK) | mc_mark_encode(profile_generation, proof);
+    ct->mark = (old_mark & ~MC_MARK_MASK) | verified.mark;
+    return true;
 }

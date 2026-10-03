@@ -549,6 +549,7 @@ xdp_required_map_names() {
 	slot_ctx_map
 	profile_ctx_map
 	mc_l7_pending
+	mc_verified
 	EOF
 }
 
@@ -1326,7 +1327,8 @@ load_minecraft_egress() {
     if ! bpftool prog load "$object_path" "$next_pin" type classifier \
             map name tcp_whitelist pinned "${BPF_PIN_DIR}/tcp_whitelist" \
             map name tcp_zone_whitelist pinned "${BPF_PIN_DIR}/tcp_zone_whitelist" \
-            map name mc_l7_pending pinned "${BPF_PIN_DIR}/mc_l7_pending" >/dev/null 2>&1; then
+            map name mc_l7_pending pinned "${BPF_PIN_DIR}/mc_l7_pending" \
+            map name mc_verified pinned "${BPF_PIN_DIR}/mc_verified" >/dev/null 2>&1; then
         _auto_xdp_warn "Kernel rejected the Linux-conntrack Minecraft egress observer."
         return 1
     fi

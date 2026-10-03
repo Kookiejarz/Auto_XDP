@@ -151,6 +151,8 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "udp_hv6",
     "slot_ctx_map",
     "profile_ctx_map",
+    "mc_l7_pending",
+    "mc_verified",
     "sit4_endpoints",
     "abuseipdb_v4",
     "syn4",
