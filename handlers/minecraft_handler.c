@@ -421,23 +421,46 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
         return profile_result(ctx, inner_off, XDP_DROP);
 
     now = bpf_ktime_get_ns();
-    if (tcp->syn && !tcp->ack) {
-        cleanup_pending(&key);
-        return profile_result(ctx, inner_off, XDP_PASS);
-    }
     linux_ct_fill_tuple(&tuple, &key);
     opts = linux_ct_opts(IPPROTO_TCP);
     ct = bpf_xdp_ct_lookup(ctx, &tuple, linux_ct_tuple_size(&key), &opts, sizeof(opts));
+    if (tcp->syn && !tcp->ack) {
+        bool live = false;
+        if (ct) {
+            linux_ct_snapshot(ct, opts.dir, &snapshot);
+            live = linux_ct_established(&snapshot);
+            bpf_ct_release(ct);
+        }
+        if (l4_len != tcp_hdr_len)
+            return profile_result(ctx, inner_off, XDP_DROP);
+        /* A SYN aimed at an existing connection must not erase its proof or
+         * revive revoked authorization. Linux owns actual tuple reuse. */
+        if (!live) {
+            cleanup_pending(&key);
+            bpf_map_delete_elem(&mc_verified, &key);
+        }
+        return profile_result(ctx, inner_off, XDP_PASS);
+    }
     if (!ct) return profile_result(ctx, inner_off, XDP_DROP);
     linux_ct_snapshot(ct, opts.dir, &snapshot);
     if (snapshot.dir != NF_CT_DIR_ORIGINAL) {
         bpf_ct_release(ct);
         return profile_result(ctx, inner_off, XDP_DROP);
     }
-    if (tcp->fin || tcp->rst) {
+    if ((tcp->fin || tcp->rst) && l4_len == tcp_hdr_len) {
         bpf_ct_release(ct);
         cleanup_pending(&key);
+        bpf_map_delete_elem(&mc_verified, &key);
         return profile_result(ctx, inner_off, XDP_PASS);
+    }
+    struct mc_verified_val *verified = bpf_map_lookup_elem(&mc_verified, &key);
+    if (verified || (snapshot.mark & MC_MARK_MAGIC_MASK) == MC_MARK_MAGIC) {
+        bool admitted = linux_ct_established(&snapshot) &&
+            mc_verified_matches(verified, snapshot.mark,
+                                profile->policy_generation, profile->profile_generation);
+        bpf_ct_release(ct);
+        /* Lost/revoked proof is not a new handshake or opaque probation. */
+        return profile_result(ctx, inner_off, admitted ? XDP_PASS : XDP_DROP);
     }
     if (!linux_ct_established(&snapshot)) {
         bool third_handshake_ack =
@@ -448,10 +471,6 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
             return profile_result(ctx, inner_off, XDP_DROP);
         if (l4_len == tcp_hdr_len)
             return profile_result(ctx, inner_off, XDP_PASS);
-    } else if (mc_mark_valid(snapshot.mark, profile->profile_generation,
-                             MC_PROOF_WIRE_VERIFIED)) {
-        bpf_ct_release(ct);
-        return profile_result(ctx, inner_off, XDP_PASS);
     } else {
         bpf_ct_release(ct);
     }
@@ -584,10 +603,12 @@ parse_login_start: ;
         if (!ct) return profile_result(ctx, inner_off, XDP_DROP);
         linux_ct_snapshot(ct, opts.dir, &snapshot);
         if (snapshot.dir == NF_CT_DIR_ORIGINAL && linux_ct_established(&snapshot)) {
-            mc_mark_conn(ct, profile->profile_generation, MC_PROOF_WIRE_VERIFIED);
+            bool admitted = mc_mark_conn(ct, &key, profile->policy_generation,
+                                        profile->profile_generation, MC_PROOF_WIRE_VERIFIED);
             bpf_ct_release(ct);
-            cleanup_pending(&key);
-            return profile_result(ctx, inner_off, XDP_PASS);
+            if (admitted)
+                cleanup_pending(&key);
+            return profile_result(ctx, inner_off, admitted ? XDP_PASS : XDP_DROP);
         }
         bpf_ct_release(ct);
         return profile_result(ctx, inner_off, XDP_DROP);

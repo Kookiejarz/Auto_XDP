@@ -459,6 +459,8 @@ test_loaded_map_abi() {
     _assert_map_abi tcp_zone_whitelist hash 8 24 4096 || return 1
     _assert_map_abi tcp_profile_handlers prog_array 4 4 256 || return 1
     _assert_map_abi profile_ctx_map percpu_array 4 24 1 || return 1
+    _assert_map_abi mc_verified lru_hash 40 24 \
+        "$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" MC_VERIFIED_MAX_ENTRIES)" || return 1
     _assert_map_abi udp_global_rl array 4 40 1 || return 1
     _assert_map_abi udp_percpu_acc percpu_array 4 16 1 || return 1
 }
@@ -584,6 +586,7 @@ test_minecraft_profile_dataplane() {
         map name tcp_whitelist pinned "$_PIN_DIR/tcp_whitelist" \
         map name tcp_zone_whitelist pinned "$_PIN_DIR/tcp_zone_whitelist" \
         map name mc_l7_pending pinned "$_PIN_DIR/mc_l7_pending" \
+        map name mc_verified pinned "$_PIN_DIR/mc_verified" \
         >/dev/null || return 1
     tc qdisc add dev "$_VETH" clsact 2>/dev/null || true
     tc filter replace dev "$_VETH" egress pref 49153 handle 2 \
@@ -618,12 +621,13 @@ def ipv6(name, seq, flags, body=b""):
 
 for writer in (ipv4, ipv6):
     writer("syn", 100, 0x02)
+    writer("syn_payload", 100, 0x02, payload)
     writer("ack", 101, 0x10)
     writer("handshake", 101, 0x18, payload)
 PYEOF
     local family packet retval expected
     for family in 4 6; do
-        for packet in syn ack handshake; do
+        for packet in syn syn_payload ack handshake; do
             expected=1
             [[ "$packet" == syn ]] && expected=2
             retval=$(bpftool -j prog run pinned "$_PIN_DIR/prog" \
@@ -635,28 +639,17 @@ PYEOF
             }
         done
     done
-    rm -f /tmp/axdp_mc4_{syn,ack,handshake} /tmp/axdp_mc6_{syn,ack,handshake}
+    rm -f /tmp/axdp_mc4_{syn,syn_payload,ack,handshake} /tmp/axdp_mc6_{syn,syn_payload,ack,handshake}
 
-    # A client network namespace may own the skb's conntrack entry before it
-    # reaches the host-side veth, so this topology cannot always exercise a
-    # host-netns lookup. The verifier/raw checks above still cover fail-closed
-    # behavior; run the dialogue checks only when the host sees the probe CT.
-    _set_tcp_policy "$port" 1 0 0 0 || return 1
-    python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("0.0.0.0",25565)); s.listen(); c,_=s.accept(); time.sleep(0.5)' &
-    local probe_server=$!
-    sleep 0.1
-    ip netns exec "$_NS" python3 -c 'import socket,time; s=socket.create_connection(("10.99.0.1",25565)); time.sleep(0.4)' &
-    local probe_client=$!
-    sleep 0.2
-    if ! grep -q 'dport=25565' /proc/net/nf_conntrack; then
-        wait "$probe_client" "$probe_server" || true
-        echo "[SKIP] host-side veth has no host-netns conntrack entry"
-        tc filter del dev "$_VETH" egress pref 49153 handle 2 2>/dev/null || true
-        rm -f "$handler_obj" "$egress_obj"
-        return 0
-    fi
-    wait "$probe_client" "$probe_server" || return 1
-    _set_tcp_policy "$port" 1 1 11 22 || return 1
+    # Register conntrack hooks in this fixture's host network namespace. The
+    # optional /proc/net/nf_conntrack interface is not a capability test: many
+    # kernels support the kfuncs without enabling that procfs listing. This
+    # accept-only table is fixture-owned and removed by _teardown.
+    nft add table inet axdp_integ || return 1
+    nft add chain inet axdp_integ mc_conntrack \
+        '{ type filter hook input priority filter; policy accept; }' || return 1
+    nft add rule inet axdp_integ mc_conntrack \
+        ct state established,related counter || return 1
 
     rm -f "$result_file" "$ready_file" "$continue_file" "$ready_file2" \
         "$continue_file2" "$ready_file3" "$continue_file3"
@@ -784,9 +777,15 @@ PYEOF
     [[ "$(bpftool -j map dump pinned "$_PIN_DIR/mc_l7_pending" \
         | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" == 0 ]] || {
         echo "wire verification did not clear the bounded parser state"
+        bpftool -j map dump pinned "$_PIN_DIR/mc_l7_pending" || true
+        grep 'dport=25565' /proc/net/nf_conntrack || true
+        tc -s filter show dev "$_VETH" egress || true
+        kill "$client_pid" "$server_pid" 2>/dev/null || true
+        wait "$client_pid" "$server_pid" 2>/dev/null || true
         return 1
     }
-    _set_tcp_policy "$port" 1 1 11 23 || return 1
+    # +256 collides in the old compact CT epoch, but not in the full proof.
+    _set_tcp_policy "$port" 1 1 11 278 || return 1
     : > "$continue_file"
     wait "$client_pid" || return 1
 
@@ -826,7 +825,7 @@ PYEOF
         echo "second Minecraft flow did not reach verified state"
         return 1
     }
-    _set_tcp_policy "$port" 1 1 12 23 || return 1
+    _set_tcp_policy "$port" 1 1 12 278 || return 1
     : > "$continue_file2"
     wait "$client_pid" || return 1
 
@@ -866,7 +865,18 @@ PYEOF
         echo "third Minecraft flow did not reach verified state"
         return 1
     }
-    _set_tcp_policy "$port" 1 1 12 24 || return 1
+    # Losing the bounded cache must revoke a still-marked live connection.
+    python3 - "$_PIN_DIR/mc_verified" <<'PYEOF' || return 1
+import json, subprocess, sys
+
+path = sys.argv[1]
+rows = json.loads(subprocess.check_output(
+    ["bpftool", "-j", "map", "dump", "pinned", path], text=True))
+assert rows, "wire verification did not publish full session proof"
+for row in rows:
+    key = [f"{int(byte, 0) if isinstance(byte, str) else byte:02x}" for byte in row["key"]]
+    subprocess.run(["bpftool", "map", "delete", "pinned", path, "key", "hex", *key], check=True)
+PYEOF
     : > "$continue_file3"
     wait "$client_pid" || return 1
 
@@ -924,7 +934,7 @@ if lines[1]:
 if lines[3]:
     raise SystemExit("old connmark survived policy generation change")
 if lines[5]:
-    raise SystemExit("second old connmark survived profile generation change")
+    raise SystemExit("old connmark survived loss of the full session proof")
 if bytes.fromhex(lines[6]) != status:
     raise SystemExit("Minecraft status/ping flow mismatch")
 if lines[7]:
@@ -998,6 +1008,32 @@ test_minecraft_profile_syncer_lifecycle() (
         "${include_args[@]}" -c "$REPO_ROOT/handlers/minecraft_handler.c" \
         -o "$install_dir/handlers/minecraft_handler.o" || return 1
 
+    local subject_resolve
+    subject_resolve=$(PYTHONPATH="$REPO_ROOT" python3 - <<'PYEOF'
+import json, os
+from auto_xdp.discovery.listeners import _pid_comm, _pid_systemd_unit
+
+# A systemd-run test and its listener share the real cgroup service identity;
+# outside a service, use the actual Python executable's comm, not a guess.
+unit = _pid_systemd_unit(os.getpid())
+kind, value = ("systemd_unit", unit) if unit else ("process_name", _pid_comm(os.getpid()))
+if not value:
+    raise SystemExit("cannot determine lifecycle listener ownership")
+print(f"{kind} = {json.dumps(value)}")
+PYEOF
+    ) || return 1
+
+    {
+        printf '[firewall]\nbogon_filter = false\n'
+        printf '[policy]\nmode = "enforce"\n'
+        printf '[zones.public]\ninterfaces = []\n'
+        printf '[unknown_subjects]\npublic = "deny"\n'
+        printf '[subjects.minecraft.resolve]\n%s\n' "$subject_resolve"
+        printf '[subjects.minecraft.exposure.public.tcp]\nports = [%d]\n' "$port"
+        printf '[subjects.minecraft.protection]\nprofile = "minecraft"\n'
+        printf '[xdp]\nbpf_pin_dir = "%s"\n' "$_PIN_DIR"
+    } >"$config_path"
+
     sync_policy() {
         env PYTHONPATH="$REPO_ROOT" PYTHON_LIB_DIR="$install_dir/python" \
             RUN_STATE_DIR="$run_dir" XDP_OBJ_PATH="$_XDP_OBJ" \
@@ -1028,18 +1064,6 @@ PYEOF
     }
 
     start_listener || return 1
-    local resolver_key resolver_value
-    read -r resolver_key resolver_value < <(listener_resolver "$listener_pid") || return 1
-    {
-        printf '[firewall]\nbogon_filter = false\n'
-        printf '[policy]\nmode = "enforce"\n'
-        printf '[zones.public]\ninterfaces = []\n'
-        printf '[unknown_subjects]\npublic = "deny"\n'
-        printf '[subjects.minecraft.resolve]\n%s = "%s"\n' "$resolver_key" "$resolver_value"
-        printf '[subjects.minecraft.exposure.public.tcp]\nports = [%d]\n' "$port"
-        printf '[subjects.minecraft.protection]\nprofile = "minecraft"\n'
-        printf '[xdp]\nbpf_pin_dir = "%s"\n' "$_PIN_DIR"
-    } >"$config_path"
     sync_policy || return 1
     read -r allow profile_id first_generation profile_generation \
         <<<"$(_get_tcp_policy "$port")"

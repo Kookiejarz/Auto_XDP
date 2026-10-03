@@ -637,6 +637,7 @@ class AdminCliTests(unittest.TestCase):
                 "slot_ctx_map",
                 "profile_ctx_map",
                 "mc_l7_pending",
+                "mc_verified",
                 "pkt_counters",
                 "byte_counters",
                 "pkt_ringbuf",
@@ -664,7 +665,7 @@ class AdminCliTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             command = run.call_args.args[0]
             for name in (
-                "slot_ctx_map", "profile_ctx_map", "mc_l7_pending",
+                "slot_ctx_map", "profile_ctx_map", "mc_l7_pending", "mc_verified",
                 "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg",
             ):
                 self.assertIn(name, command)

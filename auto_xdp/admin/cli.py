@@ -565,7 +565,7 @@ def _cmd_profile_handler_load(args: argparse.Namespace) -> int:
     shared_maps = [
         (name, bpf_pin_dir / name)
         for name in (
-            "slot_ctx_map", "profile_ctx_map", "mc_l7_pending",
+            "slot_ctx_map", "profile_ctx_map", "mc_l7_pending", "mc_verified",
             "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg",
         )
     ]
