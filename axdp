@@ -280,8 +280,43 @@ run_uninstall() {
         return 1
     fi
 
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl disable --now "$SERVICE_NAME" "$RELAY_SERVICE_NAME" >/dev/null 2>&1 || true
+    local systemd_mode=0 unit load_state active_state enabled_state enabled_status
+    local -a uninstall_units=("$RELAY_SERVICE_NAME.service" "$SERVICE_NAME.service")
+    if [[ -d "$SYSTEMD_RUN_DIR" ]]; then
+        command -v systemctl >/dev/null 2>&1 || {
+            printf 'Cannot stop systemd services: systemctl is missing.\n' >&2
+            return 1
+        }
+        systemd_mode=1
+        # Refresh stale units when retrying after files were already removed.
+        systemctl daemon-reload || return 1
+        for unit in "${uninstall_units[@]}"; do
+            load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
+            [[ -n "$load_state" ]] || return 1
+            if [[ "$load_state" != not-found ]]; then
+                systemctl disable --now "$unit" || return 1
+                systemctl disable --runtime "$unit" || return 1
+            else
+                # A partially removed unit may still have a running process.
+                active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+                case "$active_state" in
+                    inactive|failed) ;;
+                    *) systemctl stop "$unit" || return 1 ;;
+                esac
+            fi
+            active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+            case "$active_state" in
+                inactive|failed) ;;
+                *) printf 'Refusing to uninstall while %s is %s.\n' "$unit" "$active_state" >&2; return 1 ;;
+            esac
+            enabled_status=0
+            enabled_state=$(systemctl is-enabled "$unit") || enabled_status=$?
+            # is-enabled returns nonzero for disabled and absent units.
+            case "$enabled_status:$enabled_state" in
+                0:static|1:disabled|1:masked|1:masked-runtime|4:not-found) ;;
+                *) printf 'Cannot verify %s is disabled (%s).\n' "$unit" "$enabled_state" >&2; return 1 ;;
+            esac
+        done
     fi
     if command -v rc-service >/dev/null 2>&1; then
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
@@ -293,7 +328,7 @@ run_uninstall() {
     fi
     _stop_runtime_processes
 
-    local iface failures=0
+    local iface direction pref tc_filters failures=0
     if ! command -v ip >/dev/null 2>&1; then
         printf 'ip command is required to detach XDP programs.\n' >&2
         return 1
@@ -307,7 +342,27 @@ run_uninstall() {
         ip link set dev "$iface" xdpgeneric off >/dev/null 2>&1 || true
         ip link set dev "$iface" xdpoffload off >/dev/null 2>&1 || true
         if command -v tc >/dev/null 2>&1; then
-            tc filter del dev "$iface" egress pref 49153 handle 2 >/dev/null 2>&1 || true
+            for direction in ingress egress; do
+                pref=49151
+                [[ "$direction" != egress ]] || pref=49153
+                # Missing filters are harmless; failed or unreadable cleanup is not.
+                tc filter del dev "$iface" "$direction" protocol all pref "$pref" \
+                    handle 2 bpf >/dev/null 2>&1 || true
+                if ! tc_filters=$(tc -j filter show dev "$iface" "$direction" pref "$pref") \
+                    || ! python3 -c '
+import json, sys
+sys.exit(any(row.get("kind") == "bpf" and
+             str(row.get("options", {}).get("handle", "")) in ("0x2", "2")
+             for row in json.load(sys.stdin)))
+' <<< "$tc_filters"; then
+                    printf 'Cannot verify Auto XDP TC filter removal on %s %s (pref %s).\n' \
+                        "$iface" "$direction" "$pref" >&2
+                    failures=1
+                fi
+            done
+        else
+            printf 'tc command is required to verify TC filter removal on %s.\n' "$iface" >&2
+            failures=1
         fi
         if ip -d link show dev "$iface" 2>/dev/null \
                 | grep -Eq 'prog/xdp|xdpgeneric|xdpoffload|(^|[[:space:]])xdp([[:space:]]|$)'; then
@@ -318,6 +373,10 @@ run_uninstall() {
     done
 
     if command -v nft >/dev/null 2>&1; then
+        # Keep tracking alive if any data-plane detach could not be verified.
+        if [[ $failures -eq 0 ]]; then
+            PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.bpf.conntrack --remove || failures=1
+        fi
         nft delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
         if nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
             printf 'Failed to remove nftables table %s %s.\n' "$NFT_FAMILY" "$NFT_TABLE" >&2
@@ -333,20 +392,39 @@ run_uninstall() {
         return 1
     fi
 
-    _remove_owned_tree "${BPF_PIN_DIR}_next" "xdp_fw_next" || failures=1
-    _remove_owned_tree "${BPF_PIN_DIR}_rollback" "xdp_fw_rollback" || failures=1
-    _remove_owned_tree "$BPF_PIN_DIR" "xdp_fw" || failures=1
-
     _remove_owned_file "$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service" "${SERVICE_NAME}.service" || failures=1
     _remove_owned_file "$SYSTEMD_UNIT_DIR/${RELAY_SERVICE_NAME}.service" "${RELAY_SERVICE_NAME}.service" || failures=1
+    # Also remove installer-owned boot links if no systemd manager is running,
+    # or the unit was already missing and its enablement link is dangling.
+    for unit in "${uninstall_units[@]}"; do
+        _remove_owned_file "$SYSTEMD_UNIT_DIR/multi-user.target.wants/$unit" "$unit" || failures=1
+        _remove_owned_file "$SYSTEMD_RUN_DIR/multi-user.target.wants/$unit" "$unit" || failures=1
+    done
     _remove_owned_file "$OPENRC_INIT_DIR/$SERVICE_NAME" "$SERVICE_NAME" || failures=1
     _remove_owned_file "$OPENRC_INIT_DIR/$RELAY_SERVICE_NAME" "$RELAY_SERVICE_NAME" || failures=1
     _remove_owned_file "$OPENRC_RUN_DIR/${SERVICE_NAME}.pid" "${SERVICE_NAME}.pid" || failures=1
     _remove_owned_file "$OPENRC_RUN_DIR/${RELAY_SERVICE_NAME}.pid" "${RELAY_SERVICE_NAME}.pid" || failures=1
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ $systemd_mode -eq 1 ]]; then
+        systemctl daemon-reload || return 1
+        for unit in "${uninstall_units[@]}"; do
+            active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+            if [[ "$active_state" == failed ]]; then
+                systemctl reset-failed "$unit" || return 1
+                active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+            fi
+            load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
+            if [[ "$active_state" != inactive || "$load_state" != not-found ]]; then
+                printf 'Systemd unit %s remains (%s/%s); keeping runtime files for retry.\n' \
+                    "$unit" "$load_state" "$active_state" >&2
+                return 1
+            fi
+        done
     fi
+    [[ $failures -eq 0 ]] || return 1
 
+    _remove_owned_tree "${BPF_PIN_DIR}_next" "xdp_fw_next" || failures=1
+    _remove_owned_tree "${BPF_PIN_DIR}_rollback" "xdp_fw_rollback" || failures=1
+    _remove_owned_tree "$BPF_PIN_DIR" "xdp_fw" || failures=1
     _remove_owned_tree "$INSTALL_ROOT" "auto_xdp" || failures=1
     _remove_owned_tree "$RUN_STATE_DIR" "auto_xdp" || failures=1
     _remove_owned_relay_group || failures=1

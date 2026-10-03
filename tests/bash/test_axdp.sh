@@ -9,7 +9,7 @@ BASE_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 source "$REPO_ROOT/tests/bash/testlib.sh"
 
 # NOTE: stats/ports formatting, flag parsing, and csv helpers migrated to
-# Python (auto_xdp/admin_cli.py); covered by tests/python/test_admin_cli.py.
+# Python (auto_xdp/admin/cli.py); covered by tests/python/test_admin_cli.py.
 
 test_run_log_level_reads_and_updates_config() (
     source "$REPO_ROOT/axdp"
@@ -378,6 +378,7 @@ _setup_reattach_test_env() {
 
     # stubs for functions from auto_xdp_runtime_common.sh (not loaded in tests)
     ensure_bpffs() { return 0; }
+    ensure_linux_conntrack() { return 0; }
     load_sock_state_tracker() { return 0; }
     load_syncookie_program() { return 0; }
     load_minecraft_egress() { return 0; }
@@ -517,6 +518,19 @@ test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails() (
     [[ ! -e "${BPF_PIN_DIR}_next" ]]
 )
 
+test_ensure_xdp_blocks_fallback_when_conntrack_is_unavailable() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+    ensure_linux_conntrack() { return 1; }
+    _auto_xdp_any_target_has_xdp() { return 0; }
+    ensure_xdp_loaded >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 2
+)
+
 test_ensure_xdp_blocks_fallback_when_required_syncookie_is_unavailable() (
     source "$REPO_ROOT/runtime/auto_xdp_start.sh"
     set +e
@@ -561,7 +575,7 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
     source "$REPO_ROOT/axdp"
     set +e
 
-    local tmpdir
+    local tmpdir tc_scenario="${1:-success}" iface direction output status
     tmpdir=$(mktemp -d)
     local ops_log="$tmpdir/ops.log"
 
@@ -579,6 +593,7 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
     RUNNER_SCRIPT="$INSTALL_DIR/auto_xdp_start.sh"
     AXDP_CMD="$tmpdir/usr/local/bin/axdp"
     SYSTEMD_UNIT_DIR="$tmpdir/etc/systemd/system"
+    SYSTEMD_RUN_DIR="$tmpdir/run/systemd/system"
     OPENRC_INIT_DIR="$tmpdir/etc/init.d"
     OPENRC_RUN_DIR="$tmpdir/run"
     AUTO_XDP_PROC_ROOT="$tmpdir/proc"
@@ -599,6 +614,13 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         "$OPENRC_RUN_DIR/xdp-port-sync.pid" \
         "$OPENRC_RUN_DIR/auto-xdp-relay.pid" \
         "$CONFIG_FILE" "$TOML_CONFIG" "$RELAY_GROUP_MARKER"
+    if [[ "$tc_scenario" != absent ]]; then
+        for iface in eth0 eth1; do
+            for direction in ingress egress; do
+                touch "$tmpdir/tc-$iface-$direction"
+            done
+        done
+    fi
 
     require_root() { return 0; }
     getent() {
@@ -620,6 +642,32 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         esac
         return 0
     }
+    command() {
+        [[ "$tc_scenario:$*" != "missing_tc:-v tc" ]] || return 1
+        builtin command "$@"
+    }
+    tc() {
+        printf 'tc %s\n' "$*" >>"$ops_log"
+        if [[ "$1" == -j ]]; then
+            [[ "$tc_scenario" != query_failure ]] || return 1
+            [[ "$tc_scenario" != invalid_json ]] || { printf 'invalid JSON\n'; return 0; }
+            [[ "$*" == "-j filter show dev "* ]] || return 1
+            if [[ -e "$tmpdir/tc-$5-$6" ]]; then
+                printf '[{"kind":"bpf","options":{"handle":"0x2"}}]\n'
+            else
+                # Another handle at the same preference belongs to someone else.
+                printf '[{"kind":"bpf","options":{"handle":"0x3"}}]\n'
+            fi
+            return 0
+        fi
+        [[ "$*" == "filter del dev "* && "${6:-}:${7:-}:${8:-}:${10:-}:${11:-}:${12:-}" \
+            == "protocol:all:pref:handle:2:bpf" ]] || return 255
+        case "$5:$9" in ingress:49151|egress:49153) ;; *) return 1 ;; esac
+        [[ "$tc_scenario" != delete_failure ]] || return 2
+        [[ "$tc_scenario" != residual_filter ]] || return 0
+        [[ -e "$tmpdir/tc-$4-$5" ]] || return 2
+        rm "$tmpdir/tc-$4-$5"
+    }
     nft() {
         printf 'nft %s\n' "$*" >>"$ops_log"
         case "$*" in
@@ -627,8 +675,36 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         esac
         return 0
     }
+    python3() {
+        if [[ "$*" == '-m auto_xdp.bpf.conntrack --remove' ]]; then
+            printf 'conntrack remove\n' >> "$ops_log"
+            [[ "$tc_scenario" != conntrack_failure ]]
+            return
+        fi
+        command python3 "$@"
+    }
 
-    run_uninstall >/dev/null 2>&1 || return 1
+    output=$(run_uninstall 2>&1)
+    status=$?
+    case "$tc_scenario" in
+        delete_failure|query_failure|invalid_json|residual_filter|missing_tc|conntrack_failure)
+            assert_eq "$status" 1 "$tc_scenario: $output" || return 1
+            [[ -f "$AXDP_CMD" && -d "$INSTALL_ROOT" && -d "$BPF_PIN_DIR" && -d "$CONFIG_DIR" ]] \
+                || { printf 'TC failure deleted retry assets\n'; return 1; }
+            assert_contains "$output" "Uninstall stopped before deleting runtime files" || return 1
+            if [[ "$tc_scenario" != conntrack_failure ]]; then
+                ! grep -q 'conntrack remove' "$ops_log" || return 1
+            fi
+            [[ "$output" != *"completely uninstalled"* ]]
+            return ;;
+        *) assert_eq "$status" 0 "$output" || return 1 ;;
+    esac
+    for iface in eth0 eth1; do
+        for direction in ingress egress; do
+            [[ ! -e "$tmpdir/tc-$iface-$direction" ]] \
+                || { printf 'TC filter remains on %s %s\n' "$iface" "$direction"; return 1; }
+        done
+    done
 
     local path
     for path in \
@@ -649,10 +725,162 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
 
     assert_file_contains "$ops_log" "ip link set dev eth1 xdpgeneric off" || return 1
     assert_file_contains "$ops_log" "groupdel auto-xdp" || return 1
+    assert_file_contains "$ops_log" "conntrack remove" || return 1
     if grep -q "qdisc del" "$ops_log"; then
         printf 'uninstall deleted the shared clsact qdisc\n'
         return 1
     fi
+)
+
+test_uninstall_verifies_tc_cleanup_before_removing_files() (
+    local scenario
+    for scenario in absent delete_failure query_failure invalid_json residual_filter missing_tc conntrack_failure; do
+        test_uninstall_removes_all_auto_xdp_artifacts "$scenario" || return 1
+    done
+)
+
+test_uninstall_systemd_lifecycle() (
+    local scenario
+    for scenario in success failed_unit missing_unit no_manager query_failure stop_failure \
+        disable_failure still_running still_enabled reload_failure reload_retry reset_failure residual_unit; do
+        (
+            source "$REPO_ROOT/axdp"
+            set +e
+            local tmpdir unit output status
+            tmpdir=$(mktemp -d)
+            BPF_PIN_DIR="$tmpdir/bpf/xdp_fw"
+            INSTALL_ROOT="$tmpdir/lib/auto_xdp"
+            INSTALL_DIR="$INSTALL_ROOT/current"
+            CONFIG_DIR="$tmpdir/etc/auto_xdp"
+            RUN_STATE_DIR="$tmpdir/run/auto_xdp"
+            AXDP_CMD="$tmpdir/bin/axdp"
+            SYSTEMD_UNIT_DIR="$tmpdir/systemd/system"
+            SYSTEMD_RUN_DIR="$tmpdir/run/systemd/system"
+            OPENRC_INIT_DIR="$tmpdir/init.d"
+            OPENRC_RUN_DIR="$tmpdir/run"
+            AUTO_XDP_PROC_ROOT="$tmpdir/proc"
+            RELAY_GROUP_MARKER="$CONFIG_DIR/.relay-group-created"
+            mkdir -p "$BPF_PIN_DIR" "$INSTALL_ROOT" "$CONFIG_DIR" "$RUN_STATE_DIR" \
+                "${AXDP_CMD%/*}" "$SYSTEMD_UNIT_DIR/multi-user.target.wants"
+            [[ "$scenario" == no_manager ]] || mkdir -p "$SYSTEMD_RUN_DIR/multi-user.target.wants"
+            touch "$AXDP_CMD"
+            for unit in "$SERVICE_NAME.service" "$RELAY_SERVICE_NAME.service"; do
+                [[ "$scenario:$unit" == "missing_unit:$RELAY_SERVICE_NAME.service" ]] \
+                    || touch "$SYSTEMD_UNIT_DIR/$unit"
+                ln -s "../$unit" "$SYSTEMD_UNIT_DIR/multi-user.target.wants/$unit"
+                [[ "$scenario" == no_manager ]] || ln -s "$SYSTEMD_UNIT_DIR/$unit" \
+                    "$SYSTEMD_RUN_DIR/multi-user.target.wants/$unit"
+            done
+            require_root() { :; }
+            python3() {
+                [[ "$*" != '-m auto_xdp.bpf.conntrack --remove' ]] || return 0
+                command python3 "$@"
+            }
+            ip() { return 1; } # No real network interface is touched.
+            nft() { return 1; }
+            rc-service() { :; }
+            rc-update() { :; }
+            systemctl() {
+                printf '%s\n' "$*" >> "$tmpdir/systemctl.log"
+                [[ "$scenario" != no_manager ]] || return 1
+                local action="$1" name="${*: -1}" links
+                [[ "$name" == *.service ]] || name+=.service
+                case "$action" in
+                    show)
+                        [[ "$scenario" != query_failure ]] || return 1
+                        case "$*" in
+                            *LoadState*)
+                                if [[ -e "$SYSTEMD_UNIT_DIR/$name" || "$scenario" == residual_unit ]] \
+                                    || { [[ "$scenario" == reload_retry ]] && [[ ! -e "$tmpdir/removed-reloaded" ]]; }; then
+                                    printf 'loaded\n'
+                                else
+                                    printf 'not-found\n'
+                                fi ;;
+                            *ActiveState*)
+                                if [[ "$scenario" == still_running ]]; then
+                                    printf 'active\n'
+                                elif [[ "$scenario" == failed_unit || "$scenario" == reset_failure ]] \
+                                    && [[ ! -e "$tmpdir/reset-$name" ]]; then
+                                    # A deleted failed unit must be reset explicitly.
+                                    printf 'failed\n'
+                                else
+                                    printf 'inactive\n'
+                                fi ;;
+                            *) return 1 ;;
+                        esac ;;
+                    disable)
+                        [[ "$scenario" != disable_failure ]] || return 1
+                        [[ "$scenario:$*" != stop_failure:*--now* ]] || return 1
+                        links="$SYSTEMD_UNIT_DIR"
+                        [[ "$*" != *--runtime* ]] || links="$SYSTEMD_RUN_DIR"
+                        shift
+                        for name in "$@"; do
+                            [[ "$name" != -* ]] || continue
+                            [[ "$name" == *.service ]] || name+=.service
+                            [[ -e "$SYSTEMD_UNIT_DIR/$name" ]] || return 1
+                            [[ "$scenario" == still_enabled ]] \
+                                || rm -f "$links/multi-user.target.wants/$name"
+                        done ;;
+                    stop) [[ "$scenario" != stop_failure ]] ;;
+                    is-enabled)
+                        if [[ -e "$SYSTEMD_UNIT_DIR/$name" ]]; then
+                            if [[ -L "$SYSTEMD_UNIT_DIR/multi-user.target.wants/$name" ]]; then
+                                printf 'enabled\n'; return 0
+                            fi
+                            if [[ -L "$SYSTEMD_RUN_DIR/multi-user.target.wants/$name" ]]; then
+                                printf 'enabled-runtime\n'; return 0
+                            fi
+                            printf 'disabled\n'; return 1
+                        fi
+                        printf 'not-found\n'; return 4 ;;
+                    daemon-reload)
+                        if [[ ! -e "$SYSTEMD_UNIT_DIR/$SERVICE_NAME.service" ]]; then
+                            [[ "$scenario" != reload_failure ]] || return 1
+                            if [[ "$scenario" == reload_retry && ! -e "$tmpdir/reload-failed-once" ]]; then
+                                touch "$tmpdir/reload-failed-once"
+                                return 1
+                            fi
+                            touch "$tmpdir/removed-reloaded"
+                        fi ;;
+                    reset-failed)
+                        [[ "$scenario" != reset_failure ]] || return 1
+                        [[ ! -e "$SYSTEMD_UNIT_DIR/$name" ]] || return 1
+                        touch "$tmpdir/reset-$name" ;;
+                    *) return 1 ;;
+                esac
+            }
+            output=$(run_uninstall eth0 2>&1)
+            status=$?
+            if [[ "$scenario" == reload_retry ]]; then
+                [[ $status -ne 0 && -f "$AXDP_CMD" && -d "$BPF_PIN_DIR" ]] || exit 1
+                output=$(run_uninstall eth0 2>&1)
+                status=$?
+            fi
+            case "$scenario" in
+                success|failed_unit|missing_unit|no_manager|reload_retry)
+                    assert_eq "$status" 0 "$scenario: $output" || exit 1
+                    for unit in "$SERVICE_NAME.service" "$RELAY_SERVICE_NAME.service"; do
+                        [[ ! -e "$SYSTEMD_UNIT_DIR/$unit" && ! -L "$SYSTEMD_UNIT_DIR/$unit" ]] || exit 1
+                        [[ ! -L "$SYSTEMD_UNIT_DIR/multi-user.target.wants/$unit" ]] || exit 1
+                        [[ ! -L "$SYSTEMD_RUN_DIR/multi-user.target.wants/$unit" ]] || exit 1
+                    done
+                    [[ ! -e "$AXDP_CMD" ]] || exit 1
+                    if [[ "$scenario" == no_manager ]]; then
+                        [[ ! -e "$tmpdir/systemctl.log" ]] || exit 1
+                    else
+                        assert_file_contains "$tmpdir/systemctl.log" "daemon-reload" || exit 1
+                        if [[ "$scenario" == failed_unit ]]; then
+                            assert_file_contains "$tmpdir/systemctl.log" "reset-failed $SERVICE_NAME.service" || exit 1
+                            assert_file_contains "$tmpdir/systemctl.log" "reset-failed $RELAY_SERVICE_NAME.service" || exit 1
+                        fi
+                    fi ;;
+                *)
+                    [[ $status -ne 0 ]] || { printf '%s falsely reported success\n' "$scenario"; exit 1; }
+                    [[ -f "$AXDP_CMD" && -d "$INSTALL_ROOT" && -d "$BPF_PIN_DIR" && -d "$CONFIG_DIR" ]] \
+                        || { printf '%s deleted retry assets\n' "$scenario"; exit 1; } ;;
+            esac
+        ) || { printf 'systemd uninstall scenario failed: %s\n' "$scenario"; return 1; }
+    done
 )
 
 test_uninstall_preserves_used_relay_group() (
@@ -691,6 +919,7 @@ test_uninstall_keeps_runtime_when_xdp_detach_fails() (
     INSTALL_ROOT="$tmpdir/usr/local/lib/auto_xdp"
     INSTALL_DIR="$INSTALL_ROOT/current"
     AUTO_XDP_PROC_ROOT="$tmpdir/proc"
+    SYSTEMD_RUN_DIR="$tmpdir/run/systemd/system"
     IFACES="eth0"
     mkdir -p "$BPF_PIN_DIR" "$INSTALL_DIR"
 

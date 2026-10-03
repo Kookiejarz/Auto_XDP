@@ -274,7 +274,7 @@ check_required_tools_step() {
                         warn "$cmd still missing — remote source staging will be unavailable"
                         ;;
                     nft)
-                        warn "nft still missing — nftables fallback backend will be unavailable"
+                        warn "nft still missing — XDP conntrack activation and nftables fallback will be unavailable"
                         ;;
                 esac
             fi

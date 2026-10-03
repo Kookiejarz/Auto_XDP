@@ -167,6 +167,11 @@ ensure_xdp_loaded() {
 
     ensure_bpffs
 
+    ensure_linux_conntrack || {
+        _auto_xdp_any_target_has_xdp && return 2
+        return 1
+    }
+
     # A killed loader can leave a staged or rollback generation behind. Resume
     # it when possible. If the staged generation is no longer usable, verify
     # and restore the last committed generation before accepting the healthy

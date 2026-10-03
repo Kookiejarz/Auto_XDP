@@ -190,6 +190,26 @@ class AdminCliTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unsafe BPF pin path"):
             admin_runtime.deactivate_runtime(context)
 
+    def test_full_disable_removes_conntrack_activation_before_deleting_pins(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pins = root / "bpf" / "xdp_fw"
+            pins.mkdir(parents=True)
+            context = admin_runtime.RuntimeContext(root / "env", pins, root / "run", "inet", "auto_xdp")
+            with mock.patch.object(admin_runtime, "_load_json_file", return_value={}), \
+                 mock.patch.object(admin_runtime, "_pinned_xdp_program_id", return_value=None), \
+                 mock.patch.object(admin_runtime, "_command_exists", return_value=True), \
+                 mock.patch.object(admin_runtime, "_run_text", return_value=
+                                   subprocess.CompletedProcess([], 1, "", "")), \
+                 mock.patch("auto_xdp.bpf.conntrack.configure") as configure:
+                configure.side_effect = RuntimeError("cannot remove tracking table")
+                with self.assertRaisesRegex(RuntimeError, "cannot remove"):
+                    admin_runtime.deactivate_runtime(context)
+                self.assertTrue(pins.exists(), "cleanup failure must retain retry assets")
+                configure.side_effect = None
+                admin_runtime.deactivate_runtime(context)
+                configure.assert_called_with(remove=True)
+                self.assertFalse(pins.exists())
 
     def test_deactivate_runtime_refuses_foreign_xdp(self):
         with tempfile.TemporaryDirectory() as tmpdir:

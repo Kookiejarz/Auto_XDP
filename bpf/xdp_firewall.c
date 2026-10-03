@@ -10,6 +10,7 @@
 #include "include/exposure.h"
 #include "include/parse.h"
 #include "include/slots.h"
+#include "include/linux_conntrack.h"
 
 /* --- Protocol dispatch functions --- */
 
@@ -22,6 +23,10 @@ static __always_inline int check_tcp_policy(
     struct tcp_endpoint_policy endpoint_policy = {};
     __u8 reason = CNT_PORT_NOT_AUTHORIZED;
 
+    if (linux_ct_reply(ctx, key, IPPROTO_TCP)) {
+        count(CNT_TCP_PASS);
+        return XDP_PASS;
+    }
 
     if (!tcp_endpoint_policy_lookup(ctx, dest_port, &endpoint_policy))
         goto drop;
@@ -192,6 +197,10 @@ static __always_inline int check_udp_ipv4(
     struct udp_port_policy_cfg *policy;
 
     fill_flow_key_v4(&key, ip->saddr, ip->daddr, udp->source, udp->dest);
+    if (linux_ct_reply(ctx, &key, IPPROTO_UDP)) {
+        count(CNT_UDP_PASS);
+        return XDP_PASS;
+    }
     fill_udp_validation_key_v4(&validation_key, &key);
 
     if (!udp_exposure_allowed(ctx, dest_port)) {
@@ -325,6 +334,10 @@ static __always_inline int check_udp_ipv6(
     __u64 pkt_bytes = (__u64)sizeof(*ipv6) + (__u64)bpf_ntohs(ipv6->payload_len);
 
     fill_flow_key_v6(&key, &ipv6->saddr, &ipv6->daddr, udp->source, udp->dest);
+    if (linux_ct_reply(ctx, &key, IPPROTO_UDP)) {
+        count(CNT_UDP_PASS);
+        return XDP_PASS;
+    }
     fill_udp_validation_key_v6(&validation_key, &key);
 
 
