@@ -220,14 +220,17 @@ def deactivate_runtime(ctx: RuntimeContext) -> list[str]:
     backend_marker = ctx.run_state_dir / "backend"
     active_backend = backend_marker.read_text().strip() if backend_marker.exists() else ""
     if _command_exists("nft"):
+        if not ctx.interface:
+            from auto_xdp.bpf.conntrack import configure as configure_conntrack
+            configure_conntrack(remove=True)
         present = _run_text(["nft", "list", "table", ctx.nft_family, ctx.nft_table]).returncode == 0
         if present:
             result = _run_text(["nft", "delete", "table", ctx.nft_family, ctx.nft_table])
             if result.returncode != 0:
                 raise RuntimeError(f"failed to remove nftables table: {result.stderr.strip()}")
             messages.append(f"removed nftables table {ctx.nft_family} {ctx.nft_table}")
-    elif active_backend == "nftables":
-        raise RuntimeError("nft is required to remove the active Auto XDP fallback table")
+    elif active_backend in {"nftables", "xdp"}:
+        raise RuntimeError("nft is required to remove Auto XDP policy/conntrack tables")
 
     if pin_root.exists():
         try:

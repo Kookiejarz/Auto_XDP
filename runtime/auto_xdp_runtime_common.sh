@@ -1141,6 +1141,19 @@ PY
     _auto_xdp_info "SYN-cookie Level 2 enabled on ${cookie_ifaces[*]}."
 }
 
+ensure_linux_conntrack() {
+    if [[ "${NFT_FAMILY:-inet}" == inet && "${NFT_TABLE:-auto_xdp}" == auto_xdp_conntrack ]]; then
+        _auto_xdp_warn "inet auto_xdp_conntrack is reserved for XDP tracking, not the fallback policy."
+        return 1
+    fi
+    local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+    PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
+        "${PYTHON3_BIN:-python3}" -m auto_xdp.bpf.conntrack || {
+        _auto_xdp_warn "Linux conntrack is required for XDP outbound replies; current attachment preserved."
+        return 1
+    }
+}
+
 transactional_reload_xdp() {
     local xdp_obj_path=""
     xdp_obj_path=$(_auto_xdp_first_value XDP_OBJ_PATH XDP_OBJ_INSTALLED) || xdp_obj_path=""
@@ -1156,6 +1169,8 @@ transactional_reload_xdp() {
     }
     local -n switch_ifaces="$iface_var"
     [[ ${#switch_ifaces[@]} -gt 0 ]] || return 1
+
+    ensure_linux_conntrack || return 1
 
     local live_dir="$BPF_PIN_DIR"
     # bpffs rejects directory names containing dots on supported kernels, so
@@ -1299,7 +1314,7 @@ cleanup_minecraft_egress() {
     iface_var=$(_auto_xdp_iface_var_name) || return 0
     local -n cleanup_ifaces="$iface_var"
     for iface in "${cleanup_ifaces[@]}"; do
-        tc filter del dev "$iface" egress pref 49153 handle 2 2>/dev/null || true
+        tc filter del dev "$iface" egress protocol all pref 49153 handle 2 bpf 2>/dev/null || true
     done
     rm -f "${BPF_PIN_DIR}/minecraft_egress_prog" \
           "${BPF_PIN_DIR}/minecraft_egress_next" 2>/dev/null || true
@@ -1346,7 +1361,7 @@ load_minecraft_egress() {
                 tc filter replace dev "$iface" egress pref 49153 handle 2 \
                     bpf direct-action object-pinned "$live_pin" >/dev/null 2>&1 || true
             else
-                tc filter del dev "$iface" egress pref 49153 handle 2 2>/dev/null || true
+                tc filter del dev "$iface" egress protocol all pref 49153 handle 2 bpf 2>/dev/null || true
             fi
         done
         rm -f "$next_pin"

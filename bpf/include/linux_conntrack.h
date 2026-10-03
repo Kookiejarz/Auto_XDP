@@ -89,6 +89,27 @@ static __always_inline struct bpf_ct_opts___local linux_ct_opts(__u8 l4proto)
     };
 }
 
+/* Lookup is read-only: never create state from an unsolicited ingress packet.
+ * REPLY is relative to the connection initiator, not the interface direction.
+ * Do not require SEEN_REPLY/ESTABLISHED: the first DNS reply/SYN-ACK precedes
+ * those transitions. The stack still validates packets after XDP_PASS.
+ */
+static __always_inline bool linux_ct_reply(
+    struct xdp_md *ctx, const struct flow_key *key, __u8 l4proto)
+{
+    struct bpf_sock_tuple tuple;
+    struct bpf_ct_opts___local opts = linux_ct_opts(l4proto);
+    linux_ct_fill_tuple(&tuple, key);
+    struct nf_conn *ct = bpf_xdp_ct_lookup(
+        ctx, &tuple, linux_ct_tuple_size(key), &opts, sizeof(opts));
+    if (!ct)
+        return false;
+    bool reply = opts.dir == NF_CT_DIR_REPLY &&
+                 (ct->status & IPS_CONFIRMED_LOCAL);
+    bpf_ct_release(ct);
+    return reply;
+}
+
 static __always_inline void linux_ct_snapshot(
     const struct nf_conn *ct, __u8 dir, struct linux_ct_snapshot *snapshot)
 {

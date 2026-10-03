@@ -442,6 +442,17 @@ test_packet_event_v2_kernel() {
         events "$_PIN_DIR" "$_VETH"
 }
 
+test_linux_conntrack_replies() {
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_conntrack.py" \
+        "$_PIN_DIR" "$_NS"
+}
+
+test_linux_conntrack_native_replies() {
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+    test_linux_conntrack_replies
+}
+
 _header_define() {
     awk -v name="$2" '$1 == "#define" && $2 == name { print $3; exit }' "$1"
 }
@@ -1581,12 +1592,22 @@ if [[ "${ONLY_SYNCOOKIE:-0}" == 1 ]]; then
     finish_tests
     exit
 fi
+selected_tests=0
 while IFS= read -r function_name; do
     [[ -n "$function_name" ]] || continue
+    if [[ -n "${KERNEL_TEST_FILTER:-}" && \
+        "$function_name" != "test_${KERNEL_TEST_FILTER}" ]]; then
+        continue
+    fi
+    selected_tests=$((selected_tests + 1))
     _run_kernel_test "${function_name#test_}" "$function_name"
 done < <(
     discover_test_functions "${BASH_SOURCE[0]}"
 )
+if [[ "$selected_tests" -eq 0 ]]; then
+    test_log_error "no kernel test matched KERNEL_TEST_FILTER=${KERNEL_TEST_FILTER:-}"
+    exit 1
+fi
 _teardown
 
 finish_tests

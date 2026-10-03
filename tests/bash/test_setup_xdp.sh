@@ -837,8 +837,39 @@ test_xdp_attach_candidate_honors_strict_saved_mode() (
     assert_contains "$output" "XDP attach failed on eth1: kernel rejected test candidate"
 )
 
+test_transactional_conntrack_failure_preserves_attachment() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=(eth0)
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' > "$BPF_PIN_DIR/prog"
+    touch "$XDP_OBJ_INSTALLED"
+    ensure_linux_conntrack() { return 1; }
+    bpftool() { touch "$tmpdir/unexpected-load"; }
+    _auto_xdp_attach_candidate() { touch "$tmpdir/unexpected-attach"; }
+    transactional_reload_xdp >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 1 || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" old || return 1
+    [[ ! -e "$tmpdir/unexpected-load" && ! -e "$tmpdir/unexpected-attach" && ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
+test_conntrack_activation_rejects_reserved_fallback_table() (
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+    NFT_FAMILY=inet
+    NFT_TABLE=auto_xdp_conntrack
+    if ensure_linux_conntrack >/dev/null 2>&1; then
+        return 1
+    fi
+)
+
 test_transactional_xdp_validation_failure_keeps_current_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -872,6 +903,7 @@ test_transactional_xdp_validation_failure_keeps_current_generation() (
 
 test_transactional_xdp_load_failure_reports_verifier_log() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir output status
@@ -901,6 +933,7 @@ test_transactional_xdp_load_failure_reports_verifier_log() (
 
 test_transactional_xdp_load_failure_reports_missing_bpftool() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir output status
@@ -996,6 +1029,7 @@ test_verifier_summary_prints_processed_and_stack() (
 
 test_transactional_handler_failure_keeps_current_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -1079,6 +1113,7 @@ PY
 
 test_transactional_xdp_attach_failure_restores_switched_interfaces() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -1129,6 +1164,7 @@ test_transactional_xdp_attach_failure_restores_switched_interfaces() (
 
 test_transactional_xdp_verification_failure_restores_current_interface() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -1175,6 +1211,7 @@ test_transactional_xdp_verification_failure_restores_current_interface() (
 
 test_transactional_xdp_success_commits_candidate_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -1235,6 +1272,7 @@ test_interrupted_xdp_reload_resumes_candidate_generation() (
 
 test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
