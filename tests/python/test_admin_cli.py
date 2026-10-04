@@ -23,6 +23,42 @@ pytestmark = pytest.mark.component
 
 
 class AdminCliTests(unittest.TestCase):
+    def test_shared_management_clients_work_without_importing_cli(self):
+        # A fresh interpreter catches both direct and delayed imports of the CLI.
+        result = subprocess.run([sys.executable, "-c", '''
+import sys
+sys.modules["auto_xdp.admin.cli"] = None
+
+import tempfile
+from pathlib import Path
+from auto_xdp.admin import approvals
+from auto_xdp.tui import app as tui
+from auto_xdp.tui import traffic as tui_traffic
+from auto_xdp.admin import config_file, detect, formatting, handlers, ports, stats
+
+assert tui.collect_ports is ports.collect_ports
+assert tui.collect_stats_rows is stats.collect_stats_rows
+assert tui.detect_backend is detect.detect_backend
+assert tui.human_bytes is tui_traffic.human_bytes is formatting.human_bytes
+assert formatting.format_rate(10, 125, 1) == "10.00 pps / 1.00 Kbps"
+assert set(handlers.BUILTIN_SLOT_INFO) == {"gre", "esp", "sctp"}
+with tempfile.TemporaryDirectory() as directory:
+    config = Path(directory) / "config.toml"
+    store = Path(directory) / "approvals.json"
+    config_file.write_toml(config, {
+        "subjects": {"web": {"resolve": {"systemd_unit": "web.service"}}},
+    })
+    request = approvals.create_request(
+        store, config, subject="web", zone="public", protocol="tcp",
+        ports=[443], reason="management service contract",
+    )
+    approvals.approve_request(store, config, request["id"])
+    assert approvals.list_grants(config)[0]["ports"] == [443]
+    approvals.revoke_request(store, config, request["id"])
+    assert approvals.list_grants(config) == []
+'''], capture_output=True, text=True, cwd=Path(__file__).resolve().parents[2])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_handler_source_compile_includes_installed_shared_bpf_headers(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

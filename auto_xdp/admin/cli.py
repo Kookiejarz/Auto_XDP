@@ -648,8 +648,6 @@ def _cmd_profile_handler_unload(args: argparse.Namespace) -> int:
     return 0
 
 
-
-
 def _print_port_lines(
     proto: str,
     ports: list[int],
@@ -1396,7 +1394,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 
 
 def _cmd_tui(args: argparse.Namespace) -> int:
-    from auto_xdp.tui import run_tui
+    from auto_xdp.tui.app import run_tui
 
     try:
         return run_tui(args)

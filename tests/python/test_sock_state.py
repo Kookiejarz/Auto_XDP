@@ -299,24 +299,14 @@ class TestSyncerDrainRelayLines(unittest.TestCase):
         self.assertEqual(pending, bytearray())
 
 
-import auto_xdp.tui as tui_mod
+import auto_xdp.tui.app as tui_mod
 import threading
 
 
 class TestTuiPortsDirty(unittest.TestCase):
 
     def _make_relay(self):
-        relay = tui_mod.RelayClient.__new__(tui_mod.RelayClient)
-        relay.events = []
-        relay.events_offset = 0
-        relay.max_events = 100
-        relay.status = ""
-        relay.ports_dirty = False
-        relay.reason_totals = {}
-        relay.path = ""
-        relay._sock = None
-        relay._buf = ""
-        return relay
+        return tui_mod.RelayClient("/tmp/test-relay.sock", max_events=100)
 
     def test_port_change_sets_ports_dirty(self):
         relay = self._make_relay()

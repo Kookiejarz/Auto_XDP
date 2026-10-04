@@ -5,7 +5,6 @@ import datetime as _dt
 import hashlib
 import json
 import os
-import select
 import shutil
 import socket
 import subprocess
@@ -15,20 +14,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from auto_xdp.admin.ports import (
-    collect_ports as _collect_ports, lookup_port_procs as _lookup_port_procs,
-    read_xdp_ports as _read_xdp_ports,
-)
-from auto_xdp.admin.stats import (
-    collect_stats_rows as _collect_stats_rows, read_xdp_map_id as _read_xdp_map_id,
-)
-from auto_xdp.admin.detect import detect_backend as _detect_backend, autodetect_iface as _autodetect_iface
-from auto_xdp.admin.formatting import format_rate as _format_rate, human_bytes as _human_bytes
+from auto_xdp.admin.detect import autodetect_iface, detect_backend
+from auto_xdp.admin.formatting import format_rate, human_bytes
+from auto_xdp.admin.ports import collect_ports, lookup_port_procs, read_xdp_ports
+from auto_xdp.admin.stats import collect_stats_rows, read_xdp_map_id
 from auto_xdp.admin import approvals
-from auto_xdp.bpf.maps import BpfGlobalRlMap, BpfPortPolicyMap
+from auto_xdp.bpf.maps import BpfGlobalRlMap, BpfPortPolicyMap, BpfSyncookieRuntimeMap
 from auto_xdp.config import apply_toml_config, load_toml_config
 from auto_xdp.discovery.listeners import get_listening_ports
 from auto_xdp.policy import resolve_desired_state
+from auto_xdp.telemetry.geoip import GeoIPResolver
+from auto_xdp.telemetry.relay_client import RelayClient
+from auto_xdp.telemetry.traffic import TrafficRow, _collect_top_traffic, _event_bytes
+from auto_xdp.tui.traffic import (
+    _clamp_event_top, _draw_cookie, _draw_drop_reasons, _draw_event_row,
+    _draw_events, _draw_top_traffic, _event_bottom_top, _event_window, _event_visible,
+)
+from auto_xdp.tui.widgets import (
+    _add, _box, _clip, _CP_GREEN, _CP_RED, _CP_YELLOW,
+    _CP_BLACK_ON_GREEN, _CP_BLACK_ON_YELLOW, _CP_WHITE_ON_RED,
+    _CP_CYAN, _CP_BLACK_ON_CYAN,
+)
 
 
 DEFAULT_SOCKET = "/var/run/auto_xdp/pkt_events.sock"
@@ -37,16 +43,6 @@ MAP_INFO_INTERVAL = 10.0
 MAP_COUNT_INTERVAL = 10.0
 HIGH_CHURN_MAP_COUNT_INTERVAL = 30.0
 TUI_IDLE_REDRAW_INTERVAL = 1.0
-
-# curses color pair indices
-_CP_GREEN = 2
-_CP_RED = 3
-_CP_YELLOW = 4
-_CP_BLACK_ON_GREEN = 5
-_CP_BLACK_ON_YELLOW = 6
-_CP_WHITE_ON_RED = 7
-_CP_CYAN = 8
-_CP_BLACK_ON_CYAN = 9
 
 _HIGH_CHURN_MAPS = {
     "hblk4",
@@ -61,6 +57,10 @@ _HIGH_CHURN_MAPS = {
     "udprt6",
     "udpag4",
     "udpag6",
+    "sync_handoff4",
+    "sync_handoff6",
+    "sync_invalid4",
+    "sync_invalid6",
 }
 
 try:
@@ -98,6 +98,8 @@ class TuiSnapshot:
     ports: list[tuple[str, int, str, str, str]] = field(default_factory=list)
     excluded: tuple[int, int] = (0, 0)
     under_attack: bool = False
+    cookie_configured: bool | None = None
+    cookie_runtime: tuple[int, int, int, int, int] | None = None
     audit_rows: list[dict[str, Any]] = field(default_factory=list)
     audit_fingerprint: str = ""
     approval_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -106,135 +108,11 @@ class TuiSnapshot:
 
 
 @dataclass
-class TrafficRow:
-    ip: str
-    proto: str
-    port: str
-    packets: int
-    bytes_: int | None
-    verdict: str
-    last_seen: float
-
-
-@dataclass
 class MapUsageCache:
     counts: dict[str, int] = field(default_factory=dict)
     refreshed_at: dict[str, float] = field(default_factory=dict)
     map_info: dict[str, dict[str, Any]] = field(default_factory=dict)
     map_info_refreshed_at: float = 0.0
-
-
-class RelayClient:
-    def __init__(self, path: str, max_events: int = 500) -> None:
-        self.path = path
-        self.max_events = max_events
-        self.events: list[dict[str, Any]] = []
-        self.events_offset = 0
-        self.status = "relay: disconnected"
-        self._sock: socket.socket | None = None
-        self._buf = bytearray()
-        self._next_retry = 0.0
-        self.ports_dirty: bool = False
-        self.reason_totals: dict[str, int] = {}
-
-    @property
-    def events_end(self) -> int:
-        return self.events_offset + len(self.events)
-
-    def close(self) -> None:
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-        self._sock = None
-
-    def poll(self) -> None:
-        now = time.monotonic()
-        if self._sock is None:
-            if now < self._next_retry:
-                return
-            self._next_retry = now + 2.0
-            try:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.setblocking(False)
-                sock.connect(self.path)
-            except BlockingIOError:
-                self._sock = sock
-                self.status = "relay: connecting"
-            except OSError as exc:
-                if exc.errno == 2:
-                    self.status = "relay: socket missing; run `sudo systemctl restart auto-xdp-relay`"
-                else:
-                    self.status = f"relay: {exc.strerror or exc}"
-                return
-            else:
-                self._sock = sock
-                self.status = "relay: connected"
-
-        sock = self._sock
-        if sock is None:
-            return
-        try:
-            readable, _, _ = select.select([sock], [], [], 0)
-        except OSError:
-            self.close()
-            self.status = "relay: disconnected"
-            return
-        if not readable:
-            return
-
-        while True:
-            try:
-                chunk = sock.recv(65536)
-            except BlockingIOError:
-                break
-            except OSError:
-                self.close()
-                self.status = "relay: disconnected"
-                break
-            if not chunk:
-                self.close()
-                self.status = "relay: disconnected"
-                break
-            self._buf += chunk
-
-        while True:
-            nl = self._buf.find(b"\n")
-            if nl < 0:
-                break
-            line = self._buf[:nl]
-            del self._buf[:nl + 1]
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if msg.get("type") == "history":
-                history = msg.get("events", [])
-                if isinstance(history, list):
-                    history = history[-self.max_events:]
-                else:
-                    history = []
-                for ev in history:
-                    self._append(ev)
-            elif msg.get("type") == "event":
-                self._append(msg)
-            self.status = "relay: connected"
-
-    def _append(self, event: dict[str, Any]) -> None:
-        event.setdefault("seen_at", time.time())
-        if event.get("type") == "port_change":
-            self.ports_dirty = True
-        elif str(event.get("verdict", "")) == "DROP":
-            reason = str(event.get("reason") or "unknown")
-            self.reason_totals[reason] = self.reason_totals.get(reason, 0) + 1
-        self.events.append(event)
-        if len(self.events) > self.max_events:
-            drop_count = len(self.events) - self.max_events
-            del self.events[:drop_count]
-            self.events_offset += drop_count
 
 
 def _load_toml(path: str) -> dict[str, Any]:
@@ -342,7 +220,7 @@ def _collect_map_usage(
     cache = cache or MapUsageCache()
 
     try:
-        tcp_ports, udp_ports = _read_xdp_ports(bpf_pin_dir)
+        tcp_ports, udp_ports = read_xdp_ports(bpf_pin_dir)
     except Exception:
         tcp_ports, udp_ports = [], []
 
@@ -462,6 +340,19 @@ def _read_global_udp_rate(path: str) -> int:
         m.close()
 
 
+def _read_cookie_runtime(path: str) -> tuple[int, int, int, int, int] | None:
+    if not Path(path).exists():
+        return None
+    try:
+        runtime = BpfSyncookieRuntimeMap(path)
+    except OSError:
+        return None
+    try:
+        return runtime.get()
+    finally:
+        runtime.close()
+
+
 def _xdp_attach_mode(iface: str) -> str:
     try:
         result = subprocess.run(
@@ -543,9 +434,9 @@ def _limit_text(proto: str, port: int, tcp_policy: dict[int, tuple[int, ...]], u
         if fields[0]:
             parts.append(f"src {fields[0]}/s")
         if fields[1]:
-            parts.append(f"agg {_human_bytes(fields[1])}/s")
+            parts.append(f"agg {human_bytes(fields[1])}/s")
     if global_udp:
-        parts.append(f"global {_human_bytes(global_udp)}/s")
+        parts.append(f"global {human_bytes(global_udp)}/s")
     return ", ".join(parts) or "-"
 
 
@@ -557,9 +448,9 @@ def _collect_port_rows(
     *,
     include_processes: bool = True,
 ) -> list[tuple[str, int, str, str, str]]:
-    tcp_ports, udp_ports = _collect_ports(backend, bpf_pin_dir, nft_family, nft_table)
-    tcp_procs = _lookup_port_procs("tcp", tcp_ports) if include_processes else {}
-    udp_procs = _lookup_port_procs("udp", udp_ports) if include_processes else {}
+    tcp_ports, udp_ports = collect_ports(backend, bpf_pin_dir, nft_family, nft_table)
+    tcp_procs = lookup_port_procs("tcp", tcp_ports) if include_processes else {}
+    udp_procs = lookup_port_procs("udp", udp_ports) if include_processes else {}
     tcp_policy = _read_policy(str(Path(bpf_pin_dir) / "tcp_port_policies"))
     udp_policy = _read_policy(str(Path(bpf_pin_dir) / "udp_port_policies"))
     global_udp = _read_global_udp_rate(str(Path(bpf_pin_dir) / "udp_global_rl"))
@@ -675,12 +566,12 @@ def _collect_snapshot(
 ) -> tuple[TuiSnapshot, dict[str, tuple[int, int]], float]:
     ifaces = (args.iface or "").split() or []
     if not ifaces:
-        ifaces = [_autodetect_iface()]
+        ifaces = [autodetect_iface()]
     iface = ifaces[0]
-    backend = _detect_backend(Path(args.bpf_pin_dir), Path(args.run_state_dir), ifaces, args.nft_family, args.nft_table)
-    map_id = _read_xdp_map_id(args.bpf_pin_dir) if backend == "xdp" else "-"
+    backend = detect_backend(Path(args.bpf_pin_dir), Path(args.run_state_dir), ifaces, args.nft_family, args.nft_table)
+    map_id = read_xdp_map_id(args.bpf_pin_dir) if backend == "xdp" else "-"
     state_file = Path(args.run_state_dir) / "axdp_stats_tui.json"
-    rows, map_id = _collect_stats_rows(backend, args.bpf_pin_dir, iface, args.nft_family, args.nft_table, state_file)
+    rows, map_id = collect_stats_rows(backend, args.bpf_pin_dir, iface, args.nft_family, args.nft_table, state_file)
     now = time.monotonic()
     elapsed = max(now - prev_ts, 0.001)
     stats_rows = []
@@ -693,7 +584,7 @@ def _collect_snapshot(
                 packet_delta = -1
             if byte_delta < 0:
                 byte_delta = -1
-            rate = _format_rate(packet_delta, byte_delta, elapsed)
+            rate = format_rate(packet_delta, byte_delta, elapsed)
         else:
             rate = "-"
         stats_rows.append((name, packets, bytes_, rate))
@@ -722,6 +613,8 @@ def _collect_snapshot(
         except Exception as exc:
             audit_error = audit_error or f"approvals: {exc}"
 
+    cookie_cfg = _load_toml(args.config).get("syncookie", {})
+    cookie_enabled = cookie_cfg.get("enabled") if isinstance(cookie_cfg, dict) else None
     snap = TuiSnapshot(
         backend=backend,
         iface=iface,
@@ -746,6 +639,8 @@ def _collect_snapshot(
         ),
         excluded=_excluded_counts(args.config),
         under_attack=_under_attack_enabled(args.config),
+        cookie_configured=cookie_enabled if isinstance(cookie_enabled, bool) else None,
+        cookie_runtime=_read_cookie_runtime(str(Path(args.bpf_pin_dir) / "sync_run_cfg")) if backend == "xdp" else None,
         audit_rows=audit_rows,
         audit_fingerprint=_audit_fingerprint(audit_rows),
         approval_rows=approval_rows,
@@ -862,32 +757,9 @@ def _make_full_win(stdscr: Any) -> Any | None:
     return stdscr.derwin(h - 1, w, 1, 0)
 
 
-def _clip(text: str, width: int) -> str:
-    if width <= 0:
-        return ""
-    return text[: max(0, width - 1)]
-
-
-def _box(win: Any, title: str) -> None:
-    h, w = win.getmaxyx()
-    if h < 2 or w < 2:
-        return
-    win.box()
-    win.addstr(0, 2, _clip(f" {title} ", max(0, w - 4)), curses.A_BOLD)
-
-
-def _add(win: Any, y: int, x: int, text: str, attr: int = 0) -> None:
-    h, w = win.getmaxyx()
-    if 0 <= y < h and x < w:
-        try:
-            win.addstr(y, x, _clip(text, w - x), attr)
-        except curses.error:
-            pass
-
-
 def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool) -> None:
     total_mem = sum(r.memlock for r in rows if r.memlock is not None)
-    mem_label = f"  total {_human_bytes(total_mem)}" if total_mem else ""
+    mem_label = f"  total {human_bytes(total_mem)}" if total_mem else ""
     _box(win, f"BPF maps{mem_label}" + (" *" if focused else ""))
     _add(win, 1, 1, f"{'id':>7} {'map':<18} {'type':<10} {'used':>7} {'max':>7} {'%':>5} {'mem':>8}")
     visible = max(0, win.getmaxyx()[0] - 3)
@@ -897,7 +769,7 @@ def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool) -> No
         used = "-" if row.current is None else str(row.current)
         maximum = "-" if row.maximum is None else str(row.maximum)
         pct = "-" if row.pct is None else f"{row.pct:5.1f}"
-        mem = "-" if row.memlock is None else _human_bytes(row.memlock)
+        mem = "-" if row.memlock is None else human_bytes(row.memlock)
         attr = curses.A_NORMAL
         if row.pct is not None and row.pct >= 80:
             attr = curses.color_pair(_CP_RED) | curses.A_BOLD
@@ -928,181 +800,9 @@ def _draw_summary(win: Any, snap: TuiSnapshot) -> None:
         if row is None:
             continue
         name, packets, bytes_, rate = row
-        _add(win, y, 1, f"{name:<14} {packets:<12} {_human_bytes(bytes_):<11} {rate}")
+        packet_text = str(packets) if packets >= 0 else "unknown"
+        _add(win, y, 1, f"{name:<14} {packet_text:<12} {human_bytes(bytes_):<11} {rate}")
         y += 1
-
-
-def _event_bottom_top(relay: RelayClient, visible: int) -> int:
-    return max(relay.events_offset, relay.events_end - visible)
-
-
-def _clamp_event_top(relay: RelayClient, visible: int, top: int) -> int:
-    if not relay.events:
-        return relay.events_offset
-    return max(relay.events_offset, min(top, _event_bottom_top(relay, visible)))
-
-
-def _event_window(relay: RelayClient, visible: int, top: int) -> tuple[int, int, list[dict[str, Any]]]:
-    top = _clamp_event_top(relay, visible, top)
-    start = max(0, top - relay.events_offset)
-    events = relay.events[start:start + visible] if visible else []
-    return top, start, events
-
-
-def _draw_event_row(win: Any, i: int, ev: dict[str, Any]) -> None:
-    ts = float(ev.get("seen_at", time.time()))
-    tstr = _dt.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-    verdict = str(ev.get("verdict", "DROP"))
-    attr = curses.color_pair(_CP_GREEN) if verdict == "ALLOW" else curses.color_pair(_CP_RED)
-    source = f"{ev.get('src', '-')}/{ev.get('sport', '-')}"
-    line = f"{tstr:<8} {verdict:<5} {str(ev.get('proto', '-')):<8.8} {source:<36.36} {str(ev.get('dport', '-')):>5} {ev.get('reason', '-')}"
-    _add(win, i, 1, line, attr)
-
-
-def _draw_events(
-    win: Any,
-    relay: RelayClient,
-    snap: TuiSnapshot,
-    top: int,
-    focused: bool,
-    dport_filter: int | None = None,
-    filter_scroll: int = 0,
-) -> None:
-    header = f"{'time':<8} {'v':<5} {'protocol':<8} {'source':<36} {'dport':>5} reason"
-    visible = max(0, win.getmaxyx()[0] - 3)
-
-    if dport_filter is not None:
-        filtered = [ev for ev in relay.events
-                    if ev.get("type") != "port_change"
-                    and str(ev.get("dport")) == str(dport_filter)]
-        _box(win, f"events [port {dport_filter}]" + (" *" if focused else ""))
-        _add(win, 1, 1, header)
-        scroll = max(0, min(filter_scroll, max(0, len(filtered) - visible)))
-        for i, ev in enumerate(filtered[scroll:scroll + visible], start=2):
-            _draw_event_row(win, i, ev)
-        count_str = f"{scroll + 1}-{min(scroll + visible, len(filtered))}/{len(filtered)}" if filtered else "0"
-        _add(win, win.getmaxyx()[0] - 1, 2,
-             f"{count_str}  enter:clear filter  {relay.status}", curses.A_DIM)
-        return
-
-    _box(win, "events" + (" *" if focused else ""))
-    _add(win, 1, 1, header)
-    # Fix: clamp top to valid range but never advance it automatically when paused.
-    bottom_top = _event_bottom_top(relay, visible)
-    follow = top >= bottom_top
-    clamped_top = max(relay.events_offset, min(top, bottom_top))
-    start = max(0, clamped_top - relay.events_offset)
-    events = relay.events[start:start + visible] if visible else []
-    for i, ev in enumerate(events, start=2):
-        _draw_event_row(win, i, ev)
-    footer = relay.status
-    if visible > 0 and len(relay.events) > visible:
-        oldest = start + 1
-        newest = min(start + len(events), len(relay.events))
-        live_tag = " [LIVE]" if follow else " [PAUSED ↑↓]"
-        footer = f"{oldest}-{newest}/{len(relay.events)}{live_tag}  tab focus  {relay.status}"
-    _add(win, win.getmaxyx()[0] - 1, 2, footer, curses.A_DIM)
-    if snap.under_attack:
-        note = "drop events suppressed (under-attack mode)"
-        _add(win, win.getmaxyx()[0] - 1, win.getmaxyx()[1] - len(note) - 2, note,
-             curses.color_pair(_CP_RED) | curses.A_BOLD)
-
-
-def _event_bytes(ev: dict[str, Any]) -> int | None:
-    for key in ("bytes", "size", "len", "pkt_len", "packet_len"):
-        try:
-            value = int(ev.get(key, 0))
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            return value
-    return None
-
-
-def _collect_top_traffic(events: list[dict[str, Any]], limit: int = 10) -> list[TrafficRow]:
-    totals: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for ev in events:
-        if ev.get("type") == "port_change":
-            continue
-        ip = str(ev.get("src") or "-")
-        proto = str(ev.get("proto") or "-")
-        port = str(ev.get("dport") or "-")
-        key = (ip, proto, port)
-        row = totals.setdefault(
-            key,
-            {
-                "packets": 0,
-                "bytes": 0,
-                "has_bytes": False,
-                "verdict": str(ev.get("verdict") or "-"),
-                "last_seen": 0.0,
-            },
-        )
-        row["packets"] += 1
-        byte_count = _event_bytes(ev)
-        if byte_count is not None:
-            row["bytes"] += byte_count
-            row["has_bytes"] = True
-        last_seen = float(ev.get("seen_at") or 0.0)
-        if last_seen >= row["last_seen"]:
-            row["last_seen"] = last_seen
-            row["verdict"] = str(ev.get("verdict") or "-")
-
-    rows = [
-        TrafficRow(
-            ip=ip,
-            proto=proto,
-            port=port,
-            packets=int(data["packets"]),
-            bytes_=int(data["bytes"]) if data["has_bytes"] else None,
-            verdict=str(data["verdict"]),
-            last_seen=float(data["last_seen"]),
-        )
-        for (ip, proto, port), data in totals.items()
-    ]
-    return sorted(
-        rows,
-        key=lambda row: (-(row.bytes_ or 0), -row.packets, row.ip, row.proto, row.port),
-    )[:limit]
-
-
-def _draw_drop_reasons(win: Any, relay: RelayClient, scroll: int = 0) -> None:
-    rows = sorted(relay.reason_totals.items(), key=lambda x: -x[1])
-    total = sum(c for _, c in rows)
-    _box(win, f"drop reasons  {total} total")
-    h, w = win.getmaxyx()
-    bar_w = max(1, w - 48)
-    _add(win, 1, 1, f"{'reason':<28} {'count':>6}  {'%':>5}   bar")
-    visible = max(0, h - 3)
-    scroll = max(0, min(scroll, max(0, len(rows) - visible)))
-    for idx, (reason, count) in enumerate(rows[scroll:scroll + visible], start=2):
-        pct = count / total * 100.0 if total else 0.0
-        bar = "█" * max(0, int(pct / 100.0 * bar_w))
-        _add(win, idx, 1,
-             f"{reason:<28} {count:>6}  {pct:>5.1f}%  {bar}",
-             curses.color_pair(_CP_RED))
-    if len(rows) > visible:
-        _add(win, h - 1, 2, f"{scroll + 1}-{min(scroll + visible, len(rows))}/{len(rows)}  ↑↓ scroll", curses.A_DIM)
-
-
-def _draw_top_traffic(win: Any, relay: RelayClient) -> None:
-    _box(win, "top traffic by source ip / protocol / port")
-    _add(win, 1, 1, f"{'#':>2} {'source ip':<39} {'proto':<8} {'port':>5} {'packets':>10} {'bytes':>10} {'last':<8} verdict")
-    rows = _collect_top_traffic(relay.events, limit=10)
-    visible = max(0, win.getmaxyx()[0] - 3)
-    for idx, row in enumerate(rows[:visible], start=2):
-        tstr = "-"
-        if row.last_seen > 0:
-            tstr = _dt.datetime.fromtimestamp(row.last_seen).strftime("%H:%M:%S")
-        bytes_text = "-" if row.bytes_ is None else _human_bytes(row.bytes_)
-        attr = curses.color_pair(_CP_GREEN) if row.verdict == "ALLOW" else curses.color_pair(_CP_RED)
-        line = (
-            f"{idx - 1:>2} {row.ip:<39.39} {row.proto:<8.8} {row.port:>5.5} "
-            f"{row.packets:>10} {bytes_text:>10} {tstr:<8} {row.verdict}"
-        )
-        _add(win, idx, 1, line, attr)
-    footer = f"{len(relay.events)} retained events  v:overview  q:quit  {relay.status}"
-    _add(win, win.getmaxyx()[0] - 1, 2, footer, curses.A_DIM)
 
 
 def _draw_audit_page(stdscr: Any, snap: TuiSnapshot, scroll: int, last_error: str) -> None:
@@ -1215,7 +915,7 @@ def _draw_ports(
     focused: bool = False,
     excluded: tuple[int, int] = (0, 0),
 ) -> None:
-    title = _port_filter_title(proto_filter) + (" *" if focused else "")
+    title = "current " + _port_filter_title(proto_filter) + (" *" if focused else "")
     _box(win, title)
     _add(win, 1, 1, f"{'p':<3} {'port':>5} {'service':<12} {'process':<16} limit")
     now = time.monotonic()
@@ -1273,6 +973,7 @@ def _draw(
     event_filter_scroll: int = 0,
     audit_scroll: int = 0,
     approval_cursor: int = -1,
+    geoip: GeoIPResolver | None = None,
 ) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -1286,6 +987,25 @@ def _draw(
         _add(stdscr, 0, 0, _clip(f"Auto XDP TUI  approvals  backend={snap.backend}  {now}  a:audit o:overview v:traffic q:quit", w), curses.A_REVERSE)
         _draw_approvals_page(stdscr, snap, approval_cursor, 0, last_error)
         return
+    if page == "cookie":
+        full_win = _make_full_win(stdscr)
+        if full_win is None:
+            _add(stdscr, 0, 0, "terminal too small; need at least 80x20")
+        else:
+            _add(stdscr, 0, 0, "Auto XDP TUI  c:cookie / health  v:samples o:overview a:audit q:quit", curses.A_REVERSE)
+            _draw_cookie(full_win, snap, relay, reasons_scroll, geoip)
+        stdscr.refresh()
+        return
+    if page == "events":
+        full_win = _make_full_win(stdscr)
+        if full_win is None:
+            _add(stdscr, 0, 0, "terminal too small; need at least 80x20")
+        else:
+            _add(stdscr, 0, 0, "Auto XDP TUI  e:events  v:samples c:cookie/health o:overview q:quit", curses.A_REVERSE)
+            _draw_events(full_win, relay, snap, event_top, True,
+                         dport_filter=event_dport_filter, filter_scroll=event_filter_scroll)
+        stdscr.refresh()
+        return
     if page == "traffic":
         full_win = _make_full_win(stdscr)
         if full_win is None:
@@ -1297,19 +1017,19 @@ def _draw(
         bot_h = fh - top_h
         top_win = full_win.derwin(top_h, fw, 0, 0)
         now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        title = f"Auto XDP TUI  top traffic  backend={snap.backend} mode={snap.attach_mode}  {now}  v:overview a:audit q:quit"
+        title = f"Auto XDP TUI  event samples  c:cookie/health v:overview a:audit q:quit  {now}"
         _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
         if snap.under_attack:
             badge = " UNDER ATTACK "
             _add(stdscr, 0, max(0, w - len(badge)), badge, curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD)
         if last_error:
             _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(_CP_RED) | curses.A_BOLD)
-        _draw_top_traffic(top_win, relay)
+        _draw_top_traffic(top_win, relay, geoip)
         if bot_h >= 4:
             bot_win = full_win.derwin(bot_h, fw, top_h, 0)
             _draw_drop_reasons(bot_win, relay, reasons_scroll)
             if snap.under_attack:
-                note = " drop events suppressed (under-attack mode) "
+                note = " packet events suppressed (under-attack config) "
                 bh, bw = bot_win.getmaxyx()
                 _add(bot_win, bh - 1, max(0, bw - len(note) - 2), note,
                      curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD)
@@ -1320,7 +1040,7 @@ def _draw(
         stdscr.refresh()
         return
     now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"Auto XDP TUI  backend={snap.backend} mode={snap.attach_mode} map={snap.map_id} ports={port_filter}  {now}  v:traffic a:audit tab:focus t/u:filter enter:filter-events-by-port q:quit"
+    title = f"Auto XDP TUI  v:samples c:cookie/health e:events a:audit tab:focus q:quit  backend={snap.backend}  {now}"
     _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
     if snap.under_attack:
         badge = " UNDER ATTACK "
@@ -1356,6 +1076,12 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     stdscr.timeout(200)
 
     relay = RelayClient(args.socket, max_events=int(args.tui_max_events))
+    geoip_error = ""
+    try:
+        geoip = GeoIPResolver.from_config(_load_toml(args.config))
+    except ValueError as exc:
+        geoip = GeoIPResolver.from_config({})
+        geoip_error = f"GeoIP config: {exc}"
     page = _initial_tui_page(args)
     worker = SnapshotWorker(args)
     worker.start()
@@ -1372,7 +1098,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     event_filter_scroll = 0
     audit_scroll = 0
     approval_cursor = 0
-    ui_error = ""
+    ui_error = geoip_error
     wins: _WinSet | None = None
     last_draw_at = 0.0
     last_draw_state: tuple[Any, ...] | None = None
@@ -1416,6 +1142,16 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 page = "overview"
                 worker.show_approvals(False)
                 ui_dirty = True
+            elif ch in (ord("c"), ord("C")):
+                page = "cookie" if page != "cookie" else "overview"
+                reasons_scroll = 0
+                worker.show_approvals(False)
+                ui_dirty = True
+            elif ch in (ord("e"), ord("E")):
+                page = "events" if page != "events" else "overview"
+                focus = "events"
+                worker.show_approvals(False)
+                ui_dirty = True
             elif ch in (ord("v"), ord("V")):
                 page = "traffic" if page != "traffic" else "overview"
                 worker.show_approvals(False)
@@ -1446,13 +1182,13 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 ui_dirty = True
             if wins is not None:
                 map_visible = max(1, wins.maps.getmaxyx()[0] - 3)
-                event_visible = max(1, wins.events.getmaxyx()[0] - 3)
+                event_visible = max(1, (wins.h - 4) // 2) if page == "events" else max(1, _event_visible(wins.events))
             else:
                 map_visible = 1
                 event_visible = 1
             map_scroll_max = max(0, len(snap.maps) - map_visible)
             event_top = _clamp_event_top(relay, event_visible, event_top)
-            if ch == 9:
+            if ch == 9 and page == "overview":
                 if focus == "maps":
                     focus = "events"
                 elif focus == "events":
@@ -1540,7 +1276,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 elif ch == curses.KEY_NPAGE:
                     approval_cursor = min(len(snap.approval_rows) - 1, approval_cursor + max(1, event_visible))
                     ui_dirty = True
-            elif page == "traffic":
+            elif page in {"traffic", "cookie"}:
                 if ch == curses.KEY_UP:
                     reasons_scroll = max(0, reasons_scroll - 1)
                     ui_dirty = True
@@ -1636,12 +1372,13 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             )
             now = time.monotonic()
             if ui_dirty or draw_state != last_draw_state or now - last_draw_at >= TUI_IDLE_REDRAW_INTERVAL:
-                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll, audit_scroll, approval_cursor)
+                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll, audit_scroll, approval_cursor, geoip)
                 last_draw_at = now
                 last_draw_state = draw_state
     finally:
         worker.stop()
         relay.close()
+        geoip.close()
 
 
 def run_tui(args: Any) -> int:
