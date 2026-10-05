@@ -203,9 +203,8 @@ ensure_xdp_loaded() {
             fi
         done
         [[ -f "$BPF_PIN_DIR/sock_state_link" ]] || load_sock_state_tracker || true
-        # A non-zero result means an operator requested mode="always" on a
-        # kernel without the complete listener handoff. Keep XDP attached and
-        # forbid a silent nftables downgrade.
+        # Strict cookie requirements and incompatible NAT both abort activation.
+        # Keep XDP attached and forbid a silent nftables downgrade.
         load_syncookie_program || return 2
         load_minecraft_egress || return 1
         load_port_handlers || true
