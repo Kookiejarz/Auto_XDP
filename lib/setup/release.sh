@@ -139,6 +139,7 @@ validate_runtime_release() {
     local required_paths=(
         python/auto_xdp/__init__.py python/auto_xdp/install_state.py
         python/auto_xdp/default_config.toml
+        bpf/include/common.h bpf/include/counters.h bpf/include/telemetry.h
         handlers/minecraft_handler.o minecraft_egress.o xdp_required_maps.txt xdp_map_abi.txt auto_xdp_runtime_common.sh
         auto_xdp_bpf_helpers.py xdp_port_sync.py pkt_relay.py axdp
         auto_xdp_start.sh release.json
@@ -152,11 +153,7 @@ validate_runtime_release() {
     bash -n "${release_dir}/auto_xdp_start.sh" \
         "${release_dir}/auto_xdp_runtime_common.sh" \
         "${release_dir}/axdp" || return 1
-    PYTHONPATH="${release_dir}/python" "${PYTHON3_BIN:-python3}" - <<'PY'
-from auto_xdp import admin_cli, install_state
-parser = admin_cli.build_parser()
-assert parser is not None and install_state.STATE_SCHEMA >= 1
-PY
+    PYTHON_LIB_DIR="${release_dir}/python" validate_installed_python_support_package
 }
 
 stage_runtime_release() {
