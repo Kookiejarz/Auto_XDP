@@ -287,15 +287,35 @@ install_axdp_command() {
 }
 
 validate_installed_python_support_package() {
-    PYTHONPATH="${PYTHON_LIB_DIR}" "${PYTHON3_BIN:-python3}" - <<'PY'
+    PYTHONPATH="${PYTHON_LIB_DIR}" "${PYTHON3_BIN:-python3}" - "${PYTHON_LIB_DIR}" <<'PY'
 import sys
+from importlib import import_module, resources
+from pathlib import Path
+
+package_root = Path(sys.argv[1]).resolve()
+# Validate the payload, even when the installer is invoked from its source tree.
+sys.path[:] = [str(package_root)] + [
+    p for p in sys.path if p and Path(p).resolve() not in {Path.cwd(), package_root}
+]
 
 try:
-    import auto_xdp.tui  # noqa: F401
-    from auto_xdp import admin_cli
-    from importlib import resources
+    for name in (
+        "auto_xdp.cli", "auto_xdp.admin.cli", "auto_xdp.admin.main",
+        "auto_xdp.admin.approval_api", "auto_xdp.discovery.listeners",
+        "auto_xdp.discovery.proc_events", "auto_xdp.discovery.sock_state",
+        "auto_xdp.discovery.services", "auto_xdp.telemetry.events",
+        "auto_xdp.telemetry.relay_client", "auto_xdp.telemetry.traffic",
+        "auto_xdp.telemetry.geoip", "auto_xdp.tui.app", "auto_xdp.install_state",
+        "auto_xdp.bpf.conntrack",
+    ):
+        module = import_module(name)
+        if not Path(module.__file__).resolve().is_relative_to(package_root):
+            raise RuntimeError(f"{name} was imported outside the installed package")
+    from auto_xdp.admin import cli as admin_cli
+    from auto_xdp import install_state
+    assert install_state.STATE_SCHEMA >= 1
 except Exception as exc:
-    raise SystemExit(f"failed to import installed auto_xdp TUI modules: {exc}")
+    raise SystemExit(f"failed to import installed auto_xdp modules: {exc}")
 
 if not resources.files("auto_xdp").joinpath("default_config.toml").is_file():
     raise SystemExit("installed auto_xdp package is missing default_config.toml")
@@ -305,7 +325,7 @@ required_options = {"--run-state-dir", "--nft-family", "--nft-table", "--iface"}
 missing_options = sorted(required_options - set(parser._option_string_actions))
 if missing_options:
     raise SystemExit(
-        "installed auto_xdp.admin_cli is missing required wrapper options: "
+        "installed auto_xdp.admin.cli is missing required wrapper options: "
         + ", ".join(missing_options)
     )
 command_action = next(
@@ -314,7 +334,7 @@ command_action = next(
 )
 choices = set(getattr(command_action, "choices", {}) or {})
 if "tui" not in choices:
-    raise SystemExit("installed auto_xdp.admin_cli does not expose the tui command")
+    raise SystemExit("installed auto_xdp.admin.cli does not expose the tui command")
 PY
 }
 
@@ -389,17 +409,22 @@ install_toml_config() {
         local stamp
         stamp=$(date -u +%Y%m%d-%H%M%S)
         priv_mkdir "$backup_dir"
-        place_file "$toml_target" "${backup_dir}/config.toml.${stamp}"
+        local backup_path="${backup_dir}/config.toml.${stamp}"
+        place_file "$toml_target" "$backup_path"
+        as_root chown root:root "$backup_path"
+        as_root chmod 0600 "$backup_path"
         as_root chmod 0700 "$backup_dir"
         info "Preserving existing config.toml (backup: ${backup_dir}/config.toml.${stamp})"
-        return 0
+    else
+        if [[ -n "${CANDIDATE_TOML_CONFIG:-}" && -f "$CANDIDATE_TOML_CONFIG" ]]; then
+            place_file "$CANDIDATE_TOML_CONFIG" "$toml_target"
+        elif ! fetch_local_or_remote "config.toml" "config.toml" "$toml_target"; then
+            die "Failed to install config.toml"
+        fi
     fi
 
-    if [[ -n "${CANDIDATE_TOML_CONFIG:-}" && -f "$CANDIDATE_TOML_CONFIG" ]]; then
-        place_file "$CANDIDATE_TOML_CONFIG" "$toml_target"
-    elif ! fetch_local_or_remote "config.toml" "config.toml" "$toml_target"; then
-        die "Failed to install config.toml"
-    fi
+    as_root chown root:root "$toml_target"
+    as_root chmod 0600 "$toml_target"
 }
 
 build_release_payload() {

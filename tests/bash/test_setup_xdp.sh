@@ -18,6 +18,54 @@ test_log_colors_disable_for_non_tty_and_no_color() (
     assert_eq "$output" "✓ complete" "NO_COLOR output"
 )
 
+test_tc_cleanup_uses_filter_kind_including_minecraft_rollback() (
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+    set +e
+    local tmpdir iface direction
+    tmpdir=$(mktemp -d)
+    local -a IFACES=(eth0 eth1)
+    BPF_PIN_DIR="$tmpdir/pins"
+    MC_EGRESS_OBJ_PATH="$tmpdir/minecraft.o"
+    mkdir "$BPF_PIN_DIR"
+    touch "$MC_EGRESS_OBJ_PATH"
+    tc() {
+        case "$1:$2" in
+            filter:del)
+                [[ "${6:-}:${7:-}:${8:-}:${10:-}:${11:-}:${12:-}" \
+                    == "protocol:all:pref:handle:2:bpf" ]] || return 255
+                case "$5:$9" in ingress:49151|egress:49153) ;; *) return 1 ;; esac
+                rm -f "$tmpdir/tc-$4-$5" ;;
+            filter:replace)
+                [[ "$4" != eth1 ]] || return 1
+                touch "$tmpdir/tc-$4-$5" ;;
+            qdisc:add) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    syncookie_sysctl_release() { touch "$tmpdir/sysctl-released"; }
+    for iface in "${IFACES[@]}"; do
+        for direction in ingress egress; do
+            touch "$tmpdir/tc-$iface-$direction"
+        done
+    done
+    cleanup_minecraft_egress || return 1
+    cleanup_syncookie_handoff 1 || return 1
+    [[ -e "$tmpdir/sysctl-released" ]] || return 1
+    for iface in "${IFACES[@]}"; do
+        for direction in ingress egress; do
+            [[ ! -e "$tmpdir/tc-$iface-$direction" ]] \
+                || { printf 'runtime TC cleanup left %s %s\n' "$iface" "$direction"; return 1; }
+        done
+    done
+
+    _auto_xdp_minecraft_profile_configured() { return 0; }
+    bpftool() { touch "$4"; }
+    load_minecraft_egress >/dev/null 2>&1
+    assert_eq "$?" 1 "second interface attach must fail" || return 1
+    [[ ! -e "$tmpdir/tc-eth0-egress" ]] \
+        || { printf 'Minecraft rollback left the first interface attached\n'; return 1; }
+)
+
 test_detect_os_release_maps_supported_families() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -1467,11 +1515,19 @@ test_install_toml_config_preserves_existing_local_config() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
-    local tmpdir
+    local tmpdir ops_log
     tmpdir=$(mktemp -d)
+    ops_log="$tmpdir/ops.log"
     CONFIG_DIR="$tmpdir/etc"
     mkdir -p "$CONFIG_DIR"
     printf 'user_setting = 1\n' >"$CONFIG_DIR/config.toml"
+
+    as_root() {
+        printf '%s\n' "$*" >>"$ops_log"
+        if [[ "$1" == "chmod" ]]; then
+            chmod "$2" "$3"
+        fi
+    }
 
     FORCE=1
     fetch_local_or_remote() { printf 'repo_default = 1\n' >"$3"; }
@@ -1483,6 +1539,36 @@ test_install_toml_config_preserves_existing_local_config() (
     backup=$(find "$CONFIG_DIR/backups" -type f -name 'config.toml.*' | head -n 1)
     [[ -n "$backup" ]] || return 1
     assert_file_contains "$backup" "user_setting = 1"
+    assert_eq "$(stat -c '%a' "$CONFIG_DIR/config.toml" 2>/dev/null || stat -f '%Lp' "$CONFIG_DIR/config.toml")" "600" || return 1
+    assert_eq "$(stat -c '%a' "$backup" 2>/dev/null || stat -f '%Lp' "$backup")" "600" || return 1
+    assert_file_contains "$ops_log" "chown root:root $CONFIG_DIR/config.toml" || return 1
+    assert_file_contains "$ops_log" "chmod 0600 $CONFIG_DIR/config.toml"
+)
+
+test_install_toml_config_secures_new_config() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir ops_log
+    tmpdir=$(mktemp -d)
+    ops_log="$tmpdir/ops.log"
+    CONFIG_DIR="$tmpdir/etc"
+    mkdir -p "$CONFIG_DIR"
+
+    as_root() {
+        printf '%s\n' "$*" >>"$ops_log"
+        if [[ "$1" == "chmod" ]]; then
+            chmod "$2" "$3"
+        fi
+    }
+
+    fetch_local_or_remote() { printf 'repo_default = 1\n' >"$3"; }
+
+    install_toml_config >/dev/null || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml" "repo_default = 1" || return 1
+    assert_eq "$(stat -c '%a' "$CONFIG_DIR/config.toml" 2>/dev/null || stat -f '%Lp' "$CONFIG_DIR/config.toml")" "600" || return 1
+    assert_file_contains "$ops_log" "chown root:root $CONFIG_DIR/config.toml" || return 1
+    assert_file_contains "$ops_log" "chmod 0600 $CONFIG_DIR/config.toml"
 )
 
 test_check_required_tools_step_only_requires_runtime_commands() (
@@ -1872,6 +1958,58 @@ test_cleanup_build_artifacts_step_preserves_local_sources() (
     }
 )
 
+test_install_slot_handler_sdk_preserves_shared_include_layout() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir sdk_source mode header
+    tmpdir=$(mktemp -d)
+    sdk_source="$tmpdir/sdk source"
+    mkdir -p "$sdk_source/handlers" "$sdk_source/bpf/include"
+    cp "$REPO_ROOT"/handlers/*.h "$sdk_source/handlers/" || return 1
+    cp "$REPO_ROOT/handlers/gre_handler.c" "$sdk_source/handlers/" || return 1
+    cp "$REPO_ROOT"/bpf/include/*.h "$sdk_source/bpf/include/" || return 1
+    PREFER_REMOTE_SOURCES=0
+
+    for mode in staged source; do
+        BUILD_STAGING_DIR="$tmpdir/missing-stage"
+        SOURCE_ROOT="$tmpdir/missing-source"
+        if [[ "$mode" == staged ]]; then
+            BUILD_STAGING_DIR="$sdk_source"
+        else
+            SOURCE_ROOT="$sdk_source"
+        fi
+        INSTALL_DIR="$tmpdir/install-$mode"
+        install_slot_handler_sdk || return 1
+        cmp "$sdk_source/handlers/gre_handler.c" "$INSTALL_DIR/handlers/gre_handler.c" || return 1
+        for header in common.h counters.h telemetry.h flow_keys.h; do
+            cmp "$sdk_source/bpf/include/$header" "$INSTALL_DIR/bpf/include/$header" || return 1
+        done
+        [[ -f "$INSTALL_DIR/bpf/include/../../handlers/xdp_slot_ctx.h" ]] || return 1
+    done
+)
+
+test_install_slot_handler_sdk_remote_includes_shared_headers() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BUILD_STAGING_DIR="$tmpdir/missing-stage"
+    SOURCE_ROOT="$tmpdir/missing-source"
+    INSTALL_DIR="$tmpdir/install"
+    PREFER_REMOTE_SOURCES=1
+    curl() {
+        printf '%s\n' '{"tree":[{"path":"handlers/gre_handler.c"},{"path":"handlers/xdp_slot_ctx.h"},{"path":"bpf/include/common.h"},{"path":"bpf/include/telemetry.h"},{"path":"bpf/xdp_firewall.c"},{"path":"README.md"}]}'
+    }
+    fetch_local_or_remote() { place_file "$REPO_ROOT/$1" "$3"; }
+
+    install_slot_handler_sdk || return 1
+    cmp "$REPO_ROOT/bpf/include/telemetry.h" "$INSTALL_DIR/bpf/include/telemetry.h" || return 1
+    [[ -f "$INSTALL_DIR/handlers/gre_handler.c" && -f "$INSTALL_DIR/bpf/include/common.h" ]] || return 1
+    [[ ! -e "$INSTALL_DIR/bpf/xdp_firewall.c" && ! -e "$INSTALL_DIR/README.md" ]]
+)
+
 test_restore_compiled_slot_handlers_reinstalls_builtin_objects() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -1899,7 +2037,7 @@ test_restore_compiled_slot_handlers_reinstalls_builtin_objects() (
     done
 )
 
-test_install_python_support_package_includes_state_module() (
+test_install_python_support_package_includes_nested_modules() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
@@ -1916,8 +2054,34 @@ test_install_python_support_package_includes_state_module() (
 
     install_python_support_package || return 1
     assert_file_contains "$fetched" "auto_xdp/state.py -> ${AUTO_XDP_PACKAGE_DIR}/state.py"
+    local module
+    for module in admin/cli.py admin/approvals.py admin/approval_api.py \
+                  tui/app.py tui/traffic.py tui/widgets.py \
+                  telemetry/events.py telemetry/relay_client.py telemetry/geoip.py \
+                  discovery/listeners.py discovery/proc_events.py discovery/sock_state.py; do
+        assert_file_contains "$fetched" "auto_xdp/${module} -> ${AUTO_XDP_PACKAGE_DIR}/${module}" || return 1
+    done
     assert_file_contains "$fetched" "auto_xdp/default_config.toml -> ${AUTO_XDP_PACKAGE_DIR}/default_config.toml"
     assert_file_contains "$fetched" "auto_xdp/xdp_required_maps.txt -> ${AUTO_XDP_PACKAGE_DIR}/xdp_required_maps.txt"
+)
+
+test_installed_package_validation_rejects_missing_nested_module() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    PYTHON_LIB_DIR="$tmpdir/python"
+    mkdir -p "$PYTHON_LIB_DIR"
+    cp -R "$REPO_ROOT/auto_xdp" "$PYTHON_LIB_DIR/"
+    cd "$REPO_ROOT" || return 1
+    validate_installed_python_support_package || return 1
+    mv "$PYTHON_LIB_DIR/auto_xdp/telemetry/relay_client.py" "$tmpdir/relay_client.py.saved"
+    if validate_installed_python_support_package >"$tmpdir/validation.log" 2>&1; then
+        printf 'installed package validation accepted a missing relay client\n'
+        return 1
+    fi
+    assert_file_contains "$tmpdir/validation.log" "auto_xdp.telemetry.relay_client"
 )
 
 # Write a fake sudo onto PATH that logs its invocation and then runs the wrapped
@@ -2551,58 +2715,6 @@ test_main_orders_basic_info_checks_then_summary() (
         }
         prev_pos=$pos
     done
-)
-
-test_install_slot_handler_sdk_preserves_shared_include_layout() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir sdk_source mode header
-    tmpdir=$(mktemp -d)
-    sdk_source="$tmpdir/sdk source"
-    mkdir -p "$sdk_source/handlers" "$sdk_source/bpf/include"
-    cp "$REPO_ROOT"/handlers/*.h "$sdk_source/handlers/" || return 1
-    cp "$REPO_ROOT/handlers/gre_handler.c" "$sdk_source/handlers/" || return 1
-    cp "$REPO_ROOT"/bpf/include/*.h "$sdk_source/bpf/include/" || return 1
-    PREFER_REMOTE_SOURCES=0
-
-    for mode in staged source; do
-        BUILD_STAGING_DIR="$tmpdir/missing-stage"
-        SOURCE_ROOT="$tmpdir/missing-source"
-        if [[ "$mode" == staged ]]; then
-            BUILD_STAGING_DIR="$sdk_source"
-        else
-            SOURCE_ROOT="$sdk_source"
-        fi
-        INSTALL_DIR="$tmpdir/install-$mode"
-        install_slot_handler_sdk || return 1
-        cmp "$sdk_source/handlers/gre_handler.c" "$INSTALL_DIR/handlers/gre_handler.c" || return 1
-        for header in common.h counters.h telemetry.h flow_keys.h; do
-            cmp "$sdk_source/bpf/include/$header" "$INSTALL_DIR/bpf/include/$header" || return 1
-        done
-        [[ -f "$INSTALL_DIR/bpf/include/../../handlers/xdp_slot_ctx.h" ]] || return 1
-    done
-)
-
-test_install_slot_handler_sdk_remote_includes_shared_headers() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BUILD_STAGING_DIR="$tmpdir/missing-stage"
-    SOURCE_ROOT="$tmpdir/missing-source"
-    INSTALL_DIR="$tmpdir/install"
-    PREFER_REMOTE_SOURCES=1
-    curl() {
-        printf '%s\n' '{"tree":[{"path":"handlers/gre_handler.c"},{"path":"handlers/xdp_slot_ctx.h"},{"path":"bpf/include/common.h"},{"path":"bpf/include/telemetry.h"},{"path":"bpf/xdp_firewall.c"},{"path":"README.md"}]}'
-    }
-    fetch_local_or_remote() { place_file "$REPO_ROOT/$1" "$3"; }
-
-    install_slot_handler_sdk || return 1
-    cmp "$REPO_ROOT/bpf/include/telemetry.h" "$INSTALL_DIR/bpf/include/telemetry.h" || return 1
-    [[ -f "$INSTALL_DIR/handlers/gre_handler.c" && -f "$INSTALL_DIR/bpf/include/common.h" ]] || return 1
-    [[ ! -e "$INSTALL_DIR/bpf/xdp_firewall.c" && ! -e "$INSTALL_DIR/README.md" ]]
 )
 
 run_discovered_tests "${BASH_SOURCE[0]}" "setup_xdp"

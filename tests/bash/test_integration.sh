@@ -988,7 +988,7 @@ PYEOF
         echo "required profile tail-call miss did not fail closed"
         return 1
     }
-    tc filter del dev "$_VETH" egress pref 49153 handle 2 2>/dev/null || true
+    tc filter del dev "$_VETH" egress protocol all pref 49153 handle 2 bpf || return 1
     rm -f "$handler_obj" "$egress_obj" "$result_file" "$ready_file" "$continue_file" \
         "$ready_file2" "$continue_file2" "$ready_file3" "$continue_file3"
 }
