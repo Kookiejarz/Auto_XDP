@@ -45,9 +45,9 @@ for _cmd in clang bpftool ip python3 tc nft unshare mount; do
     command -v "$_cmd" &>/dev/null || _kernel_unavailable "$_cmd not found"
 done
 
-# Isolate the listener and XDP/TC hooks from runner NAT, which can discard
-# the request socket assigned by the SYN-cookie handoff. Keep test mounts
-# private so BPF pins and named client namespaces cannot affect the runner.
+# Keep the server, XDP/TC hooks and listener in a fresh, NAT-free network
+# namespace. The client gets its own namespace below. Private mounts keep
+# sysfs, BPF pins and named client namespaces scoped to this test process.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     exec unshare --mount --net --propagation private bash -euc '
         mount -t sysfs sysfs /sys
@@ -434,14 +434,6 @@ test_attach() {
     }
 }
 
-test_packet_event_v2_kernel() {
-    # Exercise the actual loaded program with controlled kernel test-run input;
-    # detach only this fixture's veth to make byte/counter deltas exact.
-    ip link set dev "$_VETH" xdpgeneric off || return 1
-    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_telemetry.py" \
-        events "$_PIN_DIR" "$_VETH"
-}
-
 test_linux_conntrack_replies() {
     PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_conntrack.py" \
         "$_PIN_DIR" "$_NS"
@@ -474,6 +466,14 @@ test_loaded_map_abi() {
         "$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" MC_VERIFIED_MAX_ENTRIES)" || return 1
     _assert_map_abi udp_global_rl array 4 40 1 || return 1
     _assert_map_abi udp_percpu_acc percpu_array 4 16 1 || return 1
+}
+
+test_packet_event_v2_kernel() {
+    # Exercise the actual loaded program with controlled kernel test-run input;
+    # detach only this fixture's veth to make byte/counter deltas exact.
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_telemetry.py" \
+        events "$_PIN_DIR" "$_VETH"
 }
 
 test_interrupted_candidate_restore() {
@@ -1460,38 +1460,55 @@ PYEOF
     return 0
 }
 
-test_syncookie_listener_handoff() {
+test_syncookie_listener_handoff() (
     [[ $_SYNCOOKIE_LEVEL2 -eq 1 ]] || {
         echo "SKIP: kernel lacks bpf_sk_assign_tcp_reqsk"
         return 0
     }
-    local port=7710 value_hex ready_file recv_file listener_pid old_sysctl
+    local port=7710 value_hex ready_file recv_file listener_pid="" live_counters gate_output mode
+    local TOML_CONFIG="$_RUN_DIR/syncookie.toml"
+    local SYNCOOKIE_OBJ_PATH="$_SYNCOOKIE_OBJ" TC_SYNCOOKIE_OBJ_PATH="$_TC_SYNCOOKIE_OBJ"
+    local SYNCOOKIE_SYSCTL_STATE="$_RUN_DIR/syncookie-sysctl.json"
+    local -a AUTO_XDP_IFACES=("$_VETH")
+    export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
     ready_file=$(mktemp)
     recv_file=$(mktemp)
-    old_sysctl=$(< /proc/sys/net/ipv4/tcp_syncookies)
-    echo 1 > /proc/sys/net/ipv4/tcp_syncookies || return 1
+    cleanup_cookie() {
+        [[ -z "$listener_pid" ]] || kill "$listener_pid" 2>/dev/null || true
+        [[ -z "$listener_pid" ]] || wait "$listener_pid" 2>/dev/null || true
+        nft delete table ip axdp_cookie_nat 2>/dev/null || true
+        bpftool map delete pinned "$_PIN_DIR/syncookie_prog_array" \
+            key hex 00 00 00 00 >/dev/null 2>&1 || true
+        cleanup_syncookie_handoff 1
+        rm -f "$ready_file" "$recv_file" "$TOML_CONFIG"
+    }
+    trap cleanup_cookie EXIT
+    # Prove the real runtime refuses NAT before allowing a cookie challenge.
+    # Only this fixture-owned table in the isolated server namespace is changed.
+    nft add table ip axdp_cookie_nat || return 1
+    nft add chain ip axdp_cookie_nat output \
+        '{ type nat hook output priority dstnat; policy accept; }' || return 1
+    for mode in auto always; do
+        printf '[syncookie]\nenabled = true\ndefault_mode = "%s"\n' "$mode" >"$TOML_CONFIG"
+        if gate_output=$(load_syncookie_program 2>&1); then
+            echo "SYN-cookie runtime bypassed the NAT compatibility check in mode=$mode"
+            return 1
+        fi
+        [[ "$gate_output" == *'error: refusing SYN-cookie enablement:'*NAT* \
+            && ! -e "$_PIN_DIR/syncookie_prog" \
+            && ! -e "$_PIN_DIR/tc_syncookie_handoff_prog" ]] || {
+            printf 'SYN-cookie NAT rejection failed in mode=%s: %s\n' "$mode" "$gate_output"
+            return 1
+        }
+        printf 'SYN-cookie runtime rejected NAT in mode=%s: %s\n' "$mode" "$gate_output"
+    done
+    nft delete table ip axdp_cookie_nat || return 1
+    load_syncookie_program || return 1
+
     ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_timestamps=1
     ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_window_scaling=1
     ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_sack=1
     ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_ecn=1
-
-    bpftool prog load "$_SYNCOOKIE_OBJ" "$_PIN_DIR/syncookie_prog" type xdp \
-        map name slot_ctx_map pinned "$_PIN_DIR/slot_ctx_map" \
-        map name pkt_counters pinned "$_PIN_DIR/pkt_counters" \
-        map name byte_counters pinned "$_PIN_DIR/byte_counters" \
-        map name tcp_synck_policy pinned "$_PIN_DIR/tcp_synck_policy" \
-        map name sync_run_cfg pinned "$_PIN_DIR/sync_run_cfg" \
-        map name sync_handoff4 pinned "$_PIN_DIR/sync_handoff4" \
-        map name sync_handoff6 pinned "$_PIN_DIR/sync_handoff6" || return 1
-    bpftool prog load "$_TC_SYNCOOKIE_OBJ" \
-        "$_PIN_DIR/tc_syncookie_handoff_prog" type classifier \
-        map name sync_handoff4 pinned "$_PIN_DIR/sync_handoff4" \
-        map name sync_handoff6 pinned "$_PIN_DIR/sync_handoff6" || return 1
-    tc qdisc add dev "$_VETH" clsact 2>/dev/null || true
-    tc filter replace dev "$_VETH" ingress pref 49151 handle 2 \
-        bpf direct-action object-pinned "$_PIN_DIR/tc_syncookie_handoff_prog" || return 1
-    bpftool map update pinned "$_PIN_DIR/syncookie_prog_array" \
-        key hex 00 00 00 00 value pinned "$_PIN_DIR/syncookie_prog" || return 1
 
     _set_tcp_policy "$port" 1 || return 1
     bpftool map update pinned "$_PIN_DIR/tcp_synck_policy" \
@@ -1504,6 +1521,15 @@ print(" ".join(f"{b:02x}" for b in struct.pack("<IIIIQ", 1, 90, 200, 1000, 5_000
 ') || return 1
     bpftool map update pinned "$_PIN_DIR/sync_run_cfg" \
         key hex 00 00 00 00 value hex $value_hex || return 1
+
+    live_counters=$(PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 - "$_PIN_DIR" <<'PYEOF'
+import json, sys
+from pathlib import Path
+from kernel_packet_telemetry import counter
+print(json.dumps({key: counter(Path(sys.argv[1]) / "pkt_counters", key)
+                  for key in (39, 40, 59, 60, 61, 62)}))
+PYEOF
+    ) || return 1
 
     python3 - "$port" "$ready_file" "$recv_file" <<'PYEOF' &
 import socket, sys
@@ -1531,7 +1557,7 @@ raise SystemExit(0 if s.recv(2) == b"ok" else 1)
 PYEOF
         python3 - "$_PIN_DIR" <<'PYEOF' || true
 import json, subprocess, sys
-for key in range(38, 46):
+for key in (*range(38, 46), 59, 60, 61, 62):
     row = json.loads(subprocess.check_output([
         "bpftool", "-j", "map", "lookup", "pinned", sys.argv[1] + "/pkt_counters",
         "key", "hex", *key.to_bytes(4, "little").hex(" ").split()], text=True))
@@ -1547,10 +1573,9 @@ PYEOF
         return 1
     }
     wait "$listener_pid" || return 1
+    listener_pid=""
     [[ $(<"$recv_file") == cookie ]] || return 1
-    echo "$old_sysctl" > /proc/sys/net/ipv4/tcp_syncookies
-
-    python3 - "$_PIN_DIR" <<'PYEOF'
+    python3 - "$_PIN_DIR" "$live_counters" <<'PYEOF' || return 1
 import json, subprocess, sys
 def counter(key):
     raw = json.loads(subprocess.check_output([
@@ -1565,11 +1590,24 @@ def counter(key):
     if values and isinstance(values[0], dict):
         return sum(scalar(item["value"]) for item in values)
     return scalar(values) if values else 0
-sent = counter(39)
-if not sent:
-    raise SystemExit("SYN-cookie sent counter did not advance")
+before = json.loads(sys.argv[2])
+counts = {key: counter(key) - before[str(key)] for key in (39, 40, 59, 60, 61, 62)}
+# In generic/veth mode Linux conntrack can admit the ACK before the XDP cookie
+# path; TC still independently validates it. The controlled kernel probe below
+# separately proves the XDP VALID event, while these deltas prove real handoff.
+for key in (39, 59, 60):
+    if counts[key] <= 0:
+        raise SystemExit(f"SYN-cookie stage counter {key} did not advance: {counts}")
+if counts[61] or counts[62] or counts[59] != counts[60]:
+    raise SystemExit(f"SYN-cookie TC handoff was not entirely successful: {counts}")
+print(f"SYN-cookie accepted and echoed; shared stage counters={counts}")
 PYEOF
-}
+    # Do not mix synthetic tuple state with the live listener proof above.
+    # Detach only this fixture before checking exact synthetic packet deltas.
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_telemetry.py" \
+        cookie "$_PIN_DIR" "$_VETH" --port "$port"
+)
 
 # ---------------------------------------------------------------------------
 # Main

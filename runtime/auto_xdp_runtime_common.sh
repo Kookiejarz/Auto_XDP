@@ -1025,7 +1025,7 @@ cleanup_syncookie_handoff() {
     if iface_var=$(_auto_xdp_iface_var_name); then
         local -n cookie_ifaces="$iface_var"
         for iface in "${cookie_ifaces[@]}"; do
-            tc filter del dev "$iface" ingress pref 49151 handle 2 2>/dev/null || true
+            tc filter del dev "$iface" ingress protocol all pref 49151 handle 2 bpf 2>/dev/null || true
         done
     fi
     rm -f "${BPF_PIN_DIR}/syncookie_prog" \
@@ -1035,7 +1035,8 @@ cleanup_syncookie_handoff() {
 
 load_syncookie_program() {
     local xdp_obj="" tc_obj="" capability="" enabled="0" strict="0"
-    local acquired_sysctl=0 sysctl_state=""
+    local acquired_sysctl=0 sysctl_state="" capability_reason="" handoff_environment_ready=0
+    local -a capability_details=()
     xdp_obj=$(_auto_xdp_first_value SYNCOOKIE_OBJ_PATH SYNCOOKIE_OBJ_INSTALLED) || true
     tc_obj=$(_auto_xdp_first_value TC_SYNCOOKIE_OBJ_PATH TC_SYNCOOKIE_OBJ_INSTALLED) || true
     readarray -t cookie_config < <("${PYTHON3_BIN:-python3}" - "$TOML_CONFIG" <<'PY'
@@ -1070,11 +1071,30 @@ PY
     capability=$("${PYTHON3_BIN:-python3}" - <<'PY'
 from auto_xdp.bpf.syncookie import probe_syncookie_capability
 cap = probe_syncookie_capability()
-print("2" if cap.helpers and cap.reqsk_handoff else str(cap.level))
+print(cap.level)
+print(cap.reason)
+print(int(cap.handoff_environment_ready))
 PY
-    ) || capability=0
-    if [[ "$capability" != 2 || ! -f "$xdp_obj" || ! -f "$tc_obj" ]]; then
-        _auto_xdp_warn "Full SYN-cookie listener handoff requires Linux 6.11+ and both optional objects."
+    ) || capability=$'0\nSYN-cookie capability probe failed'
+    readarray -t capability_details <<< "$capability"
+    capability=${capability_details[0]:-0}
+    capability_reason=${capability_details[1]:-}
+    handoff_environment_ready=${capability_details[2]:-0}
+    if [[ "$handoff_environment_ready" != 1 || "$capability" != 2 \
+            || ! -f "$xdp_obj" || ! -f "$tc_obj" ]]; then
+        # A reload may have retained the old program-array entry. Withdraw it
+        # as well as the TC filter before reporting an incompatible optional
+        # path; never leave a previously enabled challenge path active.
+        bpftool map delete pinned "${BPF_PIN_DIR}/syncookie_prog_array" \
+            key hex 00 00 00 00 >/dev/null 2>&1 || true
+        cleanup_syncookie_handoff
+        syncookie_sysctl_release || true
+        if [[ "$handoff_environment_ready" != 1 ]]; then
+            printf '[auto_xdp] error: refusing SYN-cookie enablement: %s\n' \
+                "${capability_reason:-cannot verify the handoff environment}" >&2
+            return 1
+        fi
+        _auto_xdp_warn "SYN-cookie listener handoff unavailable: ${capability_reason:-requires Linux 6.11+ and both optional objects}."
         [[ "$strict" != 1 ]]
         return
     fi

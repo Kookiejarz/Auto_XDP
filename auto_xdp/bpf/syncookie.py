@@ -4,6 +4,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,16 +27,17 @@ class SyncookieCapability:
     helper_v4: bool = False
     helper_v6: bool = False
     reqsk_handoff: bool = False
+    handoff_environment_ready: bool = True
 
     @property
     def level(self) -> int:
         if not self.helpers:
             return 0
-        return 2 if self.reqsk_handoff else 1
+        return 2 if self.reqsk_handoff and self.handoff_environment_ready else 1
 
     @property
     def available(self) -> bool:
-        return self.helpers and self.sysctl_ready
+        return self.helpers and self.sysctl_ready and self.handoff_environment_ready
 
     @property
     def status(self) -> str:
@@ -48,12 +50,86 @@ class SyncookieCapability:
                 "helper_v4": self.helper_v4, "helper_v6": self.helper_v6,
                 "sysctl_ready": self.sysctl_ready, "level": self.level,
                 "reqsk_handoff": self.reqsk_handoff,
-                "reqsk_attrs": {"mss": self.reqsk_handoff,
-                                 "timestamp": self.reqsk_handoff,
-                                 "wscale": self.reqsk_handoff,
-                                 "sack": self.reqsk_handoff,
-                                 "ecn": self.reqsk_handoff},
+                "handoff_environment_ready": self.handoff_environment_ready,
+                "reqsk_attrs": {"mss": self.level == 2,
+                                 "timestamp": self.level == 2,
+                                 "wscale": self.level == 2,
+                                 "sack": self.level == 2,
+                                 "ecn": self.level == 2},
                 "reason": self.reason}
+
+
+def _nat_expression(value: Any) -> bool:
+    if isinstance(value, dict):
+        if any(key in value for key in ("snat", "dnat", "masquerade", "redirect")):
+            return True
+        xt = value.get("xt")
+        if (isinstance(xt, dict) and xt.get("type") == "target"
+                and xt.get("name") in {"SNAT", "DNAT", "MASQUERADE", "REDIRECT", "NETMAP", "SAME"}):
+            return True
+        return any(_nat_expression(child) for child in value.values())
+    return isinstance(value, list) and any(_nat_expression(child) for child in value)
+
+
+def probe_reqsk_handoff_environment() -> tuple[bool, str]:
+    """Read-only, current-netns gate for NAT that can orphan a BPF reqsk.
+
+    A successful TC assignment is not enough: NAT LOCAL_IN can compare the
+    not-yet-initialized request socket port with conntrack, then clear skb->sk
+    before cookie_bpf_check(). Do not enable this combination or change NAT.
+    """
+    nft = shutil.which("nft")
+    if not nft:
+        return False, "SYN-cookie Level 2 environment unknown: nft is unavailable; cannot inspect current-netns NAT"
+    try:
+        # Do not request JSON here: nft 1.0.9 aborts on `-j list hooks`.
+        hooks = subprocess.run(
+            [nft, "list", "hooks", "inet"], capture_output=True, text=True,
+            check=False, timeout=5,
+        )
+        if hooks.returncode == 0 and re.search(r"\bnf_nat_(?:ipv4|ipv6|inet)_local_in\b", hooks.stdout):
+            return False, "SYN-cookie Level 2 incompatible: current-netns NAT LOCAL_IN hook can discard the assigned request socket"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    # Hook dumps can be unsupported or even empty with exit 0 on old nft.
+    # Cross-check the ruleset and legacy tables rather than treating that as
+    # proof that no NAT hook is installed. Any NAT base chain registers the
+    # implicit LOCAL_IN hook, including an output-only Docker DNS NAT chain.
+    try:
+        rules = subprocess.run(
+            [nft, "-j", "list", "ruleset"], capture_output=True, text=True,
+            check=False, timeout=5,
+        )
+        if rules.returncode != 0:
+            raise ValueError("nft ruleset query failed")
+        data = json.loads(rules.stdout)
+        rows = data.get("nftables") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError("unrecognized nft ruleset")
+        for row in rows:
+            chain = row.get("chain", {})
+            if isinstance(chain, dict) and chain.get("type") == "nat":
+                return False, "SYN-cookie Level 2 incompatible: current-netns nftables NAT base chain can discard the assigned request socket"
+            rule = row.get("rule", {})
+            if isinstance(rule, dict) and _nat_expression(rule.get("expr", [])):
+                return False, "SYN-cookie Level 2 incompatible: current-netns nftables NAT rule can discard the assigned request socket"
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False, "SYN-cookie Level 2 environment unknown: cannot verify the current-netns nftables ruleset"
+
+    for name in ("ip_tables_names", "ip6_tables_names"):
+        path = Path("/proc/net") / name
+        try:
+            tables = path.read_text(encoding="ascii").split()
+        except FileNotFoundError:
+            # Legacy table registration also creates this namespace's proc
+            # listing; absent listing means the legacy subsystem is absent.
+            continue
+        except (OSError, UnicodeError):
+            return False, f"SYN-cookie Level 2 environment unknown: cannot inspect current-netns {name}"
+        if "nat" in tables:
+            return False, "SYN-cookie Level 2 incompatible: current-netns legacy iptables NAT table can discard the assigned request socket"
+    return True, ""
 
 
 def probe_syncookie_capability(*, sysctl_path: str | Path = "/proc/sys/net/ipv4/tcp_syncookies") -> SyncookieCapability:
@@ -85,14 +161,20 @@ def probe_syncookie_capability(*, sysctl_path: str | Path = "/proc/sys/net/ipv4/
     if missing:
         return SyncookieCapability(False, False, f"missing helpers: {', '.join(missing)}", helper_v4, helper_v6, reqsk_handoff)
 
+    environment_ready, environment_reason = (True, "")
+    if reqsk_handoff:
+        environment_ready, environment_reason = probe_reqsk_handoff_environment()
+
     try:
         with open(sysctl_path, encoding="ascii") as fh:
             sysctl_ready = int(fh.read().strip()) != 0
     except (OSError, ValueError):
         sysctl_ready = False
+    reason = environment_reason
     if not sysctl_ready:
-        return SyncookieCapability(True, False, "net.ipv4.tcp_syncookies is zero or unavailable", helper_v4, helper_v6, reqsk_handoff)
-    return SyncookieCapability(True, True, "", helper_v4, helper_v6, reqsk_handoff)
+        reason = reason or "net.ipv4.tcp_syncookies is zero or unavailable"
+    return SyncookieCapability(True, sysctl_ready, reason, helper_v4, helper_v6,
+                              reqsk_handoff, environment_ready)
 
 
 SYSCTL_PATH = Path("/proc/sys/net/ipv4/tcp_syncookies")
