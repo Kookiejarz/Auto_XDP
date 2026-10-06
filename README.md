@@ -2,13 +2,15 @@
 
 **Keep a Linux host's exposure aligned with explicit workload grants and live service state.**
 <p align="center">
+  <a href="https://axdp.dev/"><strong>🌐 Website</strong></a>
+  ·
   <a href="https://github.com/Kookiejarz/Auto_XDP/wiki"><strong>📑 Manuals & Wiki</strong></a>
 </p>
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=flat-square" alt="License"></a>
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
-  <a href="https://www.kernel.org/"><img src="https://img.shields.io/badge/Kernel-%E2%89%A55.10-blue.svg?style=flat-square" alt="Kernel >= 5.10"></a>
+  <a href="https://www.kernel.org/"><img src="https://img.shields.io/badge/Kernel-XDP_CT_kfuncs-blue.svg?style=flat-square" alt="Kernel with XDP conntrack kfuncs"></a>
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   <a href="https://github.com/Kookiejarz/Auto_XDP/actions/workflows/distro-check.yml"><img src="https://github.com/Kookiejarz/Auto_XDP/actions/workflows/distro-check.yml/badge.svg" alt="Distro Checks"></a>
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
@@ -43,10 +45,15 @@ Static firewall rules drift as services come and go. Auto XDP watches runtime en
 - A newly listening service becomes reachable only when a matching workload grant exists.
 - A stopped service no longer remains open because its runtime justification disappeared.
 - Native XDP can drop unwanted packets before they enter the normal Linux networking path.
-- The `minecraft` profile validates Java handshakes/login traffic and follows the service lifecycle without requiring symmetric routing. Its first-stage parser currently requires each initial Minecraft protocol packet to fit in one TCP segment; unusually low MTUs or oversized proxy-forwarding/login metadata need a TCP-reassembly-aware profile before enforcement.
+- The `minecraft` profile validates Java handshakes/login traffic using Linux conntrack and observed server progress. Verified sessions require matching full policy/profile generations; loss of their bounded proof record revokes admission. Server replies must traverse the protected host's TC egress hook. Split or opaque initial frames receive only bounded probation, not verified status; use a TCP-reassembly-aware profile when that limit is unsuitable.
 - The same listener policy can use `nftables` when native XDP is unavailable.
 
 This keeps the firewall tied to both operator intent and current runtime state. Legacy `permanent_ports` configuration is rejected; exposure must use workload grants and zones.
+
+Optional SYN-cookie listener handoff requires the kernel request-socket helper
+(normally Linux 6.11+) and a verifiably NAT-free network namespace. NAT LOCAL_IN
+can discard the assigned request socket before TCP accepts it; Auto XDP refuses
+this combination instead of changing host NAT. Strict cookie mode fails closed.
 
 ## Auto XDP compared with other firewalls
 
@@ -61,11 +68,19 @@ Auto XDP is a good fit when a single Linux host needs a default-deny inbound pol
 
 ## Requirements
 
-- Linux. Native XDP currently requires kernel 5.10 or newer.
+- Linux with XDP conntrack lookup/release kfuncs for the XDP backend; the installer verifies the actual kernel capability before attachment.
 - Python 3.10 or newer.
 - `sudo` access.
 - One of the supported distributions: Debian/Ubuntu, Fedora/RHEL, openSUSE, Arch, or Alpine.
-- `nftables` for the fallback backend.
+- `nftables` for the fallback backend and namespace-local conntrack activation on XDP.
+
+TCP/UDP replies to outgoing connections are admitted by exact Linux conntrack
+tuple and REPLY direction, without exposing local ephemeral ports. Incoming
+service requests still require workload grants even after the server replies.
+The XDP backend owns `inet auto_xdp_conntrack`, a counter-only activation table;
+it does not replace your firewall or NAT rules. Full disable/uninstall removes
+this table. Lookup currently supports conntrack zone 0 in the ingress network
+namespace; NOTRACK and other conntrack zones do not receive this exception.
 
 The installer checks and installs the required toolchain, including `clang`, `llvm`, `libbpf`, `bpftool`, and `iproute2`, on supported distributions. See the [compatibility notes](https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade) before installing on a production host.
 
@@ -164,6 +179,23 @@ kill %1
 ```
 
 Port 8080 is reported as an unapproved endpoint unless its process is mapped by a matching subject grant. See [architecture.md](./architecture.md) for the policy format and the legacy compatibility boundary.
+
+## Packet observations
+
+In `sudo axdp tui`, use `e` for packet events and detailed DROP reasons, `v` for
+retained source samples and optional country/ASN information, and `c` for SYN
+cookie diagnostics and observation health. `o` returns to the overview.
+
+Packet totals come from dedicated BPF counters. Event lists and source rankings
+are bounded, potentially lossy samples, not full traffic or attacker attribution.
+The health page separates BPF event loss, relay queue loss, and truncated replay.
+Cookie ACK validation and successful TC handoff do **not** prove application
+acceptance. These changes do not enable SYN cookies or alter exposure grants.
+
+GeoIP is disabled by default and uses local MMDB files only. Configuration,
+upgrade/ABI notes, metric definitions, and module boundaries are in the
+[information-plane guide](./plans/information-plane.md). The phased scope and
+remaining work are tracked in the [implementation plan](./plans/2026-09-05-information-plane.md).
 
 ## Real-World Performance Benchmark
 

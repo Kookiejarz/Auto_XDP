@@ -106,15 +106,41 @@ XDP consumes ingress-interface/protocol/port policy, source ACLs, rate limits,
 and handler state. The `minecraft` profile automatically binds a per-port XDP
 handler before exposure. It validates the Minecraft Java handshake and first
 status/login packets, rate-limits status and login attempts by source prefix,
-and passes later packets only for flows that completed validation. Its flow
-state is built exclusively from ingress packets, so asymmetric routing does
-not hide required return traffic. If XDP or the handler is unavailable, the
+and uses Linux conntrack plus TC egress server progress to verify a session.
+The bounded `mc_verified` LRU stores full 64-bit policy/profile generations;
+the compact connmark is only a hint, never sufficient authorization. Generation
+changes or missing proof records revoke an already verified flow without
+reopening handshake probation. Server replies must traverse this host's egress
+hook. If XDP or the handler is unavailable, the
 profile's ports remain closed instead of silently falling back to generic
 nftables protection.
 
-If a future stateful feature needs kernel conntrack, it must capability-detect
-the kernel facility and retain a restricted stateless fallback. Auto XDP does
-not implement IP fragment reassembly.
+The base XDP program also queries Linux conntrack for TCP/UDP IPv4/IPv6 replies
+before checking service exposure, but after packet validation. Only confirmed
+connections in REPLY direction receive this exception: inbound service traffic
+in ORIGINAL direction still traverses authorization, limits and handlers.
+The first UDP reply and TCP SYN-ACK need not have SEEN_REPLY/ESTABLISHED yet.
+XDP lookup neither creates nor refreshes entries; the normal stack owns their
+timeouts, TCP validation, NAT and teardown. No custom connection table or generic
+TC egress tracker is maintained.
+
+Startup activates namespace-local IPv4/IPv6 conntrack hooks using the owned
+`inet auto_xdp_conntrack` nftables table (an output counter, no packet verdict).
+Successful candidate loading verifies the lookup/release kfuncs before replacing
+the running XDP program. Missing activation support fails startup; normal
+transactional fallback rules still apply. Stop preserves this table with the
+active data plane; full disable and uninstall remove it without flushing other
+rules or connection entries. The 12-byte lookup ABI uses the ingress device's
+network namespace and conntrack zone 0 (not an Auto XDP exposure zone).
+NOTRACK, nonzero conntrack zones, or connections tracked only in another netns
+do not get the reply exception. Host SNAT reply tuples are supported; arbitrary
+cross-namespace/container routing requires separately verified hook placement.
+
+The XDP backend requires Linux conntrack lookup kfuncs; unavailable
+profile protection remains closed. Optional SYN-cookie request-socket handoff
+also rejects NAT or unverifiable NAT state in its network namespace, since NAT
+LOCAL_IN can clear the assignment before TCP consumes it. Auto XDP does not
+implement IP fragment reassembly.
 
 ## Safety rules
 
@@ -133,13 +159,48 @@ not implement IP fragment reassembly.
 
 | Concern | Implementation |
 |---|---|
+| management commands, approvals and shared readers | `auto_xdp/admin/` |
 | endpoint model | `auto_xdp/state.py` |
-| socket and cgroup observation | `auto_xdp/discovery.py` |
+| socket and cgroup observation | `auto_xdp/discovery/listeners.py` |
+| process/socket events and local service names | `auto_xdp/discovery/` |
 | TOML policy validation | `auto_xdp/config.py` |
 | grant compilation and explanations | `auto_xdp/policy.py` |
 | observe/audit/enforce and latency | `auto_xdp/syncer.py`, `auto_xdp/cli.py` |
 | fast ingress enforcement | `bpf/xdp_firewall.c`, `bpf/include/`, and zone-port maps |
 | backend application | `auto_xdp/backends/xdp.py`, `nftables.py` |
+| packet-event emission and loss counters | `bpf/include/telemetry.h`, `counters.h` |
+| stable reason catalogue and v1/v2 event decoder | `auto_xdp/telemetry/events.py` |
+| ring consumption, bounded replay, relay health | `pkt_relay.py` |
+| socket client, session/sequence deduplication | `auto_xdp/telemetry/relay_client.py` |
+| retained sample aggregation and diagnostic models | `auto_xdp/telemetry/traffic.py` |
+| optional local country/ASN enrichment | `auto_xdp/telemetry/geoip.py` |
+| observation rendering and shared curses primitives | `auto_xdp/tui/traffic.py`, `auto_xdp/tui/widgets.py` |
+| TUI navigation, snapshots and management pages | `auto_xdp/tui/app.py` |
+
+The package root keeps configuration, policy, state and reconciliation modules.
+`auto_xdp.admin_cli` remains a compatibility command entry point; current callers
+use `auto_xdp.admin.cli`. The installer preserves nested package paths, discovers
+update candidates recursively, and validates imports against the installed
+payload independently of the source checkout.
+
+The observation path is `XDP/TC → counters/ringbuf → relay → client → views`.
+TC handoff counters reuse the main pinned counter map. Built-in tail-call
+programs account for their terminal verdict exactly once, since successful BPF
+tail calls do not return to the main program's accounting wrapper. Custom
+handlers must explicitly implement this shared-map contract to contribute to
+the totals; loading arbitrary external handlers does not imply full coverage.
+
+Event v2 keeps the original 48-byte prefix and appends ingress ifindex, original
+frame length, and version metadata (64 bytes total). The new relay supports both
+versions. Counter IDs are append-only, but increasing the counter array capacity
+changes its map ABI and requires coordinated program/map loading. Diagnostic
+stages overlap and must never be summed into packet totals. Unknown or absent
+metrics remain unknown, including when reading older producers.
+
+Source summaries use the same retained client window as DROP distributions.
+Only displayed addresses are enriched, using local databases and a bounded
+cache; neither the dataplane nor the ring consumer performs GeoIP lookup.
+See the [observation guide](./plans/information-plane.md) for operational limits.
 
 ## V1 boundary
 
