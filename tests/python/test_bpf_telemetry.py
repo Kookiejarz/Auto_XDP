@@ -83,3 +83,17 @@ def test_native_event_helpers(tmp_path: Path) -> None:
         check=True, capture_output=True, text=True,
     )
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="production BPF headers require Linux")
+def test_native_endpoint_scope_helpers(tmp_path: Path) -> None:
+    compiler = shutil.which("clang") or shutil.which("cc")
+    if compiler is None or not Path("/usr/include/bpf/bpf_helpers.h").exists():
+        pytest.skip("native C compiler and libbpf development headers required")
+    binary = tmp_path / "endpoint-scope-contract"
+    subprocess.run(
+        [compiler, "-O2", "-Wall", "-Werror", "-Wno-unknown-attributes", f"-I{ROOT}",
+         str(ROOT / "tests/c/endpoint_scope_contract.c"), "-o", str(binary)],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)

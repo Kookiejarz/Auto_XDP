@@ -507,6 +507,7 @@ xdp_required_map_names() {
 	trusted_ipv4
 	trusted_ipv6
 	tcp_whitelist
+	endpoint_scopes
 	udp_whitelist
 	tcp_zone_whitelist
 	udp_zone_whitelist

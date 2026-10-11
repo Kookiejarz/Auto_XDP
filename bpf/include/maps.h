@@ -8,6 +8,24 @@
  * in counters.h and telemetry.h alongside the helpers that use them.
  * All other SEC(".maps") map definitions are below. */
 
+struct endpoint_scope_key {
+    __u32 ifindex;  // zero represents the global public scope
+    __u16 port;     // host byte order
+    __u8 proto;
+    __u8 family;
+    __u32 daddr[4]; // network byte order; zero represents a wildcard bind
+};
+
+_Static_assert(sizeof(struct endpoint_scope_key) == 24, "endpoint scope key ABI");
+_Static_assert(__builtin_offsetof(struct endpoint_scope_key, daddr) == 8, "endpoint address ABI");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct endpoint_scope_key);
+    __type(value, __u32);
+} endpoint_scopes SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 256);

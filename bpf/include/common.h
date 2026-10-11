@@ -54,6 +54,7 @@ struct vlan_hdr {
 #define XDP_CFG_FLAG_ABUSEIPDB_ENABLED    (1U << 1)  // AbuseIPDB active (default: off)
 #define XDP_CFG_FLAG_DROP_EVENTS_DISABLED (1U << 2)  // ring-buf events off (default: on)
 #define XDP_CFG_FLAG_SLOT_DROP            (1U << 3)  // unknown proto → drop (default: pass)
+#define XDP_CFG_FLAG_ENDPOINT_POLICY      (1U << 4)  // exact address/family/interface admission
 
 // Runtime tunables. Userspace writes this map from config.toml; zero fields
 // fall back to defaults so old loaders remain compatible.

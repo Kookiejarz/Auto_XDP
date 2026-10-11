@@ -1,6 +1,38 @@
 #pragma once
 #include "maps.h"
 
+static __always_inline bool endpoint_scope_allowed(
+    struct xdp_md *ctx, __u8 family, __u8 proto,
+    const __u32 *daddr, __u16 port)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    if (!cfg || !(cfg->cfg_flags & XDP_CFG_FLAG_ENDPOINT_POLICY))
+        return true;
+
+    struct endpoint_scope_key key = {
+        .ifindex = ctx->ingress_ifindex,
+        .port = port,
+        .proto = proto,
+        .family = family,
+    };
+    __builtin_memcpy(key.daddr, daddr, sizeof(key.daddr));
+    __u32 *allow = bpf_map_lookup_elem(&endpoint_scopes, &key);
+    if (allow)
+        return *allow != 0;
+    __builtin_memset(key.daddr, 0, sizeof(key.daddr));
+    allow = bpf_map_lookup_elem(&endpoint_scopes, &key);
+    if (allow)
+        return *allow != 0;
+    key.ifindex = 0;
+    __builtin_memcpy(key.daddr, daddr, sizeof(key.daddr));
+    allow = bpf_map_lookup_elem(&endpoint_scopes, &key);
+    if (allow)
+        return *allow != 0;
+    __builtin_memset(key.daddr, 0, sizeof(key.daddr));
+    allow = bpf_map_lookup_elem(&endpoint_scopes, &key);
+    return allow && *allow;
+}
+
 static __always_inline bool tcp_endpoint_policy_lookup(
     struct xdp_md *ctx, __u32 dest_port, struct tcp_endpoint_policy *result)
 {

@@ -28,7 +28,8 @@ static __always_inline int check_tcp_policy(
         return XDP_PASS;
     }
 
-    if (!tcp_endpoint_policy_lookup(ctx, dest_port, &endpoint_policy))
+    if (!endpoint_scope_allowed(ctx, key->family, IPPROTO_TCP, key->daddr, dest_port) ||
+        !tcp_endpoint_policy_lookup(ctx, dest_port, &endpoint_policy))
         goto drop;
 
     if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
@@ -203,7 +204,8 @@ static __always_inline int check_udp_ipv4(
     }
     fill_udp_validation_key_v4(&validation_key, &key);
 
-    if (!udp_exposure_allowed(ctx, dest_port)) {
+    if (!endpoint_scope_allowed(ctx, key.family, IPPROTO_UDP, key.daddr, dest_port) ||
+        !udp_exposure_allowed(ctx, dest_port)) {
         count(CNT_PORT_NOT_AUTHORIZED);
         count(CNT_UDP_DROP);
         emit_drop(ctx, IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
@@ -341,7 +343,8 @@ static __always_inline int check_udp_ipv6(
     fill_udp_validation_key_v6(&validation_key, &key);
 
 
-    if (!udp_exposure_allowed(ctx, dest_port)) {
+    if (!endpoint_scope_allowed(ctx, key.family, IPPROTO_UDP, key.daddr, dest_port) ||
+        !udp_exposure_allowed(ctx, dest_port)) {
         count(CNT_PORT_NOT_AUTHORIZED);
         count(CNT_UDP_DROP);
         emit_drop(ctx, IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
@@ -592,6 +595,16 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
               emit_drop(ctx, IPPROTO_IPV6, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_TUNNEL_ENDPOINT_NOT_AUTHORIZED, now); }
             return XDP_DROP;
         }
+        case IPPROTO_SCTP: {
+            struct udphdr *ports = trans_data;
+            if ((void *)(ports + 1) > data_end)
+                return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
+            __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
+            if (!endpoint_scope_allowed(ctx, CT_FAMILY_IPV4, IPPROTO_SCTP,
+                                        d, bpf_ntohs(ports->dest)))
+                return drop_unclassified(ctx, CNT_SLOT_DROP);
+        }
+        /* fall through to the SCTP protocol slot */
         default: {
             __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
             __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
@@ -671,6 +684,17 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             count(CNT_IPV6_OTHER);
             return XDP_PASS;
         }
+        case IPPROTO_SCTP: {
+            struct udphdr *ports = trans_data;
+            if ((void *)(ports + 1) > data_end)
+                return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
+            __u32 d[4] = {0};
+            __builtin_memcpy(d, &ipv6->daddr, 16);
+            if (!endpoint_scope_allowed(ctx, CT_FAMILY_IPV6, IPPROTO_SCTP,
+                                        d, bpf_ntohs(ports->dest)))
+                return drop_unclassified(ctx, CNT_SLOT_DROP);
+        }
+        /* fall through to the SCTP protocol slot */
         default: {
             __u32 s[4], d[4];
             __builtin_memcpy(s, &ipv6->saddr, 16);
