@@ -1,5 +1,6 @@
 # Map capacities derived from bpf/include/map_sizes.h and counters.h.
 pkt_counters percpu_array 4 8 66
+endpoint_scopes hash 24 4 16384
 mc_verified lru_hash 40 24 65536
 hblk4 49152
 hblk6 16384

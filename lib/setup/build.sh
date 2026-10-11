@@ -84,6 +84,7 @@ generate_xdp_map_abi() {
     cat >"${BUILD_STAGING_DIR}/xdp_map_abi.txt" <<EOF
 # Map capacities derived from bpf/include/map_sizes.h and counters.h.
 pkt_counters percpu_array 4 8 ${counters}
+endpoint_scopes hash 24 4 16384
 mc_verified lru_hash 40 24 ${mc_verified}
 hblk4 ${rate4}
 hblk6 ${rate6}
