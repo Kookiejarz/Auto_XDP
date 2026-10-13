@@ -20,7 +20,7 @@ from auto_xdp.admin.ports import collect_ports, lookup_port_procs, read_xdp_port
 from auto_xdp.admin.stats import collect_stats_rows, read_xdp_map_id
 from auto_xdp.admin import approvals
 from auto_xdp.bpf.maps import BpfGlobalRlMap, BpfPortPolicyMap, BpfSyncookieRuntimeMap
-from auto_xdp.config import apply_toml_config, load_toml_config
+from auto_xdp.config import parse_toml_config, load_toml_config
 from auto_xdp.discovery.listeners import get_listening_ports
 from auto_xdp.policy import resolve_desired_state
 from auto_xdp.telemetry.geoip import GeoIPResolver
@@ -335,7 +335,7 @@ def _read_global_udp_rate(path: str) -> int:
     except OSError:
         return 0
     try:
-        return m.get()
+        return m.get() or 0
     finally:
         m.close()
 
@@ -464,8 +464,8 @@ def _collect_port_rows(
 
 
 def _collect_audit_rows(config_path: str) -> list[dict[str, Any]]:
-    apply_toml_config(load_toml_config(config_path, strict=True))
-    desired = resolve_desired_state(get_listening_ports())
+    snapshot = parse_toml_config(load_toml_config(config_path, strict=True))
+    desired = resolve_desired_state(get_listening_ports(config=snapshot), config=snapshot)
     rows = []
     for decision in desired.exposure_decisions:
         endpoint = decision.endpoint

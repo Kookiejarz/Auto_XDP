@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import struct
+import ipaddress
 import json
 import logging
 import os
@@ -21,6 +23,8 @@ from auto_xdp.abuseipdb import AbuseIPDBSyncer, BpfRiskMaps
 from auto_xdp.bpf.syscall import map_id, obj_get, probe_inner_map_support
 from auto_xdp.bpf.maps import (
     BpfAclMaps,
+    BpfEndpointScopeMap,
+    XDP_CFG_FLAG_ENDPOINT_POLICY,
     BpfArrayMap,
     BpfGlobalRlMap,
     BpfPortPolicyMap,
@@ -39,7 +43,9 @@ from auto_xdp.bpf.maps import (
 )
 from auto_xdp.policy import rate_map_entries_v6
 from auto_xdp.discovery.services import service_name
-from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcilePlan
+from auto_xdp.state import (AppliedState, BackendProjection, DesiredState, ObservedState, ReconcilePlan,
+                            ApplyResult, ApplyFailure, ApplyOperation, EndpointKey,
+                            project_endpoint_policies, endpoint_scope, EndpointPolicy)
 
 log = logging.getLogger(__name__)
 
@@ -55,15 +61,15 @@ _TCP_ENDPOINT_VALUE_FORMAT = "=IIQQ"
 _TCP_ALLOW = 1
 
 
-def _compute_cfg_flags(desired: DesiredState) -> int:
-    flags = 0
+def _compute_cfg_flags(desired: BackendProjection) -> int:
+    flags = XDP_CFG_FLAG_ENDPOINT_POLICY if desired.endpoint_policy_enabled else 0
     if not desired.bogon_filter_enabled:
         flags |= XDP_CFG_FLAG_BOGON_DISABLED
     if not desired.drop_events_enabled:
         flags |= XDP_CFG_FLAG_DROP_EVENTS_DISABLED
-    if cfg.ABUSEIPDB_ENABLED:
+    if desired.config.ABUSEIPDB_ENABLED:
         flags |= XDP_CFG_FLAG_ABUSEIPDB_ENABLED
-    if cfg.SLOT_DEFAULT_ACTION == "drop":
+    if desired.config.SLOT_DEFAULT_ACTION == "drop":
         flags |= XDP_CFG_FLAG_SLOT_DROP
     return flags
 
@@ -86,7 +92,8 @@ class XdpBackend(PortBackend):
     name = cfg.BACKEND_XDP
 
     @classmethod
-    def probe(cls) -> BackendStatus:
+    def probe(cls, config: cfg.ConfigSnapshot | None = None) -> BackendStatus:
+        config = cfg.snapshot_config() if config is None else config
         checks: dict[str, bool] = {}
         details: dict[str, str] = {}
 
@@ -102,7 +109,7 @@ class XdpBackend(PortBackend):
                 checks=checks,
             )
 
-        missing_maps = [path for path in cfg.REQUIRED_XDP_MAP_PATHS if not os.path.exists(path)]
+        missing_maps = [path for path in config.REQUIRED_XDP_MAP_PATHS if not os.path.exists(path)]
         checks["required_maps"] = not missing_maps
         if missing_maps:
             details["missing_maps"] = ", ".join(missing_maps)
@@ -114,10 +121,10 @@ class XdpBackend(PortBackend):
                 checks=checks,
             )
 
-        if cfg.XDP_OBJ_PATH:
-            checks["xdp_obj"] = os.path.exists(cfg.XDP_OBJ_PATH)
+        if config.XDP_OBJ_PATH:
+            checks["xdp_obj"] = os.path.exists(config.XDP_OBJ_PATH)
             if not checks["xdp_obj"]:
-                details["xdp_obj_path"] = cfg.XDP_OBJ_PATH
+                details["xdp_obj_path"] = config.XDP_OBJ_PATH
                 return BackendStatus(
                     name=cls.name,
                     available=False,
@@ -150,16 +157,19 @@ class XdpBackend(PortBackend):
 
         return BackendStatus(name=cls.name, available=True, checks=checks)
 
-    def __init__(self) -> None:
-        self.last_apply_failures: int = 0
-        self.tcp_map = BpfArrayMap(cfg.TCP_MAP_PATH, _TCP_ENDPOINT_VALUE_FORMAT)
-        self.udp_map = BpfArrayMap(cfg.UDP_MAP_PATH)
-        self.tcp_zone_map = BpfZonePortMap(cfg.TCP_ZONE_MAP_PATH, _TCP_ENDPOINT_VALUE_FORMAT)
-        self.udp_zone_map = BpfZonePortMap(cfg.UDP_ZONE_MAP_PATH)
-        self.tcp_profile_map = BpfArrayMap(cfg.TCP_PROFILE_HANDLER_MAP_PATH)
+    def __init__(self, config: cfg.ConfigSnapshot | None = None) -> None:
+        self._config = cfg.snapshot_config() if config is None else config
+        self.endpoint_map = BpfEndpointScopeMap(self.config.ENDPOINT_SCOPE_MAP_PATH)
+        self._endpoint_cache: dict[EndpointKey, EndpointPolicy] = {}
+        self._apply_result: ApplyResult | None = None
+        self.tcp_map = BpfArrayMap(self.config.TCP_MAP_PATH, _TCP_ENDPOINT_VALUE_FORMAT)
+        self.udp_map = BpfArrayMap(self.config.UDP_MAP_PATH)
+        self.tcp_zone_map = BpfZonePortMap(self.config.TCP_ZONE_MAP_PATH, _TCP_ENDPOINT_VALUE_FORMAT)
+        self.udp_zone_map = BpfZonePortMap(self.config.UDP_ZONE_MAP_PATH)
+        self.tcp_profile_map = BpfArrayMap(self.config.TCP_PROFILE_HANDLER_MAP_PATH)
         self._policy_generations = self._load_policy_generations()
         self._persisted_policy_generations = dict(self._policy_generations)
-        self.trusted_map = BpfTrustedMaps(cfg.TRUSTED_IPS_MAP_PATH4, cfg.TRUSTED_IPS_MAP_PATH6)
+        self.trusted_map = BpfTrustedMaps(self.config.TRUSTED_IPS_MAP_PATH4, self.config.TRUSTED_IPS_MAP_PATH6)
         self._tcp_policy_map: BpfPortPolicyMap | None = None
         self._udp_policy_map: BpfPortPolicyMap | None = None
         self.syn_rate_map: RateLimitMap | None = None
@@ -174,41 +184,41 @@ class XdpBackend(PortBackend):
         self.global_rl_map: BpfGlobalRlMap | None = None
         self.sctp_map: BpfArrayMap | None = None
         try:
-            self._tcp_policy_map = BpfPortPolicyMap(cfg.TCP_PORT_POLICY_MAP_PATH)
-            self.syn_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 0, cfg.TCP_PORT_POLICY_MAP_PATH)
-            self.syn_agg_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 1, cfg.TCP_PORT_POLICY_MAP_PATH)
+            self._tcp_policy_map = BpfPortPolicyMap(self.config.TCP_PORT_POLICY_MAP_PATH)
+            self.syn_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 0, self.config.TCP_PORT_POLICY_MAP_PATH)
+            self.syn_agg_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 1, self.config.TCP_PORT_POLICY_MAP_PATH)
             log.debug("tcp_port_policies map opened; TCP per-port policy active.")
         except OSError as exc:
             log.debug("tcp_port_policies map unavailable (%s); TCP per-port policy inactive.", exc)
         try:
-            self._udp_policy_map = BpfPortPolicyMap(cfg.UDP_PORT_POLICY_MAP_PATH)
-            self.udp_rate_map = BpfPortPolicyViewMap(self._udp_policy_map, 0, cfg.UDP_PORT_POLICY_MAP_PATH)
-            self.udp_agg_rate_map = BpfPortPolicyViewMap(self._udp_policy_map, 1, cfg.UDP_PORT_POLICY_MAP_PATH)
+            self._udp_policy_map = BpfPortPolicyMap(self.config.UDP_PORT_POLICY_MAP_PATH)
+            self.udp_rate_map = BpfPortPolicyViewMap(self._udp_policy_map, 0, self.config.UDP_PORT_POLICY_MAP_PATH)
+            self.udp_agg_rate_map = BpfPortPolicyViewMap(self._udp_policy_map, 1, self.config.UDP_PORT_POLICY_MAP_PATH)
             log.debug("udp_port_policies map opened; UDP per-port policy active.")
         except OSError as exc:
             log.debug("udp_port_policies map unavailable (%s); UDP per-port policy inactive.", exc)
         try:
             self.acl_maps = BpfAclMaps(
-                cfg.TCP_ACL_MAP_PATH4, cfg.TCP_ACL_MAP_PATH6,
-                cfg.UDP_ACL_MAP_PATH4, cfg.UDP_ACL_MAP_PATH6,
+                self.config.TCP_ACL_MAP_PATH4, self.config.TCP_ACL_MAP_PATH6,
+                self.config.UDP_ACL_MAP_PATH4, self.config.UDP_ACL_MAP_PATH6,
             )
             log.debug("ACL maps opened; per-CIDR port ACL active.")
         except OSError as exc:
             log.debug("ACL maps unavailable (%s); per-CIDR ACL inactive.", exc)
         try:
-            self.runtime_config_map = BpfRuntimeConfigMap(cfg.XDP_RUNTIME_CFG_MAP_PATH)
+            self.runtime_config_map = BpfRuntimeConfigMap(self.config.XDP_RUNTIME_CFG_MAP_PATH)
             log.debug("xdp_runtime_cfg map opened; runtime tuning active.")
         except OSError as exc:
             log.debug("xdp_runtime_cfg map unavailable (%s); runtime tuning inactive.", exc)
         try:
             self.tcp_syncookie_mode_map = BpfArrayMap(
-                cfg.TCP_SYNCOOKIE_POLICY_MAP_PATH
+                self.config.TCP_SYNCOOKIE_POLICY_MAP_PATH
             )
             self.tcp_syncookie_rate_map = BpfArrayMap(
-                cfg.SYNCOOKIE_PORT_RATE_MAP_PATH
+                self.config.SYNCOOKIE_PORT_RATE_MAP_PATH
             )
             self.syncookie_runtime_map = BpfSyncookieRuntimeMap(
-                cfg.SYNCOOKIE_RUNTIME_CFG_MAP_PATH
+                self.config.SYNCOOKIE_RUNTIME_CFG_MAP_PATH
             )
             log.debug("SYN-cookie policy maps opened.")
         except OSError as exc:
@@ -222,18 +232,18 @@ class XdpBackend(PortBackend):
             self.tcp_syncookie_rate_map = None
             self.syncookie_runtime_map = None
         try:
-            self.global_rl_map = BpfGlobalRlMap(cfg.UDP_GLOBAL_RL_MAP_PATH)
+            self.global_rl_map = BpfGlobalRlMap(self.config.UDP_GLOBAL_RL_MAP_PATH)
             log.debug("udp_global_rl map opened; global UDP rate limit control active.")
         except OSError as exc:
             log.debug("udp_global_rl map unavailable (%s); global UDP rate limit inactive.", exc)
         try:
-            self.sctp_map = BpfArrayMap(cfg.SCTP_MAP_PATH)
+            self.sctp_map = BpfArrayMap(self.config.SCTP_MAP_PATH)
             log.debug("sctp_whitelist map opened; SCTP whitelist sync active.")
         except OSError as exc:
             log.debug("sctp_whitelist map unavailable (%s); SCTP whitelist sync inactive.", exc)
         self.sit4_map: BpfSit4EndpointsMap | None = None
         try:
-            self.sit4_map = BpfSit4EndpointsMap(cfg.SIT4_ENDPOINTS_MAP_PATH)
+            self.sit4_map = BpfSit4EndpointsMap(self.config.SIT4_ENDPOINTS_MAP_PATH)
             log.debug("sit4_endpoints map opened; 6in4 tunnel endpoint control active.")
         except OSError as exc:
             log.debug("sit4_endpoints map unavailable (%s); 6in4 tunnel endpoint sync inactive.", exc)
@@ -243,16 +253,16 @@ class XdpBackend(PortBackend):
         self.udprt6_outer: BpfRateOuterMap | None = None
         try:
             self.syn4_outer = BpfRateOuterMap(
-                cfg.SYN4_MAP_PATH, 4, 8, cfg.RATE_MAP_ENTRIES_V4, "s4_"
+                self.config.SYN4_MAP_PATH, 4, 8, self.config.RATE_MAP_ENTRIES_V4, "s4_"
             )
             self.syn6_outer = BpfRateOuterMap(
-                cfg.SYN6_MAP_PATH, 16, 8, cfg.RATE_MAP_ENTRIES_V6, "s6_"
+                self.config.SYN6_MAP_PATH, 16, 8, self.config.RATE_MAP_ENTRIES_V6, "s6_"
             )
             self.udprt4_outer = BpfRateOuterMap(
-                cfg.UDPRT4_MAP_PATH, 4, 8, cfg.RATE_MAP_ENTRIES_V4, "u4_"
+                self.config.UDPRT4_MAP_PATH, 4, 8, self.config.RATE_MAP_ENTRIES_V4, "u4_"
             )
             self.udprt6_outer = BpfRateOuterMap(
-                cfg.UDPRT6_MAP_PATH, 16, 8, cfg.RATE_MAP_ENTRIES_V6, "u6_"
+                self.config.UDPRT6_MAP_PATH, 16, 8, self.config.RATE_MAP_ENTRIES_V6, "u6_"
             )
             log.debug("rate outer maps opened; per-port rate-limit isolation active.")
         except OSError as exc:
@@ -262,25 +272,25 @@ class XdpBackend(PortBackend):
         try:
             if self.runtime_config_map is not None:
                 self._risk_maps = BpfRiskMaps(
-                    cfg.ABUSEIPDB_RISK_MAP_PATH4,
+                    self.config.ABUSEIPDB_RISK_MAP_PATH4,
                     self.runtime_config_map,
                 )
-            if cfg.ABUSEIPDB_ENABLED and self._risk_maps is not None:
+            if self.config.ABUSEIPDB_ENABLED and self._risk_maps is not None:
                 self._abuseipdb_syncer = AbuseIPDBSyncer(
                     self._risk_maps,
-                    base_url=cfg.ABUSEIPDB_BASE_URL,
-                    sources=cfg.ABUSEIPDB_SOURCES,
-                    refresh_seconds=cfg.ABUSEIPDB_REFRESH_SECONDS,
+                    base_url=self.config.ABUSEIPDB_BASE_URL,
+                    sources=self.config.ABUSEIPDB_SOURCES,
+                    refresh_seconds=self.config.ABUSEIPDB_REFRESH_SECONDS,
                 )
                 self._abuseipdb_syncer.start()
             log.debug("AbuseIPDB risk maps opened.")
         except OSError as exc:
             log.debug("AbuseIPDB maps unavailable (%s); AbuseIPDB blocking inactive.", exc)
 
-    def _desired_udp_zone_values(self, desired: DesiredState) -> dict[tuple[int, int], int]:
+    def _desired_udp_zone_values(self, desired: BackendProjection) -> dict[tuple[int, int], int]:
         values: dict[tuple[int, int], int] = {}
         for zone, ports in desired.zone_udp_ports.items():
-            for interface in cfg.ZONES.get(zone, {}).get("interfaces", []):
+            for interface in desired.config.ZONES.get(zone, {}).get("interfaces", []):
                 if interface == "*":
                     continue
                 try:
@@ -289,7 +299,7 @@ class XdpBackend(PortBackend):
                     log.warning("Configured zone interface does not exist: %s", interface)
                     continue
                 values.update(((ifindex, port), 1) for port in ports)
-        for zone, spec in cfg.ZONES.items():
+        for zone, spec in desired.config.ZONES.items():
             for interface in spec.get("interfaces", []):
                 if interface == "*":
                     continue
@@ -302,7 +312,7 @@ class XdpBackend(PortBackend):
         return values
 
     def _policy_fingerprint(
-        self, desired: DesiredState, endpoint: tuple[str, int], profile: str
+        self, desired: BackendProjection, endpoint: tuple[str, int], profile: str
     ) -> str:
         zone, port = endpoint
         material = [
@@ -332,7 +342,7 @@ class XdpBackend(PortBackend):
             zone,
             port,
             profile,
-            tuple(cfg.ZONES.get(zone, {}).get("interfaces", [])),
+            tuple(desired.config.ZONES.get(zone, {}).get("interfaces", [])),
             desired.tcp_syn_rate_limits.get(port),
             desired.tcp_syn_agg_rate_limits.get(port),
             desired.tcp_syncookie_modes.get(port),
@@ -340,11 +350,13 @@ class XdpBackend(PortBackend):
             endpoint_acl,
             desired.bogon_filter_enabled,
             sorted(material),
+            tuple(sorted((key, value) for key, value in desired.endpoint_policies.items()
+                         if key[0] == "tcp" and key[2] == port and key[3] == zone)),
         )
         return hashlib.sha256(repr(payload).encode()).hexdigest()
 
     def _endpoint_generation(
-        self, desired: DesiredState, endpoint: tuple[str, int], profile: str
+        self, desired: BackendProjection, endpoint: tuple[str, int], profile: str
     ) -> int:
         fingerprint = self._policy_fingerprint(desired, endpoint, profile)
         current = self._policy_generations.get(endpoint)
@@ -361,7 +373,7 @@ class XdpBackend(PortBackend):
 
     def _tcp_endpoint_value(
         self,
-        desired: DesiredState,
+        desired: BackendProjection,
         endpoint: tuple[str, int],
         profile_generation: int,
     ) -> tuple[int, int, int, int]:
@@ -376,7 +388,7 @@ class XdpBackend(PortBackend):
         )
 
     def _desired_tcp_values(
-        self, desired: DesiredState, profile_generation: int
+        self, desired: BackendProjection, profile_generation: int
     ) -> tuple[dict[int, tuple[int, int, int, int]], dict[tuple[int, int], tuple[int, int, int, int]]]:
         active_endpoints = set(desired.tcp_protection_profiles)
         for endpoint in set(self._policy_generations) - active_endpoints:
@@ -390,7 +402,7 @@ class XdpBackend(PortBackend):
         }
         zone_values: dict[tuple[int, int], tuple[int, int, int, int]] = {}
         for zone, ports in desired.zone_tcp_ports.items():
-            for interface in cfg.ZONES.get(zone, {}).get("interfaces", []):
+            for interface in desired.config.ZONES.get(zone, {}).get("interfaces", []):
                 if interface == "*":
                     continue
                 try:
@@ -402,7 +414,7 @@ class XdpBackend(PortBackend):
                     zone_values[(ifindex, port)] = self._tcp_endpoint_value(
                         desired, (zone, port), profile_generation
                     )
-        for zone, spec in cfg.ZONES.items():
+        for zone, spec in desired.config.ZONES.items():
             for interface in spec.get("interfaces", []):
                 if interface == "*":
                     continue
@@ -417,7 +429,7 @@ class XdpBackend(PortBackend):
     def _zone_state(self, zone_map: BpfZonePortMap) -> dict[str, set[int]]:
         active = zone_map.active_entries()
         result: dict[str, set[int]] = {}
-        for zone, spec in cfg.ZONES.items():
+        for zone, spec in self.config.ZONES.items():
             indices = set()
             for interface in spec.get("interfaces", []):
                 if interface == "*":
@@ -437,8 +449,7 @@ class XdpBackend(PortBackend):
         desired_values: Mapping[tuple[int, int], int | tuple[int, ...]],
         dry_run: bool,
         additions: bool,
-    ) -> int:
-        failures = 0
+    ) -> None:
         current = zone_map.entries()
         desired_entries = set(desired_values)
         changed = {
@@ -454,15 +465,12 @@ class XdpBackend(PortBackend):
         entries = ((desired_entries - current) | changed) if additions else (current - desired_entries)
         for ifindex, port in sorted(entries):
             ok = (
-                zone_map.set(ifindex, port, desired_values[(ifindex, port)], dry_run)
+                self._map_operation(zone_map, "set", ifindex, port, desired_values[(ifindex, port)], dry_run)
                 if additions
-                else zone_map.delete(ifindex, port, dry_run)
+                else self._map_operation(zone_map, "delete", ifindex, port, dry_run)
             )
-            if not ok:
-                failures += 1
-            elif not dry_run:
+            if ok and not dry_run:
                 log.debug("%s zone port %s %d", "+" if additions else "-", ifindex, port)
-        return failures
 
     @staticmethod
     def _profile_install_dir() -> Path:
@@ -553,9 +561,9 @@ class XdpBackend(PortBackend):
             "-m",
             "auto_xdp.admin.cli",
             "--config",
-            cfg.TOML_CONFIG_PATH,
+            self.config.TOML_CONFIG_PATH,
             "--bpf-pin-dir",
-            cfg.BPF_PIN_DIR,
+            self.config.BPF_PIN_DIR,
             "--install-dir",
             str(install_dir),
             "profile-handler",
@@ -567,11 +575,13 @@ class XdpBackend(PortBackend):
         try:
             result = subprocess.run(command, capture_output=True, text=True)
         except OSError as exc:
+            self._profile_error = str(exc)
             log.error("Cannot run Minecraft profile handler command: %s", exc)
             return False
         if result.returncode == 0:
             return True
         detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        self._profile_error = detail
         log.error("Minecraft profile handler %s failed for profile %d: %s", action, profile_id, detail)
         return False
 
@@ -609,11 +619,12 @@ class XdpBackend(PortBackend):
         if not desired:
             return set(), 0
         if not object_path.is_file():
+            self._profile_error = f"Minecraft profile object is missing: {object_path}"
             log.error("Minecraft profile object is missing: %s", object_path)
             return set(desired), 0
 
         profile_id = _PROFILE_IDS[_MINECRAFT_PROFILE]
-        live_pin = Path(cfg.BPF_PIN_DIR) / "profile_handlers" / "tcp" / str(profile_id) / "prog"
+        live_pin = Path(self.config.BPF_PIN_DIR) / "profile_handlers" / "tcp" / str(profile_id) / "prog"
         live_id = self._pinned_program_id(live_pin)
         managed = self._managed_profile_handler()
         self.tcp_profile_map.verify()
@@ -653,14 +664,15 @@ class XdpBackend(PortBackend):
 
     def _remove_stale_profile_handlers(
         self, desired: dict[tuple[str, int], str], dry_run: bool
-    ) -> int:
+    ) -> None:
+        result = self._execution_result(dry_run)
         if desired:
-            return 0
+            return
         profile_map = getattr(self, "tcp_profile_map", None)
         if profile_map is None:
-            return 0
+            return
         profile_id = _PROFILE_IDS[_MINECRAFT_PROFILE]
-        live_pin = Path(cfg.BPF_PIN_DIR) / "profile_handlers" / "tcp" / str(profile_id) / "prog"
+        live_pin = Path(self.config.BPF_PIN_DIR) / "profile_handlers" / "tcp" / str(profile_id) / "prog"
         live_id = self._pinned_program_id(live_pin)
         profile_map.verify()
         array_value = profile_map.value(profile_id)
@@ -672,16 +684,19 @@ class XdpBackend(PortBackend):
                 pass
             except OSError as exc:
                 log.warning("Cannot remove stale profile marker: %s", exc)
-                return 1
-            return 0
+                result.failures.append(ApplyFailure(ApplyOperation("cleanup", "profiles", "remove marker"), str(exc)))
+                return
+            return
         if live_id is None or array_id != live_id:
             log.error("Cannot safely remove inconsistent Minecraft profile handler state")
-            return 1
+            result.failures.append(ApplyFailure(ApplyOperation("cleanup", "profiles", "unload"), "inconsistent pinned profile handler state"))
+            return
         if dry_run:
             log.info("Would unload stale Minecraft profile handler ID %d", profile_id)
-            return 0
+            return
         if not self._profile_command("unload", profile_id):
-            return 1
+            result.failures.append(ApplyFailure(ApplyOperation("cleanup", "profiles", "unload"), getattr(self, "_profile_error", "profile unload failed")))
+            return
         profile_map.refresh()
         try:
             self._profile_marker().unlink()
@@ -689,14 +704,15 @@ class XdpBackend(PortBackend):
             pass
         except OSError as exc:
             log.warning("Cannot remove stale profile marker: %s", exc)
-            return 1
+            result.failures.append(ApplyFailure(ApplyOperation("cleanup", "profiles", "remove marker"), str(exc)))
+            return
         log.info("Minecraft protection profile %d disabled", profile_id)
-        return 0
+        return
 
     def is_stale(self) -> bool:
         """Return True if the pinned tcp_whitelist map has been replaced since init."""
         try:
-            fd = obj_get(cfg.TCP_MAP_PATH)
+            fd = obj_get(self.config.TCP_MAP_PATH)
             try:
                 pinned_id = map_id(fd)
             finally:
@@ -706,6 +722,8 @@ class XdpBackend(PortBackend):
             return False
 
     def close(self) -> None:
+        if hasattr(self, "endpoint_map"):
+            self.endpoint_map.close()
         self.tcp_map.close()
         self.udp_map.close()
         if hasattr(self, "tcp_profile_map"):
@@ -743,6 +761,8 @@ class XdpBackend(PortBackend):
 
     def get_applied_state(self) -> AppliedState:
         return AppliedState(
+            endpoint_policies=dict(getattr(self, "_endpoint_cache", {})),
+            evidence={"endpoint_policies": "cached", "maps": "cached"},
             tcp_ports=self.tcp_map.active_ports(),
             udp_ports=self.udp_map.active_ports(),
             zone_tcp_ports=self._zone_state(self.tcp_zone_map) if hasattr(self, "tcp_zone_map") else {},
@@ -771,18 +791,70 @@ class XdpBackend(PortBackend):
             xdp_runtime_config=self.runtime_config_map.get() if self.runtime_config_map is not None else None,
         )
 
-    def build_reconcile_plan(
-        self,
-        desired_state: DesiredState,
-        applied_state: AppliedState,
-    ) -> ReconcilePlan:
-        plan = super().build_reconcile_plan(desired_state, applied_state)
-        return plan
+    @property
+    def last_apply_failures(self) -> int:
+        """Compatibility count derived from the structured execution result."""
+        result = getattr(self, "_apply_result", None) or self.last_apply_result
+        return len(result.failures) if result is not None else 0
 
-    def _ok(self, result: bool) -> bool:
-        if not result:
-            self.last_apply_failures += 1
+    def _execution_result(self, dry_run: bool = False) -> ApplyResult:
+        result = getattr(self, "_apply_result", None)
+        if result is None:
+            result = self._apply_result = ApplyResult(dry_run=dry_run)
         return result
+
+    def _map_operation(self, resource, method: str, *args, **kwargs) -> bool:
+        operation = ApplyOperation(getattr(self, "_apply_stage", "prepare"),
+                                   getattr(resource, "path", type(resource).__name__),
+                                   f"{method} {args!r}")
+        try:
+            ok = getattr(resource, method)(*args, **kwargs)
+            reason = getattr(resource, "last_error", "map operation returned failure")
+        except (OSError, ValueError, OverflowError, struct.error) as exc:
+            ok, reason = False, str(exc)
+        result = self._execution_result()
+        if not ok:
+            result.failures.append(ApplyFailure(operation, reason))
+        elif not result.dry_run:
+            result.succeeded.append(operation)
+        return ok
+
+    def _scope_values(self, desired: DesiredState) -> tuple[dict[bytes, int], dict[EndpointKey, str]]:
+        values: dict[bytes, int] = {}
+        blocked: dict[EndpointKey, str] = {}
+        for key, policy in desired.endpoint_policies.items():
+            try:
+                interfaces, families, address = endpoint_scope(key, desired.config)
+                indexes = [socket.if_nametoindex(name) for name in interfaces] if interfaces else [0]
+            except (OSError, ValueError) as exc:
+                if policy.allow:
+                    blocked[key] = str(exc)
+                continue
+            for family in families:
+                packed = ipaddress.ip_address(address).packed.ljust(16, b"\0") if address else bytes(16)
+                for index in indexes:
+                    raw = struct.pack("=IHBB16s", index, key[2], {"tcp": 6, "udp": 17, "sctp": 132}[key[0]],
+                                      2 if family == 4 else 10, packed)
+                    # A deny on the same native key always wins.
+                    values[raw] = min(values.get(raw, 1), int(policy.allow))
+        # Public fallback must never grant admission on a named private NIC.
+        for raw in list(values):
+            index, port, proto, family, address = struct.unpack("=IHBB16s", raw)
+            if index != 0:
+                continue
+            for zone, spec in desired.config.ZONES.items():
+                if zone == "public":
+                    continue
+                for interface in spec.get("interfaces", ()):
+                    if interface == "*":
+                        continue
+                    try:
+                        ifindex = socket.if_nametoindex(interface)
+                    except OSError:
+                        continue
+                    deny = struct.pack("=IHBB16s", ifindex, port, proto, family, bytes(16))
+                    values.setdefault(deny, 0)
+        return values, blocked
 
     def verify_kernel_state(self) -> int:
         """Re-read userspace-owned config maps from the kernel and repair caches.
@@ -831,39 +903,45 @@ class XdpBackend(PortBackend):
         desired_state: DesiredState,
         observed_state: ObservedState | None = None,
     ) -> None:
-        self.last_apply_failures = getattr(self, "_precondition_failures", 0)
-        self._precondition_failures = 0
+        if not isinstance(desired_state, BackendProjection):
+            desired_state, _ = project_endpoint_policies(desired_state)
+        if not getattr(self, "_defer_global_admission", False):
+            self._apply_result = ApplyResult(dry_run=dry_run, plan=plan)
         changed = False
         for port in sorted(plan.tcp_ports_to_remove):
-            if self._ok(self.tcp_map.set(port, 0, dry_run)):
+            if self._map_operation(self.tcp_map, 'set', port, 0, dry_run):
                 log.debug("TCP -%d  (stopped)", port)
                 changed = True
 
         for port in sorted(plan.udp_ports_to_remove):
-            if self._ok(self.udp_map.set(port, 0, dry_run)):
+            if self._map_operation(self.udp_map, 'set', port, 0, dry_run):
                 log.debug("UDP -%d  (stopped)", port)
                 changed = True
 
         if self.sctp_map is not None:
-            for port in sorted(plan.sctp_ports_to_add):
-                if self._ok(self.sctp_map.set(port, 1, dry_run)):
+            for port in sorted(plan.sctp_ports_to_add if not desired_state.endpoint_policy_enabled else set()):
+                if self._map_operation(self.sctp_map, 'set', port, 1, dry_run):
                     log.info("SCTP +%d", port)
                     changed = True
 
             for port in sorted(plan.sctp_ports_to_remove):
-                if self._ok(self.sctp_map.set(port, 0, dry_run)):
+                if self._map_operation(self.sctp_map, 'set', port, 0, dry_run):
                     log.info("SCTP -%d  (stopped)", port)
                     changed = True
 
+        if desired_state.endpoint_policy_enabled and self.last_apply_failures:
+            log.warning("Revocation failed; preserving protection state and skipping admission")
+            return
+
         # HASH maps need delete, not write-zero, when trust entries disappear.
         for ip_str in sorted(plan.trusted_cidrs_to_add):
-            tag = f" [{cfg.TRUSTED_SRC_IPS[ip_str]}]" if ip_str in cfg.TRUSTED_SRC_IPS else ""
-            if self._ok(self.trusted_map.set(ip_str, 1, dry_run)):
+            tag = f" [{desired_state.config.TRUSTED_SRC_IPS[ip_str]}]" if ip_str in desired_state.config.TRUSTED_SRC_IPS else ""
+            if self._map_operation(self.trusted_map, 'set', ip_str, 1, dry_run):
                 log.info("TRUST +%s%s", ip_str, tag)
                 changed = True
 
         for ip_str in sorted(plan.trusted_cidrs_to_remove):
-            if self._ok(self.trusted_map.delete(ip_str, dry_run)):
+            if self._map_operation(self.trusted_map, 'delete', ip_str, dry_run):
                 log.info("TRUST -%s  (removed)", ip_str)
                 changed = True
 
@@ -893,34 +971,25 @@ class XdpBackend(PortBackend):
         if cookie_mode_map is not None:
             mode_values = {"off": 0, "auto": 1, "always": 2}
             for port, mode in sorted(plan.tcp_syncookie_modes_to_upsert.items()):
-                self._ok(cookie_mode_map.set(
-                    port, mode_values[mode], dry_run
-                ))
+                self._map_operation(cookie_mode_map, 'set', port, mode_values[mode], dry_run)
             for port in sorted(plan.tcp_syncookie_modes_to_remove):
-                self._ok(cookie_mode_map.delete(port, dry_run))
+                self._map_operation(cookie_mode_map, 'delete', port, dry_run)
 
         cookie_rate_map = getattr(self, "tcp_syncookie_rate_map", None)
         if cookie_rate_map is not None:
             for port, rate in sorted(
                 plan.tcp_syncookie_rate_limits_to_upsert.items()
             ):
-                self._ok(cookie_rate_map.set(port, rate, dry_run))
+                self._map_operation(cookie_rate_map, 'set', port, rate, dry_run)
             for port in sorted(plan.tcp_syncookie_rate_limits_to_remove):
-                self._ok(cookie_rate_map.delete(port, dry_run))
+                self._map_operation(cookie_rate_map, 'delete', port, dry_run)
 
         cookie_runtime_map = getattr(self, "syncookie_runtime_map", None)
         if cookie_runtime_map is not None:
-            active = cfg.SYNCOOKIE_ENABLED and (
-                Path(cfg.BPF_PIN_DIR) / "syncookie_prog"
+            active = desired_state.config.SYNCOOKIE_ENABLED and (
+                Path(desired_state.config.BPF_PIN_DIR) / "syncookie_prog"
             ).exists()
-            self._ok(cookie_runtime_map.set(
-                active,
-                cfg.SYNCOOKIE_ACTIVATION_PERCENT,
-                cfg.SYNCOOKIE_AUTO_MAX_PERCENT,
-                cfg.SYNCOOKIE_INVALID_ACK_RATE_PPS,
-                int(cfg.SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS * 1_000_000_000),
-                dry_run,
-            ))
+            self._map_operation(cookie_runtime_map, 'set', active, desired_state.config.SYNCOOKIE_ACTIVATION_PERCENT, desired_state.config.SYNCOOKIE_AUTO_MAX_PERCENT, desired_state.config.SYNCOOKIE_INVALID_ACK_RATE_PPS, int(desired_state.config.SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS * 1_000_000_000), dry_run)
 
         if self.udp_rate_map is not None:
             self._apply_rate_map_delta(
@@ -948,7 +1017,7 @@ class XdpBackend(PortBackend):
         if self.syn6_outer is not None:
             self._apply_rate_outer_delta(
                 self.syn6_outer,
-                {p: rate_map_entries_v6(c) for p, c in tcp_entries.items()},
+                {p: rate_map_entries_v6(c, config=desired_state.config) for p, c in tcp_entries.items()},
                 dry_run,
             )
         if self.udprt4_outer is not None:
@@ -956,7 +1025,7 @@ class XdpBackend(PortBackend):
         if self.udprt6_outer is not None:
             self._apply_rate_outer_delta(
                 self.udprt6_outer,
-                {p: rate_map_entries_v6(c) for p, c in udp_entries.items()},
+                {p: rate_map_entries_v6(c, config=desired_state.config) for p, c in udp_entries.items()},
                 dry_run,
             )
 
@@ -989,24 +1058,24 @@ class XdpBackend(PortBackend):
             current = self.runtime_config_map.get()
             current_flags = self.runtime_config_map.get_cfg_flags() or 0
             if desired_state.xdp_runtime_config != current or cfg_flags != current_flags:
-                self._ok(self.runtime_config_map.set(desired_state.xdp_runtime_config, cfg_flags, dry_run))
+                self._map_operation(self.runtime_config_map, 'set', desired_state.xdp_runtime_config, cfg_flags, dry_run)
 
         if self.global_rl_map is not None and plan.udp_global_byte_rate_update is not None:
             rate = plan.udp_global_byte_rate_update
-            if self._ok(self.global_rl_map.set(rate, dry_run)):
+            if self._map_operation(self.global_rl_map, 'set', rate, dry_run):
                 if rate:
                     log.info("UDP global rate limit set to %d bytes/s", rate)
                 else:
                     log.info("UDP global rate limit disabled")
 
         if self.sit4_map is not None:
-            desired_sit4 = set(cfg.SIT4_ENDPOINTS)
+            desired_sit4 = set(desired_state.config.SIT4_ENDPOINTS)
             current_sit4 = self.sit4_map.active_keys()
             for ip_str in sorted(desired_sit4 - current_sit4):
-                if self._ok(self.sit4_map.set(ip_str, dry_run)):
+                if self._map_operation(self.sit4_map, 'set', ip_str, dry_run):
                     log.info("SIT4 +%s (6in4 tunnel endpoint added)", ip_str)
             for ip_str in sorted(current_sit4 - desired_sit4):
-                if self._ok(self.sit4_map.delete(ip_str, dry_run)):
+                if self._map_operation(self.sit4_map, 'delete', ip_str, dry_run):
                     log.info("SIT4 -%s (6in4 tunnel endpoint removed)", ip_str)
 
         # BPF maps do not provide a transaction.  Prepare all protection state
@@ -1033,10 +1102,10 @@ class XdpBackend(PortBackend):
         tcp_values = getattr(self, "_desired_tcp_global_values", {})
         for port in sorted(plan.tcp_ports_to_add):
             value = tcp_values.get(port, (_TCP_ALLOW, 0, 0, 0))
-            if self._ok(self.tcp_map.set(port, value, dry_run)):
+            if self._map_operation(self.tcp_map, 'set', port, value, dry_run):
                 log.debug("TCP +%d", port)
         for port in sorted(plan.udp_ports_to_add):
-            if self._ok(self.udp_map.set(port, 1, dry_run)):
+            if self._map_operation(self.udp_map, 'set', port, 1, dry_run):
                 log.debug("UDP +%d", port)
 
     def reconcile(
@@ -1044,131 +1113,311 @@ class XdpBackend(PortBackend):
         desired_state: DesiredState,
         dry_run: bool,
         observed_state: ObservedState | None = None,
-    ) -> None:
+    ) -> ApplyResult:
+        original = desired_state
+        result = ApplyResult(dry_run=dry_run)
+        self._apply_result = result
+        if hasattr(self, "_config") and self.config.BPF_PIN_DIR != desired_state.config.BPF_PIN_DIR:
+            raise RuntimeError("BPF pin directory changed; reopen the backend")
+        self._config = desired_state.config
+        projection, blocked = project_endpoint_policies(desired_state)
+        result.plan = self.build_reconcile_plan(projection, self.get_applied_state())
+        result.plan.target = original
+        result.blocked_endpoints.update(blocked)
+        scope_values, scope_blocked = self._scope_values(projection) if projection.endpoint_policy_enabled else ({}, {})
+        result.blocked_endpoints.update(scope_blocked)
+        for endpoint_key, policy in projection.endpoint_policies.items():
+            if not policy.allow:
+                continue
+            required = []
+            if endpoint_key[0] == "sctp":
+                required.append("sctp_map")
+            if policy.syn_rate:
+                required.extend(("syn_rate_map", "syn4_outer", "syn6_outer"))
+            if policy.syn_aggregate_rate:
+                required.append("syn_agg_rate_map")
+            if policy.udp_rate:
+                required.extend(("udp_rate_map", "udprt4_outer", "udprt6_outer"))
+            if policy.udp_byte_rate:
+                required.append("udp_agg_rate_map")
+            if endpoint_key[0] == "udp" and projection.udp_global_byte_rate:
+                required.append("global_rl_map")
+            if policy.syncookie_mode != "off":
+                required.extend(("tcp_syncookie_mode_map", "tcp_syncookie_rate_map", "syncookie_runtime_map"))
+                if not (Path(projection.config.BPF_PIN_DIR) / "syncookie_prog").exists():
+                    scope_blocked[endpoint_key] = "SYN-cookie program is unavailable"
+            missing = [name for name in required if getattr(self, name, None) is None]
+            if missing:
+                scope_blocked[endpoint_key] = "required protection unavailable: " + ", ".join(missing)
+        result.blocked_endpoints.update(scope_blocked)
+        if scope_blocked:
+            projection = replace(projection, endpoint_policies={
+                key: replace(policy, allow=False, reason=scope_blocked[key]) if key in scope_blocked else policy
+                for key, policy in projection.endpoint_policies.items()})
+            projection, _ = project_endpoint_policies(projection)
+            scope_values, _ = self._scope_values(projection)
         if not hasattr(self, "_policy_generations"):
             self._policy_generations = {}
         if not hasattr(self, "_persisted_policy_generations"):
             self._persisted_policy_generations = dict(self._policy_generations)
-        self.last_apply_failures = 0
 
-        install_dir = self._profile_install_dir()
-        profile_object = install_dir / "handlers" / f"{_MINECRAFT_PROFILE}_handler.o"
-        tentative_profile_generation = (
-            self._profile_generation(profile_object) if profile_object.is_file() else 0
-        )
-        desired_global, desired_zone = self._desired_tcp_values(
-            desired_state, tentative_profile_generation
-        )
-        desired_udp_zone = self._desired_udp_zone_values(desired_state)
-
-        # Policy/profile replacement is close-before-open.  Removing the old
-        # admission also guarantees the base reconcile sees the endpoint as an
-        # addition and writes the complete new generation atomically.
-        for port in self.tcp_map.active_ports() & set(desired_global):
-            current = self.tcp_map.value(port) if hasattr(self.tcp_map, "value") else None
-            if current is not None and current != desired_global[port]:
-                self._ok(self.tcp_map.set(port, (0, 0, 0, 0), dry_run))
-        tcp_zone_map = getattr(self, "tcp_zone_map", None)
-        if tcp_zone_map is not None:
-            for key in tcp_zone_map.entries() & set(desired_zone):
-                current = tcp_zone_map.value(*key) if hasattr(tcp_zone_map, "value") else None
-                if current is not None and current != desired_zone[key]:
-                    self._ok(tcp_zone_map.set(*key, (0, 0, 0, 0), dry_run=dry_run))
-            for key, tcp_value in desired_zone.items():
-                if tcp_zone_map.value(*key) != tcp_value and key[1] in desired_global:
-                    self._ok(self.tcp_map.set(key[1], (0, 0, 0, 0), dry_run))
-        udp_zone_map = getattr(self, "udp_zone_map", None)
-        if udp_zone_map is not None:
-            for key in udp_zone_map.entries() & set(desired_udp_zone):
-                current = udp_zone_map.value(*key) if hasattr(udp_zone_map, "value") else None
-                if current is not None and current != (desired_udp_zone[key],):
-                    self._ok(udp_zone_map.set(*key, 0, dry_run=dry_run))
-            for key, udp_value in desired_udp_zone.items():
-                if udp_zone_map.value(*key) != (udp_value,) and key[1] in desired_state.udp_ports:
-                    self._ok(self.udp_map.set(key[1], 0, dry_run))
-
-        failed_profile_endpoints, profile_generation = self._ensure_profile_handlers(
-            desired_state.tcp_protection_profiles,
-            tentative_profile_generation,
-            dry_run,
-        )
-        effective_desired = desired_state
-        if failed_profile_endpoints:
-            effective_desired = replace(
-                desired_state,
-                tcp_ports={
-                    port for port in desired_state.tcp_ports
-                    if ("public", port) not in failed_profile_endpoints
-                },
-                zone_tcp_ports={
-                    zone: {
-                        port for port in ports
-                        if (zone, port) not in failed_profile_endpoints
-                    }
-                    for zone, ports in desired_state.zone_tcp_ports.items()
-                    if any((zone, port) not in failed_profile_endpoints for port in ports)
-                },
-                tcp_protection_profiles={
-                    endpoint: profile
-                    for endpoint, profile in desired_state.tcp_protection_profiles.items()
-                    if endpoint not in failed_profile_endpoints
-                },
-            )
-
-        self._desired_tcp_global_values, tcp_zone_values = self._desired_tcp_values(
-            effective_desired, profile_generation
-        )
-        udp_zone_values = self._desired_udp_zone_values(effective_desired)
-
+        scope_map = getattr(self, "endpoint_map", None)
+        tentative_profile_generation = 0
+        tcp_zone_values: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+        udp_zone_values: dict[tuple[int, int], int] = {}
         tcp_zone_map = getattr(self, "tcp_zone_map", None)
         udp_zone_map = getattr(self, "udp_zone_map", None)
-        zone_failures = 0
-        if tcp_zone_map is not None:
-            zone_failures += self._apply_zone_delta(
-                tcp_zone_map, tcp_zone_values, dry_run, additions=False
+
+        def revoke() -> None:
+            nonlocal projection, tentative_profile_generation
+            if projection.endpoint_policy_enabled:
+                if scope_map is None or self.runtime_config_map is None:
+                    result.failures.append(ApplyFailure(ApplyOperation("prepare", "endpoint_scopes", "open"),
+                                                       "canonical endpoint admission maps are unavailable"))
+                    projection = replace(projection, tcp_ports=set(), udp_ports=set(), sctp_ports=set(),
+                                            zone_tcp_ports={}, zone_udp_ports={})
+                if scope_map is not None:
+                    try:
+                        scope_map.verify()
+                    except (OSError, RuntimeError) as exc:
+                        result.failures.append(ApplyFailure(ApplyOperation("revoke", "endpoint_scopes", "read"), str(exc)))
+                    changed = getattr(self, "_endpoint_cache", {}) != projection.endpoint_policies
+                    for raw, value in scope_map.active().items():
+                        if value and (changed or scope_values.get(raw) != value):
+                            self._map_operation(scope_map, "set", raw, 0, dry_run)
+                    for raw, value in scope_values.items():
+                        if not value and scope_map.active().get(raw) != 0:
+                            self._map_operation(scope_map, "set", raw, 0, dry_run)
+
+            install_dir = self._profile_install_dir()
+            profile_object = install_dir / "handlers" / f"{_MINECRAFT_PROFILE}_handler.o"
+            tentative_profile_generation = (
+                self._profile_generation(profile_object) if profile_object.is_file() else 0
             )
-        if udp_zone_map is not None:
-            zone_failures += self._apply_zone_delta(
-                udp_zone_map, udp_zone_values, dry_run, additions=False
+            desired_global, desired_zone = self._desired_tcp_values(
+                projection, tentative_profile_generation
             )
-        self._precondition_failures = self.last_apply_failures + zone_failures
-        self._defer_global_admission = True
-        try:
-            super().reconcile(effective_desired, dry_run, observed_state)
-        finally:
-            self._defer_global_admission = False
-        self.last_apply_failures += len(failed_profile_endpoints)
-        if not self.last_apply_failures:
+            desired_udp_zone = self._desired_udp_zone_values(projection)
+
+            # Policy/profile replacement is close-before-open.  Removing the old
+            # admission also guarantees the base reconcile sees the endpoint as an
+            # addition and writes the complete new generation atomically.
+            for port in self.tcp_map.active_ports() & set(desired_global):
+                current = self.tcp_map.value(port) if hasattr(self.tcp_map, "value") else None
+                if current is not None and current != desired_global[port]:
+                    self._map_operation(self.tcp_map, 'set', port, (0, 0, 0, 0), dry_run)
+            tcp_zone_map = getattr(self, "tcp_zone_map", None)
             if tcp_zone_map is not None:
-                self.last_apply_failures += self._apply_zone_delta(
-                    tcp_zone_map, tcp_zone_values, dry_run, additions=True
+                for key in tcp_zone_map.entries() & set(desired_zone):
+                    current = tcp_zone_map.value(*key) if hasattr(tcp_zone_map, "value") else None
+                    if current is not None and current != desired_zone[key]:
+                        self._map_operation(tcp_zone_map, 'set', *key, (0, 0, 0, 0), dry_run=dry_run)
+                for key, tcp_value in desired_zone.items():
+                    if tcp_zone_map.value(*key) != tcp_value and key[1] in desired_global:
+                        self._map_operation(self.tcp_map, 'set', key[1], (0, 0, 0, 0), dry_run)
+            udp_zone_map = getattr(self, "udp_zone_map", None)
+            if udp_zone_map is not None:
+                for key in udp_zone_map.entries() & set(desired_udp_zone):
+                    current = udp_zone_map.value(*key) if hasattr(udp_zone_map, "value") else None
+                    if current is not None and current != (desired_udp_zone[key],):
+                        self._map_operation(udp_zone_map, 'set', *key, 0, dry_run=dry_run)
+                for key, udp_value in desired_udp_zone.items():
+                    if udp_zone_map.value(*key) != (udp_value,) and key[1] in projection.udp_ports:
+                        self._map_operation(self.udp_map, 'set', key[1], 0, dry_run)
+
+        def prepare() -> None:
+            nonlocal tcp_zone_values, udp_zone_values
+            failed_profile_endpoints, profile_generation = self._ensure_profile_handlers(
+                projection.tcp_protection_profiles,
+                tentative_profile_generation,
+                dry_run,
+            )
+            if failed_profile_endpoints:
+                result.blocked_endpoints.update({key: "protection profile installation failed"
+                    for key, policy in projection.endpoint_policies.items()
+                    if policy.allow and (key[3], key[2]) in failed_profile_endpoints})
+                result.failures.append(ApplyFailure(ApplyOperation("prepare", "profiles", "install"),
+                                                   getattr(self, "_profile_error", "protection profile installation failed")))
+                return
+
+            self._desired_tcp_global_values, tcp_zone_values = self._desired_tcp_values(
+                projection, profile_generation
+            )
+            udp_zone_values = self._desired_udp_zone_values(projection)
+
+            if tcp_zone_map is not None:
+                self._apply_zone_delta(
+                    tcp_zone_map, tcp_zone_values, dry_run, additions=False
                 )
             if udp_zone_map is not None:
-                self.last_apply_failures += self._apply_zone_delta(
-                    udp_zone_map, udp_zone_values, dry_run, additions=True
+                self._apply_zone_delta(
+                    udp_zone_map, udp_zone_values, dry_run, additions=False
                 )
-        if not self.last_apply_failures:
-            admission_plan = ReconcilePlan(
-                tcp_ports_to_add=effective_desired.tcp_ports - self.tcp_map.active_ports(),
-                udp_ports_to_add=effective_desired.udp_ports - self.udp_map.active_ports(),
-            )
-            self._apply_global_admission(admission_plan, dry_run)
-        self.last_apply_failures += self._remove_stale_profile_handlers(
-            desired_state.tcp_protection_profiles,
-            dry_run,
-        )
+            if projection.endpoint_policy_enabled and result.failures:
+                return
+            self._defer_global_admission = True
+            try:
+                physical_plan = self.build_reconcile_plan(projection, self.get_applied_state())
+                self.apply_reconcile_plan(physical_plan, dry_run, projection, observed_state)
+            finally:
+                self._defer_global_admission = False
+
+        def admit() -> None:
+            if not self.last_apply_failures:
+                if tcp_zone_map is not None:
+                    self._apply_zone_delta(
+                        tcp_zone_map, tcp_zone_values, dry_run, additions=True
+                    )
+                if udp_zone_map is not None:
+                    self._apply_zone_delta(
+                        udp_zone_map, udp_zone_values, dry_run, additions=True
+                    )
+            if not self.last_apply_failures and projection.endpoint_policy_enabled and self.sctp_map is not None:
+                for port in projection.sctp_ports - self.sctp_map.active_ports():
+                    self._map_operation(self.sctp_map, "set", port, 1, dry_run)
+            if not self.last_apply_failures:
+                admission_plan = ReconcilePlan(
+                    tcp_ports_to_add=projection.tcp_ports - self.tcp_map.active_ports(),
+                    udp_ports_to_add=projection.udp_ports - self.udp_map.active_ports(),
+                )
+                self._apply_global_admission(admission_plan, dry_run)
+            if projection.endpoint_policy_enabled and scope_map is not None and not self.last_apply_failures:
+                for raw, value in scope_values.items():
+                    if value and scope_map.active().get(raw) != value:
+                        self._map_operation(scope_map, "set", raw, value, dry_run)
+
+        def cleanup() -> None:
+            if scope_map is not None and not self.last_apply_failures:
+                for raw in set(scope_map.active()) - set(scope_values):
+                    self._map_operation(scope_map, "delete", raw, dry_run)
+            if not self.last_apply_failures:
+                self._remove_stale_profile_handlers(
+                    projection.tcp_protection_profiles,
+                    dry_run,
+                )
+
+        stages = {"revoke": revoke, "prepare": prepare, "admit": admit, "cleanup": cleanup}
+        completed: set[str] = set()
+        for step in result.plan.steps:
+            if not set(step.depends_on).issubset(completed):
+                result.unconfirmed[step.operation] = "required reconciliation stage failed"
+                continue
+            self._apply_stage = step.operation
+            try:
+                stages[step.operation]()
+            except (OSError, RuntimeError) as exc:
+                result.failures.append(ApplyFailure(ApplyOperation(step.operation, "xdp", "execute stage"), str(exc)))
+            if not result.failures:
+                completed.add(step.operation)
+
         if not dry_run:
             self._save_policy_generations()
+
+        return self._finish_apply(original, projection, result, dry_run, scope_map)
+
+    def _finish_apply(
+        self, original: DesiredState, desired_state: BackendProjection,
+        result: ApplyResult, dry_run: bool, scope_map: BpfEndpointScopeMap | None,
+    ) -> ApplyResult:
+        if self.last_apply_failures:
+            if scope_map is not None:
+                for raw, value in scope_map.active().items():
+                    if value:
+                        self._map_operation(scope_map, "set", raw, 0, dry_run)
+            for key, policy in original.endpoint_policies.items():
+                if policy.allow:
+                    result.blocked_endpoints.setdefault(key, "target admission blocked after apply failure; existing state requires confirmation")
+            result.unconfirmed["maps"] = "one or more backend operations failed; retained admissions require readback"
+        if not dry_run and not self.last_apply_failures and not result.unconfirmed:
+            self._endpoint_cache = {
+                key: replace(policy, allow=False, reason=result.blocked_endpoints[key]) if key in result.blocked_endpoints else policy
+                for key, policy in desired_state.endpoint_policies.items()
+            }
+        result.applied = self.get_applied_state()
+        if dry_run:
+            result.unconfirmed["maps"] = "dry run did not write or confirm kernel state"
+        else:
+            for name in ("endpoint_map", "tcp_map", "udp_map", "tcp_zone_map", "udp_zone_map",
+                         "tcp_profile_map", "_tcp_policy_map", "_udp_policy_map", "sctp_map",
+                         "trusted_map", "acl_maps", "sit4_map", "tcp_syncookie_mode_map",
+                         "tcp_syncookie_rate_map", "syn4_outer", "syn6_outer", "udprt4_outer", "udprt6_outer"):
+                resource = getattr(self, name, None)
+                if resource is None:
+                    continue
+                if not hasattr(resource, "verify"):
+                    result.applied.evidence[name] = "cached"
+                    result.unconfirmed[name] = "resource does not support kernel readback"
+                    continue
+                try:
+                    drift = resource.verify()
+                    result.applied.evidence[name] = "confirmed"
+                    if drift:
+                        result.unconfirmed[name] = f"kernel readback differs in {drift} entries"
+                except (OSError, RuntimeError) as exc:
+                    result.applied.evidence[name] = "unknown"
+                    result.unconfirmed[name] = str(exc)
+        evidence = dict(result.applied.evidence)
+        result.applied = self.get_applied_state()
+        result.applied.evidence.update(evidence)
+        if not dry_run and self.runtime_config_map is not None:
+            timing = self.runtime_config_map.get()
+            flags = self.runtime_config_map.get_cfg_flags()
+            if timing == desired_state.xdp_runtime_config and flags == _compute_cfg_flags(desired_state):
+                result.applied.evidence["runtime_config"] = "confirmed"
+            else:
+                result.applied.evidence["runtime_config"] = "unknown"
+                result.unconfirmed["runtime_config"] = "runtime config/gate flags could not be confirmed"
+        if not dry_run and self.global_rl_map is not None:
+            rate = self.global_rl_map.get()
+            if rate == desired_state.udp_global_byte_rate:
+                result.applied.evidence["udp_global_rate"] = "confirmed"
+            else:
+                result.applied.evidence["udp_global_rate"] = "unknown"
+                result.unconfirmed["udp_global_rate"] = "global UDP rate could not be confirmed"
+        if not dry_run and scope_map is not None and result.applied.evidence.get("endpoint_map") == "confirmed" and result.applied.evidence.get("runtime_config") == "confirmed":
+            checked_policies = {**result.applied.endpoint_policies, **desired_state.endpoint_policies}
+            for key, policy in checked_policies.items():
+                if key in result.blocked_endpoints:
+                    policy = replace(policy, allow=False)
+                values, errors = self._scope_values(replace(desired_state, endpoint_policies={key: policy}))
+                known = bool(values) and key not in errors and all(scope_map.active().get(raw) == value or
+                    (not value and raw not in scope_map.active() and not any(scope_map.active().values()))
+                    for raw, value in values.items())
+                admitted = known and policy.allow
+                if admitted:
+                    proto, _, port, zone = key
+                    map_name = {"tcp": "tcp_map", "udp": "udp_map", "sctp": "sctp_map"}[proto]
+                    admitted = result.applied.evidence.get(map_name) == "confirmed"
+                    interfaces = desired_state.config.ZONES.get(zone, {}).get("interfaces", ())
+                    if proto in {"tcp", "udp"} and interfaces:
+                        zone_map = getattr(self, f"{proto}_zone_map", None)
+                        admitted = admitted and result.applied.evidence.get(f"{proto}_zone_map") == "confirmed"
+                        for interface in interfaces:
+                            try:
+                                zone_value = zone_map.value(socket.if_nametoindex(interface), port) if zone_map is not None else None
+                            except OSError:
+                                zone_value = None
+                            admitted = admitted and bool(zone_value and zone_value[0])
+                    else:
+                        admitted = admitted and port in getattr(result.applied, f"{proto}_ports")
+                result.applied.endpoint_admission[key] = "admitted" if admitted else "closed" if known and not policy.allow else "unknown"
+                if known and not policy.allow:
+                    result.closed_endpoints.add(key)
+                if result.applied.endpoint_admission[key] == "unknown":
+                    result.unconfirmed[str(key)] = "endpoint admission could not be confirmed"
+        self.last_apply_result = result
+        self._apply_result = None
+        return result
 
     def _apply_acl_delta(self, plan: ReconcilePlan, dry_run: bool) -> None:
         if self.acl_maps is None:
             return
         for (proto, cidr), ports in plan.acl_rules_to_upsert.items():
-            if self._ok(self.acl_maps.set(proto, cidr, sorted(ports), dry_run)):
+            if self._map_operation(self.acl_maps, 'set', proto, cidr, sorted(ports), dry_run):
                 log.info("ACL %s %s ports %s", proto.upper(), cidr, sorted(ports))
 
         for (proto, cidr) in plan.acl_rules_to_remove:
-            if self._ok(self.acl_maps.delete(proto, cidr, dry_run)):
+            if self._map_operation(self.acl_maps, 'delete', proto, cidr, dry_run):
                 log.info("ACL %s %s removed", proto.upper(), cidr)
 
     def _apply_rate_outer_delta(
@@ -1180,9 +1429,9 @@ class XdpBackend(PortBackend):
         current = outer.active()
         for port, capacity in desired.items():
             if current.get(port) != capacity:
-                self._ok(outer.set(port, capacity, dry_run))
+                self._map_operation(outer, 'set', port, capacity, dry_run)
         for port in set(current) - set(desired):
-            self._ok(outer.delete(port, dry_run))
+            self._map_operation(outer, 'delete', port, dry_run)
 
     def _apply_rate_map_delta(
         self,
@@ -1195,7 +1444,7 @@ class XdpBackend(PortBackend):
     ) -> None:
         port_procs = {} if port_procs is None else port_procs
         for port, rate_max in upserts.items():
-            if self._ok(rate_map.set(port, rate_max, dry_run)):
+            if self._map_operation(rate_map, 'set', port, rate_max, dry_run):
                 if kind == "tcp":
                     svc = port_procs.get(port) or service_name(port, "tcp") or "unknown"
                     log.info("SYN rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
@@ -1208,7 +1457,7 @@ class XdpBackend(PortBackend):
                     log.info("UDP aggregate port %d byte_rate_max=%d/s", port, rate_max)
 
         for port in removals:
-            if self._ok(rate_map.delete(port, dry_run)):
+            if self._map_operation(rate_map, 'delete', port, dry_run):
                 if kind == "tcp":
                     log.info("SYN rate port %d removed (port no longer whitelisted)", port)
                 elif kind == "tcp_syn_agg":

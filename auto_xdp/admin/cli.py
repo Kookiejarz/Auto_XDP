@@ -783,9 +783,9 @@ def _cmd_ports(args: argparse.Namespace) -> int:
 
 
 def _policy_snapshot(args: argparse.Namespace):
-    cfg.apply_toml_config(config_file.load_toml(Path(args.config)))
-    observed = discovery.get_listening_ports()
-    return observed, policy.resolve_desired_state(observed)
+    snapshot = cfg.parse_toml_config(config_file.load_toml(Path(args.config)))
+    observed = discovery.get_listening_ports(config=snapshot)
+    return observed, policy.resolve_desired_state(observed, config=snapshot)
 
 
 def _active_backend_name(args: argparse.Namespace) -> str:

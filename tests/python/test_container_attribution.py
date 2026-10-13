@@ -28,7 +28,7 @@ def test_docker_published_port_is_attributed_from_inspect(monkeypatch: pytest.Mo
         "_container_inspect",
         lambda runtime: [record] if runtime == "docker" else [],
     )
-    monkeypatch.setattr(discovery, "_endpoint_zone", lambda _address: "public")
+    monkeypatch.setattr(discovery, "_endpoint_zone", lambda _address, **kwargs: "public")
     discovery._container_metadata()
 
     endpoint = discovery._endpoint("tcp", "0.0.0.0", 18080, "docker-proxy", "delegated", "process-name")
@@ -50,7 +50,7 @@ def test_published_port_without_host_listener_is_still_discovered(
         "_container_metadata",
         lambda: ({("tcp", 18080): [identity]}, {identity.container_id: identity}),
     )
-    monkeypatch.setattr(discovery, "_get_listening_ports_netlink", ObservedState)
+    monkeypatch.setattr(discovery, "_get_listening_ports_netlink", lambda **kwargs: ObservedState())
 
     state = discovery.get_listening_ports()
 
@@ -67,7 +67,7 @@ def test_container_port_collision_is_not_authorized(monkeypatch: pytest.MonkeyPa
     ]
     monkeypatch.setattr(discovery, "_CONTAINER_METADATA_UNTIL", 0.0)
     monkeypatch.setattr(discovery, "_container_inspect", lambda runtime: records if runtime == "docker" else [])
-    monkeypatch.setattr(discovery, "_endpoint_zone", lambda _address: "public")
+    monkeypatch.setattr(discovery, "_endpoint_zone", lambda _address, **kwargs: "public")
     discovery._container_metadata()
 
     endpoint = discovery._endpoint("tcp", "0.0.0.0", 18080, "docker-proxy", "delegated", "process-name")

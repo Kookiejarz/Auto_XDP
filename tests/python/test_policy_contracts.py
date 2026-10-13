@@ -2,9 +2,11 @@
 
 import pytest
 
+from support import desired_for_ports
+
 from auto_xdp import config as cfg
 from auto_xdp import policy
-from auto_xdp.state import ObservedState, RuntimeEndpoint
+from auto_xdp.state import ObservedState, RuntimeEndpoint, project_endpoint_policies
 
 
 DEFAULTS = {
@@ -55,7 +57,7 @@ def isolated_policy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def resolved_tcp_policy(port: int = 8080, proc: str = "app") -> tuple[int, ...]:
-    desired = policy._desired_state_for_ports(
+    desired = desired_for_ports(
         ObservedState(tcp={port}, tcp_processes={port: proc})
     )
     return (
@@ -87,7 +89,7 @@ def test_service_value_above_threshold_remains_explicit() -> None:
 
 def test_zero_pinned_syn_limit_remains_in_desired_state() -> None:
     cfg._SYN_RATE_BY_PROC["benchmark"] = 0
-    desired = policy._desired_state_for_ports(
+    desired = desired_for_ports(
         ObservedState(tcp={9090}, tcp_processes={9090: "benchmark"})
     )
 
@@ -96,7 +98,7 @@ def test_zero_pinned_syn_limit_remains_in_desired_state() -> None:
 
 
 def test_every_observed_port_receives_default_policy() -> None:
-    desired = policy._desired_state_for_ports(
+    desired = desired_for_ports(
         ObservedState(
             tcp={8080, 9000},
             tcp_processes={8080: "app-a", 9000: "app-b"},
@@ -112,7 +114,7 @@ def test_syncookie_port_overrides_process_and_service() -> None:
     cfg._SYNCOOKIE_BY_PORT[22] = "always"
     cfg._SYNCOOKIE_PORT_RATE_BY_PORT[22] = 900
 
-    desired = policy._desired_state_for_ports(
+    desired = desired_for_ports(
         ObservedState(tcp={22}, tcp_processes={22: "sshd"})
     )
 
@@ -139,7 +141,7 @@ def test_service_aware_policy_requires_explicit_grant_and_runtime_owner() -> Non
         RuntimeEndpoint("tcp", "0.0.0.0", 22, "wildcard", "public", "unknown", "unknown"),
     ])
 
-    desired = policy.resolve_desired_state(observed)
+    desired = _projected_desired(observed)
 
     assert desired.tcp_ports == {443}
     assert [item.action for item in desired.exposure_decisions] == ["allow", "drop", "drop"]
@@ -155,7 +157,7 @@ def test_empty_subject_does_not_shadow_active_subject_with_same_resolver() -> No
         },
     }
 
-    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+    desired = _projected_desired(ObservedState(endpoints=[
         RuntimeEndpoint(
             "tcp", "0.0.0.0", 443, "wildcard", "public",
             "nginx.service", "exact", "systemd-cgroup",
@@ -176,7 +178,7 @@ def test_minecraft_profile_changes_desired_tcp_protection() -> None:
         }
     }
 
-    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+    desired = _projected_desired(ObservedState(endpoints=[
         RuntimeEndpoint(
             "tcp", "0.0.0.0", 25565, "wildcard", "public",
             "minecraft.service", "exact", "systemd-cgroup",
@@ -197,7 +199,7 @@ def test_protection_profile_never_falls_back_to_unprotected_protocol() -> None:
         }
     }
 
-    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+    desired = _projected_desired(ObservedState(endpoints=[
         RuntimeEndpoint(
             "udp", "0.0.0.0", 25565, "wildcard", "public",
             "minecraft.service", "exact", "systemd-cgroup",
@@ -241,7 +243,7 @@ def test_same_tcp_port_can_use_different_profiles_in_different_zones() -> None:
     } == {
         ("public", "minecraft", "allow"), ("trusted", "", "allow")
     }
-    desired = policy.resolve_desired_state(ObservedState(endpoints=endpoints))
+    desired = _projected_desired(ObservedState(endpoints=endpoints))
     assert desired.tcp_protection_profiles == {("public", 25565): "minecraft"}
 
 
@@ -301,7 +303,7 @@ def test_private_grant_uses_zone_admission_without_public_port() -> None:
         }
     }
 
-    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+    desired = _projected_desired(ObservedState(endpoints=[
         RuntimeEndpoint("tcp", "192.0.2.10", 5432, "specific", "trusted", "postgres", "delegated"),
     ]))
 
@@ -322,7 +324,7 @@ def test_wildcard_listener_is_evaluated_for_each_ingress_zone() -> None:
         }
     }
 
-    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+    desired = _projected_desired(ObservedState(endpoints=[
         RuntimeEndpoint(
             "tcp", "0.0.0.0", 5432, "wildcard", "public",
             "postgres.service", "exact", "systemd-cgroup",
@@ -344,9 +346,13 @@ def test_interface_scoped_public_grant_does_not_use_global_port_map() -> None:
         }
     }
 
-    desired = policy.resolve_desired_state(ObservedState(endpoints=[
+    desired = _projected_desired(ObservedState(endpoints=[
         RuntimeEndpoint("tcp", "192.0.2.10", 443, "specific", "public", "web", "delegated"),
     ]))
 
     assert desired.tcp_ports == set()
     assert desired.zone_tcp_ports == {"public": {443}}
+
+
+def _projected_desired(observed):
+    return project_endpoint_policies(policy.resolve_desired_state(observed))[0]

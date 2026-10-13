@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcilePlan, compute_reconcile_plan
+from auto_xdp.config import ConfigSnapshot, snapshot_config
+from auto_xdp.state import ApplyResult, AppliedState, DesiredState, ObservedState, ReconcilePlan, compute_reconcile_plan, project_endpoint_policies
 
 
 @dataclass
@@ -33,6 +34,11 @@ class BackendStatus:
 
 class PortBackend:
     name = "backend"
+    last_apply_result: ApplyResult | None = None
+
+    @property
+    def config(self) -> ConfigSnapshot:
+        return getattr(self, "_config", None) or snapshot_config()
 
     @classmethod
     def probe(cls) -> BackendStatus:
@@ -50,7 +56,7 @@ class PortBackend:
         dry_run: bool,
         desired_state: DesiredState,
         observed_state: ObservedState | None = None,
-    ) -> None:
+    ) -> ApplyResult | None:
         raise NotImplementedError
 
     def reconcile(
@@ -58,10 +64,18 @@ class PortBackend:
         desired_state: DesiredState,
         dry_run: bool,
         observed_state: ObservedState | None = None,
-    ) -> None:
+    ) -> ApplyResult:
         applied_state = self.get_applied_state()
-        plan = self.build_reconcile_plan(desired_state, applied_state)
-        self.apply_reconcile_plan(plan, dry_run, desired_state, observed_state)
+        projection, blocked = project_endpoint_policies(desired_state)
+        plan = self.build_reconcile_plan(projection, applied_state)
+        plan.target = desired_state
+        result = self.apply_reconcile_plan(plan, dry_run, projection, observed_state)
+        if result is not None:
+            result.blocked_endpoints.update(blocked)
+        return result if result is not None else ApplyResult(
+            dry_run=dry_run, plan=plan, applied=self.get_applied_state(),
+            unconfirmed={"backend": "adapter returned no execution result"},
+        )
 
     def close(self) -> None:
         return None

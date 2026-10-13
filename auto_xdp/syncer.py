@@ -12,6 +12,7 @@ from collections.abc import Callable
 from auto_xdp import config as cfg
 from auto_xdp.backends import NftablesBackend, PortBackend, XdpBackend
 from auto_xdp.config import apply_toml_config, load_toml_config
+from auto_xdp.state import ApplyResult
 from auto_xdp.discovery.listeners import DiscoveryError, get_listening_ports
 from auto_xdp.policy import resolve_desired_state
 from auto_xdp.discovery.proc_events import drain_proc_events, open_proc_connector
@@ -35,8 +36,8 @@ FULL_RECONCILE_INTERVAL_SECONDS = 30.0
 EVENT_SOURCE_RETRY_INTERVAL_SECONDS = 5.0
 
 
-def observe_system_state():
-    return get_listening_ports()
+def observe_system_state(*, config: cfg.ConfigSnapshot | None = None):
+    return get_listening_ports(config=config)
 
 
 def _reload_config(config_path: str) -> bool:
@@ -56,9 +57,11 @@ def sync_once(
     explain: bool = False,
 ) -> dict[str, object]:
     started = time.monotonic()
-    observed = observe_system_state()
-    desired = resolve_desired_state(observed)
-    effective_mode = mode or cfg.POLICY_MODE
+    config = cfg.snapshot_config()
+    observed = observe_system_state(config=config)
+    desired = resolve_desired_state(observed, config=config)
+    result = None
+    effective_mode = mode or config.POLICY_MODE
     if effective_mode not in {"observe", "audit", "enforce"}:
         raise ValueError(f"Unsupported policy mode: {effective_mode}")
     if explain or desired.exposure_decisions:
@@ -88,16 +91,28 @@ def sync_once(
     else:
         if backend is None:
             raise RuntimeError("an enforcement backend is required in enforce mode")
-        backend.reconcile(desired, dry_run, observed)
+        result = backend.reconcile(desired, dry_run, observed)
+        backend.last_apply_result = result
+        if isinstance(result, ApplyResult):
+            for failure in result.failures:
+                log.error("Apply failed stage=%s resource=%s operation=%s reason=%s",
+                          failure.operation.stage, failure.operation.resource,
+                          failure.operation.operation, failure.reason)
+            for endpoint_key, reason in result.blocked_endpoints.items():
+                log.warning("Endpoint target blocked %s: %s", endpoint_key, reason)
+            for resource, reason in result.unconfirmed.items():
+                log.warning("Applied state unconfirmed %s: %s", resource, reason)
     elapsed = time.monotonic() - started
     log.info(
-        "reconciliation mode=%s elapsed_ms=%.3f endpoints=%d effective_ports=%d",
+        "reconciliation mode=%s elapsed_ms=%.3f endpoints=%d authorized_endpoints=%d",
         effective_mode, elapsed * 1000, len(desired.exposure_decisions),
-        len(desired.tcp_ports) + len(desired.udp_ports) + len(desired.sctp_ports),
+        sum(policy.allow for policy in desired.endpoint_policies.values()),
     )
     return {
         "mode": effective_mode,
         "elapsed_seconds": elapsed,
+        "config": config,
+        "apply_result": result,
         "observed": observed,
         "desired": desired,
     }
@@ -352,6 +367,8 @@ def watch(
                 _old_nft_family = cfg.NFT_FAMILY
                 _old_nft_table = cfg.NFT_TABLE
                 _old_preferred = cfg.PREFERRED_BACKEND
+                _old_resources = {name: value for name, value in cfg.snapshot_config().values.items()
+                                  if name.startswith(("ABUSEIPDB_", "NFT_"))}
                 if not _reload_config(config_path):
                     continue
                 if cli_trusted_ips:
@@ -360,10 +377,13 @@ def watch(
                     _lvl = getattr(logging, cfg.LOG_LEVEL.upper(), logging.WARNING)
                     logging.getLogger().setLevel(_lvl)
                     log.setLevel(_lvl)
+                _new_resources = cfg.snapshot_config()
                 _backend_stale = (
                     cfg.BPF_PIN_DIR != _old_pin_dir
                     or cfg.NFT_FAMILY != _old_nft_family
                     or cfg.NFT_TABLE != _old_nft_table
+                    or any(_new_resources.values[name] != value
+                           for name, value in _old_resources.items())
                 )
                 if cfg.PREFERRED_BACKEND != _old_preferred and backend_name == _old_preferred:
                     backend_name = cfg.PREFERRED_BACKEND
@@ -407,7 +427,8 @@ def watch(
                 last_event_t = 0.0
                 first_event_t = 0.0
 
-                apply_failures = getattr(backend, "last_apply_failures", 0)
+                result = getattr(backend, "last_apply_result", None)
+                apply_failures = len(result.failures) + len(result.unconfirmed) if isinstance(result, ApplyResult) else getattr(backend, "last_apply_failures", 0)
                 if backend is not None and apply_failures and hasattr(backend, "verify_kernel_state"):
                     log.warning(
                         "Reconcile had %d failed map update(s); verifying kernel state.",
