@@ -166,8 +166,9 @@ class BpfArrayMap(CacheVerifyMixin, BpfFdMap):
                         value = self._lookup(port)
                         if self._is_active(value):
                             result[port] = value
-                    except OSError:
-                        continue
+                    except OSError as exc:
+                        if exc.errno != errno.ENOENT:
+                            raise
                 return result
             # ENOENT: end of map; kernel has written the fetched count back to attr.
         fetched = struct.unpack_from("=I", attr, 32)[0]
@@ -212,6 +213,7 @@ class BpfArrayMap(CacheVerifyMixin, BpfFdMap):
                 self._cache.pop(port, None)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF update failed port=%d: %s", port, exc)
             return False
 
@@ -277,17 +279,15 @@ class BpfZonePortMap(CacheVerifyMixin, BpfFdMap):
 
     def _read_kernel(self) -> dict[tuple[int, int], tuple[int, ...]]:
         result: dict[tuple[int, int], tuple[int, ...]] = {}
-        try:
-            for key_raw in self._iter_raw_keys():
-                try:
-                    ctypes.memmove(self._key, key_raw, 8)
-                    bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-                    value = struct.unpack_from(self._value_format, self._val, 0)
-                    result[struct.unpack_from("=II", self._key, 0)] = value
-                except OSError:
+        for key_raw in self._iter_raw_keys():
+            ctypes.memmove(self._key, key_raw, 8)
+            try:
+                bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
                     continue
-        except OSError:
-            pass
+                raise
+            result[struct.unpack_from("=II", self._key, 0)] = struct.unpack_from(self._value_format, self._val, 0)
         return result
 
     def _load_cache(self) -> None:
@@ -320,6 +320,7 @@ class BpfZonePortMap(CacheVerifyMixin, BpfFdMap):
             self._cache[key] = value
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF zone update failed key=%s: %s", key, exc)
             return False
 
@@ -333,6 +334,7 @@ class BpfZonePortMap(CacheVerifyMixin, BpfFdMap):
             self._cache.pop(key, None)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             if exc.errno == errno.ENOENT:
                 self._cache.pop(key, None)
                 return True
@@ -340,6 +342,77 @@ class BpfZonePortMap(CacheVerifyMixin, BpfFdMap):
             return False
 
 
+class BpfEndpointScopeMap(CacheVerifyMixin, BpfFdMap):
+    """Canonical address/family admission; raw keys follow endpoint_scope_key."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self._cache: dict[bytes, int] = self._read_kernel()
+
+    def _read_kernel(self) -> dict[bytes, int]:
+        result: dict[bytes, int] = {}
+        current = None
+        while True:
+            key = ctypes.create_string_buffer(current, 24) if current is not None else None
+            next_key = ctypes.create_string_buffer(24)
+            attr = ctypes.create_string_buffer(128)
+            struct.pack_into("=I4xQQ", attr, 0, self.fd,
+                             ctypes.addressof(key) if key is not None else 0,
+                             ctypes.addressof(next_key))
+            try:
+                bpf(BPF_MAP_GET_NEXT_KEY, attr)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    return result
+                raise
+            current = next_key.raw
+            value = ctypes.create_string_buffer(4)
+            struct.pack_into("=I4xQQ", attr, 0, self.fd,
+                             ctypes.addressof(next_key), ctypes.addressof(value))
+            try:
+                bpf(BPF_MAP_LOOKUP_ELEM, attr)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    continue
+                raise
+            result[current] = struct.unpack("=I", value.raw)[0]
+
+    def active(self) -> dict[bytes, int]:
+        return dict(self._cache)
+
+    def set(self, raw_key: bytes, value: int, dry_run: bool = False) -> bool:
+        if dry_run:
+            return True
+        key = ctypes.create_string_buffer(raw_key, 24)
+        val = ctypes.create_string_buffer(struct.pack("=I", value), 4)
+        attr = ctypes.create_string_buffer(128)
+        struct.pack_into("=I4xQQQ", attr, 0, self.fd,
+                         ctypes.addressof(key), ctypes.addressof(val), 0)
+        try:
+            bpf(BPF_MAP_UPDATE_ELEM, attr)
+        except OSError as exc:
+            self.last_error = str(exc)
+            return False
+        self._cache[raw_key] = value
+        return True
+
+    def delete(self, raw_key: bytes, dry_run: bool = False) -> bool:
+        if dry_run:
+            return True
+        key = ctypes.create_string_buffer(raw_key, 24)
+        attr = ctypes.create_string_buffer(128)
+        struct.pack_into("=I4xQ", attr, 0, self.fd, ctypes.addressof(key))
+        try:
+            bpf(BPF_MAP_DELETE_ELEM, attr)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                self.last_error = str(exc)
+                return False
+        self._cache.pop(raw_key, None)
+        return True
+
+
+XDP_CFG_FLAG_ENDPOINT_POLICY = 1 << 4
 XDP_CFG_FLAG_BOGON_DISABLED       = 1 << 0  # bogon filter off (default: on)
 XDP_CFG_FLAG_ABUSEIPDB_ENABLED    = 1 << 1  # AbuseIPDB active (default: off)
 XDP_CFG_FLAG_DROP_EVENTS_DISABLED = 1 << 2  # ring-buf events off (default: on)
@@ -391,6 +464,7 @@ class BpfRuntimeConfigMap(BpfFdMap):
             bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF runtime config update failed path=%s: %s", self.path, exc)
             return False
 
@@ -437,6 +511,7 @@ class BpfSyncookieRuntimeMap(BpfFdMap):
             bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF SYN-cookie runtime update failed path=%s: %s",
                         self.path, exc)
             return False
@@ -458,7 +533,7 @@ class BpfGlobalRlMap(BpfFdMap):
         struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, BPF_F_LOCK)
         struct.pack_into("=I4xQQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr, BPF_F_LOCK)
 
-    def get(self) -> int:
+    def get(self) -> int | None:
         try:
             struct.pack_into("=I", self._key, 0, 0)
             bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
@@ -467,7 +542,7 @@ class BpfGlobalRlMap(BpfFdMap):
         except OSError as exc:
             if exc.errno != errno.ENOENT:
                 log.warning("BPF global rl lookup failed path=%s: %s", self.path, exc)
-            return 0
+            return None
 
     def set(self, byte_rate_max: int, dry_run: bool = False) -> bool:
         if dry_run:
@@ -479,6 +554,7 @@ class BpfGlobalRlMap(BpfFdMap):
             bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF global rl update failed path=%s: %s", self.path, exc)
             return False
 
@@ -558,15 +634,13 @@ class BpfLpmMap(CacheVerifyMixin, BpfFdMap):
 
     def _read_kernel(self) -> set[str]:
         result: set[str] = set()
-        try:
-            for key_raw in self._iter_raw_keys():
-                try:
-                    if self._lookup_raw_key(key_raw):
-                        result.add(self._unpack_key(key_raw))
-                except OSError:
-                    continue
-        except OSError:
-            pass
+        for key_raw in self._iter_raw_keys():
+            try:
+                if self._lookup_raw_key(key_raw):
+                    result.add(self._unpack_key(key_raw))
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    raise
         return result
 
     def _load_cache(self) -> None:
@@ -586,6 +660,7 @@ class BpfLpmMap(CacheVerifyMixin, BpfFdMap):
             self._cache.add(normalized)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF update failed cidr=%s: %s", cidr_str, exc)
             return False
 
@@ -598,6 +673,7 @@ class BpfLpmMap(CacheVerifyMixin, BpfFdMap):
             self._cache.discard(normalized)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             if exc.errno == errno.ENOENT:
                 self._cache.discard(cfg.normalize_cidr(cidr_str))
                 return True
@@ -620,14 +696,16 @@ class BpfTrustedMaps(BpfBaseMap):
         return self._map4.active_keys() | self._map6.active_keys()
 
     def set(self, cidr_str: str, val: int, dry_run: bool = False) -> bool:
-        if ":" in cidr_str:
-            return self._map6.set(cidr_str, val, dry_run)
-        return self._map4.set(cidr_str, val, dry_run)
+        self._last_operation_map = self._map6 if ":" in cidr_str else self._map4
+        return self._last_operation_map.set(cidr_str, val, dry_run)
 
     def delete(self, cidr_str: str, dry_run: bool = False) -> bool:
-        if ":" in cidr_str:
-            return self._map6.delete(cidr_str, dry_run)
-        return self._map4.delete(cidr_str, dry_run)
+        self._last_operation_map = self._map6 if ":" in cidr_str else self._map4
+        return self._last_operation_map.delete(cidr_str, dry_run)
+
+    @property
+    def last_error(self) -> str:
+        return getattr(getattr(self, "_last_operation_map", None), "last_error", "map operation returned failure")
 
     def verify(self) -> int:
         return self._map4.verify() + self._map6.verify()
@@ -704,17 +782,15 @@ class BpfAclMap(CacheVerifyMixin, BpfFdMap):
 
     def _read_kernel(self) -> dict[str, frozenset[int]]:
         result: dict[str, frozenset[int]] = {}
-        try:
-            for key_raw in self._iter_raw_keys():
-                try:
-                    ctypes.memmove(self._key, key_raw, self._key_len)
-                    bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-                    cidr = self._unpack_key(key_raw)
-                    result[cidr] = self._unpack_val()
-                except OSError:
-                    continue
-        except OSError:
-            pass
+        for key_raw in self._iter_raw_keys():
+            try:
+                ctypes.memmove(self._key, key_raw, self._key_len)
+                bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+                cidr = self._unpack_key(key_raw)
+                result[cidr] = self._unpack_val()
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    raise
         return result
 
     def _load_cache(self) -> None:
@@ -734,6 +810,7 @@ class BpfAclMap(CacheVerifyMixin, BpfFdMap):
             self._cache[normalized] = frozenset(ports)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF ACL update failed cidr=%s: %s", cidr_str, exc)
             return False
 
@@ -747,6 +824,7 @@ class BpfAclMap(CacheVerifyMixin, BpfFdMap):
             self._cache.pop(normalized, None)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             if exc.errno == errno.ENOENT:
                 self._cache.pop(normalized, None)
                 return True
@@ -777,6 +855,10 @@ class BpfAclMaps(BpfBaseMap):
 
     def delete(self, proto: str, cidr: str, dry_run: bool = False) -> bool:
         return self._map_for(proto, cidr).delete(cidr, dry_run)
+
+    @property
+    def last_error(self) -> str:
+        return getattr(getattr(self, "_last_operation_map", None), "last_error", "map operation returned failure")
 
     def verify(self) -> int:
         return (
@@ -831,7 +913,7 @@ class BpfSynRatePortsMap(CacheVerifyMixin, BpfFdMap):
             bpf(BPF_MAP_LOOKUP_BATCH, attr)
         except OSError as exc:
             if exc.errno != errno.ENOENT:
-                return result
+                raise
         fetched = struct.unpack_from("=I", attr, 32)[0]
         for i in range(fetched):
             port = struct.unpack_from("=I", keys_buf, i * 4)[0]
@@ -856,6 +938,7 @@ class BpfSynRatePortsMap(CacheVerifyMixin, BpfFdMap):
             self._cache[port] = rate_max
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF port config update failed path=%s port=%d: %s", self.path, port, exc)
             return False
 
@@ -869,6 +952,7 @@ class BpfSynRatePortsMap(CacheVerifyMixin, BpfFdMap):
             self._cache.pop(port, None)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             if exc.errno == errno.ENOENT:
                 self._cache.pop(port, None)
                 return True
@@ -911,13 +995,15 @@ class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
             struct.pack_into("=I", key, 0, port)
             try:
                 bpf(BPF_MAP_LOOKUP_ELEM, attr)
-            except OSError:
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    raise
                 continue  # empty slot
             (inner_id,) = struct.unpack_from("=I", val, 0)
             try:
                 ifd = map_get_fd_by_id(inner_id)
             except OSError:
-                continue
+                raise
             try:
                 out[port] = map_max_entries(ifd)
             finally:
@@ -937,6 +1023,7 @@ class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
             bpf(BPF_MAP_UPDATE_ELEM, attr)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.error("rate outer %s: slot update port=%d failed: %s",
                       self.path, port, exc)
             return False
@@ -951,6 +1038,7 @@ class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
             bpf(BPF_MAP_DELETE_ELEM, attr)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             if exc.errno == errno.ENOENT:
                 return True
             log.error("rate outer %s: slot delete port=%d failed: %s",
@@ -976,6 +1064,7 @@ class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
                                   self._inner_value_size,
                                   capacity, 0, name=name)
         except OSError as exc:
+            self.last_error = str(exc)
             log.error("rate outer %s: inner create port=%d entries=%d failed: %s",
                       self.path, port, capacity, exc)
             return False
@@ -1036,7 +1125,7 @@ class BpfPortPolicyMap(CacheVerifyMixin, BpfFdMap):
             bpf(BPF_MAP_LOOKUP_BATCH, attr)
         except OSError as exc:
             if exc.errno != errno.ENOENT:
-                return result
+                raise
         fetched = struct.unpack_from("=I", attr, 32)[0]
         for i in range(fetched):
             port = struct.unpack_from("=I", keys_buf, i * 4)[0]
@@ -1060,6 +1149,7 @@ class BpfPortPolicyMap(CacheVerifyMixin, BpfFdMap):
             self._cache[port] = fields
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF port policy update failed path=%s port=%d: %s", self.path, port, exc)
             return False
 
@@ -1085,6 +1175,7 @@ class BpfPortPolicyMap(CacheVerifyMixin, BpfFdMap):
             self._cache.pop(port, None)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             if exc.errno == errno.ENOENT:
                 self._cache.pop(port, None)
                 return True
@@ -1098,6 +1189,10 @@ class BpfPortPolicyViewMap:
         self._field_index = field_index
         self.path = path
 
+    @property
+    def last_error(self) -> str:
+        return getattr(self._backing, "last_error", "map operation returned failure")
+
     def active(self) -> dict[int, int]:
         return {
             port: fields[self._field_index]
@@ -1108,7 +1203,7 @@ class BpfPortPolicyViewMap:
     def set(self, port: int, rate_max: int, dry_run: bool = False) -> bool:
         current = self._backing.active_structs().get(
             port,
-            (0, 0, 0, cfg.RATE_LIMIT_SOURCE_PREFIX_V4, cfg.RATE_LIMIT_SOURCE_PREFIX_V6, 0, 0, 0),
+            (0, 0, 0, 32, 128, 0, 0, 0),
         )
         updated = list(current)
         updated[self._field_index] = rate_max
@@ -1196,6 +1291,7 @@ class BpfSit4EndpointsMap(CacheVerifyMixin, BpfFdMap):
             self._cache.add(ip_str)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             log.warning("BPF sit4_endpoints update failed ip=%s: %s", ip_str, exc)
             return False
 
@@ -1209,6 +1305,7 @@ class BpfSit4EndpointsMap(CacheVerifyMixin, BpfFdMap):
             self._cache.discard(ip_str)
             return True
         except OSError as exc:
+            self.last_error = str(exc)
             if exc.errno == errno.ENOENT:
                 self._cache.discard(ip_str)
                 return True

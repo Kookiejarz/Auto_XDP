@@ -1,32 +1,33 @@
 """Rate-limit policy resolution helpers for port sync and firewall rules."""
 
 from dataclasses import replace
-from typing import Callable, TypeVar
+from typing import Any
+from collections.abc import Mapping
 
 from auto_xdp import config as cfg
 from auto_xdp.discovery.services import service_name
-from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
+from auto_xdp.state import DesiredState, EndpointPolicy, ExposureDecision, ObservedState, RuntimeEndpoint
 
 _NS_PER_SECOND = 1_000_000_000
-_LimitT = TypeVar("_LimitT")
 
 
 def _seconds_to_ns(value: float) -> int:
     return int(value * _NS_PER_SECOND)
 
 
-def _xdp_runtime_config() -> tuple[int, int, int, int, int, int, int, int]:
+def _xdp_runtime_config(*, config: cfg.ConfigSnapshot | None = None) -> tuple[int, int, int, int, int, int, int, int]:
+    config = cfg.snapshot_config() if config is None else config
     icmp_ns_per_token = 0
-    if cfg.XDP_ICMP_RATE_PPS > 0:
-        icmp_ns_per_token = max(1, int(_NS_PER_SECOND / cfg.XDP_ICMP_RATE_PPS))
+    if config.XDP_ICMP_RATE_PPS > 0:
+        icmp_ns_per_token = max(1, int(_NS_PER_SECOND / config.XDP_ICMP_RATE_PPS))
     return (
         0,
         0,
         0,
-        cfg.XDP_ICMP_BURST_PACKETS,
+        config.XDP_ICMP_BURST_PACKETS,
         icmp_ns_per_token,
-        _seconds_to_ns(cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS),
-        _seconds_to_ns(cfg.XDP_RATE_WINDOW_SECONDS),
+        _seconds_to_ns(config.XDP_UDP_GLOBAL_WINDOW_SECONDS),
+        _seconds_to_ns(config.XDP_RATE_WINDOW_SECONDS),
         0,
     )
 
@@ -50,20 +51,21 @@ def _explicit_lookup(
     return None
 
 
-def _is_sensitive(port: int, proc: str) -> bool:
+def _is_sensitive(port: int, proc: str, *, config: cfg.ConfigSnapshot | None = None) -> bool:
     """A port is sensitive iff the owning proc/service has rate <= threshold.
 
     Rate 0 (pin off) is exempt, not sensitive — it does not promote
     the port to the strict tier.
     """
-    threshold = cfg.XDP_SENSITIVE_PORT_THRESHOLD
+    config = cfg.snapshot_config() if config is None else config
+    threshold = config.XDP_SENSITIVE_PORT_THRESHOLD
     if proc:
-        rate = cfg._SYN_RATE_BY_PROC.get(proc)
+        rate = config._SYN_RATE_BY_PROC.get(proc)
         if rate is not None and 0 < rate <= threshold:
             return True
     svc = service_name(port, "tcp")
     if svc:
-        rate = cfg._SYN_RATE_BY_SERVICE.get(svc)
+        rate = config._SYN_RATE_BY_SERVICE.get(svc)
         if rate is not None and 0 < rate <= threshold:
             return True
     return False
@@ -86,104 +88,100 @@ def _resolve_service_limit(
     return service_limits.get(svc, 0)
 
 
-def _port_rate_limit(port: int, proc: str = "") -> int:
+def _port_rate_limit(port: int, proc: str = "", *, config: cfg.ConfigSnapshot | None = None) -> int:
     # Proc-table is authoritative explicit override (inc. explicit 0 = pin off).
-    if proc and proc in cfg._SYN_RATE_BY_PROC:
-        return cfg._SYN_RATE_BY_PROC[proc]
+    config = cfg.snapshot_config() if config is None else config
+    if proc and proc in config._SYN_RATE_BY_PROC:
+        return config._SYN_RATE_BY_PROC[proc]
     # Service-table entry ≤ threshold acts as a sensitivity marker; the resolver
     # applies the strict default rather than the raw service value.
-    if _is_sensitive(port, proc):
-        return cfg.XDP_DEFAULT_TCP_SYN_RATE_STRICT
+    if _is_sensitive(port, proc, config=config):
+        return config.XDP_DEFAULT_TCP_SYN_RATE_STRICT
     # Explicit service-table value above the sensitive threshold.
     explicit = _explicit_lookup(
-        port, proc, cfg._SYN_RATE_BY_PROC, cfg._SYN_RATE_BY_SERVICE,
+        port, proc, config._SYN_RATE_BY_PROC, config._SYN_RATE_BY_SERVICE,
     )
     if explicit is not None:
         return explicit
-    return cfg.XDP_DEFAULT_TCP_SYN_RATE
+    return config.XDP_DEFAULT_TCP_SYN_RATE
 
 
-def _syn_aggregate_rate_limit(port: int, proc: str = "") -> int:
+def _syn_aggregate_rate_limit(port: int, proc: str = "", *, config: cfg.ConfigSnapshot | None = None) -> int:
+    config = cfg.snapshot_config() if config is None else config
     explicit = _explicit_lookup(
-        port, proc, cfg._SYN_AGG_RATE_BY_PROC, cfg._SYN_AGG_RATE_BY_SERVICE,
+        port, proc, config._SYN_AGG_RATE_BY_PROC, config._SYN_AGG_RATE_BY_SERVICE,
     )
     if explicit is not None:
         return explicit
-    if _is_sensitive(port, proc):
-        return cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT
-    return cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE
+    if _is_sensitive(port, proc, config=config):
+        return config.XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT
+    return config.XDP_DEFAULT_TCP_SYN_AGG_RATE
 
 
-def _syncookie_mode(port: int, proc: str = "") -> str:
-    if not cfg.SYNCOOKIE_ENABLED:
-        return cfg.SYNCOOKIE_MODE_OFF
-    if port in cfg._SYNCOOKIE_BY_PORT:
-        return cfg._SYNCOOKIE_BY_PORT[port]
-    if proc and proc in cfg._SYNCOOKIE_BY_PROC:
-        return cfg._SYNCOOKIE_BY_PROC[proc]
+def _syncookie_mode(port: int, proc: str = "", *, config: cfg.ConfigSnapshot | None = None) -> str:
+    config = cfg.snapshot_config() if config is None else config
+    if not config.SYNCOOKIE_ENABLED:
+        return config.SYNCOOKIE_MODE_OFF
+    if port in config._SYNCOOKIE_BY_PORT:
+        return config._SYNCOOKIE_BY_PORT[port]
+    if proc and proc in config._SYNCOOKIE_BY_PROC:
+        return config._SYNCOOKIE_BY_PROC[proc]
     svc = service_name(port, "tcp")
-    if svc and svc in cfg._SYNCOOKIE_BY_SERVICE:
-        return cfg._SYNCOOKIE_BY_SERVICE[svc]
-    return cfg.SYNCOOKIE_DEFAULT_MODE
+    if svc and svc in config._SYNCOOKIE_BY_SERVICE:
+        return config._SYNCOOKIE_BY_SERVICE[svc]
+    return config.SYNCOOKIE_DEFAULT_MODE
 
 
-def _syncookie_port_rate_limit(port: int, proc: str = "") -> int:
-    if port in cfg._SYNCOOKIE_PORT_RATE_BY_PORT:
-        return cfg._SYNCOOKIE_PORT_RATE_BY_PORT[port]
-    if proc and proc in cfg._SYNCOOKIE_PORT_RATE_BY_PROC:
-        return cfg._SYNCOOKIE_PORT_RATE_BY_PROC[proc]
+def _syncookie_port_rate_limit(port: int, proc: str = "", *, config: cfg.ConfigSnapshot | None = None) -> int:
+    config = cfg.snapshot_config() if config is None else config
+    if port in config._SYNCOOKIE_PORT_RATE_BY_PORT:
+        return config._SYNCOOKIE_PORT_RATE_BY_PORT[port]
+    if proc and proc in config._SYNCOOKIE_PORT_RATE_BY_PROC:
+        return config._SYNCOOKIE_PORT_RATE_BY_PROC[proc]
     svc = service_name(port, "tcp")
-    if svc and svc in cfg._SYNCOOKIE_PORT_RATE_BY_SERVICE:
-        return cfg._SYNCOOKIE_PORT_RATE_BY_SERVICE[svc]
-    return cfg.SYNCOOKIE_PORT_RATE_DEFAULT or _port_rate_limit(port, proc)
+    if svc and svc in config._SYNCOOKIE_PORT_RATE_BY_SERVICE:
+        return config._SYNCOOKIE_PORT_RATE_BY_SERVICE[svc]
+    return config.SYNCOOKIE_PORT_RATE_DEFAULT or _port_rate_limit(port, proc, config=config)
 
 
-def rate_map_entries_v6(_v4_entries: int) -> int:
+def rate_map_entries_v6(_v4_entries: int, *, config: cfg.ConfigSnapshot | None = None) -> int:
     """Return the fixed v6 capacity required by the compiled map template."""
-    return cfg.RATE_MAP_ENTRIES_V6
+    config = cfg.snapshot_config() if config is None else config
+    return config.RATE_MAP_ENTRIES_V6
 
 
-def _rate_map_entries(port: int, proc: str = "") -> int:
+def _rate_map_entries(port: int, proc: str = "", *, config: cfg.ConfigSnapshot | None = None) -> int:
     """v4 inner rate-map capacity for a rate-limited port."""
+    config = cfg.snapshot_config() if config is None else config
     explicit = _explicit_lookup(
-        port, proc, cfg._RATE_MAP_ENTRIES_BY_PROC, cfg._RATE_MAP_ENTRIES_BY_SERVICE,
+        port, proc, config._RATE_MAP_ENTRIES_BY_PROC, config._RATE_MAP_ENTRIES_BY_SERVICE,
     )
     if explicit is not None:
         return explicit
-    return cfg.RATE_MAP_ENTRIES_V4
+    return config.RATE_MAP_ENTRIES_V4
 
 
-def _udp_port_rate_limit(port: int, proc: str = "") -> int:
+def _udp_port_rate_limit(port: int, proc: str = "", *, config: cfg.ConfigSnapshot | None = None) -> int:
     """Return the UDP rate limit for a port, or 0 to skip rate limiting."""
-    return _resolve_service_limit(port, "udp", proc, cfg._UDP_RATE_BY_PROC, cfg._UDP_RATE_BY_SERVICE)
+    config = cfg.snapshot_config() if config is None else config
+    return _resolve_service_limit(port, "udp", proc, config._UDP_RATE_BY_PROC, config._UDP_RATE_BY_SERVICE)
 
 
-def _udp_aggregate_byte_limit(port: int, proc: str = "") -> int:
+def _udp_aggregate_byte_limit(port: int, proc: str = "", *, config: cfg.ConfigSnapshot | None = None) -> int:
+    config = cfg.snapshot_config() if config is None else config
     limit = _resolve_service_limit(
-        port, "udp", proc, cfg._UDP_AGG_BYTES_BY_PROC, cfg._UDP_AGG_BYTES_BY_SERVICE
+        port, "udp", proc, config._UDP_AGG_BYTES_BY_PROC, config._UDP_AGG_BYTES_BY_SERVICE
     )
     if limit > 0:
         return limit
-    base = _udp_port_rate_limit(port, proc)
+    base = _udp_port_rate_limit(port, proc, config=config)
     return base * 1200 if base > 0 else 0
 
 
-def _resolve_port_limits(
-    ports: set[int],
-    process_names: dict[int, str],
-    resolver: Callable[[int, str], _LimitT],
-) -> dict[int, _LimitT]:
-    """Return resolver(port, proc) for every port — including 0 (pin off).
-
-    Pre-default-on, this filtered out 0 to keep the desired-state map small.
-    Now every auto-discovered port produces an entry so default-tier values
-    propagate to the BPF policy map."""
-    return {port: resolver(port, process_names.get(port, "")) for port in ports}
-
-
-def _desired_acl_rules() -> dict[tuple[str, str], frozenset[int]]:
+def _desired_acl_rules(*, config: cfg.ConfigSnapshot | None = None) -> dict[tuple[str, str], frozenset[int]]:
+    config = cfg.snapshot_config() if config is None else config
     desired: dict[tuple[str, str], frozenset[int]] = {}
-    for rule in cfg.ACL_RULES:
+    for rule in config.ACL_RULES:
         proto = rule["proto"]
         cidr = rule["cidr"]
         ports = rule["ports"]
@@ -198,7 +196,7 @@ def _unit_name(value: object) -> str:
 
 
 def _container_label_match(value: object, labels: dict[str, str]) -> bool:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return all(labels.get(str(key)) == str(label) for key, label in value.items())
     if isinstance(value, str) and "=" in value:
         key, label = value.split("=", 1)
@@ -206,7 +204,7 @@ def _container_label_match(value: object, labels: dict[str, str]) -> bool:
     return False
 
 
-def _container_resolver_matches(endpoint: RuntimeEndpoint, resolve: dict) -> bool:
+def _container_resolver_matches(endpoint: RuntimeEndpoint, resolve: Mapping[str, Any]) -> bool:
     identity_keys = {"container_id", "container_name", "container_label"}
     if not identity_keys.intersection(resolve):
         return False
@@ -225,12 +223,12 @@ def _container_resolver_matches(endpoint: RuntimeEndpoint, resolve: dict) -> boo
     return not label or _container_label_match(label, endpoint.container_labels)
 
 
-def _has_exposure_policy(subject: dict) -> bool:
+def _has_exposure_policy(subject: Mapping[str, Any]) -> bool:
     for zone in subject.get("exposure", {}).values():
-        if isinstance(zone, dict) and (
+        if isinstance(zone, Mapping) and (
             zone.get("deny")
             or any(
-                isinstance(zone.get(proto), dict) and zone[proto].get("ports")
+                isinstance(zone.get(proto), Mapping) and zone[proto].get("ports")
                 for proto in ("tcp", "udp", "sctp")
             )
         ):
@@ -238,15 +236,16 @@ def _has_exposure_policy(subject: dict) -> bool:
     return False
 
 
-def _subject_for_endpoint(endpoint: RuntimeEndpoint) -> tuple[str, dict] | None:
+def _subject_for_endpoint(endpoint: RuntimeEndpoint, *, config: cfg.ConfigSnapshot | None = None) -> tuple[str, Mapping[str, Any]] | None:
     """Resolve runtime evidence to an explicitly configured policy subject."""
+    config = cfg.snapshot_config() if config is None else config
     if endpoint.attribution_state in {"unknown", "ambiguous"} or not endpoint.subject:
         return None
-    for name, spec in cfg.SUBJECTS.items():
-        if not isinstance(spec, dict) or not _has_exposure_policy(spec):
+    for name, spec in config.SUBJECTS.items():
+        if not isinstance(spec, Mapping) or not _has_exposure_policy(spec):
             continue
         resolve = spec.get("resolve", {})
-        if not isinstance(resolve, dict):
+        if not isinstance(resolve, Mapping):
             continue
         if _container_resolver_matches(endpoint, resolve):
             return name, spec
@@ -261,40 +260,41 @@ def _subject_for_endpoint(endpoint: RuntimeEndpoint) -> tuple[str, dict] | None:
     return None
 
 
-def _grant_for(endpoint: RuntimeEndpoint, subject: dict) -> tuple[bool, str, str]:
+def _grant_for(endpoint: RuntimeEndpoint, subject: Mapping[str, Any]) -> tuple[bool, str, str]:
     exposure = subject.get("exposure", {})
-    zone = exposure.get(endpoint.ingress_zone, {}) if isinstance(exposure, dict) else {}
-    if not isinstance(zone, dict):
+    zone = exposure.get(endpoint.ingress_zone, {}) if isinstance(exposure, Mapping) else {}
+    if not isinstance(zone, Mapping):
         return False, "no exposure grant for ingress zone", ""
     if bool(zone.get("deny", False)):
         return False, "subject explicitly denies this ingress zone", ""
     protocol = zone.get(endpoint.protocol, {})
-    if not isinstance(protocol, dict):
+    if not isinstance(protocol, Mapping):
         return False, "no exposure grant for protocol", ""
     ports = protocol.get("ports", [])
     if endpoint.host_port not in {int(port) for port in ports}:
         return False, "port is not listed in the exposure grant", ""
     protection = subject.get("protection", {})
-    profile = str(protection.get("profile", "")).strip().lower() if isinstance(protection, dict) else ""
+    profile = str(protection.get("profile", "")).strip().lower() if isinstance(protection, Mapping) else ""
     if profile and (profile != "minecraft" or endpoint.protocol != "tcp"):
         return False, "protection profile is unavailable for this protocol", profile
     return True, "matched explicit exposure grant", profile
 
 
-def resolve_exposure_decisions(observed: ObservedState) -> list[ExposureDecision]:
+def resolve_exposure_decisions(observed: ObservedState, *, config: cfg.ConfigSnapshot | None = None) -> list[ExposureDecision]:
     """Compile runtime endpoints against explicit workload exposure grants."""
+    config = cfg.snapshot_config() if config is None else config
     decisions: list[ExposureDecision] = []
     for observed_endpoint in observed.endpoints:
         endpoints = (
             tuple(
                 replace(observed_endpoint, ingress_zone=zone)
-                for zone in cfg.ZONES
+                for zone in config.ZONES
             )
-            if observed_endpoint.bind_scope == "wildcard" and cfg.ZONES
+            if observed_endpoint.bind_scope == "wildcard" and config.ZONES
             else (observed_endpoint,)
         )
         for endpoint in endpoints:
-            resolved = _subject_for_endpoint(endpoint)
+            resolved = _subject_for_endpoint(endpoint, config=config)
             if resolved is None:
                 decisions.append(
                     ExposureDecision(
@@ -339,124 +339,59 @@ def resolve_exposure_decisions(observed: ObservedState) -> list[ExposureDecision
     return decisions
 
 
-def _service_aware_desired_state(observed: ObservedState) -> DesiredState:
-    decisions = resolve_exposure_decisions(observed)
-    zone_tcp_ports: dict[str, set[int]] = {}
-    zone_udp_ports: dict[str, set[int]] = {}
-    for item in decisions:
-        if item.action != "allow":
-            continue
-        target = zone_tcp_ports if item.endpoint.protocol == "tcp" else zone_udp_ports
-        if item.endpoint.protocol in {"tcp", "udp"}:
-            target.setdefault(item.endpoint.ingress_zone, set()).add(item.endpoint.host_port)
-    allowed = {
-        (item.endpoint.protocol, item.endpoint.host_port)
-        for item in decisions
-        if item.action == "allow"
-    }
-    # The current global maps represent public exposure. Private/trusted grants
-    # are carried separately and enforced by the zone-aware backend path.
-    public_is_global = not cfg.ZONES.get("public", {}).get("interfaces", [])
-    public_tcp_ports = {
-        item.endpoint.host_port for item in decisions
-        if item.action == "allow" and item.endpoint.protocol == "tcp"
-        and item.endpoint.ingress_zone == "public" and public_is_global
-    }
-    public_udp_ports = {
-        item.endpoint.host_port for item in decisions
-        if item.action == "allow" and item.endpoint.protocol == "udp"
-        and item.endpoint.ingress_zone == "public" and public_is_global
-    }
-    # SCTP remains global-map only until its slot handlers accept an interface
-    # key; never widen it when a public zone is interface-scoped.
-    sctp_ports = {
-        item.endpoint.host_port for item in decisions
-        if item.action == "allow" and item.endpoint.protocol == "sctp"
-        and item.endpoint.ingress_zone == "public" and public_is_global
-    }
-    # Resolve protection for every allowed endpoint, while only the public
-    # subset enters the global XDP maps. Zone-only ports are admitted by the
-    # interface/port maps installed by the zone-aware backend.
-    allowed_tcp_ports = {port for proto, port in allowed if proto == "tcp"}
-    allowed_udp_ports = {port for proto, port in allowed if proto == "udp"}
-    desired = _desired_state_for_ports(
-        ObservedState(
-            tcp=allowed_tcp_ports,
-            udp=allowed_udp_ports,
-            sctp=sctp_ports,
-            tcp_processes={port: observed.tcp_processes.get(port, "") for port in allowed_tcp_ports},
-            udp_processes={port: observed.udp_processes.get(port, "") for port in allowed_udp_ports},
-        ),
-    )
-    desired.tcp_ports = public_tcp_ports
-    desired.udp_ports = public_udp_ports
+def resolve_desired_state(observed: ObservedState, *, config: cfg.ConfigSnapshot | None = None) -> DesiredState:
+    config = cfg.snapshot_config() if config is None else config
+    decisions = resolve_exposure_decisions(observed, config=config)
+    desired = _global_desired_state(config)
     desired.exposure_decisions = decisions
-    desired.zone_tcp_ports = zone_tcp_ports
-    desired.zone_udp_ports = zone_udp_ports
-    desired.tcp_protection_profiles = {
-        (item.endpoint.ingress_zone, item.endpoint.host_port): item.protection_profile
-        for item in decisions
-        if item.action == "allow"
-        and item.endpoint.protocol == "tcp"
-        and item.protection_profile == "minecraft"
-    }
+    for decision in decisions:
+        endpoint = decision.endpoint
+        port = endpoint.host_port
+        process = endpoint.process_name or endpoint.subject
+        if not process:
+            processes = observed.tcp_processes if endpoint.protocol == "tcp" else observed.udp_processes
+            process = processes.get(port, "")
+        policy = _endpoint_policy(endpoint, process, config, decision)
+        previous = desired.endpoint_policies.get(endpoint.key)
+        if previous is not None:
+            instances = sorted(set(previous.instance_id.split(",") + [policy.instance_id]) - {""})
+            if replace(previous, instance_id="") != replace(policy, instance_id=""):
+                policy = replace(policy, allow=False, reason="conflicting listeners share endpoint identity")
+            policy = replace(policy, instance_id=",".join(instances))
+        desired.endpoint_policies[endpoint.key] = policy
     return desired
 
 
-def _desired_state_for_ports(observed: ObservedState) -> DesiredState:
-    tcp_ports = set(observed.tcp)
-    udp_ports = set(observed.udp)
-    sctp_ports = set(observed.sctp)
-    tcp_syn_rate_limits = _resolve_port_limits(
-        tcp_ports, observed.tcp_processes, _port_rate_limit
+def _endpoint_policy(endpoint: RuntimeEndpoint, process: str, config: cfg.ConfigSnapshot,
+                     decision: ExposureDecision) -> EndpointPolicy:
+    port = endpoint.host_port
+    tcp = endpoint.protocol == "tcp"
+    udp = endpoint.protocol == "udp"
+    return EndpointPolicy(
+        allow=decision.action == "allow",
+        reason=decision.reason,
+        subject=decision.subject,
+        instance_id=endpoint.instance_id,
+        profile=decision.protection_profile,
+        syn_rate=_port_rate_limit(port, process, config=config) if tcp else 0,
+        syn_aggregate_rate=_syn_aggregate_rate_limit(port, process, config=config) if tcp else 0,
+        udp_rate=_udp_port_rate_limit(port, process, config=config) if udp else 0,
+        udp_byte_rate=_udp_aggregate_byte_limit(port, process, config=config) if udp else 0,
+        syncookie_mode=_syncookie_mode(port, process, config=config) if tcp else "off",
+        syncookie_rate=_syncookie_port_rate_limit(port, process, config=config) if tcp else 0,
+        rate_map_entries=_rate_map_entries(port, process, config=config) if tcp or udp else 0,
     )
-    udp_rate_limits = _resolve_port_limits(
-        udp_ports, observed.udp_processes, _udp_port_rate_limit
-    )
-    tcp_syncookie_modes = {
-        port: mode for port, mode in _resolve_port_limits(
-            tcp_ports, observed.tcp_processes, _syncookie_mode
-        ).items() if mode != cfg.SYNCOOKIE_MODE_OFF
-    }
-    tcp_rate_map_entries = {
-        port: _rate_map_entries(port, observed.tcp_processes.get(port, ""))
-        for port, rate in tcp_syn_rate_limits.items() if rate > 0
-    }
-    udp_rate_map_entries = {
-        port: _rate_map_entries(port, observed.udp_processes.get(port, ""))
-        for port, rate in udp_rate_limits.items() if rate > 0
-    }
 
+
+def _global_desired_state(config: cfg.ConfigSnapshot) -> DesiredState:
     return DesiredState(
-        tcp_ports=tcp_ports,
-        udp_ports=udp_ports,
-        sctp_ports=sctp_ports,
-        trusted_cidrs=set(cfg.TRUSTED_SRC_IPS),
-        tcp_syn_rate_limits=tcp_syn_rate_limits,
-        tcp_syn_agg_rate_limits=_resolve_port_limits(
-            tcp_ports, observed.tcp_processes, _syn_aggregate_rate_limit
-        ),
-        tcp_syncookie_modes=tcp_syncookie_modes,
-        tcp_syncookie_rate_limits={
-            port: _syncookie_port_rate_limit(
-                port, observed.tcp_processes.get(port, "")
-            ) for port in tcp_syncookie_modes
-        },
-        udp_rate_limits=udp_rate_limits,
-        tcp_rate_map_entries=tcp_rate_map_entries,
-        udp_rate_map_entries=udp_rate_map_entries,
-        udp_agg_rate_limits=_resolve_port_limits(
-            udp_ports, observed.udp_processes, _udp_aggregate_byte_limit
-        ),
-        acl_rules=_desired_acl_rules(),
-        bogon_filter_enabled=cfg.BOGON_FILTER_ENABLED,
-        drop_events_enabled=cfg.DROP_EVENTS_ENABLED,
-        rate_limit_source_prefix_v4=cfg.RATE_LIMIT_SOURCE_PREFIX_V4,
-        rate_limit_source_prefix_v6=cfg.RATE_LIMIT_SOURCE_PREFIX_V6,
-        udp_global_byte_rate=cfg.XDP_UDP_GLOBAL_BYTE_RATE,
-        xdp_runtime_config=_xdp_runtime_config(),
+        config=config,
+        trusted_cidrs=set(config.TRUSTED_SRC_IPS),
+        acl_rules=_desired_acl_rules(config=config),
+        bogon_filter_enabled=config.BOGON_FILTER_ENABLED,
+        drop_events_enabled=config.DROP_EVENTS_ENABLED,
+        rate_limit_source_prefix_v4=config.RATE_LIMIT_SOURCE_PREFIX_V4,
+        rate_limit_source_prefix_v6=config.RATE_LIMIT_SOURCE_PREFIX_V6,
+        udp_global_byte_rate=config.XDP_UDP_GLOBAL_BYTE_RATE,
+        xdp_runtime_config=_xdp_runtime_config(config=config),
     )
-
-
-def resolve_desired_state(observed: ObservedState) -> DesiredState:
-    return _service_aware_desired_state(observed)

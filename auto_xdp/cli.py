@@ -8,6 +8,7 @@ import sys
 
 from auto_xdp import config as cfg
 from auto_xdp.config import apply_toml_config, load_toml_config
+from auto_xdp.state import ApplyResult
 from auto_xdp.syncer import open_backend, sync_once, watch
 
 log = logging.getLogger(__name__)
@@ -120,7 +121,10 @@ def main() -> None:
             return
         with open_backend(args.backend) as backend:
             if args.mode is None and not args.explain:
-                sync_once(backend, args.dry_run)
+                report = sync_once(backend, args.dry_run)
             else:
-                sync_once(backend, args.dry_run, mode=args.mode, explain=args.explain)
+                report = sync_once(backend, args.dry_run, mode=args.mode, explain=args.explain)
+            result = report.get("apply_result") if isinstance(report, dict) else None
+            if isinstance(result, ApplyResult) and not args.dry_run and not result.successful:
+                raise SystemExit(1)
             log.info("Sync completed.")

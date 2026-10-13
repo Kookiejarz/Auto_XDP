@@ -12,6 +12,57 @@ compiles only approved endpoints into the existing XDP or nftables backend.
 The dataplane never needs to understand PIDs, systemd, containers, or policy
 files.
 
+## Reconciliation data contract
+
+A round captures one deeply immutable `ConfigSnapshot`. Discovery, policy,
+backend operations and explanation readers receive that same snapshot.
+`parse_toml_config()` validates candidates without changing live configuration;
+only a fully validated candidate may be published by `apply_toml_config()`.
+
+| Model | Meaning |
+|---|---|
+| `ConfigSnapshot` | Fixed discovery settings, authorization/protection policy and backend settings for this round. |
+| `ObservedState` | Facts and attribution evidence; discovery never authorizes traffic. |
+| `DesiredState` | Complete endpoint targets plus explicit global tuning and the configuration snapshot. |
+| `AppliedState` | Actual admission facts, kernel-confirmed resources, cached execution records and unknown state. Missing evidence means unknown. |
+| `ReconcilePlan` | Target, endpoint changes and dependencies: revoke → prepare → admit → cleanup. |
+| `ApplyResult` | Successful operations, failed operations with reasons, blocked targets, confirmed closed endpoints and unconfirmed resources. |
+
+`EndpointKey` is `(protocol, address, port, zone)`. `EndpointPolicy` attaches
+resolved authorization, protection limits, SYN-cookie mode, profile and
+`instance_id` to that key. Socket inode or pid/fd identifies a listener lifetime;
+NAT-only container publications use container ID and start time when available.
+Shared listener lifetimes are retained together. Restarting a protected listener
+changes its policy generation even if discovery missed the closed interval.
+
+Endpoint policies are the only endpoint targets in `DesiredState`. Flat port,
+zone, rate and profile fields belong to `BackendProjection`, compiled at the
+backend boundary. Legacy port adapters/bootstrap explicitly construct that
+projection. XDP executes `ReconcilePlan.steps` and records every operation failure
+in `ApplyResult`; its compatibility failure count is derived from that journal. XDP uses
+`endpoint_scopes` (24-byte key, 4-byte value) to check address family, destination
+address and ingress interface before TCP/UDP/SCTP admission. Public fallback
+cannot override named private-interface deny entries. nftables applies the same
+scope gate ahead of trust and protection rules, using one atomic transaction.
+
+Protection maps still use native port keys (profiles use zone/port keys). When
+endpoint targets require incompatible values on one such key, the projection
+keeps those targets closed and reports the limitation. Missing protection maps
+also block admission. nftables cannot supply XDP profiles or SYN-cookie protection;
+those endpoints remain closed after a successful transaction. Scope outside a
+single-family nftables table is reported as unknown, never confirmed closed.
+
+XDP revocation failures stop dependent preparation and cleanup. Successful
+writes form a cached execution journal; kernel readback confirms resources and
+admission separately. Read errors preserve the last cache and mark the resource
+unknown. nftables transaction acknowledgment confirms that generation; later
+cache reads are labeled cached. Dry runs never report successful application.
+Failed or unconfirmed one-shot enforcement exits with status 1.
+
+The new map is required by the loader and ABI manifests. Upgrade/rebuild the BPF
+object and reload the installed runtime together with the Python controller;
+existing pinned programs without `endpoint_scopes` fail the readiness check.
+
 ## Runtime objects
 
 `RuntimeEndpoint` records protocol, bind address, port, bind scope, ingress
@@ -213,6 +264,6 @@ Implemented after the V1 baseline: Docker/Podman published-port attribution,
 including NAT-only publications, and the approval workflow.
 
 Deferred until separately evidenced: additional service-specific profiles,
-optional kernel conntrack lookup, destination-address/CIDR zone keys, strict
+destination-CIDR policy selectors, strict
 per-packet workload authentication, full L7 inspection, custom BPF conntrack,
 and upstream volumetric mitigation.

@@ -11,6 +11,8 @@ from unittest import mock
 
 import pytest
 
+from support import desired_for_ports
+
 from auto_xdp.discovery.listeners import (
     DiscoveryError,
     _bind_ip_is_exposed,
@@ -355,7 +357,7 @@ class XdpPortSyncTests(unittest.TestCase):
                  mock.patch.object(cfg, "BPF_PIN_DIR", str(pin_dir)), \
                  mock.patch.object(backend, "_pinned_program_id", return_value=42), \
                  mock.patch.object(backend, "_profile_command", return_value=True) as command:
-                self.assertEqual(backend._remove_stale_profile_handlers({}, dry_run=False), 0)
+                self.assertIsNone(backend._remove_stale_profile_handlers({}, dry_run=False))
 
             command.assert_called_once_with("unload", 1)
             self.assertFalse(marker.exists())
@@ -444,12 +446,13 @@ class XdpPortSyncTests(unittest.TestCase):
     def test_global_admission_installs_known_zone_deny_tombstones(self):
         backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
         backend._policy_generations = {}
-        desired = state_mod.DesiredState(tcp_ports={25565}, udp_ports={19132})
+        desired = state_mod.BackendProjection(tcp_ports={25565}, udp_ports={19132})
 
         with mock.patch.object(cfg, "ZONES", {
             "public": {"interfaces": []},
             "trusted": {"interfaces": ["wg0"]},
         }), mock.patch.object(socket, "if_nametoindex", return_value=7):
+            desired.config = cfg.snapshot_config()
             _, tcp_zone = backend._desired_tcp_values(desired, 0)
             udp_zone = backend._desired_udp_zone_values(desired)
 
@@ -467,7 +470,7 @@ class XdpPortSyncTests(unittest.TestCase):
         decision = state_mod.ExposureDecision(
             endpoint, "allow", "matched", "minecraft", "minecraft"
         )
-        desired = state_mod.DesiredState(
+        desired = state_mod.BackendProjection(
             tcp_ports={25565},
             tcp_protection_profiles={("public", 25565): "minecraft"},
             exposure_decisions=[decision],
@@ -475,14 +478,14 @@ class XdpPortSyncTests(unittest.TestCase):
 
         first, _ = backend._desired_tcp_values(desired, 0)
         unchanged, _ = backend._desired_tcp_values(desired, 0)
-        changed_policy = state_mod.DesiredState(
+        changed_policy = state_mod.BackendProjection(
             tcp_ports={25565},
             tcp_syn_rate_limits={25565: 99},
             tcp_protection_profiles={("public", 25565): "minecraft"},
             exposure_decisions=[decision],
         )
         changed, _ = backend._desired_tcp_values(changed_policy, 0)
-        restarted = state_mod.DesiredState(
+        restarted = state_mod.BackendProjection(
             tcp_ports={25565},
             tcp_syn_rate_limits={25565: 99},
             tcp_protection_profiles={("public", 25565): "minecraft"},
@@ -496,7 +499,7 @@ class XdpPortSyncTests(unittest.TestCase):
             )],
         )
         restarted_value, _ = backend._desired_tcp_values(restarted, 0)
-        backend._desired_tcp_values(state_mod.DesiredState(), 0)
+        backend._desired_tcp_values(state_mod.BackendProjection(), 0)
         reactivated, _ = backend._desired_tcp_values(desired, 0)
 
         self.assertEqual(first[25565], unchanged[25565])
@@ -509,7 +512,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend._policy_generations = {}
 
         global_values, _ = backend._desired_tcp_values(
-            state_mod.DesiredState(tcp_ports={8080}), 0
+            state_mod.BackendProjection(tcp_ports={8080}), 0
         )
 
         self.assertEqual(global_values[8080], (1, 0, 0, 0))
@@ -560,7 +563,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.apply_reconcile_plan(
             plan,
             dry_run=False,
-            desired_state=state_mod.DesiredState(tcp_ports={443}),
+            desired_state=state_mod.BackendProjection(tcp_ports={443}),
         )
 
         self.assertEqual(backend.tcp_map.ops, [])
@@ -955,7 +958,7 @@ class XdpPortSyncTests(unittest.TestCase):
                  XDP_RATE_WINDOW_SECONDS=0.5,
                  XDP_UDP_GLOBAL_BYTE_RATE=124_625_000,
              ):
-            desired = policy_mod._desired_state_for_ports(observed)
+            desired = desired_for_ports(observed)
 
         self.assertEqual(desired.tcp_ports, {80, 2222})
         self.assertEqual(desired.udp_ports, {53})
@@ -1014,7 +1017,7 @@ class XdpPortSyncTests(unittest.TestCase):
             500_000_000,
             30_000_000_000,
         )
-        desired = state_mod.DesiredState(
+        desired = state_mod.BackendProjection(
             tcp_ports={22, 443},
             udp_ports={53},
             sctp_ports={3868, 2905},
@@ -1031,6 +1034,7 @@ class XdpPortSyncTests(unittest.TestCase):
 
         with mock.patch.object(cfg, "SLOT_DEFAULT_ACTION", "pass"), \
              mock.patch.object(cfg, "TRUSTED_SRC_IPS", {"198.51.100.5/32": "office"}):
+            desired.config = cfg.snapshot_config()
             backend.reconcile(desired, dry_run=False, observed_state=observed)
 
         self.assertEqual(backend.tcp_map.ops[0], (80, 0, False))
@@ -1295,7 +1299,7 @@ class TcpDefaultOnSmokeTests(unittest.TestCase):
             tcp={8080},
             tcp_processes={8080: "myapp"},
         )
-        desired = policy_mod._desired_state_for_ports(observed)
+        desired = desired_for_ports(observed)
 
         # L1 SYN rate — Bug 1 fix
         self.assertEqual(desired.tcp_syn_rate_limits.get(8080), cfg.XDP_DEFAULT_TCP_SYN_RATE)
@@ -1314,7 +1318,8 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
     def test_nftables_keeps_minecraft_profile_port_closed(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
         backend._policy_signature = None
-        desired = state_mod.DesiredState(
+        backend.get_applied_state = mock.Mock(return_value=state_mod.AppliedState())
+        desired = state_mod.BackendProjection(
             tcp_ports={443, 25565},
             zone_tcp_ports={"public": {443, 25565}, "trusted": {25565}},
             tcp_protection_profiles={("public", 25565): "minecraft"},
@@ -1354,7 +1359,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         base.update(cfg_overrides)
         with mock.patch.object(policy_mod, "service_name", return_value=""), \
              mock.patch.multiple(policy_mod.cfg, **base):
-            return policy_mod._desired_state_for_ports(observed)
+            return desired_for_ports(observed)
 
     def test_default_capacity_for_rate_limited_ports(self):
         desired = self._resolve()
@@ -1474,7 +1479,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             trusted_cidrs_to_remove={"203.0.113.1/32"},
         )
 
-        desired = state_mod.DesiredState(
+        desired = state_mod.BackendProjection(
             tcp_ports={22, 443},
             udp_ports={53},
             sctp_ports={2905, 3868},
@@ -1514,6 +1519,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
 
     def test_nftables_backend_dry_run_does_not_mutate_caches(self):
         backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
+        backend.get_applied_state = mock.Mock(return_value=state_mod.AppliedState())
         backend._tcp_cache = {22, 80}
         backend._udp_cache = {53, 9999}
         backend._sctp_cache = {3868, 9899}
@@ -1531,7 +1537,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         )
 
         with mock.patch.object(nftables_mod, "_run_nft"):
-            backend.apply_reconcile_plan(plan, dry_run=True, desired_state=state_mod.DesiredState())
+            backend.apply_reconcile_plan(plan, dry_run=True, desired_state=state_mod.BackendProjection())
 
         self.assertEqual(backend._tcp_cache, {22, 80})
         self.assertEqual(backend._udp_cache, {53, 9999})
@@ -1546,7 +1552,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         backend._sctp_cache = set()
         backend._trusted_cache = set()
         backend._reset_policy_cache()
-        desired = state_mod.DesiredState(tcp_ports={443})
+        desired = state_mod.BackendProjection(tcp_ports={443})
         backend._remember_desired(desired)
 
         with mock.patch.object(nftables_mod, "_run_nft") as run_nft:
@@ -1869,7 +1875,7 @@ def _make_failing_backend():
 
 
 def _failing_desired_state():
-    return state_mod.DesiredState(
+    return state_mod.BackendProjection(
         tcp_ports={22, 443},
         udp_ports={53},
         sctp_ports={3868, 2905},
@@ -1892,6 +1898,7 @@ class ApplyFailureCountingTests(unittest.TestCase):
         desired = _failing_desired_state()
         with mock.patch.object(cfg, "TRUSTED_SRC_IPS", {}), \
              mock.patch.object(cfg, "SIT4_ENDPOINTS", ["198.51.100.77"]):
+            desired.config = cfg.snapshot_config()
             backend.reconcile(desired, dry_run=dry_run, observed_state=state_mod.ObservedState())
 
     def _total_ops(self, backend):
@@ -2002,11 +2009,12 @@ def _make_outer_backend():
 class RateOuterReconcileTests(unittest.TestCase):
     def _reconcile(self, backend, desired, dry_run=False):
         with mock.patch.object(cfg, "TRUSTED_SRC_IPS", {}):
+            desired.config = cfg.snapshot_config()
             backend.reconcile(desired, dry_run=dry_run, observed_state=state_mod.ObservedState())
 
     def test_reconcile_creates_inner_for_rate_limited_ports(self):
         backend = _make_outer_backend()
-        desired = state_mod.DesiredState(
+        desired = state_mod.BackendProjection(
             tcp_ports={443},
             udp_ports={5353},
             tcp_syn_rate_limits={443: 100},
@@ -2025,7 +2033,7 @@ class RateOuterReconcileTests(unittest.TestCase):
         for outer in (backend.syn4_outer, backend.syn6_outer,
                       backend.udprt4_outer, backend.udprt6_outer):
             outer._active = {22: 16384}
-        self._reconcile(backend, state_mod.DesiredState())
+        self._reconcile(backend, state_mod.BackendProjection())
         for outer in (backend.syn4_outer, backend.syn6_outer,
                       backend.udprt4_outer, backend.udprt6_outer):
             self.assertIn(("delete", 22, False), outer.ops)

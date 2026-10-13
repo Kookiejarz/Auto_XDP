@@ -76,6 +76,7 @@ class ContainerIdentity:
     name: str
     labels: dict[str, str]
     host_ip: str = ""
+    instance_id: str = ""
 
     @property
     def subject(self) -> str:
@@ -282,11 +283,14 @@ def _container_metadata() -> tuple[dict[tuple[str, int], list[ContainerIdentity]
                 str(key): str(value)
                 for key, value in raw_labels.items()
             } if isinstance(raw_labels, dict) else {}
-            identity = ContainerIdentity(runtime, container_id, raw_name, labels)
+            state = record.get("State", {})
+            started_at = str(state.get("StartedAt", "")) if isinstance(state, dict) else ""
+            instance_id = f"{container_id}:{started_at}" if started_at else container_id
+            identity = ContainerIdentity(runtime, container_id, raw_name, labels, instance_id=instance_id)
             by_id[f"{runtime}:{container_id}"] = identity
             by_id.setdefault(container_id, identity)
             for protocol, host_port, host_ip in _container_port_bindings(record):
-                bound = ContainerIdentity(runtime, container_id, raw_name, labels, host_ip)
+                bound = ContainerIdentity(runtime, container_id, raw_name, labels, host_ip, instance_id)
                 by_port.setdefault((protocol, host_port), []).append(bound)
     _CONTAINER_PORTS = by_port
     _CONTAINER_BY_ID = by_id
@@ -347,9 +351,10 @@ def _resolve_pid_name(pid: int, cache: dict[int, str]) -> str:
     return cache[pid]
 
 
-def _discovery_exclude_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+def _discovery_exclude_networks(*, config: cfg.ConfigSnapshot | None = None) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    config = cfg.snapshot_config() if config is None else config
     nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-    for cidr in cfg.DISCOVERY_EXCLUDE_BIND_CIDRS:
+    for cidr in config.DISCOVERY_EXCLUDE_BIND_CIDRS:
         try:
             nets.append(ipaddress.ip_network(cidr, strict=False))
         except ValueError:
@@ -360,14 +365,16 @@ def _discovery_exclude_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv
 def _bind_ip_is_exposed(
     ip_str: str,
     exclude_nets: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+    *, config: cfg.ConfigSnapshot | None = None,
 ) -> bool:
+    config = cfg.snapshot_config() if config is None else config
     if ip_str in ("0.0.0.0", "::", "*"):
         return True
     try:
         addr = ipaddress.ip_address(ip_str.split("%", 1)[0])
     except ValueError:
         return True
-    if cfg.DISCOVERY_EXCLUDE_LOOPBACK and addr.is_loopback:
+    if config.DISCOVERY_EXCLUDE_LOOPBACK and addr.is_loopback:
         return False
     if addr.is_multicast:
         return False
@@ -404,13 +411,14 @@ def _pid_systemd_unit(pid: int) -> str:
     return ""
 
 
-def _endpoint_zone(host_address: str) -> str:
+def _endpoint_zone(host_address: str, *, config: cfg.ConfigSnapshot | None = None) -> str:
     """Classify the local bind into a configured ingress zone.
 
     Exact address-to-interface resolution is intentionally conservative. A
     wildcard bind is reported as public because it is the only zone that can
     safely represent the global port maps used by the current backends.
     """
+    config = cfg.snapshot_config() if config is None else config
     global _LOCAL_ADDRESS_ZONES
     try:
         address = ipaddress.ip_address(host_address.split("%", 1)[0])
@@ -433,7 +441,7 @@ def _endpoint_zone(host_address: str) -> str:
                 ifname = link.get("ifname")
                 if not isinstance(ifname, str):
                     continue
-                for zone, spec in cfg.ZONES.items():
+                for zone, spec in config.ZONES.items():
                     if ifname not in spec.get("interfaces", []) and "*" not in spec.get("interfaces", []):
                         continue
                     for info in link.get("addr_info", []):
@@ -445,7 +453,7 @@ def _endpoint_zone(host_address: str) -> str:
     mapped_zone = _LOCAL_ADDRESS_ZONES.get(host_address.split("%", 1)[0])
     if mapped_zone:
         return mapped_zone
-    for zone, spec in cfg.ZONES.items():
+    for zone, spec in config.ZONES.items():
         for cidr in spec.get("cidrs", []):
             try:
                 if address in ipaddress.ip_network(cidr, strict=False):
@@ -464,17 +472,20 @@ def _endpoint(
     attribution_source: str,
     container: ContainerIdentity | None = None,
     instance_id: str = "",
+    *, config: cfg.ConfigSnapshot | None = None, process_name: str = "",
 ) -> RuntimeEndpoint:
+    config = cfg.snapshot_config() if config is None else config
     endpoint = RuntimeEndpoint(
         protocol=protocol,
         host_address=host_address,
         host_port=port,
         bind_scope=_bind_scope(host_address),
-        ingress_zone=_endpoint_zone(host_address),
+        ingress_zone=_endpoint_zone(host_address, config=config),
         subject=subject,
         attribution_state=attribution_state,
         attribution_source=attribution_source,
         instance_id=instance_id,
+        process_name=process_name,
     )
     identity = container or _container_for_endpoint(protocol, host_address, port)
     if identity is None:
@@ -569,12 +580,13 @@ def _build_systemd_socket_map() -> dict[int, str]:
 
 # Linux netlink implementation
 
-def _get_listening_ports_netlink() -> ObservedState:
+def _get_listening_ports_netlink(*, config: cfg.ConfigSnapshot | None = None) -> ObservedState:
     """Query sockets via SOCK_DIAG — no subprocess, no psutil."""
+    config = cfg.snapshot_config() if config is None else config
     global _LOCAL_ADDRESS_ZONES
     _LOCAL_ADDRESS_ZONES = None
     state = ObservedState()
-    exclude_nets = _discovery_exclude_networks()
+    exclude_nets = _discovery_exclude_networks(config=config)
 
     inode_pid: dict[int, int] | None = None
     pid_names: dict[int, str] = {}
@@ -623,9 +635,9 @@ def _get_listening_ports_netlink() -> ObservedState:
     for family in (socket.AF_INET, socket.AF_INET6):
         for sport_h, _dp, src, _dst, inode, _rq in _nldiag_dump(family, socket.IPPROTO_TCP, _SS_LISTEN):
             port = sport_h
-            if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets):
+            if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets, config=config):
                 continue
-            if port in cfg.DISCOVERY_EXCLUDE_PORTS:
+            if port in config.DISCOVERY_EXCLUDE_PORTS:
                 continue
             state.tcp.add(port)
             raw_name = _proc_name(inode)
@@ -641,7 +653,7 @@ def _get_listening_ports_netlink() -> ObservedState:
                 _endpoint(
                     "tcp", _addr_str(family, src), port, subject, attribution,
                     source, container, str(inode),
-                )
+                    config=config, process_name=name)
             )
 
     # UDP — collect drops from /proc, rqueue from SOCK_DIAG
@@ -677,9 +689,9 @@ def _get_listening_ports_netlink() -> ObservedState:
     for info in udp_sockets:
         port = info["port"]
         family, src = info["family"], info["src"]
-        if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets):
+        if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets, config=config):
             continue
-        if port in cfg.DISCOVERY_EXCLUDE_PORTS:
+        if port in config.DISCOVERY_EXCLUDE_PORTS:
             continue
         aggregate = udp_agg[port]
         if info["connected"]:
@@ -701,7 +713,7 @@ def _get_listening_ports_netlink() -> ObservedState:
             _endpoint(
                 "udp", _addr_str(family, src), port, subject, attribution,
                 source, container, str(info["inode"]),
-            )
+                config=config, process_name=name)
         )
         opts: set[str] = set()
         if aggregate["count"] > 1:
@@ -719,14 +731,14 @@ def _get_listening_ports_netlink() -> ObservedState:
             for sport_h, _dp, src, _dst, _in, _rq in _nldiag_dump(
                 family, _IPPROTO_SCTP, _SS_LISTEN
             ):
-                if _bind_ip_is_exposed(_addr_str(family, src), exclude_nets) and sport_h not in cfg.DISCOVERY_EXCLUDE_PORTS:
+                if _bind_ip_is_exposed(_addr_str(family, src), exclude_nets, config=config) and sport_h not in config.DISCOVERY_EXCLUDE_PORTS:
                     state.sctp.add(sport_h)
                     subject, attribution, source, container = _proc_attribution(_in)
                     state.endpoints.append(
                         _endpoint(
                             "sctp", _addr_str(family, src), sport_h, subject,
                             attribution, source, container, str(_in),
-                        )
+                         process_name=subject, config=config)
                     )
     except OSError:
         pass
@@ -737,9 +749,11 @@ def _get_listening_ports_netlink() -> ObservedState:
 def _append_published_container_endpoints(
     state: ObservedState,
     published: dict[tuple[str, int], list[ContainerIdentity]],
+    *, config: cfg.ConfigSnapshot | None = None,
 ) -> ObservedState:
     """Add runtime endpoints implemented by container NAT rather than a host socket."""
-    exclude_nets = _discovery_exclude_networks()
+    config = cfg.snapshot_config() if config is None else config
+    exclude_nets = _discovery_exclude_networks(config=config)
     existing = {
         (
             endpoint.protocol,
@@ -760,7 +774,7 @@ def _append_published_container_endpoints(
                 identity.runtime,
                 identity.container_id,
             )
-            if key in existing or not _bind_ip_is_exposed(host_address, exclude_nets):
+            if key in existing or not _bind_ip_is_exposed(host_address, exclude_nets, config=config):
                 continue
             if protocol == "tcp":
                 state.tcp.add(port)
@@ -781,6 +795,8 @@ def _append_published_container_endpoints(
                     "exact",
                     f"{identity.runtime}-inspect",
                     identity,
+                    identity.instance_id,
+                    config=config,
                 )
             )
             existing.add(key)
@@ -828,7 +844,8 @@ def _annotate_udp_sock_opts(port: int, proc_udp: dict[int, dict], state: Observe
         state.udp_sock_opts[port] = state.udp_sock_opts.get(port, frozenset()) | frozenset(opts)
 
 
-def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
+def _get_listening_ports_psutil(cached_conns=None, *, config: cfg.ConfigSnapshot | None = None) -> ObservedState:
+    config = cfg.snapshot_config() if config is None else config
     if psutil is None or _net_connections is None:
         sys.exit("psutil not installed. Run: pip3 install psutil")
 
@@ -836,7 +853,7 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
     global _LOCAL_ADDRESS_ZONES
     _LOCAL_ADDRESS_ZONES = None
     state = ObservedState()
-    exclude_nets = _discovery_exclude_networks()
+    exclude_nets = _discovery_exclude_networks(config=config)
     pid_names: dict[int, str] = {}
     proc_udp = _collect_proc_udp_stats()
     systemd_map: dict[int, str] | None = None
@@ -847,9 +864,9 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
         port = conn.laddr.port
         if conn.type == socket.SOCK_STREAM:
             if conn.status == psutil.CONN_LISTEN:
-                if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets):
+                if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets, config=config):
                     continue
-                if port in cfg.DISCOVERY_EXCLUDE_PORTS:
+                if port in config.DISCOVERY_EXCLUDE_PORTS:
                     continue
                 state.tcp.add(port)
                 pid = getattr(conn, "pid", None)
@@ -864,7 +881,7 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
                         "systemd-socket" if name.endswith(".service") else ("process-name" if name else ""),
                         container,
                         f"{pid}:{getattr(conn, 'fd', -1)}",
-                    )
+                     process_name=name, config=config)
                 )
         elif conn.type in (socket.SOCK_DGRAM, socket.SOCK_SEQPACKET):
             if conn.raddr:
@@ -873,9 +890,9 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
                 pd = proc_udp.get(port, {})
                 if not (pd.get("rx_queue", 0) > 0 or pd.get("drops", 0) > 0):
                     continue
-            if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets):
+            if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets, config=config):
                 continue
-            if port in cfg.DISCOVERY_EXCLUDE_PORTS:
+            if port in config.DISCOVERY_EXCLUDE_PORTS:
                 continue
             if conn.type == socket.SOCK_DGRAM:
                 state.udp.add(port)
@@ -891,13 +908,15 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
                         "systemd-socket" if name.endswith(".service") else ("process-name" if name else ""),
                         container,
                         f"{pid}:{getattr(conn, 'fd', -1)}",
-                    )
+                     process_name=name, config=config)
                 )
                 _annotate_udp_sock_opts(port, proc_udp, state)
             else:
                 state.sctp.add(port)
                 state.endpoints.append(
-                    _endpoint("sctp", conn.laddr.ip, port, "", "unknown", "")
+                    _endpoint("sctp", conn.laddr.ip, port, "", "unknown", "",
+                              instance_id=f"{getattr(conn, 'pid', None)}:{getattr(conn, 'fd', -1)}",
+                              config=config)
                 )
 
     return _mark_shared_endpoints(state)
@@ -905,11 +924,13 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
 
 # public API
 
-def get_listening_ports(cached_conns=None) -> ObservedState:
+def get_listening_ports(cached_conns=None, *, config: cfg.ConfigSnapshot | None = None) -> ObservedState:
     """Read externally reachable listening TCP/UDP/SCTP ports."""
+    config = cfg.snapshot_config() if config is None else config
     if _IS_LINUX:
         published, _ = _container_metadata()
         return _append_published_container_endpoints(
-            _get_listening_ports_netlink(), published
+            _get_listening_ports_netlink(config=config), published,
+            config=config,
         )
-    return _get_listening_ports_psutil(cached_conns)
+    return _get_listening_ports_psutil(cached_conns, config=config)
