@@ -1,4 +1,6 @@
 """Unit tests for BpfRateOuterMap (per-port ARRAY_OF_MAPS wrapper)."""
+import ctypes
+import errno
 import struct
 import unittest
 from unittest import mock
@@ -128,6 +130,174 @@ class RateOuterMapTests(unittest.TestCase):
         m._cache = {22: 4096}
         with mock.patch.object(m, "_read_kernel", return_value={22: 4096}):
             self.assertEqual(m.verify(), 0)
+
+
+@pytest.fixture
+def readable_map():
+    outer = _make_map(None)
+    outer.fd = 42
+    yield outer
+    outer.fd = -1
+
+
+def batch_page(attr, entries):
+    incoming, cursor, keys, values, count, fd, elem_flags, flags = struct.unpack_from("=QQQQIIQQ", attr)
+    assert fd == 42 and elem_flags == flags == 0
+    assert len(entries) <= count
+    for index, (port, inner_id) in enumerate(entries):
+        ctypes.c_uint32.from_address(keys + index * 4).value = port
+        ctypes.c_uint32.from_address(values + index * 4).value = inner_id
+    struct.pack_into("=I", attr, 32, len(entries))
+    if entries:
+        ctypes.c_uint32.from_address(cursor).value = entries[-1][0]
+
+
+def test_empty_batch_repairs_stale_cache_without_single_lookups(readable_map, monkeypatch):
+    readable_map._cache = {443: 8192}
+    calls = []
+
+    def syscall(cmd, attr):
+        calls.append(cmd)
+        batch_page(attr, [])
+        raise OSError(errno.ENOENT, "end of map")
+
+    monkeypatch.setattr(maps_mod, "bpf", syscall)
+    assert readable_map.verify() == 1
+    assert readable_map.active() == {}
+    assert calls == [maps_mod.BPF_MAP_LOOKUP_BATCH]
+
+
+def test_sparse_batches_resume_and_keep_entries_returned_with_enoent(readable_map, monkeypatch):
+    calls = []
+    opened = []
+    closed = []
+
+    def syscall(cmd, attr):
+        assert cmd == maps_mod.BPF_MAP_LOOKUP_BATCH
+        incoming = struct.unpack_from("=Q", attr)[0]
+        calls.append(None if not incoming else ctypes.c_uint32.from_address(incoming).value)
+        assert struct.unpack_from("=I", attr, 32)[0] == 1024
+        if len(calls) == 1:
+            batch_page(attr, [(0, 100), (443, 101)])
+        else:
+            batch_page(attr, [(65535, 102)])
+            raise OSError(errno.ENOENT, "last page")
+
+    def open_inner(inner_id):
+        opened.append(inner_id)
+        return inner_id + 1000
+
+    monkeypatch.setattr(maps_mod, "bpf", syscall)
+    monkeypatch.setattr(maps_mod, "map_get_fd_by_id", open_inner)
+    monkeypatch.setattr(maps_mod, "map_max_entries", lambda fd: {1100: 8, 1101: 16, 1102: 32}[fd])
+    monkeypatch.setattr(maps_mod.os, "close", closed.append)
+    assert readable_map._read_kernel() == {0: 8, 443: 16, 65535: 32}
+    assert calls == [None, 443]
+    assert opened == [100, 101, 102]
+    assert closed == [1100, 1101, 1102]
+
+
+@pytest.mark.parametrize("unsupported", [errno.EINVAL, errno.EOPNOTSUPP, errno.ENOSYS])
+def test_unsupported_batch_falls_back_to_single_slot_reads(readable_map, monkeypatch, unsupported):
+    readable_map._max_entries = 4
+    commands = []
+
+    def syscall(cmd, attr):
+        commands.append(cmd)
+        if cmd == maps_mod.BPF_MAP_LOOKUP_BATCH:
+            raise OSError(unsupported, "unsupported batch")
+        assert cmd == maps_mod.BPF_MAP_LOOKUP_ELEM
+        fd, key, value = struct.unpack_from("=I4xQQ", attr)
+        assert fd == 42
+        port = ctypes.c_uint32.from_address(key).value
+        if port != 3:
+            raise OSError(errno.ENOENT, "empty slot")
+        ctypes.c_uint32.from_address(value).value = 123
+
+    monkeypatch.setattr(maps_mod, "bpf", syscall)
+    monkeypatch.setattr(maps_mod, "map_get_fd_by_id", lambda inner_id: inner_id)
+    monkeypatch.setattr(maps_mod, "map_max_entries", lambda fd: 8192)
+    with mock.patch.object(maps_mod.os, "close") as close:
+        assert readable_map._read_kernel() == {3: 8192}
+    close.assert_called_once_with(123)
+    assert commands == [maps_mod.BPF_MAP_LOOKUP_BATCH] + [maps_mod.BPF_MAP_LOOKUP_ELEM] * 4
+
+
+@pytest.mark.parametrize("failure", [errno.EPERM, errno.EFAULT, errno.EIO])
+def test_batch_read_errors_preserve_cache(readable_map, monkeypatch, failure):
+    readable_map._cache = {443: 8192}
+    syscall = mock.Mock(side_effect=OSError(failure, "read failed"))
+    monkeypatch.setattr(maps_mod, "bpf", syscall)
+    with pytest.raises(OSError) as exc:
+        readable_map.verify()
+    assert exc.value.errno == failure
+    assert readable_map.active() == {443: 8192}
+    assert syscall.call_count == 1
+
+
+def test_inner_metadata_failure_closes_fd_and_preserves_cache(readable_map, monkeypatch):
+    readable_map._cache = {443: 8192}
+
+    def syscall(cmd, attr):
+        batch_page(attr, [(443, 100)])
+        raise OSError(errno.ENOENT, "last page")
+
+    monkeypatch.setattr(maps_mod, "bpf", syscall)
+    monkeypatch.setattr(maps_mod, "map_get_fd_by_id", lambda inner_id: 123)
+    monkeypatch.setattr(maps_mod, "map_max_entries", mock.Mock(side_effect=OSError(errno.EIO, "metadata failed")))
+    with mock.patch.object(maps_mod.os, "close") as close, pytest.raises(OSError):
+        readable_map.verify()
+    close.assert_called_once_with(123)
+    assert readable_map.active() == {443: 8192}
+
+
+@pytest.mark.parametrize("failure", [errno.EIO, errno.EOPNOTSUPP])
+def test_error_after_first_batch_does_not_publish_partial_cache(readable_map, monkeypatch, failure):
+    readable_map._cache = {443: 8192}
+    calls = []
+
+    def syscall(cmd, attr):
+        calls.append(cmd)
+        if len(calls) == 1:
+            batch_page(attr, [(22, 100)])
+        else:
+            raise OSError(failure, "next page failed")
+
+    monkeypatch.setattr(maps_mod, "bpf", syscall)
+    monkeypatch.setattr(maps_mod, "map_get_fd_by_id", lambda inner_id: 123)
+    monkeypatch.setattr(maps_mod, "map_max_entries", lambda fd: 8192)
+    with mock.patch.object(maps_mod.os, "close"), pytest.raises(OSError):
+        readable_map.verify()
+    assert calls == [maps_mod.BPF_MAP_LOOKUP_BATCH] * 2
+    assert readable_map.active() == {443: 8192}
+
+
+def test_disappearing_inner_map_is_not_treated_as_end_of_batch(readable_map, monkeypatch):
+    readable_map._cache = {443: 8192}
+
+    def syscall(cmd, attr):
+        batch_page(attr, [(443, 100)])
+        raise OSError(errno.ENOENT, "last page")
+
+    monkeypatch.setattr(maps_mod, "bpf", syscall)
+    monkeypatch.setattr(maps_mod, "map_get_fd_by_id", mock.Mock(side_effect=OSError(errno.ENOENT, "inner disappeared")))
+    with pytest.raises(OSError):
+        readable_map.verify()
+    assert readable_map.active() == {443: 8192}
+
+
+@pytest.mark.parametrize("count", [0, 1025])
+def test_invalid_batch_count_cannot_confirm_or_loop_forever(readable_map, monkeypatch, count):
+    readable_map._cache = {443: 8192}
+
+    def syscall(cmd, attr):
+        struct.pack_into("=I", attr, 32, count)
+
+    monkeypatch.setattr(maps_mod, "bpf", syscall)
+    with pytest.raises(OSError) as exc:
+        readable_map.verify()
+    assert exc.value.errno == errno.EIO
+    assert readable_map.active() == {443: 8192}
 
 
 if __name__ == "__main__":

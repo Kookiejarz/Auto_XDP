@@ -8,6 +8,7 @@ import os
 import socket
 import struct
 import subprocess
+from collections.abc import Iterator
 from typing import Any
 
 from auto_xdp import config as cfg
@@ -982,9 +983,46 @@ class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
         return dict(self._cache)
 
     def _read_kernel(self) -> dict[int, int]:
-        """Full slot scan. O(65536) lookups; runs at init and on verify()
-        (30s cadence / after failed applies) — accepted cost."""
+        """Read all occupied slots and verify their inner-map capacities."""
         out: dict[int, int] = {}
+        for port, inner_id in self._iter_inner_maps():
+            ifd = map_get_fd_by_id(inner_id)
+            try:
+                out[port] = map_max_entries(ifd)
+            finally:
+                os.close(ifd)
+        return out
+
+    def _iter_inner_maps(self) -> Iterator[tuple[int, int]]:
+        batch_size = min(self._max_entries, 1024)
+        keys = ctypes.create_string_buffer(4 * batch_size)
+        values = ctypes.create_string_buffer(4 * batch_size)
+        cursor = ctypes.create_string_buffer(4)
+        attr = ctypes.create_string_buffer(56)
+        in_batch = 0
+        while True:
+            struct.pack_into("=QQQQIIQQ", attr, 0, in_batch,
+                             ctypes.addressof(cursor), ctypes.addressof(keys),
+                             ctypes.addressof(values), batch_size, self.fd, 0, 0)
+            finished = False
+            try:
+                bpf(BPF_MAP_LOOKUP_BATCH, attr)
+            except OSError as exc:
+                if not in_batch and exc.errno in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOSYS):
+                    break  # Older kernels may not support batch reads for map-in-map.
+                if exc.errno != errno.ENOENT:
+                    raise
+                finished = True  # The final ENOENT can still contain entries.
+            count = struct.unpack_from("=I", attr, 32)[0]
+            if count > batch_size or (not count and not finished):
+                raise OSError(errno.EIO, "invalid BPF outer-map batch count")
+            for index in range(count):
+                yield (struct.unpack_from("=I", keys, index * 4)[0],
+                       struct.unpack_from("=I", values, index * 4)[0])
+            if finished:
+                return
+            in_batch = ctypes.addressof(cursor)
+
         key = ctypes.create_string_buffer(4)
         val = ctypes.create_string_buffer(4)
         attr = ctypes.create_string_buffer(64)
@@ -999,16 +1037,7 @@ class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
                 if exc.errno != errno.ENOENT:
                     raise
                 continue  # empty slot
-            (inner_id,) = struct.unpack_from("=I", val, 0)
-            try:
-                ifd = map_get_fd_by_id(inner_id)
-            except OSError:
-                raise
-            try:
-                out[port] = map_max_entries(ifd)
-            finally:
-                os.close(ifd)
-        return out
+            yield port, struct.unpack_from("=I", val, 0)[0]
 
     def _update_slot(self, port: int, inner_fd: int) -> bool:
         key = ctypes.create_string_buffer(4)
