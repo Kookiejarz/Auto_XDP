@@ -5,8 +5,9 @@ const { join } = require('node:path');
 const vm = require('node:vm');
 
 const html = readFileSync(join(__dirname, '../website/src/index.html'), 'utf8');
-const script = html.slice(html.lastIndexOf('<script>') + 8, html.lastIndexOf('</script>'));
-new vm.Script(script); // Check syntax of the entire page script too.
+const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]);
+scripts.forEach(script => new vm.Script(script)); // Check every inline page script.
+const script = scripts.find(script => script.includes('/* THEME PREFERENCE'));
 const preference = script.slice(script.indexOf('/* THEME PREFERENCE'), script.indexOf('/* GITHUB STATS'));
 const toggle = script.slice(script.indexOf('/* THEME TOGGLE */'));
 
