@@ -1439,24 +1439,32 @@ test_nftables_packet_path() {
     PYTHONPATH="$REPO_ROOT" python3 - <<'PYEOF' || return 1
 from auto_xdp import config as cfg
 from auto_xdp.backends.nftables import NftablesBackend
-from auto_xdp.state import DesiredState
+from auto_xdp.state import DesiredState, EndpointPolicy
 
 cfg.NFT_FAMILY = "inet"
 cfg.NFT_TABLE = "axdp_integ"
 cfg.BOGON_FILTER_ENABLED = False
 cfg.SLOT_DEFAULT_ACTION = "drop"
+endpoint = ("tcp", "*", 7707, "public")
 backend = NftablesBackend()
 try:
-    backend.reconcile(
-        DesiredState(tcp_ports={7707}, bogon_filter_enabled=False),
+    result = backend.reconcile(
+        DesiredState(
+            endpoint_policies={endpoint: EndpointPolicy(allow=True, reason="test grant")},
+            bogon_filter_enabled=False,
+        ),
         dry_run=False,
     )
+    assert result.successful, result
+    assert result.applied.endpoint_admission[endpoint] == "admitted", result
 finally:
     backend.close()
 PYEOF
 
     _tcp_probe 7707 || { echo "nftables did not accept SYN to allowed TCP port"; return 1; }
     _tcp_probe 7708 && { echo "nftables did not drop SYN to closed TCP port"; return 1; }
+    _tcp_probe 7707 "$_HOST_IP6" inet6 || { echo "nftables did not accept IPv6 SYN to allowed TCP port"; return 1; }
+    _tcp_probe 7708 "$_HOST_IP6" inet6 && { echo "nftables did not drop IPv6 SYN to closed TCP port"; return 1; }
     return 0
 }
 
