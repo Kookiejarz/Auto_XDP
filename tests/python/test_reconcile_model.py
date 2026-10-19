@@ -12,7 +12,7 @@ from auto_xdp.backends.nftables import NftablesBackend
 from auto_xdp.backends.xdp import XdpBackend
 from auto_xdp.bpf.maps import BpfEndpointScopeMap, CacheVerifyMixin
 from auto_xdp.state import (
-    AppliedState, DesiredState, EndpointPolicy, ObservedState, RuntimeEndpoint, ReconcileStep,
+    AppliedState, BackendProjection, DesiredState, EndpointPolicy, ObservedState, RuntimeEndpoint, ReconcileStep,
     compute_reconcile_plan, project_endpoint_policies,
 )
 from test_xdp_port_sync import (
@@ -166,6 +166,80 @@ def test_xdp_reports_partial_failure_and_confirms_closed_admission():
     assert KEY in result.blocked_endpoints and KEY in result.closed_endpoints
     assert result.applied.endpoint_admission[KEY] == "closed"
     assert all(not value for value in backend.endpoint_map.active().values())
+
+
+@pytest.mark.parametrize("grant", [None, KEY, ("tcp", "0.0.0.0", 22, "public")])
+def test_xdp_confirms_denied_scopes_when_vpn_interfaces_and_zone_are_absent(grant):
+    policies = {
+        ("tcp", address, 22, zone): EndpointPolicy(False, "no grant")
+        for address in ("0.0.0.0", "::") for zone in ("public", "trusted")
+    }
+    policies[("udp", "10.1.0.126", 68, "unknown")] = EndpointPolicy(False, "no attribution")
+    if grant is not None:
+        policies[grant] = EndpointPolicy(True, "grant")
+    desired = target(policies, ZONES={"public": {"interfaces": []},
+                                     "trusted": {"interfaces": ["tailscale0", "wg0"]}})
+    backend = xdp_backend()
+    with mock.patch.object(socket, "if_nametoindex", side_effect=OSError("no interface with this name")), \
+         mock.patch.object(socket, "if_nameindex", return_value=[(1, "lo"), (7, "eth0")]):
+        result = backend.reconcile(desired, False)
+    assert result.successful, result.unconfirmed
+    assert result.closed_endpoints == {key for key, value in policies.items() if not value.allow}
+    assert result.applied.endpoint_admission == {
+        key: "admitted" if value.allow else "closed" for key, value in policies.items()
+    }
+
+
+@pytest.mark.parametrize("address,family,raw_address,ifindex", [
+    ("10.1.0.126", 2, "10.1.0.126", 0),
+    ("10.1.0.126", 2, "0.0.0.0", 7),
+    ("0.0.0.0", 2, "10.1.0.126", 0),
+    ("2001:db8::1", 10, "::", 0),
+    ("::", 10, "2001:db8::1", 7),
+    ("*", 10, "2001:db8::1", 0),
+])
+def test_unresolved_denial_stays_unknown_if_readback_finds_a_matching_allow(address, family, raw_address, ifindex):
+    denied = ("udp", address, 68, "unknown")
+    desired = target({denied: EndpointPolicy(False, "no attribution")}, ZONES={})
+    backend = xdp_backend()
+    packed = socket.inet_pton(socket.AF_INET if family == 2 else socket.AF_INET6, raw_address).ljust(16, b"\0")
+    raw = struct.pack("=IHBB16s", ifindex, 68, 17, family, packed)
+    reads = 0
+
+    def readback():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            backend.endpoint_map.cache[raw] = 1
+            return 1
+        return 0
+
+    backend.endpoint_map.verify = readback
+    result = backend.reconcile(desired, False)
+    assert not result.successful
+    assert result.applied.endpoint_admission[denied] == "unknown"
+    assert denied not in result.closed_endpoints
+    assert "endpoint_map" in result.unconfirmed
+
+
+@pytest.mark.parametrize("failure", ["readback", "gate", "legacy_gate_disabled", "dry_run", "interface_lookup"])
+def test_unresolved_denial_requires_verified_map_and_enabled_gate(failure):
+    denied = ("udp", "10.1.0.126", 68, "trusted" if failure == "interface_lookup" else "unknown")
+    desired = target({denied: EndpointPolicy(False, "no attribution")},
+                     ZONES={"trusted": {"interfaces": ["wg0"]}})
+    backend = xdp_backend()
+    if failure == "readback":
+        backend.endpoint_map.unreadable = True
+    elif failure == "gate":
+        backend.runtime_config_map.get_cfg_flags = lambda: 0
+    elif failure == "legacy_gate_disabled":
+        desired = BackendProjection(config=desired.config, endpoint_policies=desired.endpoint_policies)
+    with mock.patch.object(socket, "if_nametoindex", side_effect=OSError("no interface with this name")), \
+         mock.patch.object(socket, "if_nameindex", side_effect=OSError(errno.EPERM, "lookup denied")):
+        result = backend.reconcile(desired, failure == "dry_run")
+    assert not result.successful
+    assert result.applied.endpoint_admission.get(denied, "unknown") == "unknown"
+    assert denied not in result.closed_endpoints
 
 
 def test_xdp_honors_plan_dependencies_before_admitting_endpoints():
