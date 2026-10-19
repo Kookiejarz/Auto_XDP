@@ -856,6 +856,41 @@ class XdpBackend(PortBackend):
                     values.setdefault(deny, 0)
         return values, blocked
 
+    @staticmethod
+    def _unresolved_scope_closed(
+        key: EndpointKey, config: cfg.ConfigSnapshot, active: Mapping[bytes, int],
+    ) -> bool:
+        """Prove default-deny closure when no native scope key can be emitted.
+
+        The caller must first confirm the scope map and enabled endpoint gate.
+        Any potentially matching allow keeps an unresolved scope unconfirmed.
+        """
+        protocol, address, port, zone = key
+        interfaces = tuple(name for name in config.ZONES.get(zone, {}).get("interfaces", ()) if name != "*")
+        indexes = None
+        if interfaces:
+            try:
+                indexes = {index for index, name in socket.if_nameindex() if name in interfaces}
+            except OSError:
+                return False
+            if not indexes:
+                return True  # This named zone currently has no ingress interface.
+        ip = None if address == "*" else ipaddress.ip_address(address.split("%", 1)[0])
+        families = (2, 10) if ip is None else (2 if ip.version == 4 else 10,)
+        packed = None if ip is None or ip.is_unspecified else ip.packed.ljust(16, b"\0")
+        proto = {"tcp": 6, "udp": 17, "sctp": 132}[protocol]
+        for raw, allow in active.items():
+            if not allow:
+                continue
+            raw_index, raw_port, raw_proto, raw_family, raw_address = struct.unpack("=IHBB16s", raw)
+            if raw_port != port or raw_proto != proto or raw_family not in families:
+                continue
+            if indexes is not None and raw_index != 0 and raw_index not in indexes:
+                continue
+            if packed is None or raw_address in (bytes(16), packed):
+                return False
+        return True
+
     def verify_kernel_state(self) -> int:
         """Re-read userspace-owned config maps from the kernel and repair caches.
 
@@ -1383,6 +1418,8 @@ class XdpBackend(PortBackend):
                 known = bool(values) and key not in errors and all(scope_map.active().get(raw) == value or
                     (not value and raw not in scope_map.active() and not any(scope_map.active().values()))
                     for raw, value in values.items())
+                if not values and not policy.allow and desired_state.endpoint_policy_enabled:
+                    known = self._unresolved_scope_closed(key, desired_state.config, scope_map.active())
                 admitted = known and policy.allow
                 if admitted:
                     proto, _, port, zone = key
