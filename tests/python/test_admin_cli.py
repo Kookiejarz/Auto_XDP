@@ -164,7 +164,7 @@ with tempfile.TemporaryDirectory() as directory:
             pin_dir.mkdir(parents=True)
             run_dir.mkdir()
             (pin_dir / "prog").write_text("")
-            env_config.write_text('IFACES="eth0"\n')
+            env_config.write_text(f'IFACES="eth0"\nRUNTIME_STATE="{root / "runtime.json"}"\n')
             attached = {"eth0": 77}
 
             def run_text(command):
@@ -193,7 +193,7 @@ with tempfile.TemporaryDirectory() as directory:
             pin_dir.mkdir(parents=True)
             run_dir.mkdir()
             (pin_dir / "prog").write_text("")
-            env_config.write_text('IFACES="eth0"\n')
+            env_config.write_text(f'IFACES="eth0"\nRUNTIME_STATE="{root / "runtime.json"}"\n')
             attached = {"eth0": None, "eth1": 77}
 
             def run_text(command):
