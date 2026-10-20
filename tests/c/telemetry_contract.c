@@ -14,7 +14,7 @@ static void submit(void *record, __u64 flags);
 #include "bpf/include/common.h"
 
 static __u64 counts[CNT_MAX];
-static __u64 bytes[4];
+static struct xdp_traffic_totals totals;
 static struct xdp_runtime_cfg config;
 static struct pkt_event event;
 static bool full;
@@ -28,7 +28,7 @@ static void *lookup(void *map, const void *key)
     if (map == &pkt_counters)
         return idx < CNT_MAX ? &counts[idx] : NULL;
     if (map == &byte_counters)
-        return idx < 4 ? &bytes[idx] : NULL;
+        return idx == 0 ? &totals : NULL;
     return NULL;
 }
 
@@ -78,6 +78,7 @@ int main(void)
 
     count_bytes(false, 100);
     count_bytes(true, 200);
-    assert(bytes[0] == 300 && bytes[1] == 200 && bytes[2] == 2 && bytes[3] == 1);
+    assert(totals.total_bytes == 300 && totals.drop_bytes == 200);
+    assert(totals.total_pkts == 2 && totals.drop_pkts == 1);
     return 0;
 }

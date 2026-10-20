@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,56 @@ from auto_xdp.telemetry.events import COUNTER_NAMES
 
 
 _NFT_CHAIN = "input"
+
+
+def _decode_byte_counters(data: Any) -> tuple[int, int, int, int]:
+    """Decode struct totals and legacy 2/4-entry scalar bpftool dumps."""
+    unavailable = (-1, -1, -1, -1)
+    fields = ("total_bytes", "drop_bytes", "total_pkts", "drop_pkts")
+
+    def integer(value: Any) -> int:
+        if isinstance(value, list):
+            raw = bytes(int(v, 0) if isinstance(v, str) else v for v in value)
+            return int.from_bytes(raw, sys.byteorder)
+        return int(value, 0) if isinstance(value, str) else int(value)
+
+    def record(value: Any) -> tuple[int, ...]:
+        if isinstance(value, dict):
+            return tuple(integer(value[field]) for field in fields)
+        if isinstance(value, list):
+            if len(value) == 32:
+                return tuple(integer(value[offset:offset + 8]) for offset in range(0, 32, 8))
+            if len(value) != 8:
+                raise ValueError("unexpected traffic counter value size")
+        return (integer(value),)
+
+    if not isinstance(data, list) or not data:
+        return unavailable
+    scalar_totals: dict[int, int] = {}
+    try:
+        for raw_row in data:
+            row = raw_row.get("formatted", raw_row)
+            index = integer(row["key"])
+            if "values" in row:
+                values = [record(item["value"] if isinstance(item, dict) else item)
+                          for item in row["values"]]
+            else:
+                values = [record(row["value"])]
+            if not values:
+                return unavailable
+            if len(values[0]) == 4:
+                if index != 0 or len(data) != 1 or any(len(value) != 4 for value in values):
+                    return unavailable
+                totals = [sum(value[i] for value in values) for i in range(4)]
+                return totals[0], totals[1], totals[2], totals[3]
+            if any(len(value) != 1 for value in values):
+                return unavailable
+            scalar_totals[index] = sum(value[0] for value in values)
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        # Missing or malformed telemetry must not look like a counter reset.
+        return unavailable
+    return (scalar_totals.get(0, -1), scalar_totals.get(1, -1),
+            scalar_totals.get(2, -1), scalar_totals.get(3, -1))
 
 
 def _read_byte_counters(bpf_pin_dir: str) -> tuple[int, int, int, int]:
@@ -29,52 +80,7 @@ def _read_byte_counters(bpf_pin_dir: str) -> tuple[int, int, int, int]:
     except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
         return -1, -1, -1, -1
 
-    key_vals: dict[int, int] = {}
-    for row in data:
-        k = row.get("key")
-        if isinstance(k, int):
-            idx = k
-        elif isinstance(k, list):
-            b = bytes((int(x, 0) if isinstance(x, str) else x) & 0xFF for x in k[:4])
-            idx = int.from_bytes(b, "little")
-        else:
-            continue
-        v = row.get("values", row.get("value", 0))
-        if isinstance(v, list):
-            total = 0
-            for e in v:
-                if isinstance(e, dict):
-                    val = e.get("value", 0)
-                    if isinstance(val, list):
-                        raw = bytes((int(b, 0) if isinstance(b, str) else int(b)) & 0xFF for b in val)
-                        total += int.from_bytes(raw, "little")
-                    elif isinstance(val, int):
-                        total += val
-                    elif isinstance(val, str):
-                        try:
-                            total += int(val, 0)
-                        except ValueError:
-                            pass
-                elif isinstance(e, str):
-                    try:
-                        total += int(e, 0)
-                    except ValueError:
-                        pass
-                elif isinstance(e, int):
-                    total += e
-        elif isinstance(v, int):
-            total = v
-        else:
-            total = 0
-        key_vals[idx] = key_vals.get(idx, 0) + total
-
-    total_bytes = key_vals.get(0, 0)
-    drop_bytes = key_vals.get(1, 0)
-    # Indices 2/3 (total_pkts/drop_pkts) present only in BPF objects built after
-    # byte_counters was expanded from 2 to 4 entries.
-    total_pkts = key_vals.get(2, -1)
-    drop_pkts = key_vals.get(3, -1)
-    return total_bytes, drop_bytes, total_pkts, drop_pkts
+    return _decode_byte_counters(data)
 
 
 def _read_xdp_rows(bpf_pin_dir: str) -> list[tuple[str, int, int]]:

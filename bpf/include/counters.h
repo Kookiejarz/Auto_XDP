@@ -92,32 +92,34 @@ static __always_inline void count(enum xdp_counter_idx idx)
         (*value)++;
 }
 
-/* index 0 = total bytes, 1 = drop bytes, 2 = total packets, 3 = drops. */
+/* One current-CPU record per packet. Readers aggregate CPUs without resetting
+ * live values; the four fields are cumulative, not an atomic snapshot. */
+struct xdp_traffic_totals {
+    __u64 total_bytes;
+    __u64 drop_bytes;
+    __u64 total_pkts;
+    __u64 drop_pkts;
+};
+
+_Static_assert(sizeof(struct xdp_traffic_totals) == 32, "traffic totals map ABI");
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 4);
+    __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u64);
+    __type(value, struct xdp_traffic_totals);
 } byte_counters SEC(".maps");
 
 static __always_inline void count_bytes(bool is_drop, __u32 pkt_len)
 {
     __u32 key = 0;
-    __u64 *value = bpf_map_lookup_elem(&byte_counters, &key);
-    if (value)
-        (*value) += pkt_len;
-    key = 2;
-    value = bpf_map_lookup_elem(&byte_counters, &key);
-    if (value)
-        (*value)++;
+    struct xdp_traffic_totals *totals = bpf_map_lookup_elem(&byte_counters, &key);
+    if (!totals)
+        return;
+    totals->total_bytes += pkt_len;
+    totals->total_pkts++;
     if (is_drop) {
-        key = 1;
-        value = bpf_map_lookup_elem(&byte_counters, &key);
-        if (value)
-            (*value) += pkt_len;
-        key = 3;
-        value = bpf_map_lookup_elem(&byte_counters, &key);
-        if (value)
-            (*value)++;
+        totals->drop_bytes += pkt_len;
+        totals->drop_pkts++;
     }
 }

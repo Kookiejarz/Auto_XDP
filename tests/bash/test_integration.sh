@@ -466,6 +466,7 @@ test_loaded_map_abi() {
         "$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" MC_VERIFIED_MAX_ENTRIES)" || return 1
     _assert_map_abi udp_global_rl array 4 40 1 || return 1
     _assert_map_abi udp_percpu_acc percpu_array 4 16 1 || return 1
+    _assert_map_abi byte_counters percpu_array 4 32 1 || return 1
 }
 
 test_packet_event_v2_kernel() {
@@ -952,8 +953,9 @@ if lines[7]:
     raise SystemExit("non-Minecraft payload reached the protected listener")
 PYEOF
 
-    python3 - "$_PIN_DIR" <<'PYEOF' || return 1
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" <<'PYEOF' || return 1
 import json, subprocess, sys
+from auto_xdp.admin.stats import _read_byte_counters
 
 def scalar(value):
     if isinstance(value, list):
@@ -976,9 +978,10 @@ if counter(f"{root}/pkt_counters", 36) == 0:
     raise SystemExit("profile allow counter stayed zero")
 if counter(f"{root}/pkt_counters", 37) == 0:
     raise SystemExit("profile drop counter stayed zero")
-if counter(f"{root}/byte_counters", 2) == 0:
+totals = _read_byte_counters(root)
+if totals[2] <= 0:
     raise SystemExit("profile traffic missing from total packet counter")
-if counter(f"{root}/byte_counters", 3) == 0:
+if totals[3] <= 0:
     raise SystemExit("profile drops missing from total drop counter")
 PYEOF
 
