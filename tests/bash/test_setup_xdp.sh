@@ -743,6 +743,37 @@ test_xdp_maps_ready_rejects_endpoint_value_size_mismatch() (
     assert_eq "$status" "1"
 )
 
+test_xdp_maps_ready_rejects_legacy_totals_even_with_old_manifest() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir map_name counter_size=8 counter_entries=4 status
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BPF_PIN_DIR="$tmpdir"
+    while IFS= read -r map_name; do
+        [[ -n "$map_name" ]] && touch "$tmpdir/$map_name"
+    done < <(xdp_required_map_names)
+    printf '# Old generation did not declare the byte_counters ABI.\n' >"$tmpdir/xdp_map_abi.txt"
+    bpftool() {
+        [[ "$*" == "map show pinned $tmpdir/byte_counters" ]] || return 1
+        printf '1: percpu_array name byte_counters flags 0x0\n'
+        printf '    key 4B value %sB max_entries %s\n' "$counter_size" "$counter_entries"
+    }
+
+    xdp_maps_ready >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1" || return 1
+    counter_size=32
+    xdp_maps_ready >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1" || return 1
+    counter_entries=1
+    xdp_maps_ready >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "0"
+)
+
 test_xdp_required_map_manifest_matches_program_maps() (
     local manifest="$REPO_ROOT/auto_xdp/xdp_required_maps.txt"
 

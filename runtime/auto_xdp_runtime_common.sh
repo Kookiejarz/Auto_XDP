@@ -451,6 +451,7 @@ xdp_maps_ready() {
     #   tcp_endpoint_policy / xdp_profile_ctx                      = 24 B
     #   xdp_runtime_cfg  8 × __u64 + 2 × __u32 (cfg_flags + _pad) = 72 B
     #   udp_global_state bpf_spin_lock(4) + __u32(4) + 4×__u64     = 40 B
+    #   xdp_traffic_totals 4 × __u64                              = 32 B
     # Update these numbers whenever the corresponding struct gains or loses fields.
     for map_name in tcp_whitelist tcp_zone_whitelist profile_ctx_map; do
         _map_value_size_ok "${BPF_PIN_DIR}/${map_name}" 24 || {
@@ -466,6 +467,13 @@ xdp_maps_ready() {
         _auto_xdp_warn "udp_global_rl value_size mismatch; forcing XDP reload"
         return 1
     }
+    # Also check outside the manifest: an old pinned generation may carry its
+    # own manifest without the consolidated traffic-counter layout.
+    if ! _map_value_size_ok "${BPF_PIN_DIR}/byte_counters" 32 ||
+       ! _map_max_entries_ok "${BPF_PIN_DIR}/byte_counters" 1; then
+        _auto_xdp_warn "byte_counters layout mismatch; forcing XDP reload"
+        return 1
+    fi
     _xdp_map_abi_ready || return 1
 }
 

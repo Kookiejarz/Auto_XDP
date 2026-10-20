@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 
 from auto_xdp.telemetry.events import decode_event
+from auto_xdp.admin.stats import _read_byte_counters
 from pkt_relay import RingBufReader
 
 
@@ -82,7 +83,9 @@ def run_packet(pin: Path, ifindex: int, packet: bytes) -> tuple[int, bytes]:
 
 
 def byte_counts(pin: Path) -> list[int]:
-    return [counter(pin / "byte_counters", key) for key in range(4)]
+    totals = _read_byte_counters(str(pin))
+    assert all(value >= 0 for value in totals), f"traffic totals unavailable: {totals}"
+    return list(totals)
 
 
 def check_event(raw: bytes, *, reason: int, ifindex: int, packet: bytes,
