@@ -113,7 +113,9 @@ run_static() {
             | sort
     )
     [[ -f ./axdp ]] && shell_files+=(./axdp)
-    run_stage "syntax:shell" bash -n "${shell_files[@]}"
+    for script in "${shell_files[@]}"; do
+        run_stage "syntax:shell:$script" bash -n "$script"
+    done
     log_info "shell syntax files=${#shell_files[@]}"
 
     local metadata_count=0
