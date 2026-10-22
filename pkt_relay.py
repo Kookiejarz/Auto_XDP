@@ -325,6 +325,8 @@ class RelayServer:
         self._max_history_send = max_history_send
         self._clients: dict[int, socket.socket] = {}   # fd → socket
         self._server: socket.socket | None = None
+        self._wakeup_reader: socket.socket | None = None
+        self._wakeup_writer: socket.socket | None = None
         self._running = False
         self._queue: queue.Queue[dict] = queue.Queue(maxsize=EVENT_QUEUE_MAX)
         self._session_id = uuid.uuid4().hex
@@ -458,6 +460,17 @@ class RelayServer:
                 self._port_events_dropped += 1
             else:
                 self._queue_dropped += 1
+        else:
+            self._wake_broadcaster()
+
+    def _wake_broadcaster(self) -> None:
+        wakeup = self._wakeup_writer
+        if wakeup is not None:
+            try:
+                wakeup.send(b"\0")
+            except OSError:
+                # Full or closing socket: events stay queued for the polling fallback.
+                pass
 
     def _health_status(self) -> dict:
         """Cumulative relay counters, independent of retained packet samples."""
@@ -529,25 +542,29 @@ class RelayServer:
     def run(self) -> None:
         self._open_server()
         assert self._server is not None
-        self._running = True
-        log.info("pkt_relay running  retention=%.0fs", self._retention_ns / 1e9)
-
         reader = threading.Thread(target=self._reader_loop, name="rb-reader", daemon=True)
-        reader.start()
-
-        srv_fd = self._server.fileno()
-        last_trim = time.monotonic()
-
         try:
+            self._wakeup_reader, self._wakeup_writer = socket.socketpair()
+            self._wakeup_reader.setblocking(False)
+            self._wakeup_writer.setblocking(False)
+            self._running = True
+            log.info("pkt_relay running  retention=%.0fs", self._retention_ns / 1e9)
+            reader.start()
+            srv_fd = self._server.fileno()
+            wakeup_fd = self._wakeup_reader.fileno()
+            last_trim = time.monotonic()
+
             while self._running:
-                rfds: list[int] = [srv_fd, *self._clients.keys()]
+                rfds: list[int] = [srv_fd, wakeup_fd, *self._clients.keys()]
                 try:
                     readable, _, _ = select.select(rfds, [], [], 0 if not self._queue.empty() else 0.05)
                 except (InterruptedError, ValueError):
                     readable = []
 
                 for rfd in readable:
-                    if rfd == srv_fd:
+                    if rfd == wakeup_fd:
+                        self._wakeup_reader.recv(65536)
+                    elif rfd == srv_fd:
                         self._accept_client()
                     else:
                         conn = self._clients.get(rfd)
@@ -568,11 +585,13 @@ class RelayServer:
                     last_trim = now
         finally:
             self._running = False
-            reader.join(timeout=2.0)
+            if reader.ident is not None:
+                reader.join(timeout=2.0)
             self._cleanup()
 
     def stop(self) -> None:
         self._running = False
+        self._wake_broadcaster()
 
     def _cleanup(self) -> None:
         if self._ss is not None:
@@ -581,6 +600,10 @@ class RelayServer:
         for fd in self._ss_perf_fds:
             os.close(fd)
         self._ss_perf_fds.clear()
+        for wakeup in (self._wakeup_reader, self._wakeup_writer):
+            if wakeup is not None:
+                wakeup.close()
+        self._wakeup_reader = self._wakeup_writer = None
         for conn in list(self._clients.values()):
             try:
                 conn.close()
