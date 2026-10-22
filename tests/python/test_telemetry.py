@@ -1,8 +1,11 @@
 """Production event decoding and relay-pressure contracts; no Linux required."""
 import json
+from pathlib import Path
 import queue
 import socket
 import struct
+import tempfile
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -63,6 +66,13 @@ def relay():
     return pkt_relay.RelayServer(reader, max_events=10)
 
 
+@pytest.fixture
+def relay_path():
+    # Keep Unix socket paths below the platform limit, including on macOS.
+    with tempfile.TemporaryDirectory(prefix="relay-") as directory:
+        yield Path(directory) / "relay.sock"
+
+
 def test_relay_counts_pressure_and_keeps_sequence_gaps_visible():
     server = relay()
     server._queue = queue.Queue(maxsize=1)
@@ -88,6 +98,117 @@ def test_relay_flush_is_bounded_and_history_retains_wire_identity(monkeypatch):
     assert server._queue.qsize() == 1
     assert [event["seq"] for event in server._history] == [1, 2]
     assert server._health_status()["retained_events"] == 2
+
+
+@pytest.mark.component
+@pytest.mark.parametrize("event_count", [0, 1, 5])
+def test_relay_wakes_idle_broadcaster_for_events_and_stop(relay_path, monkeypatch, event_count):
+    server = pkt_relay.RelayServer(Mock(), sock_path=str(relay_path))
+    sender, client = socket.socketpair()
+    sender.setblocking(False)
+    client.settimeout(3)
+    server._clients[sender.fileno()] = sender
+    idle = threading.Event()
+    idle_ready = []
+    errors = []
+    select = pkt_relay.select.select
+
+    def wait_for_work(readers, writers, errors, timeout):
+        if timeout and not idle.is_set():
+            idle.set()
+            # Require FD readiness, not success from the polling timeout.
+            ready = select(readers, writers, errors, 1.0)
+            idle_ready.extend(ready[0])
+            return ready
+        return select(readers, writers, errors, timeout)
+
+    def produce():
+        if idle.wait(3):
+            if not event_count:
+                server.stop()
+            for index in range(event_count):
+                server._enqueue({"type": "port_change", "port": 8000 + index})
+
+    def serve():
+        try:
+            server.run()
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(pkt_relay.select, "select", wait_for_work)
+    monkeypatch.setattr(pkt_relay, "EVENT_BROADCAST_BATCH", 2)
+    monkeypatch.setattr(server, "_reader_loop", produce)
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        assert idle.wait(3), errors
+        if not event_count:
+            worker.join(3)
+        events = []
+        with client.makefile("rb") as stream:
+            while len(events) < event_count:
+                event = json.loads(stream.readline())
+                if event["type"] == "port_change":
+                    events.append(event)
+        assert [event["port"] for event in events] == list(range(8000, 8000 + event_count))
+        assert [event["seq"] for event in events] == list(range(1, event_count + 1))
+    finally:
+        server.stop()
+        worker.join(3)
+        client.close()
+    assert not worker.is_alive()
+    assert not errors
+    assert idle_ready
+    assert sender.fileno() == -1
+    assert not relay_path.exists()
+    assert server._wakeup_reader is server._wakeup_writer is None
+
+
+@pytest.mark.component
+def test_relay_full_wakeup_socket_keeps_events_queued(relay_path):
+    server = pkt_relay.RelayServer(Mock(), sock_path=str(relay_path))
+    wake_reader, wake_writer = socket.socketpair()
+    server._wakeup_reader, server._wakeup_writer = wake_reader, wake_writer
+    wake_reader.setblocking(False)
+    wake_writer.setblocking(False)
+    try:
+        while True:
+            try:
+                wake_writer.send(b"\0" * 65536)
+            except BlockingIOError:
+                break
+        server._enqueue({"type": "port_change", "port": 443})
+        assert server._queue.get_nowait()["port"] == 443
+        assert server._port_events_dropped == 0
+        assert pkt_relay.select.select([wake_reader], [], [], 0)[0] == [wake_reader]
+    finally:
+        server._cleanup()
+    assert wake_reader.fileno() == wake_writer.fileno() == -1
+
+
+@pytest.mark.component
+@pytest.mark.parametrize("failure", ["socketpair", "thread"])
+def test_relay_startup_failure_closes_owned_sockets(relay_path, monkeypatch, failure):
+    server = pkt_relay.RelayServer(Mock(), sock_path=str(relay_path))
+    socketpair = socket.socketpair
+    opened = []
+
+    def open_wakeup():
+        if failure == "socketpair":
+            raise OSError("cannot allocate wakeup sockets")
+        pair = socketpair()
+        opened.extend(pair)
+        return pair
+
+    monkeypatch.setattr(pkt_relay.socket, "socketpair", open_wakeup)
+    monkeypatch.setattr(threading.Thread, "start", Mock(side_effect=RuntimeError("cannot start reader")))
+    with pytest.raises((OSError, RuntimeError)):
+        server.run()
+    assert not server._running
+    assert server._server.fileno() == -1
+    assert all(sock.fileno() == -1 for sock in opened)
+    assert server._wakeup_reader is server._wakeup_writer is None
+    assert not relay_path.exists()
 
 
 def test_ring_reader_accepts_mixed_versions_and_counts_unsupported_records():
