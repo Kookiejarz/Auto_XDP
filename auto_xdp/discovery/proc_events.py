@@ -27,13 +27,17 @@ def _make_subscribe_msg(pid: int) -> bytes:
 
 
 def open_proc_connector() -> socket.socket | None:
+    sock = None
     try:
         sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, _NETLINK_CONNECTOR)
         sock.bind((os.getpid(), _CN_IDX_PROC))
         sock.send(_make_subscribe_msg(os.getpid()))
+        sock.setblocking(False)
         log.info("Netlink proc connector active -> event-driven mode.")
         return sock
     except OSError as exc:
+        if sock is not None:
+            sock.close()
         log.warning(
             "Netlink unavailable (%s); using relay and periodic reconciliation.",
             exc,
@@ -42,15 +46,15 @@ def open_proc_connector() -> socket.socket | None:
 
 
 def drain_proc_events(sock: socket.socket) -> bool:
-    """Drain buffered netlink messages; return True if any EXEC/EXIT was seen."""
+    """Read a bounded batch so a proc storm cannot starve other event sources."""
     triggered = False
-    while True:
+    for _ in range(8):
         try:
             rdy, _, _ = select.select([sock], [], [], 0)
             if not rdy:
                 break
             data = sock.recv(4096)
-        except OSError:
+        except BlockingIOError:
             break
         offset = 0
         while offset + _NLMSG_HDRLEN <= len(data):

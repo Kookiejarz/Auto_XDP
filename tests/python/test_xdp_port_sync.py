@@ -2113,125 +2113,71 @@ class MapVerifyTests(unittest.TestCase):
 
 @pytest.mark.component
 class SyncerVerifyTriggerTests(unittest.TestCase):
-    def _run_watch(self, backend, select_effects):
-        nl = mock.MagicMock()
+    def _run_watch(self, backend, hints, *, debounce=0.0, interval=30.0, effects=None):
+        notifications = mock.MagicMock()
+        notifications.wait.side_effect = hints
         with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
-             mock.patch.object(syncer_mod, "open_proc_connector", return_value=nl), \
-             mock.patch.object(syncer_mod, "_open_relay_client", return_value=None), \
-             mock.patch.object(syncer_mod, "drain_proc_events", return_value=True), \
-             mock.patch.object(syncer_mod, "sync_once") as sync_once, \
-             mock.patch.object(syncer_mod.select, "select", side_effect=select_effects), \
-             mock.patch.object(cfg, "DEBOUNCE_SECONDS", 0.0):
+             mock.patch.object(syncer_mod, "NotificationReceiver", return_value=notifications), \
+             mock.patch.object(syncer_mod, "sync_once", side_effect=effects) as sync_once, \
+             mock.patch.object(cfg, "DEBOUNCE_SECONDS", debounce), \
+             mock.patch.object(syncer_mod, "FULL_RECONCILE_INTERVAL_SECONDS", interval):
             syncer_mod.watch(
-                dry_run=False,
-                backend_name="xdp",
-                monotonic=lambda: 100.0,
-                mode="enforce",
+                dry_run=False, backend_name="xdp", monotonic=lambda: 100.0, mode="enforce",
             )
+        notifications.start.assert_called_once()
+        notifications.close.assert_called_once()
         return sync_once
 
-    def test_failed_apply_triggers_verify_and_corrective_sync(self):
+    def _backend(self):
         backend = mock.MagicMock()
-        backend.last_apply_failures = 3
+        backend.last_apply_failures = 0
         backend.is_stale.return_value = False
         backend.verify_kernel_state.return_value = 0
+        return backend
 
+    def test_failed_apply_triggers_verify_and_corrective_sync(self):
+        from auto_xdp.discovery.notifications import Notification
+        backend = self._backend()
+        backend.last_apply_failures = 3
         sync_once = self._run_watch(
-            backend,
-            [([mock.ANY], [], []), ([], [], []), KeyboardInterrupt()],
+            backend, [Notification(100.0, 100.0, False), None, KeyboardInterrupt()],
         )
-
-        # init sync + event sync + debounce-armed corrective sync
         self.assertEqual(sync_once.call_count, 3)
         self.assertTrue(backend.verify_kernel_state.called)
 
     def test_periodic_stale_check_verifies_kernel_state(self):
-        backend = mock.MagicMock()
-        backend.last_apply_failures = 0
-        backend.is_stale.return_value = False
-        backend.verify_kernel_state.return_value = 0
-
-        nl = mock.MagicMock()
-        with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
-             mock.patch.object(syncer_mod, "open_proc_connector", return_value=nl), \
-             mock.patch.object(syncer_mod, "_open_relay_client", return_value=None), \
-             mock.patch.object(syncer_mod, "drain_proc_events", return_value=True), \
-             mock.patch.object(syncer_mod, "sync_once"), \
-             mock.patch.object(
-                 syncer_mod.select,
-                 "select",
-                 side_effect=[([], [], []), KeyboardInterrupt()],
-             ), \
-             mock.patch.object(cfg, "DEBOUNCE_SECONDS", 0.0):
-            syncer_mod.watch(
-                dry_run=False,
-                backend_name="xdp",
-                monotonic=lambda: 100.0,
-                mode="enforce",
-            )
-
+        backend = self._backend()
+        self._run_watch(backend, [None, KeyboardInterrupt()])
         backend.is_stale.assert_called_once()
         backend.verify_kernel_state.assert_called_once()
 
-    def test_netlink_unavailable_does_not_block_relay_sync(self):
-        backend = mock.MagicMock()
-        backend.last_apply_failures = 0
-        backend.is_stale.return_value = False
-        backend.verify_kernel_state.return_value = 0
-        relay = mock.MagicMock()
+    def test_relay_hint_bypasses_proc_debounce(self):
+        from auto_xdp.discovery.notifications import Notification
+        sync_once = self._run_watch(
+            self._backend(), [Notification(100.0, 100.0, True), KeyboardInterrupt()],
+            debounce=60.0,
+        )
+        self.assertEqual(sync_once.call_count, 2)
 
-        with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
-             mock.patch.object(syncer_mod, "open_proc_connector", return_value=None), \
-             mock.patch.object(syncer_mod, "_open_relay_client", return_value=relay) as open_relay, \
-             mock.patch.object(syncer_mod, "_drain_relay_lines", return_value=True), \
-             mock.patch.object(syncer_mod, "sync_once") as sync_once, \
-             mock.patch.object(
-                 syncer_mod.select,
-                 "select",
-                 side_effect=[([relay], [], []), KeyboardInterrupt()],
-             ):
-            syncer_mod.watch(dry_run=False, backend_name="xdp", mode="enforce")
-
-        open_relay.assert_called()
-        # Initial reconcile plus the relay-triggered reconcile.
+    def test_proc_hint_retains_first_receipt_time_for_max_wait(self):
+        from auto_xdp.discovery.notifications import Notification
+        sync_once = self._run_watch(
+            self._backend(), [Notification(98.0, 100.0, False), KeyboardInterrupt()],
+            debounce=60.0,
+        )
         self.assertEqual(sync_once.call_count, 2)
 
     def test_periodic_reconcile_runs_without_event_sources(self):
-        backend = mock.MagicMock()
-        backend.last_apply_failures = 0
-        backend.is_stale.return_value = False
-        backend.verify_kernel_state.return_value = 0
-
-        with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
-             mock.patch.object(syncer_mod, "open_proc_connector", return_value=None), \
-             mock.patch.object(syncer_mod, "_open_relay_client", return_value=None), \
-             mock.patch.object(syncer_mod, "sync_once") as sync_once, \
-             mock.patch.object(syncer_mod.time, "sleep", side_effect=[None, KeyboardInterrupt()]), \
-             mock.patch.object(syncer_mod, "FULL_RECONCILE_INTERVAL_SECONDS", 0.0):
-            syncer_mod.watch(dry_run=False, backend_name="xdp", mode="enforce")
-
-        # Initial reconcile plus a timer-triggered full reconcile.
+        sync_once = self._run_watch(self._backend(), [None, KeyboardInterrupt()], interval=0.0)
         self.assertEqual(sync_once.call_count, 2)
 
     def test_discovery_error_keeps_existing_policy_and_backend(self):
-        backend = mock.MagicMock()
-        backend.last_apply_failures = 0
-        backend.is_stale.return_value = False
-        backend.verify_kernel_state.return_value = 0
-        with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
-             mock.patch.object(syncer_mod, "open_proc_connector", return_value=None), \
-             mock.patch.object(syncer_mod, "_open_relay_client", return_value=None), \
-             mock.patch.object(
-                 syncer_mod,
-                 "sync_once",
-                 side_effect=[None, DiscoveryError("truncated dump"), KeyboardInterrupt()],
-             ), \
-             mock.patch.object(syncer_mod.time, "sleep", return_value=None), \
-             mock.patch.object(syncer_mod, "FULL_RECONCILE_INTERVAL_SECONDS", 0.0):
-            with self.assertLogs("auto_xdp.syncer", level="ERROR") as logs:
-                syncer_mod.watch(dry_run=False, backend_name="xdp", mode="enforce")
-        # Discovery failures must not tear down a working backend mid-loop.
-        # The only close() is the shutdown path in watch()'s finally block.
+        backend = self._backend()
+        with self.assertLogs("auto_xdp.syncer", level="ERROR") as logs:
+            self._run_watch(
+                backend, [None, None, KeyboardInterrupt()], interval=0.0,
+                effects=[None, DiscoveryError("truncated dump"), KeyboardInterrupt()],
+            )
         self.assertEqual(backend.close.call_count, 1)
         self.assertTrue(any("keeping existing policy" in line for line in logs.output), logs.output)
 

@@ -253,7 +253,7 @@ class TestRelaySecurity(unittest.TestCase):
             self.assertEqual(target.read_text(), "protected")
 
 
-import auto_xdp.syncer as syncer_mod
+import auto_xdp.discovery.notifications as notifications_mod
 
 
 class TestSyncerDrainRelayLines(unittest.TestCase):
@@ -265,21 +265,21 @@ class TestSyncerDrainRelayLines(unittest.TestCase):
         }).encode() + b"\n"
         fake_sock = mock.MagicMock()
         fake_sock.recv.side_effect = [line, BlockingIOError()]
-        triggered = syncer_mod._drain_relay_lines(fake_sock)
+        triggered = notifications_mod._drain_relay_lines(fake_sock)
         self.assertTrue(triggered)
 
     def test_non_port_change_line_returns_false(self):
         line = json.dumps({"type": "event", "verdict": "DROP"}).encode() + b"\n"
         fake_sock = mock.MagicMock()
         fake_sock.recv.side_effect = [line, BlockingIOError()]
-        triggered = syncer_mod._drain_relay_lines(fake_sock)
+        triggered = notifications_mod._drain_relay_lines(fake_sock)
         self.assertFalse(triggered)
 
     def test_empty_recv_raises_connection_reset(self):
         fake_sock = mock.MagicMock()
         fake_sock.recv.return_value = b""
         with self.assertRaises(ConnectionResetError):
-            syncer_mod._drain_relay_lines(fake_sock)
+            notifications_mod._drain_relay_lines(fake_sock)
 
     def test_port_change_split_across_reads_is_preserved(self):
         line = json.dumps({
@@ -291,11 +291,11 @@ class TestSyncerDrainRelayLines(unittest.TestCase):
         fake_sock = mock.MagicMock()
         fake_sock.recv.side_effect = [line[:split_at], BlockingIOError()]
 
-        self.assertFalse(syncer_mod._drain_relay_lines(fake_sock, pending))
+        self.assertFalse(notifications_mod._drain_relay_lines(fake_sock, pending))
         self.assertEqual(bytes(pending), line[:split_at])
 
         fake_sock.recv.side_effect = [line[split_at:], BlockingIOError()]
-        self.assertTrue(syncer_mod._drain_relay_lines(fake_sock, pending))
+        self.assertTrue(notifications_mod._drain_relay_lines(fake_sock, pending))
         self.assertEqual(pending, bytearray())
 
 
