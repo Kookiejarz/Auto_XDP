@@ -488,7 +488,6 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
     bpf_pin_dir, _, handlers_dir = _slot_paths(args)
     proto = str(args.proto).lower()
     port = handlers.normalize_handler_port(int(args.port))
-    slot_ctx_map = bpf_pin_dir / "slot_ctx_map"
     handler_map = handlers.port_handler_map_path(bpf_pin_dir, proto)
 
     source_path = Path(args.path)
@@ -511,29 +510,14 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
         print(f"Handler object not found: {obj_path}", file=sys.stderr)
         return 1
     obj_path = obj_path.resolve()
-    if not slot_ctx_map.exists():
-        print("XDP not loaded (slot_ctx_map not found). Run setup first.", file=sys.stderr)
-        return 1
     if not handler_map.exists():
         print(f"XDP not loaded ({handler_map.name} map not found).", file=sys.stderr)
         return 1
 
-    shared_maps = [
-        ("slot_ctx_map", slot_ctx_map),
-        ("hblk4", bpf_pin_dir / "hblk4"),
-        ("hblk6", bpf_pin_dir / "hblk6"),
-    ]
-    if proto == "udp":
-        shared_maps.extend(
-            [
-                ("udp_hv4", bpf_pin_dir / "udp_hv4"),
-                ("udp_hv6", bpf_pin_dir / "udp_hv6"),
-            ]
-        )
-
-    missing = [name for name, map_path in shared_maps if not map_path.exists()]
-    if missing:
-        print(f"XDP not loaded completely (missing pinned maps: {', '.join(missing)}).", file=sys.stderr)
+    try:
+        shared_maps = handlers.port_handler_shared_maps(obj_path, bpf_pin_dir)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
 
     pin_dir = handlers.port_handler_dir(bpf_pin_dir, proto, port)

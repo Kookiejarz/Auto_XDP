@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import errno
 import json
 import os
@@ -13,10 +14,11 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 from auto_xdp.admin import config_file
 from auto_xdp.bpf.syscall import (
-    BPF_MAP_DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, bpf, obj_get,
+    BPF_MAP_DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_OBJ_GET_INFO_BY_FD, bpf, obj_get,
 )
 
 
@@ -61,6 +63,99 @@ _BUILTIN_SLOT_ARTIFACTS = {
 _CUSTOM_SLOT_ARTIFACT_RE = re.compile(r"^custom_\d+_.+\.(?:c|o)$")
 _CUSTOM_PORT_ARTIFACT_RE = re.compile(r"^custom_(?:tcp|udp)_\d+_.+\.(?:c|o)$")
 _PORT_HANDLER_MARKERS = ("udp_hv4", "udp_hv6", "hblk4", "hblk6")
+_PORT_SHARED_MAPS = (
+    "slot_ctx_map", "hblk4", "hblk6", "udp_hv4", "udp_hv6",
+    "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg",
+)
+
+
+class HandlerMapAbi(NamedTuple):
+    map_type: int
+    key_size: int
+    value_size: int
+    max_entries: int
+    map_flags: int
+
+
+def handler_object_maps(obj_path: Path) -> dict[str, HandlerMapAbi]:
+    """Inspect declarations with libbpf without creating or loading kernel objects."""
+    try:
+        lib = ctypes.CDLL(ctypes.util.find_library("bpf") or "libbpf.so.1", use_errno=True)
+        lib.bpf_object__open_file.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+        lib.bpf_object__open_file.restype = ctypes.c_void_p
+        lib.libbpf_get_error.argtypes = [ctypes.c_void_p]
+        lib.libbpf_get_error.restype = ctypes.c_long
+        lib.bpf_object__next_map.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.bpf_object__next_map.restype = ctypes.c_void_p
+        lib.bpf_map__name.argtypes = [ctypes.c_void_p]
+        lib.bpf_map__name.restype = ctypes.c_char_p
+        getters = [getattr(lib, f"bpf_map__{field}") for field in
+                   ("type", "key_size", "value_size", "max_entries", "map_flags")]
+        for getter in getters:
+            getter.argtypes = [ctypes.c_void_p]
+            getter.restype = ctypes.c_uint
+        lib.bpf_object__close.argtypes = [ctypes.c_void_p]
+        lib.bpf_object__close.restype = None
+    except (OSError, AttributeError) as exc:
+        raise RuntimeError(f"Cannot inspect handler maps with libbpf: {exc}") from exc
+
+    ctypes.set_errno(0)
+    obj = lib.bpf_object__open_file(os.fsencode(obj_path), None)
+    error = lib.libbpf_get_error(obj)
+    if not obj or error:
+        code = -error if error < 0 else ctypes.get_errno()
+        detail = os.strerror(code) if code else "invalid BPF object"
+        raise RuntimeError(f"Cannot inspect handler object {obj_path}: {detail}")
+    try:
+        maps: dict[str, HandlerMapAbi] = {}
+        current = lib.bpf_object__next_map(obj, None)
+        while current:
+            name = lib.bpf_map__name(current)
+            if not name:
+                raise RuntimeError(f"Unnamed map in handler object {obj_path}")
+            maps[os.fsdecode(name)] = HandlerMapAbi(*(getter(current) for getter in getters))
+            current = lib.bpf_object__next_map(obj, current)
+        return maps
+    finally:
+        lib.bpf_object__close(obj)
+
+
+def pinned_handler_map_abi(path: Path) -> HandlerMapAbi:
+    try:
+        fd = obj_get(str(path))
+        try:
+            info = ctypes.create_string_buffer(128)
+            attr = ctypes.create_string_buffer(16)
+            struct.pack_into("=IIQ", attr, 0, fd, len(info), ctypes.addressof(info))
+            bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
+            map_type, _, key_size, value_size, max_entries, flags = struct.unpack_from("=6I", info)
+            return HandlerMapAbi(map_type, key_size, value_size, max_entries, flags)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise RuntimeError(f"Cannot inspect pinned handler map {path}: {exc}") from exc
+
+
+def port_handler_shared_maps(obj_path: Path, bpf_pin_dir: Path) -> list[tuple[str, Path]]:
+    """Bind declared public maps; private maps stay owned by the handler.
+
+    A declared public map must reuse the main program's pinned instance. Never
+    fall back to creating a private copy when that pin is missing. Explicitly
+    check the declared ABI: bpftool/libbpf reuse may adopt the pinned map's
+    attributes rather than rejecting incompatible object declarations.
+    """
+    maps = handler_object_maps(obj_path)
+    shared = [(name, bpf_pin_dir / name) for name in _PORT_SHARED_MAPS if name in maps]
+    missing = [name for name, path in shared if not path.exists()]
+    if missing:
+        raise RuntimeError(f"Handler requires missing pinned maps: {', '.join(missing)}")
+    for name, path in shared:
+        actual = pinned_handler_map_abi(path)
+        if maps[name] != actual:
+            raise RuntimeError(
+                f"Incompatible shared map {name}: handler declares {maps[name]}, pinned map has {actual}"
+            )
+    return shared
 
 
 def run_checked(cmd: list[str], fail_msg: str) -> subprocess.CompletedProcess[str]:
