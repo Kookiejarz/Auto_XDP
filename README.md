@@ -180,6 +180,20 @@ kill %1
 
 Port 8080 is reported as an unapproved endpoint unless its process is mapped by a matching subject grant. See [architecture.md](./architecture.md) for the policy format and the legacy compatibility boundary.
 
+## Custom port handlers
+
+Custom TCP/UDP port handlers can be loaded with
+`sudo axdp port-handler load udp 30120 /path/to/handler.c` (or a compiled `.o`).
+The loader inspects the object with libbpf and reuses only declared public maps:
+`slot_ctx_map`, `hblk4`, `hblk6`, `udp_hv4`, `udp_hv6`, `pkt_counters`,
+`byte_counters`, `pkt_ringbuf`, and `xdp_runtime_cfg`. Other maps remain private
+to the handler. A declared public map requires an existing compatible pinned
+instance; missing or incompatible maps reject the candidate before replacing
+the active handler. A handler that parses packets and keeps its own state can
+declare no shared maps. Loading a handler does not create a service grant or
+automatically add its verdicts to the main counters. Built-in protocol handlers
+and required TCP protection profiles retain their required-map checks.
+
 ## Packet observations
 
 In `sudo axdp tui`, use `e` for packet events and detailed DROP reasons, `v` for

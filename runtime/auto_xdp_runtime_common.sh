@@ -1587,12 +1587,6 @@ load_port_handlers() {
     local install_dir="${INSTALL_DIR:-/usr/local/lib/auto_xdp/current}"
     local strict="${AUTO_XDP_STRICT_HANDLERS:-0}"
 
-    [[ -e "${BPF_PIN_DIR}/slot_ctx_map" ]] || {
-        _auto_xdp_warn "slot_ctx_map not pinned; skipping per-port handler loading."
-        [[ "$strict" -eq 0 ]]
-        return
-    }
-
     [[ -f "$TOML_CONFIG" ]] || return 0
 
     "$py_bin" - "$TOML_CONFIG" "${BPF_PIN_DIR}" "$install_dir" "$strict" <<'PYEOF'
