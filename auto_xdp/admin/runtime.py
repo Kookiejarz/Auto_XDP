@@ -211,6 +211,10 @@ def deactivate_runtime(ctx: RuntimeContext) -> list[str]:
         if program_id is None:
             continue
         mode = _iface_xdp_state(iface)
+        if mode not in {"native", "generic", "offload"}:
+            raise RuntimeError(
+                f"cannot determine a single XDP attachment mode on {iface} ({mode}); refusing to detach it"
+            )
         keyword = "xdpgeneric" if mode == "generic" else "xdpoffload" if mode == "offload" else "xdp"
         result = _run_text(["ip", "link", "set", "dev", iface, keyword, "off"])
         if result.returncode != 0 or _iface_xdp_program_id(iface) is not None:

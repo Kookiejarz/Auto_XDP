@@ -137,7 +137,7 @@ PY
 validate_runtime_release() {
     local release_dir="$1" required
     local required_paths=(
-        python/auto_xdp/__init__.py python/auto_xdp/install_state.py
+        python/auto_xdp/__init__.py python/auto_xdp/install_state.py python/auto_xdp/xdp_link.py
         python/auto_xdp/default_config.toml
         bpf/include/common.h bpf/include/counters.h bpf/include/telemetry.h
         handlers/minecraft_handler.o minecraft_egress.o xdp_required_maps.txt xdp_map_abi.txt auto_xdp_runtime_common.sh

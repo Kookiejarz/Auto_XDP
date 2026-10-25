@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from auto_xdp.admin.detect import autodetect_iface, detect_backend
+from auto_xdp.admin.detect import autodetect_iface, detect_backend, iface_xdp_state
 from auto_xdp.admin.formatting import format_rate, human_bytes
 from auto_xdp.admin.ports import collect_ports, lookup_port_procs, read_xdp_ports
 from auto_xdp.admin.stats import collect_stats_rows, read_xdp_map_id
@@ -354,24 +354,8 @@ def _read_cookie_runtime(path: str) -> tuple[int, int, int, int, int] | None:
 
 
 def _xdp_attach_mode(iface: str) -> str:
-    try:
-        result = subprocess.run(
-            ["ip", "-d", "link", "show", "dev", iface],
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return "unknown"
-    if result.returncode != 0:
-        return "missing"
-    text = result.stdout
-    if "xdpgeneric" in text:
-        return "xdp generic"
-    if "xdpoffload" in text:
-        return "xdp offload"
-    if "xdp" in text:
-        return "xdp native"
-    return "xdp off"
+    mode = iface_xdp_state(iface)
+    return mode if mode in {"missing", "unknown"} else f"xdp {mode}"
 
 
 def _display_mode(mode: str) -> str:
@@ -380,6 +364,7 @@ def _display_mode(mode: str) -> str:
         "xdp native": "XDP Native",
         "xdp generic": "XDP Generic",
         "xdp offload": "XDP Offload",
+        "xdp multi": "XDP Multiple",
         "xdp off": "XDP Off",
         "missing": "Missing",
         "unknown": "Unknown",

@@ -328,7 +328,7 @@ run_uninstall() {
     fi
     _stop_runtime_processes
 
-    local iface direction pref tc_filters failures=0
+    local iface direction pref tc_filters xdp_details xdp_mode failures=0
     if ! command -v ip >/dev/null 2>&1; then
         printf 'ip command is required to detach XDP programs.\n' >&2
         return 1
@@ -364,9 +364,10 @@ sys.exit(any(row.get("kind") == "bpf" and
             printf 'tc command is required to verify TC filter removal on %s.\n' "$iface" >&2
             failures=1
         fi
-        if ip -d link show dev "$iface" 2>/dev/null \
-                | grep -Eq 'prog/xdp|xdpgeneric|xdpoffload|(^|[[:space:]])xdp([[:space:]]|$)'; then
-            printf 'Failed to detach XDP from %s.\n' "$iface" >&2
+        if ! xdp_details=$(ip -j -d link show dev "$iface" 2>/dev/null) \
+                || ! xdp_mode=$(run_py_module auto_xdp.xdp_link <<< "$xdp_details") \
+                || [[ "$xdp_mode" != "off" && "$xdp_mode" != "missing" ]]; then
+            printf 'Failed to verify XDP removal from %s.\n' "$iface" >&2
             failures=1
         fi
 

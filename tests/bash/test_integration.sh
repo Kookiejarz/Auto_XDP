@@ -41,7 +41,7 @@ if [[ $EUID -ne 0 ]]; then
     _kernel_unavailable "must run as root"
 fi
 
-for _cmd in clang bpftool ip python3 tc nft unshare mount; do
+for _cmd in clang bpftool ip python3 tc nft ethtool unshare mount; do
     command -v "$_cmd" &>/dev/null || _kernel_unavailable "$_cmd not found"
 done
 
@@ -444,6 +444,64 @@ test_linux_conntrack_native_replies() {
     ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
     test_linux_conntrack_replies
 }
+
+test_named_interfaces_use_json_and_real_unsupported_mode_fallback() (
+    local name
+    trap 'ip link del xdpgeneric0 2>/dev/null || true; ip link del xdp0 2>/dev/null || true' EXIT
+    for name in xdpgeneric0 xdp0; do
+        ip link add "$name" type dummy || return 1
+        ip link set "$name" up || return 1
+        assert_eq "$(_auto_xdp_iface_xdp_mode "$name")" none || return 1
+        _auto_xdp_attach_candidate "$name" "$_PIN_DIR/prog" || return 1
+        assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" generic || return 1
+        assert_eq "$AUTO_XDP_LAST_ATTACH_ERROR_CLASS" unsupported || return 1
+        assert_eq "$AUTO_XDP_ATTACH_FATAL" 0 || return 1
+        assert_eq "$(_auto_xdp_iface_xdp_mode "$name")" generic || return 1
+        _auto_xdp_verify_iface_program "$name" "$_PIN_DIR/prog" || return 1
+        ip link del "$name" || return 1
+    done
+)
+
+test_veth_auto_mode_preserves_peer_offloads() (
+    local MACHINE_STATE="$_RUN_DIR/machine-state.json"
+    local mode tso_before tso_after
+    # Simulate reboot/link recovery with a previously verified native mode.
+    # This also covers arbitrary link names: _VETH does not start with veth.
+    printf '{"interfaces":{"%s":{"requested_mode":"auto","xdp_mode":"native"}}}\n' \
+        "$_VETH" > "$MACHINE_STATE"
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    tso_before=$(ip netns exec "$_NS" ethtool -k "$_VETH_IN" \
+        | awk '$1 == "tcp-segmentation-offload:" { print $2 }') || return 1
+    [[ -n "$tso_before" ]] || return 1
+
+    _auto_xdp_attach_candidate "$_VETH" "$_PIN_DIR/prog" || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "generic" || return 1
+    mode=$(_auto_xdp_iface_xdp_mode "$_VETH")
+    assert_eq "$mode" "generic" || return 1
+    _auto_xdp_verify_iface_program "$_VETH" "$_PIN_DIR/prog" || return 1
+    tso_after=$(ip netns exec "$_NS" ethtool -k "$_VETH_IN" \
+        | awk '$1 == "tcp-segmentation-offload:" { print $2 }') || return 1
+    assert_eq "$tso_after" "$tso_before" "auto mode preserves peer TSO" || return 1
+
+    # Verify packet policy and outbound reply admission on the selected hook.
+    test_linux_conntrack_replies
+)
+
+test_veth_auto_reload_preserves_active_native_protection() (
+    local MACHINE_STATE="$_RUN_DIR/machine-state.json"
+    printf '{"interfaces":{"%s":{"requested_mode":"auto","xdp_mode":"native"}}}\n' \
+        "$_VETH" > "$MACHINE_STATE"
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+
+    # The kernel cannot atomically change native <-> generic. A live reload
+    # must keep filtering rather than detach it to obtain the preferred mode.
+    _auto_xdp_attach_candidate "$_VETH" "$_PIN_DIR/prog" || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "native" || return 1
+    assert_eq "$(_auto_xdp_iface_xdp_mode "$_VETH")" "native" || return 1
+    _auto_xdp_verify_iface_program "$_VETH" "$_PIN_DIR/prog" || return 1
+    test_linux_conntrack_replies
+)
 
 _header_define() {
     awk -v name="$2" '$1 == "#define" && $2 == name { print $3; exit }' "$1"

@@ -841,6 +841,7 @@ test_xdp_attach_mode_uses_atomic_bpftool_overwrite() (
     local tmpdir
     tmpdir=$(mktemp -d)
     bpftool() {
+        [[ "${LC_ALL:-}" == C ]] || return 1
         printf '%s\n' "$*" >> "$tmpdir/ops.log"
         return 0
     }
@@ -885,6 +886,124 @@ test_xdp_attach_candidate_prefers_saved_per_interface_mode() (
     assert_eq "$(head -n 1 "$tmpdir/modes")" "generic"
 )
 
+test_xdp_attach_candidate_auto_prefers_generic_for_renamed_veth() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'auto:native\n'; }
+    ip() {
+        printf '%s\n' '[{"ifname":"eth1","linkinfo":{"info_kind":"veth"}}]'
+    }
+    bpftool() { printf '%s\n' "$*" >> "$tmpdir/ops.log"; }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "generic" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpgeneric pinned /tmp/prog dev eth1 overwrite"
+)
+
+test_xdp_attach_candidate_auto_keeps_native_first_for_other_link_kinds() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'auto:auto\n'; }
+    # A prefix is not a reliable link-kind signal in either direction.
+    ip() {
+        printf '%s\n' '[{"ifname":"veth0","linkinfo":{"info_kind":"dummy"}}]'
+    }
+    bpftool() { printf '%s\n' "$*" >> "$tmpdir/ops.log"; }
+
+    _auto_xdp_attach_candidate veth0 /tmp/prog || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "native" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpdrv pinned /tmp/prog dev veth0 overwrite"
+)
+
+test_xdp_attach_candidate_unknown_link_kind_preserves_saved_mode() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'auto:generic\n'; }
+    ip() { printf 'invalid link JSON\n'; }
+    bpftool() { printf '%s\n' "$*" >> "$tmpdir/ops.log"; }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "generic" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpgeneric pinned /tmp/prog dev eth1 overwrite"
+)
+
+test_xdp_attach_candidate_honors_explicit_native_on_veth() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'native:generic\n'; }
+    ip() { printf '%s\n' '[{"linkinfo":{"info_kind":"veth"}}]'; }
+    bpftool() { printf '%s\n' "$*" >> "$tmpdir/ops.log"; }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog >"$tmpdir/warnings" 2>&1 || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "native" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpdrv pinned /tmp/prog dev eth1 overwrite" || return 1
+    assert_file_contains "$tmpdir/warnings" "can disable peer TSO"
+)
+
+test_xdp_attach_candidate_veth_fallback_warns_without_detaching() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'auto:native\n'; }
+    ip() {
+        [[ "$*" == '-j -d link show dev eth1' ]] || return 1
+        printf '%s\n' '[{"linkinfo":{"info_kind":"veth"},"xdp":{"mode":1,"prog":{"id":101}}}]'
+    }
+    bpftool() {
+        printf '%s\n' "$*" >> "$tmpdir/ops.log"
+        if [[ "$3" != "xdpdrv" ]]; then
+            printf 'Error: interface xdpgeneric attach failed: File exists\n' >&2
+            return 1
+        fi
+    }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog >"$tmpdir/warnings" 2>&1 || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "native" || return 1
+    assert_eq "$(wc -l < "$tmpdir/ops.log" | tr -d ' ')" "2" || return 1
+    assert_eq "$(head -n 1 "$tmpdir/ops.log")" \
+        "net attach xdpgeneric pinned /tmp/prog dev eth1 overwrite" || return 1
+    assert_file_contains "$tmpdir/warnings" "existing native attachment is preserved"
+)
+
+test_xdp_attach_candidate_honors_explicit_generic_without_native_fallback() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'generic:native\n'; }
+    ip() { printf '%s\n' '[{"linkinfo":{"info_kind":"veth"}}]'; }
+    bpftool() {
+        printf '%s\n' "$*" >> "$tmpdir/ops.log"
+        return 1
+    }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1" || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpgeneric pinned /tmp/prog dev eth1 overwrite"
+)
+
 test_xdp_switch_mode_reports_mixed_multi_interface_modes() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -913,7 +1032,7 @@ test_xdp_attach_candidate_honors_strict_saved_mode() (
     status=$?
     assert_eq "$status" "1" || return 1
     assert_eq "$(cat "$tmpdir/modes")" "native" || return 1
-    assert_contains "$output" "XDP attach failed on eth1: kernel rejected test candidate"
+    assert_contains "$output" "XDP attach failed on eth1: native [unknown, exit 1]: kernel rejected test candidate"
 )
 
 test_transactional_conntrack_failure_preserves_attachment() (
@@ -1922,7 +2041,7 @@ printf 'axdp0\naxdp0p\n'
 EOF_LS
     cat >"$tmpdir/bin/ip" <<'EOF_IP'
 #!/bin/sh
-printf '2: %s: <BROADCAST,MULTICAST,UP>\n    link/ether 00:00:00:00:00:01\n' "$4"
+printf '[{"ifname":"%s"}]\n' "$6"
 EOF_IP
     chmod +x "$tmpdir/bin/ls" "$tmpdir/bin/ip"
     PATH="$tmpdir/bin:$PATH"
@@ -2086,7 +2205,7 @@ test_install_python_support_package_includes_nested_modules() (
     install_python_support_package || return 1
     assert_file_contains "$fetched" "auto_xdp/state.py -> ${AUTO_XDP_PACKAGE_DIR}/state.py"
     local module
-    for module in admin/cli.py admin/approvals.py admin/approval_api.py \
+    for module in xdp_link.py admin/cli.py admin/approvals.py admin/approval_api.py \
                   tui/app.py tui/traffic.py tui/widgets.py \
                   telemetry/events.py telemetry/relay_client.py telemetry/geoip.py \
                   discovery/listeners.py discovery/proc_events.py discovery/sock_state.py; do

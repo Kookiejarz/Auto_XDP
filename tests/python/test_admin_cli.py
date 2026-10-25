@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory() as directory:
         with mock.patch.object(
             admin_detect.subprocess,
             "check_output",
-            return_value="2: eth0: <UP> xdpoffload prog/xdp id 77",
+            return_value='[{"ifname":"eth0","xdp":{"mode":3,"prog":{"id":77}}}]',
         ):
             self.assertEqual(admin_detect.iface_xdp_state("eth0"), "offload")
 
@@ -183,6 +183,23 @@ with tempfile.TemporaryDirectory() as directory:
 
             self.assertFalse(pin_dir.exists())
             self.assertIn("detached Auto XDP from eth0", messages)
+
+    def test_deactivate_runtime_refuses_unknown_or_multiple_modes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            env = root / "env"
+            env.write_text(f'IFACES="eth0"\nRUNTIME_STATE="{root / "runtime.json"}"\n')
+            context = admin_runtime.RuntimeContext(env, root / "pins", root / "run", "inet", "auto_xdp")
+            for mode in ("unknown", "multi"):
+                with self.subTest(mode=mode), \
+                     mock.patch.object(admin_runtime, "_pinned_xdp_program_id", return_value=77), \
+                     mock.patch.object(admin_runtime, "_iface_xdp_program_id", return_value=77), \
+                     mock.patch.object(admin_runtime, "_all_interface_names", return_value=[]), \
+                     mock.patch.object(admin_runtime, "_iface_xdp_state", return_value=mode), \
+                     mock.patch.object(admin_runtime, "_run_text") as run:
+                    with self.assertRaisesRegex(RuntimeError, "cannot determine a single XDP attachment mode"):
+                        admin_runtime.deactivate_runtime(context)
+                    run.assert_not_called()
 
     def test_deactivate_runtime_includes_previously_managed_interfaces(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -872,7 +889,7 @@ with tempfile.TemporaryDirectory() as directory:
             (bin_dir / "ip").write_text(
                 "#!/bin/sh\n"
                 "case \"$*\" in\n"
-                "  *'-j -d'*) printf '%s\\n' '[{\"ifname\":\"eth9\",\"xdp\":{\"prog_id\":77}}]' ;;\n"
+                "  *'-j -d'*) printf '%s\\n' '[{\"ifname\":\"eth9\",\"xdp\":{\"mode\":1,\"prog_id\":77}}]' ;;\n"
                 "  *) printf '%s\\n' '2: eth9: <BROADCAST> mtu 1500 xdp' ;;\n"
                 "esac\n"
             )

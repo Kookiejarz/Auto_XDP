@@ -84,6 +84,30 @@ namespace; NOTRACK and other conntrack zones do not receive this exception.
 
 The installer checks and installs the required toolchain, including `clang`, `llvm`, `libbpf`, `bpftool`, and `iproute2`, on supported distributions. See the [compatibility notes](https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade) before installing on a production host.
 
+`interfaces.xdp_mode = "auto"` prefers generic XDP on explicitly included veth
+interfaces. Native veth XDP can disable the peer's TCP segmentation offloads and
+introduce a receive-queue bottleneck, reducing permitted TCP throughput even
+with a small BPF program. Other interfaces restore their last verified mode,
+or try native first. The alternate mode is tried when the first mode is
+unsupported, or when a verified native/generic conflict requires retaining the
+already active mode. An explicit `native` or `generic` setting stays strict.
+Permission, resource, configuration, and unclassified attachment errors stop
+activation and block automatic nftables fallback; diagnostics retain each
+attempt's mode and error. Native attachment alone does not
+guarantee faster permitted traffic. Virtual/container interfaces remain excluded
+from automatic discovery unless explicitly opted in.
+
+Reload replaces programs within their active mode without detaching protection.
+An already attached native veth program can therefore remain native during an
+upgrade. Apply a mode change with a full `axdp disable` / `axdp enable` cycle;
+this temporarily disables filtering. A clean start in auto mode chooses generic
+for veth even if machine state recorded native previously.
+
+The runtime, CLI, and TUI read numeric XDP modes from `ip -j -d link` output.
+Interface names, aliases, and program names do not determine the attachment
+mode. Unreadable state is reported as unknown; multiple attached modes are
+reported separately from a single native or generic attachment.
+
 ## Installation
 
 ### Quick Install

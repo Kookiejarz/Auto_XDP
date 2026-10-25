@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
+
+from auto_xdp.xdp_link import xdp_mode_from_link
 
 
 def iface_xdp_state(iface: str) -> str:
@@ -11,25 +14,25 @@ def iface_xdp_state(iface: str) -> str:
         return "missing"
     try:
         info = subprocess.check_output(
-            ["ip", "-d", "link", "show", "dev", iface],
-            stderr=subprocess.DEVNULL,
+            ["ip", "-j", "-d", "link", "show", "dev", iface],
+            stderr=subprocess.PIPE,
             text=True,
         )
-    except (subprocess.CalledProcessError, OSError):
-        return "missing"
-    if not info:
-        return "missing"
-    if "xdpgeneric" in info:
-        return "generic"
-    if "xdpoffload" in info:
-        return "offload"
-    if "xdp" in info:
-        return "native"
-    return "off"
+    except subprocess.CalledProcessError as exc:
+        error = str(exc.stderr or "").lower()
+        if any(text in error for text in ("does not exist", "no such device", "cannot find device")):
+            return "missing"
+        return "unknown"
+    except OSError:
+        return "unknown"
+    try:
+        return xdp_mode_from_link(json.loads(info))
+    except ValueError:
+        return "unknown"
 
 
 def _iface_has_xdp(iface: str) -> bool:
-    return iface_xdp_state(iface) in ("generic", "native", "offload")
+    return iface_xdp_state(iface) in ("generic", "native", "offload", "multi")
 
 
 def _nft_table_exists(family: str, table: str) -> bool:

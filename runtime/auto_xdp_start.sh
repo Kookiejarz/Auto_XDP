@@ -156,6 +156,7 @@ run_sync_script() {
 }
 
 ensure_xdp_loaded() {
+    AUTO_XDP_ATTACH_FATAL=0
     if declare -F _auto_xdp_resolve_bpftool >/dev/null 2>&1; then
         _auto_xdp_resolve_bpftool || return 1
     else
@@ -186,8 +187,16 @@ ensure_xdp_loaded() {
     # If the prog is already pinned and maps are intact, just re-attach any
     # interface that has lost its XDP program (e.g. after a link bounce).
     if [[ -f "$BPF_PIN_DIR/prog" ]] && xdp_maps_ready; then
-        local _iface _any_missing=0 _xdp_mode="native"
+        local _iface _current_mode _any_missing=0 _xdp_mode="native"
         for _iface in "${_IFACES[@]}"; do
+            _current_mode=$(_auto_xdp_iface_xdp_mode "$_iface")
+            case "$_current_mode" in
+                none|native|generic) ;;
+                *)
+                    echo "[auto_xdp] cannot confirm a single XDP mode on $_iface ($_current_mode); current protection retained" >&2
+                    return 2
+                    ;;
+            esac
             if ! _auto_xdp_verify_iface_program "$_iface" "$BPF_PIN_DIR/prog"; then
                 _any_missing=1
                 if _auto_xdp_attach_candidate "$_iface" "$BPF_PIN_DIR/prog" \
@@ -196,9 +205,10 @@ ensure_xdp_loaded() {
                     [[ "$AUTO_XDP_LAST_ATTACH_MODE" == "generic" ]] && _xdp_mode="generic"
                 else
                     echo "[auto_xdp] warning: could not re-attach XDP to $_iface" >&2
+                    [[ ${AUTO_XDP_ATTACH_FATAL:-0} -eq 0 ]] || return 2
                     return 1
                 fi
-            elif ip -d link show dev "$_iface" 2>/dev/null | grep -q "xdpgeneric"; then
+            elif [[ "$_current_mode" == "generic" ]]; then
                 _xdp_mode="generic"
             fi
         done
@@ -225,6 +235,10 @@ ensure_xdp_loaded() {
     # replace operation fails.
     if ! transactional_reload_xdp; then
         echo "[auto_xdp] transactional XDP reload failed; previous protection preserved or restored" >&2
+        if [[ ${AUTO_XDP_ATTACH_FATAL:-0} -eq 1 ]]; then
+            echo "[auto_xdp] fatal XDP attachment error; automatic backend fallback disabled" >&2
+            return 2
+        fi
         if _auto_xdp_any_target_has_xdp; then
             echo "[auto_xdp] refusing nftables fallback while XDP remains attached" >&2
             return 2
@@ -342,7 +356,7 @@ select_backend() {
             return 0
         fi
         if [[ $xdp_status -eq 2 ]]; then
-            echo "[auto_xdp] XDP reload failed with an attachment still active; backend selection aborted" >&2
+            echo "[auto_xdp] XDP activation blocked; automatic backend fallback disabled" >&2
             return 1
         fi
     fi

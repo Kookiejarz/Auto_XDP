@@ -562,21 +562,31 @@ xdp_required_map_names() {
 	EOF
 }
 
-_auto_xdp_iface_xdp_mode() {
-    local details=""
-    details=$(ip -d link show dev "$1" 2>/dev/null) || {
-        printf 'none'
-        return 0
-    }
-    if grep -q 'xdpgeneric' <<< "$details"; then
-        printf 'generic'
-    elif grep -q 'xdpoffload' <<< "$details"; then
-        printf 'offload'
-    elif grep -Eq 'prog/xdp|(^|[[:space:]])xdp([[:space:]]|$)' <<< "$details"; then
-        printf 'native'
-    else
-        printf 'none'
+_auto_xdp_parse_link_mode() {
+    local python_root="${AUTO_XDP_RUNTIME_COMMON_DIR}/.."
+    if [[ ! -f "${python_root}/auto_xdp/xdp_link.py" ]]; then
+        python_root="${AUTO_XDP_RUNTIME_COMMON_DIR}/python"
     fi
+    if [[ ! -f "${python_root}/auto_xdp/xdp_link.py" ]]; then
+        python_root="${PYTHON_LIB_DIR:-}"
+    fi
+    PYTHONPATH="${python_root}${PYTHONPATH:+:$PYTHONPATH}" \
+        "${PYTHON3_BIN:-python3}" -m auto_xdp.xdp_link
+}
+
+_auto_xdp_iface_xdp_mode() {
+    local details="" mode="unknown"
+    if details=$(LC_ALL=C ip -j -d link show dev "$1" 2>&1); then
+        mode=$(_auto_xdp_parse_link_mode <<< "$details" 2>/dev/null) || mode="unknown"
+    elif [[ "$details" == *"does not exist"* || "$details" == *"No such device"* \
+            || "$details" == *"Cannot find device"* ]]; then
+        mode="missing"
+    fi
+    case "$mode" in
+        off|missing) printf 'none' ;;
+        native|generic|offload|multi) printf '%s' "$mode" ;;
+        *) printf 'unknown' ;;
+    esac
 }
 
 _auto_xdp_any_target_has_xdp() {
@@ -609,13 +619,51 @@ _auto_xdp_attach_mode() {
 
     # iproute2 refuses to replace an attached XDP program. bpftool's explicit
     # overwrite flag performs the kernel's atomic old-or-new replacement.
-    bpftool net attach "$attach_type" pinned "$prog" dev "$iface" overwrite
+    LC_ALL=C bpftool net attach "$attach_type" pinned "$prog" dev "$iface" overwrite
+}
+
+_auto_xdp_attach_error_class() {
+    local error="${1,,}"
+    case "$error" in
+        *"operation not permitted"*|*"permission denied"*) printf 'permission' ;;
+        *"cannot allocate memory"*|*"no space left on device"*|*"no buffer space available"*|*"too many open files"*)
+            printf 'resource' ;;
+        *"no such device"*|*"cannot find device"*|*"invalid devname"*) printf 'device' ;;
+        *"interface xdpdrv attach failed: operation not supported"*|*"interface xdpgeneric attach failed: operation not supported"*)
+            printf 'unsupported' ;;
+        *"native and generic xdp can't be active at the same time"*|*"interface xdpdrv attach failed: file exists"*|*"interface xdpgeneric attach failed: file exists"*)
+            printf 'mode-conflict' ;;
+        *"device or resource busy"*|*"file exists"*) printf 'busy' ;;
+        *"invalid argument"*|*"argument list too long"*) printf 'configuration' ;;
+        *"command not found"*|*"no such file or directory"*|*"not found for kernel"*) printf 'tooling' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+_auto_xdp_iface_is_veth() {
+    # Link names are arbitrary (a container's veth is often named eth0).
+    # Inspect the kernel-reported kind rather than matching a name prefix.
+    local details=""
+    details=$(ip -j -d link show dev "$1" 2>/dev/null) || return 1
+    "${PYTHON3_BIN:-python3}" -c '
+import json, sys
+try:
+    links = json.load(sys.stdin)
+    kind = links[0].get("linkinfo", {}).get("info_kind")
+except (ValueError, IndexError, KeyError, TypeError, AttributeError):
+    raise SystemExit(1)
+raise SystemExit(0 if kind == "veth" else 1)
+' <<< "$details"
 }
 
 _auto_xdp_attach_candidate() {
     local iface="$1" prog="$2"
     local preference="auto:auto" requested="auto" preferred="auto"
-    local attach_error="" last_error=""
+    local attach_error="" error_class="" active_mode="" is_veth=0 status index
+    AUTO_XDP_LAST_ATTACH_MODE=""
+    AUTO_XDP_LAST_ATTACH_ERRORS=""
+    AUTO_XDP_LAST_ATTACH_ERROR_CLASS=""
+    AUTO_XDP_ATTACH_FATAL=0
     preference=$(_auto_xdp_saved_iface_mode "$iface") || preference="auto:auto"
     if [[ "$preference" == *:* ]]; then
         requested=${preference%%:*}
@@ -623,25 +671,59 @@ _auto_xdp_attach_candidate() {
     else
         preferred="$preference"
     fi
+    _auto_xdp_iface_is_veth "$iface" && is_veth=1
     local -a modes=(native generic)
     case "$requested" in
         native) modes=(native) ;;
         generic) modes=(generic) ;;
-        *) [[ "$preferred" == "generic" ]] && modes=(generic native) ;;
+        *)
+            # veth native XDP queues already-allocated skbs and can disable
+            # peer segmentation offloads. A previously verified native attach
+            # is not evidence of better throughput. Prefer generic even when
+            # restoring a saved native mode; keep native as an available
+            # fallback without detaching an existing program to change modes.
+            if [[ $is_veth -eq 1 || "$preferred" == "generic" ]]; then
+                modes=(generic native)
+            fi
+            ;;
     esac
-    local mode
-    for mode in "${modes[@]}"; do
+    local mode next_mode
+    for ((index = 0; index < ${#modes[@]}; index++)); do
+        mode="${modes[$index]}"
         if attach_error=$(_auto_xdp_attach_mode "$iface" "$prog" "$mode" 2>&1); then
             AUTO_XDP_LAST_ATTACH_MODE="$mode"
+            if [[ $is_veth -eq 1 && "$mode" == "native" ]]; then
+                _auto_xdp_warn "Native XDP on veth $iface can disable peer TSO and bottleneck its receive queue; prefer generic mode. An existing native attachment is preserved during reload; generic takes effect after a full disable/enable."
+            fi
             return 0
+        else
+            status=$?
         fi
-        [[ -z "$attach_error" ]] || last_error="$attach_error"
+        error_class=$(_auto_xdp_attach_error_class "$attach_error")
+        AUTO_XDP_LAST_ATTACH_ERROR_CLASS="$error_class"
+        [[ -z "$attach_error" ]] || attach_error=${attach_error//$'\n'/; }
+        [[ -n "$attach_error" ]] || attach_error="attach command returned no diagnostic"
+        AUTO_XDP_LAST_ATTACH_ERRORS+="${AUTO_XDP_LAST_ATTACH_ERRORS:+$'\n'}${mode} [${error_class}, exit ${status}]: ${attach_error}"
+        _auto_xdp_warn "XDP attach failed on $iface: $mode [$error_class, exit $status]: $attach_error"
+
+        # Only a known unsupported mode permits an automatic downgrade. On
+        # reload, an opposite-mode EEXIST may instead retry the already active
+        # mode, without detaching protection to change hooks.
+        if [[ "$requested" == "auto" && "$error_class" == "unsupported" ]]; then
+            continue
+        fi
+        if [[ "$requested" == "auto" && "$error_class" == "mode-conflict" \
+                && $((index + 1)) -lt ${#modes[@]} ]]; then
+            next_mode="${modes[$((index + 1))]}"
+            active_mode=$(_auto_xdp_iface_xdp_mode "$iface")
+            if [[ "$active_mode" == "$next_mode" ]]; then
+                continue
+            fi
+        fi
+        AUTO_XDP_ATTACH_FATAL=1
+        break
     done
     AUTO_XDP_LAST_ATTACH_MODE=""
-    if [[ -n "$last_error" ]]; then
-        last_error=${last_error//$'\n'/; }
-        _auto_xdp_warn "XDP attach failed on $iface: $last_error"
-    fi
     return 1
 }
 
@@ -1184,6 +1266,8 @@ ensure_linux_conntrack() {
 }
 
 transactional_reload_xdp() {
+    AUTO_XDP_ATTACH_FATAL=0
+    AUTO_XDP_LAST_ATTACH_ERRORS=""
     local xdp_obj_path=""
     xdp_obj_path=$(_auto_xdp_first_value XDP_OBJ_PATH XDP_OBJ_INSTALLED) || xdp_obj_path=""
     [[ -f "$xdp_obj_path" ]] || {
@@ -1223,6 +1307,14 @@ transactional_reload_xdp() {
 
     for iface in "${switch_ifaces[@]}"; do
         mode=$(_auto_xdp_iface_xdp_mode "$iface")
+        case "$mode" in
+            none|native|generic) ;;
+            *)
+                _auto_xdp_warn "Cannot confirm a single XDP mode on $iface ($mode); refusing replacement."
+                AUTO_XDP_ATTACH_FATAL=1
+                return 1
+                ;;
+        esac
         old_modes+=("$mode")
         if [[ "$mode" != "none" && ! -e "$live_dir/prog" ]]; then
             _auto_xdp_warn "XDP is active on $iface but its previous program is not pinned at $live_dir/prog; refusing unsafe replacement."
