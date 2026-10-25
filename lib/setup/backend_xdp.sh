@@ -6,11 +6,16 @@ cleanup_existing_xdp() {
     # attached XDP to different interfaces. Discovery and confirmation happen
     # before staging, but the programs remain attached until the candidate XDP
     # program has committed successfully.
-    local iface any_xdp=0
+    local iface mode any_xdp=0
     XDP_PREVIOUS_IFACES=()
     for iface in $(ls /sys/class/net/ 2>/dev/null); do
-        if ip -d link show dev "$iface" 2>/dev/null \
-                | grep -Eq '(^|[[:space:]])prog/xdp([[:space:]]|$)|(^|[[:space:]])xdpgeneric([[:space:]]|$)|(^|[[:space:]])xdpoffload([[:space:]]|$)'; then
+        mode=$(_auto_xdp_iface_xdp_mode "$iface")
+        if [[ "$mode" == "unknown" ]]; then
+            warn "Could not determine XDP attachment state on $iface; refusing replacement."
+            XDP_FALLBACK_BLOCKED=1
+            return 1
+        fi
+        if [[ "$mode" != "none" ]]; then
             XDP_PREVIOUS_IFACES+=("$iface")
             any_xdp=1
         fi
@@ -50,11 +55,16 @@ deploy_xdp_backend() {
     fi
 
     ensure_bpffs
-    cleanup_existing_xdp
+    cleanup_existing_xdp || return 1
 
     if ! transactional_reload_xdp; then
         XDP_FALLBACK_REASON="transactional XDP switch failed; previous attachment was preserved or restored"
         warn "XDP upgrade failed transactionally; previous protection was preserved or restored."
+        if [[ ${AUTO_XDP_ATTACH_FATAL:-0} -eq 1 ]]; then
+            XDP_FALLBACK_REASON="${AUTO_XDP_LAST_ATTACH_ERRORS:-fatal XDP attachment error}"
+            XDP_FALLBACK_BLOCKED=1
+            warn "Fatal XDP attachment error; automatic nftables fallback disabled."
+        fi
         if _auto_xdp_any_target_has_xdp; then
             XDP_FALLBACK_BLOCKED=1
             warn "Refusing nftables fallback while XDP remains attached."
@@ -121,7 +131,7 @@ deploy_backend_step() {
             return 1
         fi
         if [[ ${XDP_FALLBACK_BLOCKED:-0} -eq 1 ]]; then
-            step_fail "XDP reload failed while an XDP attachment remains active; nftables fallback was not started."
+            step_fail "XDP activation failed; nftables fallback was blocked (see the attachment error above)."
             return 1
         fi
         ACTIVE_BACKEND="nftables"

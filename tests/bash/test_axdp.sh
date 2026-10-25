@@ -357,6 +357,7 @@ EOF_CFG
 
 _setup_reattach_test_env() {
     local tmpdir="$1"
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
     BPF_PIN_DIR="$tmpdir/bpf"
     RUN_STATE_DIR="$tmpdir/run"
     XDP_OBJ_PATH="$tmpdir/xdp.o"
@@ -388,7 +389,9 @@ _setup_reattach_test_env() {
     _TEST_XDP_ATTACHED=""
     _auto_xdp_verify_iface_program() {
         [[ " $_TEST_XDP_ATTACHED " == *" $1 "* ]] && return 0
-        ip -d link show dev "$1" 2>/dev/null | grep -Eq 'xdp|xdpgeneric'
+        local mode
+        mode=$(_auto_xdp_iface_xdp_mode "$1")
+        [[ "$mode" == native || "$mode" == generic ]]
     }
     _auto_xdp_attach_candidate() {
         if ip link set dev "$1" xdp pinned "$2" 2>/dev/null; then
@@ -420,9 +423,9 @@ test_ensure_xdp_reattach_records_generic_mode_on_fallback() (
 #!/bin/sh
 args="$*"
 if echo "$args" | grep -q "show.*eth0\b\|show dev eth0"; then
-    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether\n"
+    printf '%s\n' '[{"ifname":"eth0"}]'
 elif echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
-    printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
+    printf '%s\n' '[{"ifname":"eth1","xdp":{"mode":1,"prog":{"id":77}}}]'
 elif echo "$args" | grep -q "set.*eth0.*xdpgeneric"; then
     exit 0
 elif echo "$args" | grep -q "set.*eth0.*xdp "; then
@@ -450,9 +453,9 @@ test_ensure_xdp_reattach_records_native_mode_when_all_native() (
 #!/bin/sh
 args="$*"
 if echo "$args" | grep -q "show.*eth0\b\|show dev eth0"; then
-    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether\n"
+    printf '%s\n' '[{"ifname":"eth0"}]'
 elif echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
-    printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
+    printf '%s\n' '[{"ifname":"eth1","xdp":{"mode":1,"prog":{"id":77}}}]'
 elif echo "$args" | grep -q "set.*eth0.*xdp "; then
     exit 0
 fi
@@ -478,9 +481,9 @@ test_ensure_xdp_reattach_records_generic_when_existing_iface_is_generic() (
 #!/bin/sh
 args="$*"
 if echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
-    printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdpgeneric\n"
+    printf '%s\n' '[{"ifname":"eth1","xdp":{"mode":2,"prog":{"id":77}}}]'
 else
-    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
+    printf '%s\n' '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":77}}}]'
 fi
 exit 0
 EOF_IP
@@ -638,7 +641,7 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         printf 'ip %s\n' "$*" >>"$ops_log"
         case "$*" in
             "link show dev "*) return 0 ;;
-            "-d link show dev "*) printf '2: test: <UP>\n'; return 0 ;;
+            "-j -d link show dev "*) printf '[{"ifname":"%s"}]\n' "$6"; return 0 ;;
         esac
         return 0
     }
@@ -684,6 +687,7 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         command python3 "$@"
     }
 
+    PYTHON_LIB_DIR="$REPO_ROOT"
     output=$(run_uninstall 2>&1)
     status=$?
     case "$tc_scenario" in
@@ -928,12 +932,13 @@ test_uninstall_keeps_runtime_when_xdp_detach_fails() (
     ip() {
         case "$*" in
             "link show dev eth0") return 0 ;;
-            "-d link show dev eth0") printf '2: eth0: <UP> prog/xdp id 42\n'; return 0 ;;
+            "-j -d link show dev eth0") printf '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":42}}}]\n'; return 0 ;;
         esac
         return 0
     }
     tc() { return 0; }
     nft() { return 1; }
+    PYTHON_LIB_DIR="$REPO_ROOT"
 
     run_uninstall >/dev/null 2>&1
     local status=$?

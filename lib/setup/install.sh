@@ -306,7 +306,7 @@ try:
         "auto_xdp.discovery.services", "auto_xdp.telemetry.events",
         "auto_xdp.telemetry.relay_client", "auto_xdp.telemetry.traffic",
         "auto_xdp.telemetry.geoip", "auto_xdp.tui.app", "auto_xdp.install_state",
-        "auto_xdp.bpf.conntrack",
+        "auto_xdp.bpf.conntrack", "auto_xdp.xdp_link",
     ):
         module = import_module(name)
         if not Path(module.__file__).resolve().is_relative_to(package_root):

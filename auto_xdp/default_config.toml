@@ -61,8 +61,11 @@ include = []
 exclude = []
 allow_container = false
 
-# auto restores each interface's last verified mode first, then tries the
-# other XDP mode. native/generic make that mode strict on every interface.
+# auto prefers generic on veth to preserve peer segmentation offloads; on
+# other interfaces it restores the last verified mode, or tries native first.
+# The other mode remains a fallback. native/generic require that mode strictly.
+# Changing an active native/generic attachment requires a full disable/enable;
+# reload preserves protection rather than detaching it to change modes.
 xdp_mode = "auto"
 
 [ringbuf]
