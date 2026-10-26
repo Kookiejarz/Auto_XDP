@@ -65,6 +65,19 @@ class DumpCountTests(unittest.TestCase):
         )
         self.assertEqual(self._count(out), 2)
 
+    def test_raw_and_formatted_keys_are_one_entry(self):
+        out = b'[{"key":["0x01"],"value":["0x02"],"formatted":{"key":1,"value":{"key":2}}}]'
+        self.assertEqual(self._count(out), 1)
+
+    def test_whitespace_and_nested_keys_do_not_inflate_count(self):
+        out = b'[ { "key" : {"key": 1}, "value": {"key": 2}}, {"key":2,"value":3} ]'
+        self.assertEqual(self._count(out), 2)
+
+    def test_invalid_array_is_not_reported_as_an_entry_count(self):
+        for out in (b'[{"key":1},]', b'[{"key":1}', b'[{"value":1}]', b'[{"key":1}] trailing'):
+            with self.subTest(out=out):
+                self.assertIsNone(self._count(out))
+
     def test_empty_map_returns_zero(self):
         self.assertEqual(self._count(b"[]"), 0)
 
@@ -239,6 +252,33 @@ class TuiTopTrafficTests(unittest.TestCase):
 
 
 class TuiMapUsageTests(unittest.TestCase):
+    def test_metadata_matches_full_pin_paths_not_truncated_or_duplicate_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            policy = Path(td, "tcp_port_policies")
+            array = Path(td, "tcp_synck_policy")
+            for path in (policy, array, Path(td, "sock_state_prog")):
+                path.touch()
+            entries = [
+                {"id": 10, "name": "tcp_port_polici", "type": "hash", "max_entries": 1024,
+                 "pinned": [str(policy)]},
+                {"id": 20, "name": "tcp_port_polici", "type": "hash", "max_entries": 999,
+                 "pinned": [str(Path(td, "other", "tcp_port_policies"))]},
+                {"id": 30, "name": "tcp_synck_polic", "type": "array", "max_entries": 65536,
+                 "pinned": [str(array)]},
+            ]
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([], [])), \
+                 mock.patch("auto_xdp.tui.app.shutil.which", return_value="/sbin/bpftool"), \
+                 mock.patch("auto_xdp.tui.app._run_json", return_value=entries) as batch, \
+                 mock.patch("auto_xdp.tui.app._dump_count", return_value=1) as dump:
+                rows = {row.name: row for row in _collect_map_usage(td, now=100)}
+            self.assertEqual(set(rows), {"tcp_port_policies", "tcp_synck_policy"})
+            self.assertEqual((rows[policy.name].map_id, rows[policy.name].maximum), (10, 1024))
+            self.assertEqual(rows[policy.name].current, 1)
+            self.assertEqual(rows[array.name].current, 65536)
+            self.assertEqual(rows[array.name].kind, "array")
+            batch.assert_called_once_with(["bpftool", "-j", "-f", "map"])
+            dump.assert_called_once_with(policy)
+
     def test_high_churn_map_is_sampled_outside_under_attack(self):
         with tempfile.TemporaryDirectory() as td:
             Path(td, "hblk4").touch()
@@ -453,8 +493,10 @@ class TuiObservationTests(unittest.TestCase):
         with mock.patch("auto_xdp.tui.app.curses.color_pair", return_value=0):
             _draw_events(win, relay, TuiSnapshot(), top=0, focused=False)
         rendered = "\n".join(win.lines.values())
-        self.assertIn("if=3 len=60 SYN_RATE_DROP", rendered)
-        self.assertIn("if=? len=? TCP_DROP", rendered)
+        self.assertIn("if=3 len=60", rendered)
+        self.assertIn("SYN_RATE_DROP", rendered)
+        self.assertIn("if=? len=?", rendered)
+        self.assertIn("TCP_DROP", rendered)
 
     def test_runtime_reader_gets_one_value_and_closes_map(self):
         runtime = mock.Mock()
@@ -496,8 +538,9 @@ class TuiPortFilterTests(unittest.TestCase):
         self.assertIn("[UDP]", title_calls[0])
         self.assertIn("UDP", rendered)
         self.assertIn("domain", rendered)
-        self.assertNotIn("TCP", rendered)
-        self.assertNotIn("ssh", rendered)
+        body = "\n".join(text for y, text in win.lines.items() if 2 <= y < win.height - 1)
+        self.assertNotIn("TCP", body)
+        self.assertNotIn("ssh", body)
 
 
 class TuiAuditMarkerTests(unittest.TestCase):

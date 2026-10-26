@@ -19,7 +19,10 @@ from auto_xdp.admin.formatting import format_rate, human_bytes
 from auto_xdp.admin.ports import collect_ports, lookup_port_procs, read_xdp_ports
 from auto_xdp.admin.stats import collect_stats_rows, read_xdp_map_id
 from auto_xdp.admin import approvals
-from auto_xdp.bpf.maps import BpfGlobalRlMap, BpfPortPolicyMap, BpfSyncookieRuntimeMap
+from auto_xdp.bpf.maps import (
+    BpfGlobalRlMap, BpfPortPolicyMap, BpfSyncookieRuntimeMap, BpfRuntimeConfigMap,
+    XDP_CFG_FLAG_DROP_EVENTS_DISABLED,
+)
 from auto_xdp.config import parse_toml_config, load_toml_config
 from auto_xdp.discovery.listeners import get_listening_ports
 from auto_xdp.policy import resolve_desired_state
@@ -29,12 +32,19 @@ from auto_xdp.telemetry.traffic import TrafficRow, _collect_top_traffic, _event_
 from auto_xdp.tui.traffic import (
     _clamp_event_top, _draw_cookie, _draw_drop_reasons, _draw_event_row,
     _draw_events, _draw_top_traffic, _event_bottom_top, _event_window, _event_visible,
+    _resize_event_top, _event_capacity, _events_suppressed, _only_socket_events,
 )
 from auto_xdp.tui.widgets import (
-    _add, _box, _clip, _CP_GREEN, _CP_RED, _CP_YELLOW,
+    _add, _box, _clip, _color, _init_colors, _CP_GREEN, _CP_RED, _CP_YELLOW,
     _CP_BLACK_ON_GREEN, _CP_BLACK_ON_YELLOW, _CP_WHITE_ON_RED,
-    _CP_CYAN, _CP_BLACK_ON_CYAN,
+    _CP_CYAN, _CP_BLACK_ON_CYAN, _CP_MUTED, _CP_TEXT, _CP_SELECTED,
 )
+from auto_xdp.tui.metrics import HostMetrics, NetworkMetrics, ResourceSampler
+from auto_xdp.tui.maps import _draw_maps
+from auto_xdp.tui.dashboard import (
+    _draw_network, _draw_system, _draw_header, _draw_footer, _number,
+)
+from auto_xdp.tui.mouse import MouseAction, _enable_mouse, _disable_mouse, _mouse_action, _port_window_start
 
 
 DEFAULT_SOCKET = "/var/run/auto_xdp/pkt_events.sock"
@@ -93,11 +103,15 @@ class TuiSnapshot:
     attach_target: str = "-"
     attach_targets: list[tuple[str, str]] = field(default_factory=list)
     collected_at: float = 0.0
+    rates: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+    host: HostMetrics = field(default_factory=HostMetrics)
+    network: NetworkMetrics = field(default_factory=NetworkMetrics)
     stats: list[tuple[str, int, int, str]] = field(default_factory=list)
     maps: list[MapUsage] = field(default_factory=list)
     ports: list[tuple[str, int, str, str, str]] = field(default_factory=list)
     excluded: tuple[int, int] = (0, 0)
     under_attack: bool = False
+    packet_events_enabled: bool | None = None
     cookie_configured: bool | None = None
     cookie_runtime: tuple[int, int, int, int, int] | None = None
     audit_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -159,20 +173,29 @@ def _run_json(cmd: list[str]) -> Any:
 
 
 def _all_map_info() -> dict[str, dict[str, Any]]:
-    """Single bpftool call → map name → metadata dict."""
+    """One batch, indexed by full pin path and unambiguous kernel name."""
     if not shutil.which("bpftool"):
         return {}
     try:
-        data = _run_json(["bpftool", "-j", "map"])
+        data = _run_json(["bpftool", "-j", "-f", "map"])
     except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
         return {}
     result: dict[str, dict[str, Any]] = {}
+    ambiguous: set[str] = set()
     if isinstance(data, list):
         for entry in data:
             if isinstance(entry, dict) and "name" in entry:
                 name = str(entry["name"])
-                if name not in result:
+                if name in result:
+                    result.pop(name)
+                    ambiguous.add(name)
+                elif name not in ambiguous:
                     result[name] = entry
+                pins = entry.get("pinned", [])
+                if isinstance(pins, list):
+                    for pin in pins:
+                        if isinstance(pin, str):
+                            result[str(Path(pin).resolve())] = entry
     return result
 
 
@@ -184,22 +207,37 @@ def _dump_count(path: Path) -> int | None:
         )
     except (subprocess.CalledProcessError, OSError):
         return None
-    # bpftool -j emits a compact JSON array with one object per entry, each
-    # wrapped as {"key":...,"value":...} (or "values" for per-CPU maps). For a
-    # large LRU map json.loads would build an
-    # equally large list of dicts just so we can take its length. Counting the
-    # per-entry "key" wrapper over the raw bytes yields the same number without
-    # materializing any of it — nested per-CPU/struct objects use other field
-    # names ("value"/"cpu"/struct members), never the wrapper key.
-    n = out.count(b'"key":')
-    if n:
-        return n
-    # Empty map ("[]") or an unexpected format: fall back to a real parse.
+    # Decode one entry at a time: BTF dumps can include a second "key" in
+    # "formatted", and values can themselves contain fields named "key".
+    # Avoid both double counting and materializing a whole large LRU dump.
     try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
+        text = out.decode().strip()
+        if not text.startswith("[") or not text.endswith("]"):
+            return None
+        decoder = json.JSONDecoder()
+        index, count = 1, 0
+        while True:
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index == len(text) - 1:
+                return count
+            entry, index = decoder.raw_decode(text, index)
+            if not isinstance(entry, dict) or "key" not in entry:
+                return None
+            count += 1
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index == len(text) - 1:
+                return count
+            if text[index] != ",":
+                return None
+            index += 1
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text) - 1:
+                return None
+    except (ValueError, UnicodeDecodeError, IndexError):
         return None
-    return len(data) if isinstance(data, list) else None
 
 
 def _collect_map_usage(
@@ -232,6 +270,7 @@ def _collect_map_usage(
             cache.map_info = all_info
             cache.map_info_refreshed_at = now
     bpftool_ok = bool(shutil.which("bpftool")) or bool(all_info)
+    pin_aware = any(name.startswith("/") for name in all_info)
     rows: list[MapUsage] = []
 
     def _sample_count(path: Path, interval: float) -> tuple[int | None, str]:
@@ -247,10 +286,15 @@ def _collect_map_usage(
         return count, "sampled"
 
     for path in sorted(p for p in pin_dir.iterdir() if p.is_file()):
-        info = all_info.get(path.name, {})
+        info = all_info.get(str(path.resolve()))
+        if info is None:
+            if pin_aware:
+                # Program pins share this directory but are not BPF maps.
+                continue
+            info = all_info.get(path.name, {})
         if not bpftool_ok and not info:
             continue
-        name = str(info.get("name") or path.name)
+        name = path.name
         kind = str(info.get("type") or "-")
         maximum = info.get("max_entries")
         maximum = int(maximum) if isinstance(maximum, int) else None
@@ -292,8 +336,10 @@ def _collect_map_usage(
         memlock = int(memlock_val) if isinstance(memlock_val, int) else None
         rows.append(MapUsage(name, kind, current, maximum, pct, note, map_id=map_id, memlock=memlock))
 
-    def sort_key(row: MapUsage) -> tuple[float, str]:
-        return (-(row.pct or -1.0), row.name)
+    def sort_key(row: MapUsage) -> tuple[bool, float, str]:
+        # Dense arrays have every slot allocated; that is not capacity pressure.
+        fixed = row.kind in {"array", "percpu_array", "prog_array", "ringbuf"}
+        return (fixed, -(row.pct if row.pct is not None else -1.0), row.name)
 
     return sorted(rows, key=sort_key)
 
@@ -349,6 +395,20 @@ def _read_cookie_runtime(path: str) -> tuple[int, int, int, int, int] | None:
         return None
     try:
         return runtime.get()
+    finally:
+        runtime.close()
+
+
+def _read_packet_events_enabled(path: str) -> bool | None:
+    if not Path(path).exists():
+        return None
+    try:
+        runtime = BpfRuntimeConfigMap(path)
+    except OSError:
+        return None
+    try:
+        flags = runtime.get_cfg_flags()
+        return not bool(flags & XDP_CFG_FLAG_DROP_EVENTS_DISABLED) if flags is not None else None
     finally:
         runtime.close()
 
@@ -520,19 +580,8 @@ def _mark_audit_reviewed(path: Path, fingerprint: str) -> None:
 
 
 def _initial_tui_page(args: Any) -> str:
-    try:
-        rows = _collect_audit_rows(args.config)
-        fingerprint = _audit_fingerprint(rows)
-    except Exception:
-        return "audit"
-    path = _audit_marker_path(args)
-    needs_review = _audit_needs_review(path, fingerprint)
-    if needs_review:
-        try:
-            _mark_audit_reviewed(path, fingerprint)
-        except OSError:
-            pass
-        return "audit"
+    # Opening the monitor should show live traffic immediately. Audit markers
+    # are updated only when the operator actually visits the audit view.
     return "overview"
 
 
@@ -548,6 +597,7 @@ def _collect_snapshot(
     *,
     fast: bool = False,
     include_approvals: bool = False,
+    resource_sampler: ResourceSampler | None = None,
 ) -> tuple[TuiSnapshot, dict[str, tuple[int, int]], float]:
     ifaces = (args.iface or "").split() or []
     if not ifaces:
@@ -560,6 +610,7 @@ def _collect_snapshot(
     now = time.monotonic()
     elapsed = max(now - prev_ts, 0.001)
     stats_rows = []
+    rates: dict[str, tuple[float | None, float | None]] = {}
     for name, packets, bytes_ in rows:
         old_packets, old_bytes = prev_stats.get(name, (-1, -1))
         if old_packets >= 0:
@@ -570,8 +621,13 @@ def _collect_snapshot(
             if byte_delta < 0:
                 byte_delta = -1
             rate = format_rate(packet_delta, byte_delta, elapsed)
+            rates[name] = (
+                packet_delta / elapsed if packet_delta >= 0 else None,
+                byte_delta / elapsed if byte_delta >= 0 else None,
+            )
         else:
             rate = "-"
+            rates[name] = (None, None)
         stats_rows.append((name, packets, bytes_, rate))
     if backend == "xdp":
         attach_targets = [(name, _xdp_attach_mode(name)) for name in ifaces]
@@ -600,6 +656,8 @@ def _collect_snapshot(
 
     cookie_cfg = _load_toml(args.config).get("syncookie", {})
     cookie_enabled = cookie_cfg.get("enabled") if isinstance(cookie_cfg, dict) else None
+    host, network = (resource_sampler.sample(iface, now) if resource_sampler is not None
+                     else (HostMetrics(), NetworkMetrics(iface=iface)))
     snap = TuiSnapshot(
         backend=backend,
         iface=iface,
@@ -608,6 +666,9 @@ def _collect_snapshot(
         attach_target=attach_target,
         attach_targets=attach_targets,
         collected_at=now,
+        rates=rates,
+        host=host,
+        network=network,
         stats=stats_rows,
         maps=_collect_map_usage(
             args.bpf_pin_dir,
@@ -624,6 +685,7 @@ def _collect_snapshot(
         ),
         excluded=_excluded_counts(args.config),
         under_attack=_under_attack_enabled(args.config),
+        packet_events_enabled=_read_packet_events_enabled(str(Path(args.bpf_pin_dir) / "xdp_runtime_cfg")) if backend == "xdp" else None,
         cookie_configured=cookie_enabled if isinstance(cookie_enabled, bool) else None,
         cookie_runtime=_read_cookie_runtime(str(Path(args.bpf_pin_dir) / "sync_run_cfg")) if backend == "xdp" else None,
         audit_rows=audit_rows,
@@ -649,6 +711,7 @@ class SnapshotWorker:
         self._map_cache = MapUsageCache()
         self._first_collect = True
         self._include_approvals = False
+        self._resources = ResourceSampler()
 
     def start(self) -> None:
         self._thread.start()
@@ -688,6 +751,7 @@ class SnapshotWorker:
                     self._map_cache,
                     fast=self._first_collect,
                     include_approvals=include_approvals,
+                    resource_sampler=self._resources,
                 )
                 self._first_collect = False
                 snap.status = f"updated {_dt.datetime.now().strftime('%H:%M:%S')}"
@@ -716,22 +780,31 @@ class _WinSet:
     events: Any
     summary: Any
     ports: Any
+    network: Any
+    system: Any
 
 
 def _make_win_set(stdscr: Any) -> _WinSet | None:
     h, w = stdscr.getmaxyx()
     if h < 20 or w < 80:
         return None
-    left_w = max(48, int(w * 0.56))
-    right_w = w - left_w
-    top_h = max(8, int((h - 1) * 0.36))
-    summary_h = 8
+    right_w = min(56, max(30, int(w * 0.34)))
+    left_w = w - right_w - 1
+    content_h = h - 3
+    network_h = max(6, min(13, content_h // 3))
+    ports_h = max(4, (content_h - network_h) // 2)
+    events_h = content_h - network_h - ports_h
+    summary_h = max(6, min(10, content_h // 3))
+    system_h = max(5, min(13, content_h // 3))
     return _WinSet(
         h=h, w=w,
-        maps=stdscr.derwin(top_h, left_w, 1, 0),
-        events=stdscr.derwin(h - top_h - 1, left_w, 1 + top_h, 0),
-        summary=stdscr.derwin(summary_h, right_w, 1, left_w),
-        ports=stdscr.derwin(h - summary_h - 1, right_w, 1 + summary_h, left_w),
+        network=stdscr.derwin(network_h, left_w, 2, 0),
+        ports=stdscr.derwin(ports_h, left_w, 2 + network_h, 0),
+        events=stdscr.derwin(events_h, left_w, 2 + network_h + ports_h, 0),
+        summary=stdscr.derwin(summary_h, right_w, 2, left_w + 1),
+        system=stdscr.derwin(system_h, right_w, 2 + summary_h, left_w + 1),
+        maps=stdscr.derwin(content_h - summary_h - system_h, right_w,
+                         2 + summary_h + system_h, left_w + 1),
     )
 
 
@@ -739,36 +812,14 @@ def _make_full_win(stdscr: Any) -> Any | None:
     h, w = stdscr.getmaxyx()
     if h < 20 or w < 80:
         return None
-    return stdscr.derwin(h - 1, w, 1, 0)
-
-
-def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool) -> None:
-    total_mem = sum(r.memlock for r in rows if r.memlock is not None)
-    mem_label = f"  total {human_bytes(total_mem)}" if total_mem else ""
-    _box(win, f"BPF maps{mem_label}" + (" *" if focused else ""))
-    _add(win, 1, 1, f"{'id':>7} {'map':<18} {'type':<10} {'used':>7} {'max':>7} {'%':>5} {'mem':>8}")
-    visible = max(0, win.getmaxyx()[0] - 3)
-    scroll = max(0, min(scroll, max(0, len(rows) - visible)))
-    for idx, row in enumerate(rows[scroll: scroll + visible], start=2):
-        id_str = str(row.map_id) if row.map_id is not None else "-"
-        used = "-" if row.current is None else str(row.current)
-        maximum = "-" if row.maximum is None else str(row.maximum)
-        pct = "-" if row.pct is None else f"{row.pct:5.1f}"
-        mem = "-" if row.memlock is None else human_bytes(row.memlock)
-        attr = curses.A_NORMAL
-        if row.pct is not None and row.pct >= 80:
-            attr = curses.color_pair(_CP_RED) | curses.A_BOLD
-        _add(win, idx, 1, f"{id_str:>7} {row.name:<18.18} {row.kind:<10.10} {used:>7} {maximum:>7} {pct:>5} {mem:>8}", attr)
-    if len(rows) > visible:
-        _add(win, win.getmaxyx()[0] - 1, 2, f"{scroll + 1}-{min(scroll + visible, len(rows))}/{len(rows)}  tab focus", curses.A_DIM)
+    return stdscr.derwin(h - 3, w, 2, 0)
 
 
 def _draw_summary(win: Any, snap: TuiSnapshot) -> None:
-    _box(win, "stats")
-    _add(win, 1, 1, "Mode: ")
-    _add(win, 1, 7, f"[{_display_mode(snap.attach_mode)}]", _mode_attr(snap.attach_mode))
-    _add(win, 2, 1, "Attach: ")
-    x = 9
+    h, _ = win.getmaxyx()
+    _box(win, "Protection", accent=_CP_GREEN)
+    _add(win, 1, 2, _display_mode(snap.attach_mode), _mode_attr(snap.attach_mode) | curses.A_BOLD)
+    x = 2
     targets = snap.attach_targets or [(snap.attach_target, snap.attach_mode)]
     for idx, (target, mode) in enumerate(targets):
         if idx:
@@ -776,18 +827,24 @@ def _draw_summary(win: Any, snap: TuiSnapshot) -> None:
             x += 1
         _add(win, 2, x, target, _mode_badge_attr(mode))
         x += len(target)
-    _add(win, win.getmaxyx()[0] - 1, 2, snap.status, curses.A_DIM)
-    drops = next((r for r in snap.stats if r[0] == "XDP_DROP_TOTAL"), None)
-    total = next((r for r in snap.stats if r[0] == "XDP_TOTAL"), None)
-    iface = next((r for r in snap.stats if r[0] == "IFACE_RX"), None)
-    y = 3
-    for row in (total, drops, iface):
-        if row is None:
-            continue
-        name, packets, bytes_, rate = row
-        packet_text = str(packets) if packets >= 0 else "unknown"
-        _add(win, y, 1, f"{name:<14} {packet_text:<12} {human_bytes(bytes_):<11} {rate}")
-        y += 1
+    total = snap.rates.get("XDP_TOTAL", (None, None))[0]
+    drop = snap.rates.get("XDP_DROP_TOTAL", (None, None))[0]
+    _add(win, 3, 2, f"Seen  {_number(total):>9} pps", _color(_CP_CYAN))
+    _add(win, 4, 2, f"Drop  {_number(drop):>9} pps", _color(_CP_RED) if drop else _color(_CP_MUTED))
+    if h >= 8:
+        ratio = drop / total * 100 if drop is not None and total and 0 <= drop <= total else None
+        text = "--" if ratio is None else f"{ratio:.1f}%"
+        _add(win, 5, 2, "Drop ratio", _color(_CP_MUTED))
+        _add(win, 5, 15, text, _color(_CP_RED) if ratio else _color(_CP_MUTED))
+        tcp = sum(row[0] == "TCP" for row in snap.ports)
+        udp = sum(row[0] == "UDP" for row in snap.ports)
+        _add(win, 6, 2, f"Ports  {tcp} TCP / {udp} UDP", _color(_CP_MUTED))
+    if h >= 10:
+        cookie = "unknown" if snap.cookie_runtime is None else "on" if snap.cookie_runtime[0] else "off"
+        _add(win, 7, 2, f"SYN cookie runtime  {cookie}", _color(_CP_MUTED))
+    suppressed = _events_suppressed(snap)
+    note = " packet records OFF " if suppressed else f" backend: {snap.backend} "
+    _add(win, h - 1, 2, note, _color(_CP_YELLOW) if suppressed else _color(_CP_MUTED))
 
 
 def _draw_audit_page(stdscr: Any, snap: TuiSnapshot, scroll: int, last_error: str) -> None:
@@ -812,7 +869,7 @@ def _draw_audit_page(stdscr: Any, snap: TuiSnapshot, scroll: int, last_error: st
     footer = "↑↓/PgUp/PgDn scroll  o:overview  p:approvals  v:traffic  q:quit"
     if len(snap.audit_rows) > visible:
         footer = f"{scroll + 1}-{min(scroll + visible, len(snap.audit_rows))}/{len(snap.audit_rows)}  " + footer
-    _add(win, win.getmaxyx()[0] - 1, 2, footer, curses.A_DIM)
+    _add(win, win.getmaxyx()[0] - 1, 2, footer, _color(_CP_MUTED))
     error = last_error or snap.audit_status
     if error:
         _add(stdscr, stdscr.getmaxyx()[0] - 1, 0, _clip(error, stdscr.getmaxyx()[1]), curses.color_pair(_CP_RED) | curses.A_BOLD)
@@ -844,14 +901,14 @@ def _draw_approvals_page(stdscr: Any, snap: TuiSnapshot, cursor: int, scroll: in
             attr = curses.color_pair(_CP_RED)
         row_idx = scroll + idx - 2
         if row_idx == cursor:
-            attr |= curses.A_REVERSE
+            attr = (attr & ~curses.A_COLOR) | _color(_CP_SELECTED) | curses.A_BOLD
         ports = ",".join(str(port) for port in row.get("ports", []))
         line = f"{row['id']:>3}  {status:<8} {str(row['protocol']).upper():<5} {row['subject']:<20.20} {row['zone']:<10.10} {ports:<17.17} {row.get('reason', '-') }"
         _add(win, idx, 1, line, attr)
     footer = "↑↓ select  n:new  enter:approve  d:reject  x:revoke  a:audit  o:overview  q:quit"
     if not privileged:
         footer = "↑↓ select  root required for changes  a:audit  o:overview  q:quit"
-    _add(win, win.getmaxyx()[0] - 1, 2, footer, curses.A_DIM)
+    _add(win, win.getmaxyx()[0] - 1, 2, footer, _color(_CP_MUTED))
     if last_error:
         _add(stdscr, stdscr.getmaxyx()[0] - 1, 0, _clip(last_error, stdscr.getmaxyx()[1]), curses.color_pair(_CP_RED) | curses.A_BOLD)
     stdscr.refresh()
@@ -862,14 +919,21 @@ def _tui_prompt(stdscr: Any, label: str) -> str:
     stdscr.nodelay(False)
     curses.echo()
     curses.curs_set(1)
+    old_mouse_mask = 0
     try:
-        _add(stdscr, h - 1, 0, _clip(label, w - 1), curses.A_REVERSE)
+        _, old_mouse_mask = curses.mousemask(0)
+    except curses.error:
+        pass
+    try:
+        _add(stdscr, h - 1, 0, _clip(label, w - 1), _color(_CP_SELECTED) | curses.A_BOLD)
         stdscr.refresh()
         return stdscr.getstr(h - 1, min(len(label), max(0, w - 2)), max(1, w - len(label) - 2)).decode(errors="replace").strip()
     finally:
         curses.noecho()
         curses.curs_set(0)
         stdscr.nodelay(True)
+        if old_mouse_mask:
+            curses.mousemask(old_mouse_mask)
 
 
 def _port_key(row: tuple[str, int, str, str, str]) -> tuple[str, int]:
@@ -900,9 +964,17 @@ def _draw_ports(
     focused: bool = False,
     excluded: tuple[int, int] = (0, 0),
 ) -> None:
-    title = "current " + _port_filter_title(proto_filter) + (" *" if focused else "")
-    _box(win, title)
-    _add(win, 1, 1, f"{'p':<3} {'port':>5} {'service':<12} {'process':<16} limit")
+    h, w = win.getmaxyx()
+    title = _port_filter_title(proto_filter)
+    _box(win, title, focused=focused)
+    interior = max(0, w - 4)
+    with_limit = interior >= 64
+    service_width = 12 if with_limit else 10
+    process_width = min(24, max(10, interior - 12 - service_width - 18)) if with_limit else max(8, interior - 12 - service_width)
+    header = f"{'P':<4}{'PORT':>5}  {'SERVICE':<{service_width}} {'PROCESS':<{process_width}}"
+    if with_limit:
+        header += "  LIMIT"
+    _add(win, 1, 2, header, _color(_CP_MUTED))
     now = time.monotonic()
     display_rows = list(rows)
     current_keys = {_port_key(row) for row in rows}
@@ -914,7 +986,9 @@ def _draw_ports(
     display_rows.extend(sorted(removed_rows, key=lambda row: (row[0], row[1])))
     display_rows = _filter_port_rows(display_rows, proto_filter)
 
-    for idx, (proto, port, svc, proc, limit) in enumerate(display_rows[: max(0, win.getmaxyx()[0] - 3)], start=2):
+    visible = max(0, h - 3)
+    start = _port_window_start(cursor, len(display_rows), visible)
+    for idx, (proto, port, svc, proc, limit) in enumerate(display_rows[start:start + visible], start=2):
         mark = port_marks.get((proto, port))
         attr = curses.A_NORMAL
         if mark and mark[1] > now:
@@ -922,11 +996,14 @@ def _draw_ports(
                 attr = curses.color_pair(_CP_YELLOW) | curses.A_BOLD
             elif mark[0] == "removed":
                 attr = curses.color_pair(_CP_RED) | curses.A_BOLD
-        if idx - 2 == cursor:
-            attr |= curses.A_REVERSE
+        if focused and start + idx - 2 == cursor:
+            attr = (attr & ~curses.A_COLOR) | _color(_CP_SELECTED) | curses.A_BOLD
         if port == event_dport_filter:
             attr |= curses.A_BOLD
-        _add(win, idx, 1, f"{proto:<3} {port:>5} {svc:<12.12} {proc:<16.16} {limit}", attr)
+        line = f"{proto:<4}{port:>5}  {svc:<{service_width}.{service_width}} {proc:<{process_width}.{process_width}}"
+        if with_limit:
+            line += f"  {limit}"
+        _add(win, idx, 2, line, attr)
     excl_ports, excl_cidrs = excluded
     excl_parts = []
     if excl_ports:
@@ -934,10 +1011,14 @@ def _draw_ports(
     if excl_cidrs:
         excl_parts.append(f"{excl_cidrs} src CIDR{'s' if excl_cidrs != 1 else ''}")
     excl_hint = f"  excluded: {', '.join(excl_parts)}  (axdp exclude list)" if excl_parts else ""
+    footer = f" {start + bool(display_rows)}-{min(start + visible, len(display_rows))}/{len(display_rows)} · t TCP / u UDP "
     if focused:
-        _add(win, win.getmaxyx()[0] - 1, 2, f"↑↓ move  enter: filter events{excl_hint}", curses.A_DIM)
-    elif excl_hint:
-        _add(win, win.getmaxyx()[0] - 1, 2, excl_hint.strip(), curses.A_DIM)
+        footer += "· enter events "
+        if w >= 78:
+            footer += "· double-click details "
+    if w >= 100:
+        footer += excl_hint
+    _add(win, h - 1, 2, footer, _color(_CP_MUTED))
 
 
 def _draw(
@@ -959,17 +1040,20 @@ def _draw(
     audit_scroll: int = 0,
     approval_cursor: int = -1,
     geoip: GeoIPResolver | None = None,
+    mouse_enabled: bool = False,
 ) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
+    if h < 20 or w < 80:
+        _add(stdscr, 0, 0, "Auto XDP · resize to at least 80x20")
+        stdscr.refresh()
+        return
+    _draw_header(stdscr, snap, page, _dt.datetime.now().strftime("%H:%M:%S"))
+    _draw_footer(stdscr, snap, last_error, focus, page, mouse_enabled=mouse_enabled)
     if page == "audit":
-        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _add(stdscr, 0, 0, _clip(f"Auto XDP TUI  audit  backend={snap.backend} mode={snap.attach_mode}  {now}  a:overview p:approvals v:traffic q:quit", w), curses.A_REVERSE)
         _draw_audit_page(stdscr, snap, audit_scroll, last_error)
         return
     if page == "approvals":
-        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _add(stdscr, 0, 0, _clip(f"Auto XDP TUI  approvals  backend={snap.backend}  {now}  a:audit o:overview v:traffic q:quit", w), curses.A_REVERSE)
         _draw_approvals_page(stdscr, snap, approval_cursor, 0, last_error)
         return
     if page == "cookie":
@@ -977,7 +1061,6 @@ def _draw(
         if full_win is None:
             _add(stdscr, 0, 0, "terminal too small; need at least 80x20")
         else:
-            _add(stdscr, 0, 0, "Auto XDP TUI  c:cookie / health  v:samples o:overview a:audit q:quit", curses.A_REVERSE)
             _draw_cookie(full_win, snap, relay, reasons_scroll, geoip)
         stdscr.refresh()
         return
@@ -986,7 +1069,6 @@ def _draw(
         if full_win is None:
             _add(stdscr, 0, 0, "terminal too small; need at least 80x20")
         else:
-            _add(stdscr, 0, 0, "Auto XDP TUI  e:events  v:samples c:cookie/health o:overview q:quit", curses.A_REVERSE)
             _draw_events(full_win, relay, snap, event_top, True,
                          dport_filter=event_dport_filter, filter_scroll=event_filter_scroll)
         stdscr.refresh()
@@ -1001,44 +1083,37 @@ def _draw(
         top_h = max(8, int(fh * 0.60))
         bot_h = fh - top_h
         top_win = full_win.derwin(top_h, fw, 0, 0)
-        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        title = f"Auto XDP TUI  event samples  c:cookie/health v:overview a:audit q:quit  {now}"
-        _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
-        if snap.under_attack:
-            badge = " UNDER ATTACK "
-            _add(stdscr, 0, max(0, w - len(badge)), badge, curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD)
         if last_error:
             _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(_CP_RED) | curses.A_BOLD)
         _draw_top_traffic(top_win, relay, geoip)
         if bot_h >= 4:
             bot_win = full_win.derwin(bot_h, fw, top_h, 0)
             _draw_drop_reasons(bot_win, relay, reasons_scroll)
-            if snap.under_attack:
+            if _events_suppressed(snap):
                 note = " packet events suppressed (under-attack config) "
                 bh, bw = bot_win.getmaxyx()
                 _add(bot_win, bh - 1, max(0, bw - len(note) - 2), note,
                      curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD)
         stdscr.refresh()
         return
+    if page == "maps":
+        full_win = _make_full_win(stdscr)
+        if full_win is not None:
+            _draw_maps(full_win, snap.maps, map_scroll, True, expanded=True)
+        stdscr.refresh()
+        return
     if wins is None:
         _add(stdscr, 0, 0, "terminal too small; need at least 80x20")
         stdscr.refresh()
         return
-    now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"Auto XDP TUI  v:samples c:cookie/health e:events a:audit tab:focus q:quit  backend={snap.backend}  {now}"
-    _add(stdscr, 0, 0, _clip(title, w), curses.A_REVERSE)
-    if snap.under_attack:
-        badge = " UNDER ATTACK "
-        badge_x = max(0, w - len(badge))
-        _add(stdscr, 0, badge_x, badge, curses.color_pair(_CP_WHITE_ON_RED) | curses.A_BOLD)
-    if last_error:
-        _add(stdscr, h - 1, 0, _clip(last_error, w), curses.color_pair(_CP_RED) | curses.A_BOLD)
+    _draw_network(wins.network, snap.network, snap)
+    _draw_system(wins.system, snap.host)
     _draw_maps(wins.maps, snap.maps, map_scroll, focus == "maps")
     _draw_events(wins.events, relay, snap, event_top, focus == "events",
-                 dport_filter=event_dport_filter, filter_scroll=event_filter_scroll)
+                 dport_filter=event_dport_filter, filter_scroll=event_filter_scroll, compact=True)
     _draw_summary(wins.summary, snap)
     _draw_ports(wins.ports, snap.ports, port_marks, port_filter,
-                cursor=port_cursor if focus == "ports" else -1,
+                cursor=port_cursor,
                 event_dport_filter=event_dport_filter,
                 focused=focus == "ports",
                 excluded=snap.excluded)
@@ -1047,18 +1122,15 @@ def _draw(
 
 def _curses_main(stdscr: Any, args: Any) -> int:
     curses.curs_set(0)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(_CP_GREEN, curses.COLOR_GREEN, -1)
-    curses.init_pair(_CP_RED, curses.COLOR_RED, -1)
-    curses.init_pair(_CP_YELLOW, curses.COLOR_YELLOW, -1)
-    curses.init_pair(_CP_BLACK_ON_GREEN, curses.COLOR_BLACK, curses.COLOR_GREEN)
-    curses.init_pair(_CP_BLACK_ON_YELLOW, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-    curses.init_pair(_CP_WHITE_ON_RED, curses.COLOR_WHITE, curses.COLOR_RED)
-    curses.init_pair(_CP_CYAN, curses.COLOR_CYAN, -1)
-    curses.init_pair(_CP_BLACK_ON_CYAN, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    _init_colors()
+    stdscr.bkgd(" ", _color(_CP_TEXT))
     stdscr.nodelay(True)
     stdscr.timeout(200)
+    mouse_enabled = _enable_mouse()
+    copy_mode = False
+    restore_mouse = False
+    copy_follow_events = False
+    resume_follow_events = False
 
     relay = RelayClient(args.socket, max_events=int(args.tui_max_events))
     geoip_error = ""
@@ -1072,7 +1144,8 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     worker.start()
     map_scroll = 0
     event_top = 0
-    focus = "maps"
+    previous_event_visible = 1
+    focus = "ports"
     last_ports_snapshot_at = 0.0
     previous_port_rows: dict[tuple[str, int], tuple[str, int, str, str, str]] | None = None
     port_marks: dict[tuple[str, int], tuple[str, float, tuple[str, int, str, str, str]]] = {}
@@ -1087,6 +1160,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     wins: _WinSet | None = None
     last_draw_at = 0.0
     last_draw_state: tuple[Any, ...] | None = None
+    last_reviewed_fingerprint = ""
 
     def _refresh_wins() -> bool:
         nonlocal wins
@@ -1102,9 +1176,60 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     try:
         while True:
             ui_dirty = False
+            scroll_step = 1
+            mouse: MouseAction | None = None
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
                 return 0
+            if ch == curses.KEY_F2:
+                if copy_mode:
+                    copy_mode = False
+                    mouse_enabled = _enable_mouse() if restore_mouse else False
+                    resume_follow_events = copy_follow_events
+                    last_draw_state = None
+                elif mouse_enabled and not _disable_mouse():
+                    ui_error = "Cannot release mouse; hold Shift and drag to select terminal text"
+                else:
+                    restore_mouse = mouse_enabled
+                    mouse_enabled = False
+                    copy_mode = True
+                    copy_follow_events = (event_dport_filter is None and
+                                          event_top >= _event_bottom_top(relay, previous_event_visible))
+                ui_dirty = True
+            if copy_mode and not ui_dirty and ch != curses.KEY_RESIZE:
+                # Keep draining the bounded relay while leaving terminal selection
+                # undisturbed. Only F2, quit and resize affect the frozen display.
+                relay.poll()
+                if relay.ports_dirty:
+                    relay.ports_dirty = False
+                    worker.wakeup()
+                continue
+            if ch == curses.KEY_MOUSE and mouse_enabled:
+                ui_dirty = _refresh_wins() or ui_dirty
+                try:
+                    _, mouse_x, mouse_y, _, mouse_state = curses.getmouse()
+                    mouse = _mouse_action(stdscr, wins, page, mouse_x, mouse_y, mouse_state)
+                except curses.error:
+                    pass
+                ch = -1
+                if mouse is not None:
+                    ui_dirty = True
+                    if mouse.kind == "page":
+                        page = mouse.target
+                        if page in {"maps", "events"}:
+                            focus = page
+                        if page == "audit":
+                            audit_scroll = 0
+                        worker.show_approvals(page == "approvals")
+                    elif mouse.kind == "focus":
+                        focus = mouse.target
+                    elif mouse.kind == "clear_filter":
+                        event_dport_filter = None
+                        event_filter_scroll = 0
+                    elif mouse.kind == "scroll":
+                        if page == "overview" or mouse.target in {"maps", "events"}:
+                            focus = mouse.target
+                        ch, scroll_step = mouse.key, 3
             if ch == curses.KEY_RESIZE:
                 ui_dirty = _refresh_wins() or ui_dirty
             elif ch in (ord("t"), ord("T")):
@@ -1118,7 +1243,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 audit_scroll = 0
                 worker.show_approvals(False)
                 ui_dirty = True
-            elif ch in (ord("p"), ord("P")) and page == "audit":
+            elif ch in (ord("p"), ord("P")):
                 page = "approvals"
                 approval_cursor = 0
                 worker.show_approvals(True)
@@ -1137,11 +1262,23 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 focus = "events"
                 worker.show_approvals(False)
                 ui_dirty = True
+            elif ch in (ord("m"), ord("M")):
+                page = "maps" if page != "maps" else "overview"
+                focus = "maps"
+                worker.show_approvals(False)
+                ui_dirty = True
             elif ch in (ord("v"), ord("V")):
                 page = "traffic" if page != "traffic" else "overview"
                 worker.show_approvals(False)
                 ui_dirty = True
             snap, worker_error = worker.get()
+            if page == "audit" and snap.audit_fingerprint and not snap.audit_status \
+                    and snap.audit_fingerprint != last_reviewed_fingerprint:
+                try:
+                    _mark_audit_reviewed(_audit_marker_path(args), snap.audit_fingerprint)
+                    last_reviewed_fingerprint = snap.audit_fingerprint
+                except OSError:
+                    pass
             last_error = ui_error or worker_error
             now = time.monotonic()
             before_marks = set(port_marks)
@@ -1166,13 +1303,19 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 last_ports_snapshot_at = snap.collected_at
                 ui_dirty = True
             if wins is not None:
-                map_visible = max(1, wins.maps.getmaxyx()[0] - 3)
-                event_visible = max(1, (wins.h - 4) // 2) if page == "events" else max(1, _event_visible(wins.events))
+                map_visible = max(1, wins.h - 6) if page == "maps" else max(1, wins.maps.getmaxyx()[0] - 3)
+                event_height = wins.h - 3 if page == "events" else wins.events.getmaxyx()[0]
+                event_visible = max(1, _event_capacity(event_height, compact=page != "events",
+                    suppressed=_events_suppressed(snap), port_only=_only_socket_events(relay)))
             else:
                 map_visible = 1
                 event_visible = 1
             map_scroll_max = max(0, len(snap.maps) - map_visible)
-            event_top = _clamp_event_top(relay, event_visible, event_top)
+            event_top = _resize_event_top(relay, previous_event_visible, event_visible, event_top)
+            if resume_follow_events:
+                event_top = _event_bottom_top(relay, event_visible)
+                resume_follow_events = False
+            previous_event_visible = event_visible
             if ch == 9 and page == "overview":
                 if focus == "maps":
                     focus = "events"
@@ -1184,6 +1327,22 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             display_port_rows = _filter_port_rows(snap.ports, port_filter)
             port_cursor = max(0, min(port_cursor, len(display_port_rows) - 1))
             approval_cursor = max(0, min(approval_cursor, len(snap.approval_rows) - 1)) if snap.approval_rows else -1
+            if mouse is not None and mouse.kind in {"port", "port_events"} and wins is not None:
+                visible = max(1, wins.ports.getmaxyx()[0] - 3)
+                clicked = _port_window_start(port_cursor, len(display_port_rows), visible) + mouse.index
+                focus = "ports"
+                if 0 <= clicked < len(display_port_rows):
+                    port_cursor = clicked
+                    if mouse.kind == "port_events":
+                        event_dport_filter = display_port_rows[clicked][1]
+                        event_filter_scroll = 0
+                        page, focus = "events", "events"
+                        worker.show_approvals(False)
+            elif mouse is not None and mouse.kind == "approval":
+                visible = max(1, stdscr.getmaxyx()[0] - 6)
+                clicked = _port_window_start(approval_cursor, len(snap.approval_rows), visible) + mouse.index
+                if 0 <= clicked < len(snap.approval_rows):
+                    approval_cursor = clicked
             if page == "approvals" and ch in (10, 13, curses.KEY_ENTER, ord("d"), ord("D"), ord("x"), ord("X"), ord("n"), ord("N")):
                 if os.geteuid() != 0:
                     ui_error = "approval changes require root"
@@ -1224,7 +1383,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             if ch in (10, 13, curses.KEY_ENTER):
                 if page == "approvals":
                     pass
-                elif focus == "ports" and display_port_rows:
+                elif page == "overview" and focus == "ports" and display_port_rows:
                     selected_port = display_port_rows[port_cursor][1]
                     if event_dport_filter == selected_port:
                         event_dport_filter = None
@@ -1232,15 +1391,15 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                         event_dport_filter = selected_port
                         event_filter_scroll = 0
                     ui_dirty = True
-                elif focus == "events" and event_dport_filter is not None:
+                elif page in {"overview", "events"} and focus == "events" and event_dport_filter is not None:
                     event_dport_filter = None
                     ui_dirty = True
             if page == "audit":
                 if ch == curses.KEY_UP:
-                    audit_scroll = max(0, audit_scroll - 1)
+                    audit_scroll = max(0, audit_scroll - scroll_step)
                     ui_dirty = True
                 elif ch == curses.KEY_DOWN:
-                    audit_scroll += 1
+                    audit_scroll += scroll_step
                     ui_dirty = True
                 elif ch == curses.KEY_PPAGE:
                     audit_scroll = max(0, audit_scroll - max(1, event_visible))
@@ -1250,10 +1409,10 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                     ui_dirty = True
             elif page == "approvals":
                 if ch == curses.KEY_UP:
-                    approval_cursor = max(0, approval_cursor - 1)
+                    approval_cursor = max(0, approval_cursor - scroll_step)
                     ui_dirty = True
                 elif ch == curses.KEY_DOWN:
-                    approval_cursor = min(len(snap.approval_rows) - 1, approval_cursor + 1)
+                    approval_cursor = min(len(snap.approval_rows) - 1, approval_cursor + scroll_step)
                     ui_dirty = True
                 elif ch == curses.KEY_PPAGE:
                     approval_cursor = max(0, approval_cursor - max(1, event_visible))
@@ -1263,10 +1422,10 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                     ui_dirty = True
             elif page in {"traffic", "cookie"}:
                 if ch == curses.KEY_UP:
-                    reasons_scroll = max(0, reasons_scroll - 1)
+                    reasons_scroll = max(0, reasons_scroll - scroll_step)
                     ui_dirty = True
                 elif ch == curses.KEY_DOWN:
-                    reasons_scroll += 1
+                    reasons_scroll += scroll_step
                     ui_dirty = True
                 elif ch == curses.KEY_PPAGE:
                     reasons_scroll = max(0, reasons_scroll - 5)
@@ -1276,29 +1435,29 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                     ui_dirty = True
             elif focus == "ports":
                 if ch == curses.KEY_UP:
-                    port_cursor = max(0, port_cursor - 1)
+                    port_cursor = max(0, port_cursor - scroll_step)
                     ui_dirty = True
                 elif ch == curses.KEY_DOWN:
-                    port_cursor = min(len(display_port_rows) - 1, port_cursor + 1)
+                    port_cursor = min(len(display_port_rows) - 1, port_cursor + scroll_step)
                     ui_dirty = True
             else:
                 if ch == curses.KEY_UP:
                     if focus == "events":
                         if event_dport_filter is not None:
-                            event_filter_scroll = max(0, event_filter_scroll - 1)
+                            event_filter_scroll = max(0, event_filter_scroll - scroll_step)
                         else:
-                            event_top = max(relay.events_offset, event_top - 1)
+                            event_top = max(relay.events_offset, event_top - scroll_step)
                     else:
-                        map_scroll = max(0, map_scroll - 1)
+                        map_scroll = max(0, map_scroll - scroll_step)
                     ui_dirty = True
                 elif ch == curses.KEY_DOWN:
                     if focus == "events":
                         if event_dport_filter is not None:
-                            event_filter_scroll += 1
+                            event_filter_scroll += scroll_step
                         else:
-                            event_top = min(_event_bottom_top(relay, event_visible), event_top + 1)
+                            event_top = min(_event_bottom_top(relay, event_visible), event_top + scroll_step)
                     else:
-                        map_scroll = min(map_scroll_max, map_scroll + 1)
+                        map_scroll = min(map_scroll_max, map_scroll + scroll_step)
                     ui_dirty = True
                 elif ch == curses.KEY_PPAGE:
                     if focus == "events":
@@ -1357,10 +1516,14 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             )
             now = time.monotonic()
             if ui_dirty or draw_state != last_draw_state or now - last_draw_at >= TUI_IDLE_REDRAW_INTERVAL:
-                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll, audit_scroll, approval_cursor, geoip)
+                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll, audit_scroll, approval_cursor, geoip, mouse_enabled)
+                if copy_mode:
+                    _draw_footer(stdscr, snap, "", focus, page, copy_mode=True)
+                    stdscr.refresh()
                 last_draw_at = now
                 last_draw_state = draw_state
     finally:
+        _disable_mouse()
         worker.stop()
         relay.close()
         geoip.close()

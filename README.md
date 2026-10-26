@@ -220,9 +220,63 @@ and required TCP protection profiles retain their required-map checks.
 
 ## Packet observations
 
-In `sudo axdp tui`, use `e` for packet events and detailed DROP reasons, `v` for
-retained source samples and optional country/ASN information, and `c` for SYN
-cookie diagnostics and observation health. `o` returns to the overview.
+`sudo axdp tui` opens a dashboard with RX/TX history, current packet and bit
+rates, protection mode, CPU/memory meters, allowed services, recent events, and
+BPF map capacity. The layout adapts to terminals of at least 80 columns by 20
+rows. Interface traffic comes from Linux network counters; XDP totals and drops
+come from dedicated BPF counters. Initial or unavailable rates display `--`.
+Fixed-size array maps display `fixed`, rather than a capacity warning; `~` marks
+sampled or cached map counts.
+The full Maps page sizes columns to the current terminal and map names. Wider
+screens show map IDs, count sources and occupancy bars; narrow screens retain
+the map name, type, used/max counts, usage and memory. Long names use an ellipsis
+when they cannot fit. Resizing reallocates column widths immediately, and the
+overview's smaller map panel also uses all its available width.
+
+Use `Tab` to focus ports, maps, or events, then the arrow keys to scroll. `t`/`u`
+toggle TCP/UDP ports; `Enter` on a port filters retained events. `m` opens the
+full maps table, `e` packet events and detailed DROP reasons, `v` retained source
+samples and optional country/ASN information, and `c` SYN cookie diagnostics and
+observation health. `a` opens the authorization audit, `p` approval requests,
+`o` returns to the overview, and `q` exits.
+Events retain live following across page changes and resizes; scrolling up
+pauses the list, and scrolling back to the bottom resumes it.
+Mouse support is enabled when the terminal supports it: click a tab to switch
+pages, click a panel to focus it, click a port to select it, double-click a port
+to open its retained events, and use the wheel to scroll the panel under the
+pointer. Click the filtered event view's title to clear its port filter.
+Clicking an approval request only selects it; approval actions retain
+their keyboard controls. Hold `Shift` to select terminal text with the mouse,
+or press `F2` for copy mode: the TUI releases the mouse and freezes the display
+so ordinary dragging can select text without refreshes clearing the selection.
+Use your terminal's copy shortcut, then press `F2` again to resume the display
+and its previous mouse mode. Background collection and relay consumption
+continue; other navigation and approval keys are ignored while copying.
+Resizing redraws the paused display once, and `q` still exits.
+
+When `[under_attack].enabled = true`, packet event recording is suppressed to
+reduce overhead; packet/drop counters continue updating. The TUI checks the
+runtime flag and shows why records are absent. Socket state notifications are
+displayed separately from packet fields. Use `sudo axdp under-attack off` to
+resume packet records when desired. `skip` in a map's entry count means its
+contents were deliberately not sampled in this performance mode. Metadata is
+matched by the full BPF pin path, so truncated or duplicate kernel map names do
+not lose the type, capacity, or map ID.
+
+The red `EVENTS SUPPRESSED` badge refers to packet records; socket notifications
+can still arrive. With recording enabled, Recent events shows packet time,
+PASS/DROP, protocol, source address/port, destination port and service, plus the
+reason when space permits.
+The full Events page also shows destination address, ingress interface index,
+recorded packet length and reason details. The standard path records new TCP
+SYN allows, drops and selected SYN cookie results; established TCP passes and
+normal UDP passes are not a per-packet log. Custom handlers may have different
+event coverage. The service label uses current discovered endpoints, matched by
+protocol, destination address and port. `unknown`/`ambiguous` avoid guessing an
+owner; `port:name` is only a services-database label for an active port. These
+labels are current inventory, not historical ownership. Service inventory and
+authorization decisions remain available in Ports and Audit independently of
+packet recording.
 
 Packet totals come from dedicated BPF counters. Event lists and source rankings
 are bounded, potentially lossy samples, not full traffic or attacker attribution.
