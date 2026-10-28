@@ -264,7 +264,13 @@ matched by the full BPF pin path, so truncated or duplicate kernel map names do
 not lose the type, capacity, or map ID.
 
 The red `EVENTS SUPPRESSED` badge refers to packet records; socket notifications
-can still arrive. With recording enabled, Recent events shows packet time,
+can still arrive. Socket notifications are event history, not current listener
+state; TCP4/TCP6 identify the address family. The kernel tracepoint also observes
+other network namespaces, and these records do not identify the namespace or
+prove which current service owned the event. Distinct events remain visible;
+replaying the same relay event does not add another row. A new relay session
+clears the old retained window so notices from an earlier helper generation do
+not linger after an upgrade. With recording enabled, Recent events shows packet time,
 PASS/DROP, protocol, source address/port, destination port and service, plus the
 reason when space permits.
 The full Events page also shows destination address, ingress interface index,

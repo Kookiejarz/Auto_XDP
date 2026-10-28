@@ -246,8 +246,21 @@ def test_socket_notices_are_dense_and_packet_recording_reason_is_visible():
     _draw_events(screen, relay, TuiSnapshot(under_attack=True, packet_events_enabled=False), 0, False)
     rendered = "\n".join(text for _, _, text, _ in screen.calls)
     assert "Packet records OFF" in rendered and "axdp under-attack off" in rendered
-    assert "SOCKET STATE NOTIFICATIONS" in rendered
+    assert "SOCKET EVENTS" in rendered and "global trace" in rendered
     assert [y for y, _, text, _ in screen.calls if "SOCKET close" in text] == [4, 5, 6]
+
+
+def test_same_second_socket_events_keep_address_family_and_unique_identity_visible():
+    relay = RelayClient("/unused")
+    for seq, family in [(1, 4), (2, 6)]:
+        relay._append(dict(type="port_change", proto="tcp", port=22, action="open", family=family,
+                           seen_at=1700000000, session_id="test-relay", seq=seq))
+    screen = Canvas(12, 140)
+    _draw_events(screen, relay, TuiSnapshot(), 0, False)
+    rendered = "\n".join(text for _, _, text, _ in screen.calls)
+    assert "TCP4" in rendered and "TCP6" in rendered
+    assert "id=test-r:1" in rendered and "id=test-r:2" in rendered
+    assert len(relay.events) == 2
 
 
 def _service_snapshot():
@@ -325,7 +338,7 @@ def test_socket_service_inventory_is_visible_even_when_packets_are_suppressed():
     _draw_events(screen, relay, snap, 0, False)
     rendered = "\n".join(text for _, _, text, _ in screen.calls)
     assert "Packet records OFF" in rendered
-    assert "svc=ssh" in rendered
+    assert "svc(current)=ssh" in rendered
 
 
 @pytest.mark.parametrize("x,target", [(7, "overview"), (18, "traffic"), (29, "events"),

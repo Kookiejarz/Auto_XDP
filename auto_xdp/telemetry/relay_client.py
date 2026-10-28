@@ -53,9 +53,15 @@ class RelayClient:
 
     def _session(self, value: Any) -> None:
         if isinstance(value, str) and value and value != self.session_id:
+            # A fresh relay owns a new observation window. In particular, do
+            # not keep old listener notices on screen after a helper upgrade.
+            self.events_offset += len(self.events)
+            self.events.clear()
             self.session_id = value
             self._last_seq = -1
             self.telemetry_status = {}
+            self.history_available = None
+            self.history_truncated = False
 
     def _message(self, msg: Any) -> None:
         if not isinstance(msg, dict):
