@@ -29,13 +29,25 @@ class RelayClientTests(unittest.TestCase):
         self.assertEqual(relay.events_offset, 1)
         self.assertEqual(relay.reason_totals, {"SYN_RATE_DROP": 3})
 
-    def test_restart_resets_sequence_without_merging_distinct_packets(self):
+    def test_restart_starts_a_new_retained_window(self):
         relay = RelayClient("unused")
         relay._message(event(100))
         relay.telemetry_status = {"queue_dropped": 9}
         relay._message(dict(type="history", session_id="run-b", events=[event(1, "run-b")]))
-        self.assertEqual([(row["session_id"], row["seq"]) for row in relay.events], [("run-a", 100), ("run-b", 1)])
+        self.assertEqual([(row["session_id"], row["seq"]) for row in relay.events], [("run-b", 1)])
+        self.assertEqual(relay.events_offset, 1)
         self.assertEqual(relay.telemetry_status, {})
+
+    def test_empty_history_from_new_relay_removes_old_socket_notices(self):
+        relay = RelayClient("unused")
+        relay._message(dict(type="port_change", session_id="run-a", seq=1, port=22, action="close"))
+        relay.history_truncated = True
+        relay._message(dict(type="history", session_id="run-b", events=[]))
+        self.assertEqual(relay.events, [])
+        self.assertEqual(relay.events_offset, 1)
+        self.assertFalse(relay.history_truncated)
+        relay._message(dict(type="port_change", session_id="run-b", seq=1, port=22, action="open"))
+        self.assertEqual([row["action"] for row in relay.events], ["open"])
 
     def test_reason_counts_expire_with_retained_window(self):
         relay = RelayClient("unused", max_events=2)

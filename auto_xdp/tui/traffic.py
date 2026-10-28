@@ -64,9 +64,12 @@ def _draw_event_row(win: Any, i: int, ev: dict[str, Any], compact: bool = False,
     ts = event_time(ev)
     tstr = _dt.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "--:--:--"
     if ev.get("type") == "port_change":
+        family = ev.get("family")
+        protocol = str(ev.get("proto", "-")).upper() + (str(family) if family in (4, 6) else "?")
+        identity = f" id={str(ev['session_id'])[:6]}:{ev['seq']}" if not compact and win.getmaxyx()[1] >= 110 and "seq" in ev and "session_id" in ev else ""
         _add(win, i, 2 if compact else 1,
-             f"{tstr} SOCKET {ev.get('action', 'change')} {str(ev.get('proto', '-')).upper()} "
-             f"local:{ev.get('port', '-')} svc={service} (current; notice)")
+             f"{tstr} SOCKET {ev.get('action', 'change')} {protocol} "
+             f"local:{ev.get('port', '-')} svc(current)={service}{identity}")
         return
     verdict = str(ev.get("verdict", "-"))
     attr = curses.color_pair(_CP_GREEN) if verdict == "ALLOW" else curses.color_pair(_CP_RED)
@@ -116,7 +119,7 @@ def _draw_events(win: Any, relay: RelayClient, snap: Any, top: int, focused: boo
         header = (f"{'TIME':<8} {'ACT':<4} {'PROTO':<4} {'SOURCE':<{source_width}} {'PORT':>5} "
                   f"{'SERVICE':<{service_width}}")
     if port_only:
-        header = "TIME     SOCKET STATE NOTIFICATIONS · service=current"
+        header = "TIME     SOCKET EVENTS · history / global trace · service=current"
     if suppressed:
         reason = "under_attack=true" if snap.under_attack else "runtime flag"
         notice_text = (f"Packet records OFF ({reason})" if getattr(snap, "packet_events_enabled", None) is False
