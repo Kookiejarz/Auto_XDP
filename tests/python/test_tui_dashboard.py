@@ -14,6 +14,8 @@ from auto_xdp.tui.traffic import _draw_events, _event_bottom_top, _resize_event_
 from auto_xdp.tui.traffic import _event_capacity, _events_suppressed
 from auto_xdp.tui.mouse import _mouse_action, _port_window_start, _enable_mouse, _disable_mouse
 from auto_xdp.tui.services import EventServices
+from auto_xdp.tui.dashboard import page_tabs
+from auto_xdp.tui.handlers import HandlerInventory, HandlerRow, draw_handlers
 
 
 class Canvas:
@@ -78,7 +80,7 @@ def _snapshot():
 
 
 @pytest.mark.parametrize("width,height", [(80, 20), (80, 24), (100, 30), (140, 42), (200, 50)])
-@pytest.mark.parametrize("page", ["overview", "maps", "events", "traffic", "cookie", "audit", "approvals"])
+@pytest.mark.parametrize("page", ["overview", "maps", "events", "traffic", "cookie", "audit", "approvals", "handlers"])
 def test_all_pages_fit_supported_terminal_sizes(width, height, page):
     screen = Canvas(height, width)
     snap = _snapshot()
@@ -168,9 +170,8 @@ def test_overview_map_panel_expands_names_and_marks_truncation(width):
     line = next(text for y, x, text, _ in screen.calls if y == 2 and x == 2)
     assert "skip/49k" in line
     if width == 56:
-        assert name in line
-    else:
-        assert "…" in line
+        assert "memory" in "".join(text for y, _, text, _ in screen.calls if y == 1)
+    assert "…" in line
 
 
 def test_map_names_with_wide_characters_do_not_shift_numeric_columns():
@@ -180,6 +181,42 @@ def test_map_names_with_wide_characters_do_not_shift_numeric_columns():
     cells = sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in {"W", "F"} else 1 for c in line)
     assert cells == 136
     assert "12.0%" in line and "100" in line
+
+
+@pytest.mark.parametrize("width", [80, 140, 200])
+def test_exact_map_bytes_and_total_do_not_double_count_aliases_or_hide_unknown_memory(width):
+    rows = [MapUsage("state", "hash", 0, 20, 0.0, map_id=7, memlock=4096),
+            MapUsage("state_alias", "hash", 0, 20, 0.0, map_id=7, memlock=4096),
+            MapUsage("unreadable", "hash", None, 20, None, map_id=8)]
+    screen = Canvas(12, width)
+    _draw_maps(screen, rows, 0, True, expanded=True, exact_bytes=True)
+    rendered = "\n".join(text for _, _, text, _ in screen.calls)
+    assert "4096 B" in rendered
+    footer = "".join(text for y, _, text, _ in screen.calls if y == 11)
+    assert "4,096 B" in footer and "≥4.00 KiB" in footer
+
+
+def test_compact_map_panel_shows_each_map_memory_when_it_fits():
+    screen = Canvas(8, 56)
+    _draw_maps(screen, [MapUsage("state", "hash", 0, 20, 0.0, memlock=4096)], 0, False)
+    assert "memory" in "".join(text for y, _, text, _ in screen.calls if y == 1)
+    assert "4.00 KiB" in "".join(text for y, _, text, _ in screen.calls if y == 2)
+
+
+@pytest.mark.parametrize("width,height", [(80, 17), (140, 39), (200, 47)])
+def test_handler_page_shows_live_ids_separately_from_configured_and_pin_only_entries(width, height):
+    screen = Canvas(height, width)
+    inventory = HandlerInventory([
+        HandlerRow("SLOT", 47, 15, "custom_gre", "loaded", "handlers/proto_47", "/custom/gre.c"),
+        HandlerRow("UDP", 30120, 16, "private_udp", "pin only", "port_handlers/udp/30120/prog"),
+        HandlerRow("TCP", 8080, None, "-", "configured", source="/srv/custom\nhandler.c"),
+    ])
+    draw_handlers(screen, inventory, 0)
+    rendered = "\n".join(text for _, _, text, _ in screen.calls)
+    assert "1 loaded" in rendered and "47/GRE" in rendered
+    assert "15" in rendered and "custom_gre" in rendered
+    assert "pin only" in rendered and "configured" in rendered
+    assert "config=/custom/gre.c" in rendered and "pin=handlers/proto_47" in rendered
 
 
 def test_port_selection_scrolls_into_view_and_filter_is_applied():
@@ -341,11 +378,13 @@ def test_socket_service_inventory_is_visible_even_when_packets_are_suppressed():
     assert "svc(current)=ssh" in rendered
 
 
-@pytest.mark.parametrize("x,target", [(7, "overview"), (18, "traffic"), (29, "events"),
-                                      (39, "cookie"), (48, "maps"), (56, "audit"), (67, "approvals")])
+@pytest.mark.parametrize("target", ["overview", "traffic", "events", "cookie", "maps", "audit", "approvals", "handlers"])
 @pytest.mark.parametrize("width,height", [(80, 20), (140, 42)])
-def test_clickable_tabs_match_visible_header(x, target, width, height):
+def test_clickable_tabs_match_visible_header(target, width, height):
     screen = Canvas(height, width)
+    x, text, _ = next(tab for tab in page_tabs(width) if tab[2] == target)
+    assert x + len(text) <= width - 1
+    x += 2
     action = _mouse_action(screen, _make_win_set(screen), target, x, 1, curses.BUTTON1_CLICKED)
     assert action is not None and action.kind == "page" and action.target == target
 
@@ -538,6 +577,19 @@ def test_mouse_wheel_scrolls_full_maps_page(mouse_main):
     snap = TuiSnapshot(maps=[MapUsage(str(i), "hash", 0, 10, 0.0) for i in range(100)])
     draw = mouse_main(snap, [(0, 5, 5, 0, curses.BUTTON5_PRESSED)], initial="maps")
     assert draw.call_args.args[4] == 3
+
+
+def test_handler_page_keyboard_requests_inventory_and_scrolls_it(mouse_main):
+    rows = [HandlerRow("UDP", index + 1, index + 100, "handler", "loaded") for index in range(40)]
+    draw = mouse_main(TuiSnapshot(handlers=HandlerInventory(rows)), keys_override=[ord("h"), curses.KEY_DOWN])
+    draw.worker.show_handlers.assert_called_once_with(True)
+    assert draw.call_args.args[10] == "handlers"
+    assert draw.call_args.kwargs["handler_scroll"] == 1
+
+
+def test_maps_byte_toggle_is_available_from_keyboard(mouse_main):
+    draw = mouse_main(TuiSnapshot(), initial="maps", keys_override=[ord("b")])
+    assert draw.call_args.kwargs["map_bytes"] is True
 
 
 def _proc_fixture(root, *, user=100, idle=100, available=256):

@@ -232,12 +232,23 @@ screens show map IDs, count sources and occupancy bars; narrow screens retain
 the map name, type, used/max counts, usage and memory. Long names use an ellipsis
 when they cannot fit. Resizing reallocates column widths immediately, and the
 overview's smaller map panel also uses all its available width.
+The memory column uses the kernel's `bytes_memlock` report, including
+preallocated map storage. Press `b` on Maps to switch each row to exact bytes;
+the footer also shows the total in bytes. Nested handler map pins are included,
+and aliases to the same map ID count once. This is the reported memory of the
+listed pinned maps; unpinned and map-in-map inner allocations are not included.
+An unavailable memory report stays unknown rather than becoming zero.
 
 Use `Tab` to focus ports, maps, or events, then the arrow keys to scroll. `t`/`u`
 toggle TCP/UDP ports; `Enter` on a port filters retained events. `m` opens the
 full maps table, `e` packet events and detailed DROP reasons, `v` retained source
 samples and optional country/ASN information, and `c` SYN cookie diagnostics and
-observation health. `a` opens the authorization audit, `p` approval requests,
+observation health. `h` opens Handlers & slots: actual protocol slots, TCP/UDP
+port handlers, TCP profiles and the SYN-cookie dispatch entry, with program IDs,
+names, ownership pins and configured paths. `loaded` means a live dispatch-map
+entry; `pin only` and `configured` do not imply that packets reach the program.
+The inventory refreshes while this page is open, without changing attachments.
+`a` opens the authorization audit, `p` approval requests,
 `o` returns to the overview, and `q` exits.
 Events retain live following across page changes and resizes; scrolling up
 pauses the list, and scrolling back to the bottom resumes it.

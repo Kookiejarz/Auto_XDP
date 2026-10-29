@@ -49,13 +49,14 @@ def _count_source(row: MapUsage) -> str:
     return row.note or "-"
 
 
-def _values(row: MapUsage) -> dict[str, str]:
+def _values(row: MapUsage, exact_bytes: bool = False) -> dict[str, str]:
     used = ("skip" if row.note == "attack skip" else "pending" if row.note == "deferred"
             else "-") if row.current is None else ("~" if row.note in _SAMPLED else "") + str(row.current)
     usage = "fixed" if row.kind in _FIXED else "--" if row.pct is None else f"{row.pct:.1f}%"
     return dict(name=row.name, type=row.kind, id=str(row.map_id) if row.map_id is not None else "-",
                 used=used, max=str(row.maximum) if row.maximum is not None else "-", usage=usage,
-                memory=human_bytes(row.memlock) if row.memlock is not None else "-", source=_count_source(row))
+                memory=(f"{row.memlock} B" if exact_bytes else human_bytes(row.memlock)) if row.memlock is not None else "-",
+                source=_count_source(row))
 
 
 def _columns(values: list[dict[str, str]], available: int) -> tuple[list[tuple[str, int]], int]:
@@ -103,18 +104,22 @@ def _short_count(value: int | None) -> str:
     return str(value)
 
 
-def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool, *, expanded: bool = False) -> None:
+def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool, *, expanded: bool = False,
+               exact_bytes: bool = False) -> None:
     h, w = win.getmaxyx()
-    _box(win, f"BPF maps / {len(rows)}", focused=focused)
+    _box(win, f"BPF maps / {len(rows)} pinned", focused=focused)
     wide = expanded or w >= 90
     available = max(0, w - 4)
-    values = [_values(row) for row in rows]
+    values = [_values(row, exact_bytes) for row in rows]
+    compact_memory = not wide and available >= 44
     if wide:
         columns, gap = _columns(values, available)
         header = (" " * gap).join(_field(_TITLES[key], width, key in _RIGHT) for key, width in columns)
     else:
-        name_width = max(1, available - 17)
+        name_width = max(1, available - (30 if compact_memory else 17))
         header = f"{_field('map', name_width)} {'entries':>10} {'%':>5}"
+        if compact_memory:
+            header += f" {'memory':>12}"
     _add(win, 1, 2, header, _color(_CP_MUTED))
     visible = max(0, h - 3)
     scroll = max(0, min(scroll, max(0, len(rows) - visible)))
@@ -145,11 +150,36 @@ def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool, *, ex
             if row.note in _SAMPLED:
                 capacity = "~" + capacity
             usage = "fixed" if fixed else "--" if row.pct is None else f"{row.pct:.1f}"
-            _add(win, idx, 2, f"{_field(row.name, name_width)} {_field(capacity, 10, True)} {_field(usage, 5, True)}", attr)
-    total_mem = sum(row.memlock for row in rows if row.memlock is not None)
-    memory = f" · {human_bytes(total_mem)}" if total_mem and w >= 40 else ""
+            text = f"{_field(row.name, name_width)} {_field(capacity, 10, True)} {_field(usage, 5, True)}"
+            if compact_memory:
+                text += " " + _field(value["memory"], 12, True)
+            _add(win, idx, 2, text, attr)
+    # Each BPF map is counted once, even when several pins reference it.
+    seen_ids: set[int] = set()
+    total_mem, unknown, known = 0, 0, 0
+    for row in rows:
+        if row.map_id is not None:
+            if row.map_id in seen_ids:
+                continue
+            seen_ids.add(row.map_id)
+        if row.memlock is None:
+            unknown += 1
+        else:
+            total_mem += row.memlock
+            known += 1
+    total = ("≥" if unknown else "") + human_bytes(total_mem)
+    if not known:
+        total = "--"
     action = "m back" if expanded else "m expand"
-    footer = f" {scroll + bool(rows)}-{min(scroll + visible, len(rows))}/{len(rows)}{memory} · {action} "
-    if wide and w >= 110:
-        footer += "· ~ sampled/cached · skip: count paused"
+    footer = f" {scroll + bool(rows)}-{min(scroll + visible, len(rows))}/{len(rows)} · {action}"
+    if expanded:
+        footer += f" · b {'units' if exact_bytes else 'bytes'} · reported {total}"
+        if known:
+            footer += f" ({total_mem:,} B)"
+        if unknown:
+            footer += f" + {unknown} unknown"
+    else:
+        footer += f" · {total}"
+    if wide and w >= 140:
+        footer += " · pinned maps only; inner/unpinned maps excluded"
     _add(win, h - 1, 2, footer, _color(_CP_MUTED))
