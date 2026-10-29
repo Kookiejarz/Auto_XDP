@@ -128,7 +128,19 @@ _PAGES = (
     ("o", "Overview", "overview"), ("v", "Sources", "traffic"),
     ("e", "Events", "events"), ("c", "Health", "cookie"),
     ("m", "Maps", "maps"), ("a", "Audit", "audit"), ("p", "Requests", "approvals"),
+    ("h", "Handlers", "handlers"),
 )
+
+
+def page_tabs(width: int) -> list[tuple[int, str, str]]:
+    short = {"Overview": "Home", "Requests": "Reqs"} if width < 90 else {}
+    result = []
+    x = 1
+    for key, label, target in _PAGES:
+        text = f" {key} {short.get(label, label)} "
+        result.append((x, text, target))
+        x += len(text)
+    return result
 
 
 def _draw_header(stdscr: Any, snap: Any, page: str, clock: str) -> None:
@@ -141,12 +153,9 @@ def _draw_header(stdscr: Any, snap: Any, page: str, clock: str) -> None:
     if suppressed:
         _add(stdscr, 0, max(24, w - 37), " EVENTS SUPPRESSED ", _color(_CP_RED))
     _add(stdscr, 0, max(0, w - len(clock) - 2), clock, _color(_CP_MUTED))
-    x = 1
-    for key, label, target in _PAGES:
-        text = f" {key} {label} "
+    for x, text, target in page_tabs(w):
         active = target == page
         _add(stdscr, 1, x, text, (_color(_CP_SELECTED) | curses.A_BOLD) if active else _color(_CP_MUTED))
-        x += len(text)
 
 
 def _draw_footer(stdscr: Any, snap: Any, error: str, focus: str, page: str, *,

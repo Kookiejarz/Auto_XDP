@@ -41,6 +41,7 @@ from auto_xdp.tui.widgets import (
 )
 from auto_xdp.tui.metrics import HostMetrics, NetworkMetrics, ResourceSampler
 from auto_xdp.tui.maps import _draw_maps
+from auto_xdp.tui.handlers import HandlerCache, HandlerInventory, collect_handlers, draw_handlers, handler_capacity
 from auto_xdp.tui.dashboard import (
     _draw_network, _draw_system, _draw_header, _draw_footer, _number,
 )
@@ -108,6 +109,7 @@ class TuiSnapshot:
     network: NetworkMetrics = field(default_factory=NetworkMetrics)
     stats: list[tuple[str, int, int, str]] = field(default_factory=list)
     maps: list[MapUsage] = field(default_factory=list)
+    handlers: HandlerInventory = field(default_factory=HandlerInventory)
     ports: list[tuple[str, int, str, str, str]] = field(default_factory=list)
     excluded: tuple[int, int] = (0, 0)
     under_attack: bool = False
@@ -273,19 +275,22 @@ def _collect_map_usage(
     pin_aware = any(name.startswith("/") for name in all_info)
     rows: list[MapUsage] = []
 
-    def _sample_count(path: Path, interval: float) -> tuple[int | None, str]:
-        last = cache.refreshed_at.get(path.name, 0.0)
-        if path.name in cache.counts and now - last < interval:
-            return cache.counts[path.name], "cached"
+    def _sample_count(path: Path, interval: float, name: str) -> tuple[int | None, str]:
+        last = cache.refreshed_at.get(name, 0.0)
+        if name in cache.counts and now - last < interval:
+            return cache.counts[name], "cached"
         count = _dump_count(path)
         if count is None:
-            cached = cache.counts.get(path.name)
+            cached = cache.counts.get(name)
             return cached, "cached" if cached is not None else "live"
-        cache.counts[path.name] = count
-        cache.refreshed_at[path.name] = now
+        cache.counts[name] = count
+        cache.refreshed_at[name] = now
         return count, "sampled"
 
-    for path in sorted(p for p in pin_dir.iterdir() if p.is_file()):
+    seen_ids: set[int] = set()
+    paths = sorted((p for p in pin_dir.rglob("*") if p.is_file()),
+                   key=lambda p: (len(p.relative_to(pin_dir).parts), str(p)))
+    for path in paths:
         info = all_info.get(str(path.resolve()))
         if info is None:
             if pin_aware:
@@ -294,31 +299,37 @@ def _collect_map_usage(
             info = all_info.get(path.name, {})
         if not bpftool_ok and not info:
             continue
-        name = path.name
+        map_id_val = info.get("id")
+        map_id = map_id_val if type(map_id_val) is int else None
+        if map_id is not None:
+            if map_id in seen_ids:
+                continue
+            seen_ids.add(map_id)
+        name = str(path.relative_to(pin_dir))
         kind = str(info.get("type") or "-")
         maximum = info.get("max_entries")
         maximum = int(maximum) if isinstance(maximum, int) else None
         current: int | None
         note = ""
-        if path.name == "tcp_whitelist":
+        if name == "tcp_whitelist":
             current = len(tcp_ports)
             note = "open tcp"
-        elif path.name == "udp_whitelist":
+        elif name == "udp_whitelist":
             current = len(udp_ports)
             note = "open udp"
         elif not sample_counts:
-            current = cache.counts.get(path.name)
+            current = cache.counts.get(name)
             note = "cached" if current is not None else "deferred"
         elif path.name in _HIGH_CHURN_MAPS:
-            last = cache.refreshed_at.get(path.name, 0.0)
+            last = cache.refreshed_at.get(name, 0.0)
             if under_attack:
-                current = cache.counts.get(path.name)
+                current = cache.counts.get(name)
                 note = "attack cached" if current is not None else "attack skip"
-            elif path.name in cache.counts and now - last < high_churn_interval:
-                current = cache.counts[path.name]
+            elif name in cache.counts and now - last < high_churn_interval:
+                current = cache.counts[name]
                 note = "cached"
             else:
-                current, note = _sample_count(path, high_churn_interval)
+                current, note = _sample_count(path, high_churn_interval, name)
         elif kind in {"array", "percpu_array"} and maximum is not None:
             # Array maps are dense — every index always exists, so the live
             # entry count is exactly max_entries. Use the metadata instead of
@@ -328,12 +339,10 @@ def _collect_map_usage(
         elif kind in {"ringbuf", "prog_array"}:
             current = None
         else:
-            current, note = _sample_count(path, count_interval)
+            current, note = _sample_count(path, count_interval, name)
         pct = (current / maximum * 100.0) if current is not None and maximum else None
-        map_id_val = info.get("id")
-        map_id = int(map_id_val) if isinstance(map_id_val, int) else None
         memlock_val = info.get("bytes_memlock")
-        memlock = int(memlock_val) if isinstance(memlock_val, int) else None
+        memlock = memlock_val if type(memlock_val) is int and memlock_val >= 0 else None
         rows.append(MapUsage(name, kind, current, maximum, pct, note, map_id=map_id, memlock=memlock))
 
     def sort_key(row: MapUsage) -> tuple[bool, float, str]:
@@ -597,6 +606,8 @@ def _collect_snapshot(
     *,
     fast: bool = False,
     include_approvals: bool = False,
+    include_handlers: bool = False,
+    handler_cache: HandlerCache | None = None,
     resource_sampler: ResourceSampler | None = None,
 ) -> tuple[TuiSnapshot, dict[str, tuple[int, int]], float]:
     ifaces = (args.iface or "").split() or []
@@ -658,6 +669,12 @@ def _collect_snapshot(
     cookie_enabled = cookie_cfg.get("enabled") if isinstance(cookie_cfg, dict) else None
     host, network = (resource_sampler.sample(iface, now) if resource_sampler is not None
                      else (HostMetrics(), NetworkMetrics(iface=iface)))
+    handler_inventory = handler_cache.inventory if handler_cache is not None else HandlerInventory()
+    if backend != "xdp":
+        handler_inventory = HandlerInventory(status="XDP backend is not active")
+    elif include_handlers:
+        handler_inventory = collect_handlers(args.bpf_pin_dir, _load_toml(args.config),
+                                             handler_cache or HandlerCache(), generation=map_id)
     snap = TuiSnapshot(
         backend=backend,
         iface=iface,
@@ -676,6 +693,7 @@ def _collect_snapshot(
             cache=map_cache,
             sample_counts=not fast,
         ),
+        handlers=handler_inventory,
         ports=_collect_port_rows(
             backend,
             args.bpf_pin_dir,
@@ -711,6 +729,8 @@ class SnapshotWorker:
         self._map_cache = MapUsageCache()
         self._first_collect = True
         self._include_approvals = False
+        self._include_handlers = False
+        self._handler_cache = HandlerCache()
         self._resources = ResourceSampler()
 
     def start(self) -> None:
@@ -729,6 +749,11 @@ class SnapshotWorker:
             self._include_approvals = enabled
         self.wakeup()
 
+    def show_handlers(self, enabled: bool) -> None:
+        with self._lock:
+            self._include_handlers = enabled
+        self.wakeup()
+
     def get(self) -> tuple[TuiSnapshot, str]:
         with self._lock:
             return self._snapshot, self._error
@@ -744,6 +769,7 @@ class SnapshotWorker:
             try:
                 with self._lock:
                     include_approvals = self._include_approvals
+                    include_handlers = self._include_handlers
                 snap, self._prev_stats, self._prev_ts = _collect_snapshot(
                     self._args,
                     self._prev_stats,
@@ -751,6 +777,8 @@ class SnapshotWorker:
                     self._map_cache,
                     fast=self._first_collect,
                     include_approvals=include_approvals,
+                    include_handlers=include_handlers,
+                    handler_cache=self._handler_cache,
                     resource_sampler=self._resources,
                 )
                 self._first_collect = False
@@ -1041,6 +1069,8 @@ def _draw(
     approval_cursor: int = -1,
     geoip: GeoIPResolver | None = None,
     mouse_enabled: bool = False,
+    handler_scroll: int = 0,
+    map_bytes: bool = False,
 ) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -1099,7 +1129,13 @@ def _draw(
     if page == "maps":
         full_win = _make_full_win(stdscr)
         if full_win is not None:
-            _draw_maps(full_win, snap.maps, map_scroll, True, expanded=True)
+            _draw_maps(full_win, snap.maps, map_scroll, True, expanded=True, exact_bytes=map_bytes)
+        stdscr.refresh()
+        return
+    if page == "handlers":
+        full_win = _make_full_win(stdscr)
+        if full_win is not None:
+            draw_handlers(full_win, snap.handlers, handler_scroll)
         stdscr.refresh()
         return
     if wins is None:
@@ -1143,6 +1179,9 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     worker = SnapshotWorker(args)
     worker.start()
     map_scroll = 0
+    map_bytes = False
+    handler_scroll = 0
+    handler_page_active = False
     event_top = 0
     previous_event_visible = 1
     focus = "ports"
@@ -1267,10 +1306,20 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 focus = "maps"
                 worker.show_approvals(False)
                 ui_dirty = True
+            elif ch in (ord("h"), ord("H")):
+                page = "handlers" if page != "handlers" else "overview"
+                worker.show_approvals(False)
+                ui_dirty = True
+            elif ch in (ord("b"), ord("B")) and page == "maps":
+                map_bytes = not map_bytes
+                ui_dirty = True
             elif ch in (ord("v"), ord("V")):
                 page = "traffic" if page != "traffic" else "overview"
                 worker.show_approvals(False)
                 ui_dirty = True
+            if (page == "handlers") != handler_page_active:
+                handler_page_active = page == "handlers"
+                worker.show_handlers(handler_page_active)
             snap, worker_error = worker.get()
             if page == "audit" and snap.audit_fingerprint and not snap.audit_status \
                     and snap.audit_fingerprint != last_reviewed_fingerprint:
@@ -1394,7 +1443,15 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 elif page in {"overview", "events"} and focus == "events" and event_dport_filter is not None:
                     event_dport_filter = None
                     ui_dirty = True
-            if page == "audit":
+            if page == "handlers":
+                visible = max(1, handler_capacity((wins.h if wins is not None else 20) - 3))
+                limit = max(0, len(snap.handlers.rows) - visible)
+                if ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
+                    step = visible if ch in (curses.KEY_PPAGE, curses.KEY_NPAGE) else scroll_step
+                    handler_scroll = max(0, min(limit, handler_scroll + (-step if ch in (curses.KEY_UP, curses.KEY_PPAGE) else step)))
+                    ui_dirty = True
+                handler_scroll = min(handler_scroll, limit)
+            elif page == "audit":
                 if ch == curses.KEY_UP:
                     audit_scroll = max(0, audit_scroll - scroll_step)
                     ui_dirty = True
@@ -1499,6 +1556,8 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 relay.events_end,
                 relay.status,
                 map_scroll,
+                map_bytes,
+                handler_scroll,
                 event_top,
                 focus,
                 port_filter,
@@ -1516,7 +1575,8 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             )
             now = time.monotonic()
             if ui_dirty or draw_state != last_draw_state or now - last_draw_at >= TUI_IDLE_REDRAW_INTERVAL:
-                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll, audit_scroll, approval_cursor, geoip, mouse_enabled)
+                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll, audit_scroll, approval_cursor, geoip, mouse_enabled,
+                      handler_scroll=handler_scroll, map_bytes=map_bytes)
                 if copy_mode:
                     _draw_footer(stdscr, snap, "", focus, page, copy_mode=True)
                     stdscr.refresh()

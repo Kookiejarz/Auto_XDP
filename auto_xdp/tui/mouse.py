@@ -5,7 +5,7 @@ import curses
 from dataclasses import dataclass
 from typing import Any
 
-from auto_xdp.tui.dashboard import _PAGES
+from auto_xdp.tui.dashboard import page_tabs
 
 
 @dataclass(frozen=True)
@@ -47,12 +47,10 @@ def _mouse_action(screen: Any, wins: Any, page: str, x: int, y: int, state: int)
     wheel_down = bool(state & getattr(curses, "BUTTON5_PRESSED", 0))
     key = curses.KEY_UP if wheel_up else curses.KEY_DOWN
     if y == 1 and click:
-        start = 1
-        for shortcut, label, target in _PAGES:
-            end = start + len(f" {shortcut} {label} ")
+        for start, text, target in page_tabs(width):
+            end = start + len(text)
             if start <= x < min(end, width - 1):
                 return MouseAction("page", target)
-            start = end
     if page == "events" and y == 2 and click:
         return MouseAction("clear_filter")
     if page == "overview" and wins is not None:
