@@ -129,6 +129,17 @@ compares the runtime inventory with grants and makes no backend changes.
 `xdp_port_sync.py --mode audit --explain`; reconcile latency is logged in
 milliseconds.
 
+The daemon receives proc and relay notifications on a dedicated thread; the
+main thread owns discovery, configuration reload, backend creation and policy
+map writes, readback and cleanup. The receiver coalesces hints into one bounded
+pending notification, retaining the first/last receipt times and immediate relay priority.
+The worker consumes hints before a round, so notifications received during a
+slow apply or verification trigger another discovery afterward. Proc events
+retain bounded debounce; relay changes and connection gaps request immediate
+reconciliation. Each source has a read budget, and the periodic full reconcile
+remains the safety net. Notifications never authorize endpoints or interrupt an
+in-flight apply; this separation does not eliminate the revocation window.
+
 ## Control and data planes
 
 ```text
@@ -235,6 +246,10 @@ update candidates recursively, and validates imports against the installed
 payload independently of the source checkout.
 
 The observation path is `XDP/TC → counters/ringbuf → relay → client → views`.
+The relay reader wakes the broadcaster through a nonblocking socketpair after
+enqueueing an event, so an idle broadcaster need not wait for its polling timeout.
+The bounded event queue and broadcast batches retain their ordering and limits;
+the wakeup carries no event data. Shutdown also wakes the broadcaster.
 TC handoff counters reuse the main pinned counter map. Built-in tail-call
 programs account for their terminal verdict exactly once, since successful BPF
 tail calls do not return to the main program's accounting wrapper. Custom
