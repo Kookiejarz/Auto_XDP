@@ -90,15 +90,15 @@ drop:
 static __always_inline int check_tcp_ipv4(
     struct xdp_md *ctx,
     struct iphdr *ip, void *trans_data, void *data_end,
-    __u16 l3_off, __u16 inner_off)
+    __u16 l3_off, __u16 inner_off, __u32 l4_len)
 {
     struct tcphdr *tcp = trans_data;
     struct flow_key key;
 
-    if ((void *)(tcp + 1) > data_end)
+    if (l4_len < sizeof(*tcp) || (void *)(tcp + 1) > data_end)
         return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
 
-    __u8 malform = tcp_malformed_reason(tcp, data_end);
+    __u8 malform = tcp_malformed_reason(tcp, data_end, l4_len);
     if (malform) {
         count(malform);
         count(CNT_TCP_DROP);
@@ -112,7 +112,6 @@ static __always_inline int check_tcp_ipv4(
 
     __u8  tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
-    __u32 l4_len = (__u32)bpf_ntohs(ip->tot_len) - (inner_off - l3_off);
     bool pure_ack = tcp_flags == TCP_FLAG_ACK && l4_len == (__u32)tcp->doff * 4U;
     fill_flow_key_v4(&key, ip->saddr, ip->daddr, tcp->source, tcp->dest);
 
@@ -129,15 +128,15 @@ static __always_inline int check_tcp_ipv4(
 static __always_inline int check_tcp_ipv6(
     struct xdp_md *ctx,
     struct ipv6hdr *ipv6, void *trans_data, void *data_end,
-    __u16 l3_off, __u16 inner_off)
+    __u16 l3_off, __u16 inner_off, __u32 l4_len)
 {
     struct tcphdr *tcp = trans_data;
     struct flow_key key;
 
-    if ((void *)(tcp + 1) > data_end)
+    if (l4_len < sizeof(*tcp) || (void *)(tcp + 1) > data_end)
         return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
 
-    __u8 malform = tcp_malformed_reason(tcp, data_end);
+    __u8 malform = tcp_malformed_reason(tcp, data_end, l4_len);
     if (malform) {
         count(malform);
         count(CNT_TCP_DROP);
@@ -152,8 +151,6 @@ static __always_inline int check_tcp_ipv6(
 
     __u8 tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
-    __u32 l4_len = (__u32)bpf_ntohs(ipv6->payload_len) -
-                   (inner_off - l3_off - sizeof(*ipv6));
     bool pure_ack = tcp_flags == TCP_FLAG_ACK && l4_len == (__u32)tcp->doff * 4U;
     fill_flow_key_v6(&key, &ipv6->saddr, &ipv6->daddr, tcp->source, tcp->dest);
 
@@ -170,7 +167,7 @@ static __always_inline int check_tcp_ipv6(
 static __always_inline int check_udp_ipv4(
     struct xdp_md *ctx,
     struct iphdr *ip, void *trans_data, void *data_end,
-    __u16 l3_off, __u16 inner_off)
+    __u16 l3_off, __u16 inner_off, __u32 l4_len)
 {
     struct udphdr *udp = trans_data;
     struct flow_key key;
@@ -178,11 +175,10 @@ static __always_inline int check_udp_ipv4(
     __u64 now = bpf_ktime_get_ns();
     struct xdp_runtime_cfg *cfg = runtime_cfg();
 
-    if ((void *)(udp + 1) > data_end)
+    if (l4_len < sizeof(*udp) || (void *)(udp + 1) > data_end)
         return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
 
-    __u32 l4_avail = (__u32)((__u8 *)data_end - (__u8 *)udp);
-    __u8 malform = udp_malformed_reason(udp, l4_avail);
+    __u8 malform = udp_malformed_reason(udp, l4_len);
     if (malform) {
         count(malform);
         count(CNT_UDP_DROP);
@@ -307,7 +303,7 @@ static __always_inline int check_udp_ipv4(
 static __always_inline int check_udp_ipv6(
     struct xdp_md *ctx,
     struct ipv6hdr *ipv6, void *trans_data, void *data_end,
-    __u16 l3_off, __u16 inner_off)
+    __u16 l3_off, __u16 inner_off, __u32 l4_len)
 {
     struct udphdr *udp = trans_data;
     struct flow_key key;
@@ -316,11 +312,10 @@ static __always_inline int check_udp_ipv6(
     struct xdp_runtime_cfg *cfg = runtime_cfg();
     struct udp_port_policy_cfg *policy;
 
-    if ((void *)(udp + 1) > data_end)
+    if (l4_len < sizeof(*udp) || (void *)(udp + 1) > data_end)
         return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
 
-    __u32 l4_avail = (__u32)((__u8 *)data_end - (__u8 *)udp);
-    __u8 malform = udp_malformed_reason(udp, l4_avail);
+    __u8 malform = udp_malformed_reason(udp, l4_len);
     if (malform) {
         count(malform);
         count(CNT_UDP_DROP);
@@ -522,6 +517,16 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         if (ip_hlen < sizeof(*ip) || (void *)ip + ip_hlen > data_end)
             return drop_unclassified(ctx, CNT_IP_HEADER_INVALID);
 
+        /* IP length excludes Ethernet padding. Validate the complete datagram
+         * before policy/cookie dispatch, then bound all transport parsing by
+         * its declared payload as well as the verifier's physical data_end. */
+        __u32 ip_len = bpf_ntohs(ip->tot_len);
+        if (ip->version != 4 || ip_len < ip_hlen)
+            return drop_unclassified(ctx, CNT_IP_HEADER_INVALID);
+        if ((void *)ip + ip_len > data_end)
+            return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
+        __u32 l4_len = ip_len - ip_hlen;
+
         // Drop IPv4 fragmented packets (rarely needed on personal servers, and fragments can bypass port filtering)
         if (ip->frag_off & bpf_htons(IP_MF | IP_OFFSET)) {
             count(CNT_FRAG_DROP);
@@ -546,12 +551,12 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
 
         switch (ip->protocol) {
         case IPPROTO_TCP:
-            return check_tcp_ipv4(ctx, ip, trans_data, data_end, l3_off, inner_off);
+            return check_tcp_ipv4(ctx, ip, trans_data, data_end, l3_off, inner_off, l4_len);
         case IPPROTO_UDP:
-            return check_udp_ipv4(ctx, ip, trans_data, data_end, l3_off, inner_off);
+            return check_udp_ipv4(ctx, ip, trans_data, data_end, l3_off, inner_off, l4_len);
         case IPPROTO_ICMP: {
             struct icmphdr *icmp = trans_data;
-            if ((void *)(icmp + 1) > data_end) {
+            if (l4_len < sizeof(*icmp) || (void *)(icmp + 1) > data_end) {
                 count(CNT_IPV4_OTHER);
                 return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
             }
@@ -597,7 +602,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         }
         case IPPROTO_SCTP: {
             struct udphdr *ports = trans_data;
-            if ((void *)(ports + 1) > data_end)
+            if (l4_len < sizeof(*ports) || (void *)(ports + 1) > data_end)
                 return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
             __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
             if (!endpoint_scope_allowed(ctx, CT_FAMILY_IPV4, IPPROTO_SCTP,
@@ -618,10 +623,16 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         struct ipv6hdr *ipv6 = l3_data;
         if ((void *)(ipv6 + 1) > data_end)
             return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
+        if (ipv6->version != 6)
+            return drop_unclassified(ctx, CNT_IP_HEADER_INVALID);
 
         void *trans_data = (void *)(ipv6 + 1);
+        __u32 payload_len = bpf_ntohs(ipv6->payload_len);
+        if (trans_data + payload_len > data_end)
+            return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
 
-        __u8 nexthdr = skip_ipv6_exthdr(&trans_data, data_end, ipv6->nexthdr);
+        __u8 nexthdr = skip_ipv6_exthdr(
+            &trans_data, data_end, ipv6->nexthdr, payload_len);
         // 0xFF is our dedicated sentinel for every IPv6 fragment.
         if (nexthdr == IPV6_FRAG_DROP_SENTINEL) {
             count(CNT_FRAG_DROP);
@@ -636,8 +647,11 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         if (nexthdr == IPPROTO_NONE)
             return XDP_PASS;
 
+        __u32 l4_len = payload_len -
+            (__u32)(trans_data - (void *)(ipv6 + 1));
         bool ndp_control = false;
         if (nexthdr == IPPROTO_ICMPV6 &&
+            l4_len >= sizeof(struct icmp6hdr) &&
             (void *)((struct icmp6hdr *)trans_data + 1) <= data_end) {
             __u8 icmp6_type = ((struct icmp6hdr *)trans_data)->icmp6_type;
             ndp_control = icmp6_type >= 133 && icmp6_type <= 137;
@@ -659,15 +673,15 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
 
         switch (nexthdr) {
         case IPPROTO_TCP:
-            return check_tcp_ipv6(ctx, ipv6, trans_data, data_end, l3_off, inner_off);
+            return check_tcp_ipv6(ctx, ipv6, trans_data, data_end, l3_off, inner_off, l4_len);
         case IPPROTO_UDP:
-            return check_udp_ipv6(ctx, ipv6, trans_data, data_end, l3_off, inner_off);
+            return check_udp_ipv6(ctx, ipv6, trans_data, data_end, l3_off, inner_off, l4_len);
         case IPPROTO_ICMPV6: {
             // NDP (RS/RA/NS/NA/Redirect, types 133-137) must always pass —
             // dropping them breaks IPv6 neighbour discovery and routing.
             // Only echo requests (type 128) go through the shared token bucket.
             struct icmp6hdr *icmp6 = trans_data;
-            if ((void *)(icmp6 + 1) > data_end) {
+            if (l4_len < sizeof(*icmp6) || (void *)(icmp6 + 1) > data_end) {
                 count(CNT_IPV6_OTHER);
                 return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
             }
@@ -686,7 +700,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         }
         case IPPROTO_SCTP: {
             struct udphdr *ports = trans_data;
-            if ((void *)(ports + 1) > data_end)
+            if (l4_len < sizeof(*ports) || (void *)(ports + 1) > data_end)
                 return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
             __u32 d[4] = {0};
             __builtin_memcpy(d, &ipv6->daddr, 16);

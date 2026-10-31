@@ -535,6 +535,12 @@ test_packet_event_v2_kernel() {
         events "$_PIN_DIR" "$_VETH"
 }
 
+test_ip_packet_lengths() {
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_lengths.py" \
+        "$_PIN_DIR" "$_VETH"
+}
+
 test_interrupted_candidate_restore() {
     local candidate_dir="${_PIN_DIR}_next"
     local stable_id candidate_id attached_id
