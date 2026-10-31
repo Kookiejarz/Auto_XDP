@@ -6,12 +6,14 @@
 // for any packet that violates RFC 793 structural invariants.
 // Returns 0 for valid packets, or a CNT_TCP_MALFORM_* reason code for drops.
 // count() and emit_drop() are the caller's responsibility.
-static __always_inline __u8 tcp_malformed_reason(struct tcphdr *tcp, void *data_end)
+static __always_inline __u8 tcp_malformed_reason(
+    struct tcphdr *tcp, void *data_end, __u32 l4_len)
 {
     __u8 doff = tcp->doff;
     if (doff < 5 || doff > 15)
         return (__u8)CNT_TCP_MALFORM_DOFF;
-    if ((void *)tcp + ((__u32)doff * 4) > data_end)
+    if ((__u32)doff * 4 > l4_len ||
+        (void *)tcp + ((__u32)doff * 4) > data_end)
         return (__u8)CNT_TCP_MALFORM_DOFF;
     if (tcp->source == 0 || tcp->dest == 0)
         return (__u8)CNT_TCP_MALFORM_PORT0;
@@ -32,8 +34,8 @@ static __always_inline __u8 tcp_malformed_reason(struct tcphdr *tcp, void *data_
 
 // Returns 0 for valid packets, or a CNT_UDP_MALFORM_* reason code for drops.
 // count() and emit_drop() are the caller's responsibility.
-// l4_avail = (u32)(data_end - udp): caller computes this via pointer subtraction
-// (not addition) before the call so the verifier retains range tracking.
+// l4_avail is the IP-declared payload remaining after IP/extension headers.
+// Ethernet padding must never supply missing UDP header/body bytes.
 static __always_inline __u8 udp_malformed_reason(struct udphdr *udp, __u32 l4_avail)
 {
     if (udp->source == 0 || udp->dest == 0)
@@ -47,7 +49,7 @@ static __always_inline __u8 udp_malformed_reason(struct udphdr *udp, __u32 l4_av
 // IPv6 extension header traversal to prevent bypassing port checks
 
 static __always_inline __u8 skip_ipv6_exthdr(
-    void **trans_data, void *data_end, __u8 nexthdr)
+    void **trans_data, void *data_end, __u8 nexthdr, __u32 remaining)
 {
     // Traverse at most 6 extension headers; treat more as anomalous and let the
     // caller apply its fail-closed policy.
@@ -59,10 +61,13 @@ static __always_inline __u8 skip_ipv6_exthdr(
         case IPPROTO_DSTOPTS:  // 60 Destination options
         {
             __u8 *hdr = *trans_data;
-            if ((void *)(hdr + 2) > data_end)
+            if (remaining < 2 || (void *)(hdr + 2) > data_end)
                 return IPV6_EXTHDR_MALFORMED_SENTINEL;
             nexthdr = hdr[0];
             __u32 hdrlen = (((__u32)hdr[1] + 1) * 8);
+            if (hdrlen > remaining)
+                return IPV6_EXTHDR_MALFORMED_SENTINEL;
+            remaining -= hdrlen;
             *trans_data += hdrlen;
             if (*trans_data > data_end)
                 return IPV6_EXTHDR_MALFORMED_SENTINEL;
@@ -71,7 +76,7 @@ static __always_inline __u8 skip_ipv6_exthdr(
         case IPPROTO_FRAGMENT: // 44 Fragment header (fixed 8 bytes)
         {
             __u8 *hdr = *trans_data;
-            if ((void *)(hdr + 8) > data_end)
+            if (remaining < 8 || (void *)(hdr + 8) > data_end)
                 return IPV6_EXTHDR_MALFORMED_SENTINEL;
             return IPV6_FRAG_DROP_SENTINEL;
         }
