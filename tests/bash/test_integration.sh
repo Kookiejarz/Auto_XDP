@@ -41,7 +41,7 @@ if [[ $EUID -ne 0 ]]; then
     _kernel_unavailable "must run as root"
 fi
 
-for _cmd in clang bpftool ip python3 tc nft ethtool unshare mount; do
+for _cmd in clang bpftool ip python3 tc nft ethtool unshare mount nsenter conntrack; do
     command -v "$_cmd" &>/dev/null || _kernel_unavailable "$_cmd not found"
 done
 
@@ -1541,6 +1541,7 @@ test_syncookie_listener_handoff() (
         return 0
     }
     local port=7710 value_hex ready_file recv_file listener_pid="" live_counters gate_output mode
+    local attach_mode="${1:-generic}" detach_mode=xdpgeneric
     local TOML_CONFIG="$_RUN_DIR/syncookie.toml"
     local SYNCOOKIE_OBJ_PATH="$_SYNCOOKIE_OBJ" TC_SYNCOOKIE_OBJ_PATH="$_TC_SYNCOOKIE_OBJ"
     local SYNCOOKIE_SYSCTL_STATE="$_RUN_DIR/syncookie-sysctl.json"
@@ -1579,6 +1580,25 @@ test_syncookie_listener_handoff() (
     done
     nft delete table ip axdp_cookie_nat || return 1
     load_syncookie_program || return 1
+
+    if [[ "$attach_mode" == native ]]; then
+        # Native veth XDP_TX needs the peer's XDP/NAPI receive path as well.
+        clang -O2 -g -target bpf "${_include_args[@]}" -x c - \
+            -c -o "$_RUN_DIR/peer-pass.o" <<'CEOF' || return 1
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+SEC("xdp") int peer_pass(struct xdp_md *ctx) { return XDP_PASS; }
+char LICENSE[] SEC("license") = "GPL";
+CEOF
+        bpftool prog load "$_RUN_DIR/peer-pass.o" "$_PIN_DIR/peer_pass" \
+            type xdp || return 1
+        # ip netns exec remounts sysfs and hides this fixture's private pins.
+        nsenter --net="/run/netns/$_NS" ip link set dev "$_VETH_IN" \
+            xdpdrv pinned "$_PIN_DIR/peer_pass" || return 1
+        ip link set dev "$_VETH" xdpgeneric off || return 1
+        ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+        detach_mode=xdpdrv
+    fi
 
     ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_timestamps=1
     ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_window_scaling=1
@@ -1650,6 +1670,22 @@ PYEOF
     wait "$listener_pid" || return 1
     listener_pid=""
     [[ $(<"$recv_file") == cookie ]] || return 1
+
+    # A successful handoff must also permit prompt client-first payloads.
+    # Exercise both families and a transfer larger than the bootstrap window.
+    rm -f "$ready_file" "$recv_file"
+    python3 "$REPO_ROOT/tests/python/kernel_syncookie_latency.py" server "$port" \
+        --ready "$ready_file" --output "$recv_file" --stale-conntrack \
+        --pin-dir "$_PIN_DIR" --interface "$_VETH" &
+    listener_pid=$!
+    for _ in {1..50}; do
+        [[ -s "$ready_file" ]] && break
+        sleep 0.02
+    done
+    ip netns exec "$_NS" python3 \
+        "$REPO_ROOT/tests/python/kernel_syncookie_latency.py" client "$port" || return 1
+    wait "$listener_pid" || return 1
+    listener_pid=""
     python3 - "$_PIN_DIR" "$live_counters" <<'PYEOF' || return 1
 import json, subprocess, sys
 def counter(key):
@@ -1677,12 +1713,41 @@ if counts[61] or counts[62] or counts[59] != counts[60]:
     raise SystemExit(f"SYN-cookie TC handoff was not entirely successful: {counts}")
 print(f"SYN-cookie accepted and echoed; shared stage counters={counts}")
 PYEOF
+    if [[ "$attach_mode" == native ]]; then
+        live_counters=$(PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 - "$_PIN_DIR" <<'PYEOF'
+import json, sys
+from pathlib import Path
+from kernel_packet_telemetry import counter
+print(json.dumps({key: counter(Path(sys.argv[1]) / "pkt_counters", key)
+                  for key in (38, 39, 53)}))
+PYEOF
+        ) || return 1
+        ip netns exec "$_NS" python3 "$REPO_ROOT/tests/python/kernel_syncookie_native.py" \
+            "$_VETH_IN" "$(cat "/sys/class/net/$_VETH/address")" "$port" || return 1
+        PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 - \
+            "$_PIN_DIR" "$live_counters" <<'PYEOF' || return 1
+import json, sys
+from pathlib import Path
+from kernel_packet_telemetry import counter
+before = json.loads(sys.argv[2])
+counts = {key: counter(Path(sys.argv[1]) / "pkt_counters", key) - before[str(key)]
+          for key in (38, 39, 53)}
+assert counts == {38: 200, 39: 200, 53: 0}, counts
+print(f"Native short-SYN counters: {counts}")
+PYEOF
+    fi
     # Do not mix synthetic tuple state with the live listener proof above.
     # Detach only this fixture before checking exact synthetic packet deltas.
-    ip link set dev "$_VETH" xdpgeneric off || return 1
+    ip link set dev "$_VETH" "$detach_mode" off || return 1
     PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_telemetry.py" \
-        cookie "$_PIN_DIR" "$_VETH" --port "$port"
+        cookie "$_PIN_DIR" "$_VETH" --port "$port" || return 1
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_lengths.py" \
+        "$_PIN_DIR" "$_VETH" --port "$port" --cookie
 )
+
+test_syncookie_native_tailroom() {
+    test_syncookie_listener_handoff native
+}
 
 # ---------------------------------------------------------------------------
 # Main
@@ -1701,6 +1766,7 @@ _run_kernel_test() {
 trap - EXIT
 if [[ "${ONLY_SYNCOOKIE:-0}" == 1 ]]; then
     _run_kernel_test syncookie_listener_handoff test_syncookie_listener_handoff
+    _run_kernel_test syncookie_native_tailroom test_syncookie_native_tailroom
     _teardown
     finish_tests
     exit

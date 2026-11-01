@@ -6,6 +6,20 @@
 #include "include/map_sizes.h"
 #include "include/linux_conntrack.h"
 
+/* Keep helper/verifier workspace separate from the driver's packet tailroom. */
+struct syncookie_tcp_work {
+    struct tcphdr tcp;
+    __u8 options[40];
+};
+_Static_assert(sizeof(struct syncookie_tcp_work) == 60, "TCP header workspace");
+
+/* Unlike a forwarding SYN proxy, reqsk handoff does not send a separate
+ * window-opening ACK. A zero SYN-ACK window therefore stalls client-first
+ * protocols until a persist probe. Advertise a conservative bootstrap window;
+ * the listening socket's TCP stack controls subsequent receive-window updates.
+ * SYN windows are unscaled, even when the SYN-ACK negotiates window scaling. */
+#define SYNCOOKIE_INITIAL_WINDOW 4096U
+
 static __always_inline bool syncookie_linux_established(
     struct xdp_md *ctx, const struct xdp_slot_ctx *sc)
 {
@@ -21,13 +35,27 @@ static __always_inline bool syncookie_linux_established(
     struct bpf_ct_opts___local opts = linux_ct_opts(IPPROTO_TCP);
     struct nf_conn *ct = bpf_xdp_ct_lookup(
         ctx, &tuple, linux_ct_tuple_size(&key), &opts, sizeof(opts));
-    if (!ct)
+    if (ct) {
+        struct linux_ct_snapshot snapshot;
+        linux_ct_snapshot(ct, opts.dir, &snapshot);
+        bpf_ct_release(ct);
+        if (snapshot.dir == NF_CT_DIR_ORIGINAL &&
+            linux_ct_established(&snapshot))
+            return true;
+    }
+    /* XDP_TX SYN-ACKs do not traverse conntrack. A reused tuple can retain
+     * CLOSE/TIME_WAIT state even after reqsk handoff created a live socket.
+     * Do not revalidate its data ACKs as handshake cookies. The exact tuple
+     * must name a real established socket; Linux still checks TCP sequence
+     * numbers. Listeners, request sockets and timewait sockets never qualify.
+     */
+    struct bpf_sock *sk = bpf_sk_lookup_tcp(
+        ctx, &tuple, linux_ct_tuple_size(&key), BPF_F_CURRENT_NETNS, 0);
+    if (!sk)
         return false;
-    struct linux_ct_snapshot snapshot;
-    linux_ct_snapshot(ct, opts.dir, &snapshot);
-    bpf_ct_release(ct);
-    return snapshot.dir == NF_CT_DIR_ORIGINAL &&
-           linux_ct_established(&snapshot);
+    bool established = sk->state == BPF_TCP_ESTABLISHED;
+    bpf_sk_release(sk);
+    return established;
 }
 
 struct syncookie_syn_opts {
@@ -46,7 +74,10 @@ syncookie_parse_syn_opts(struct tcphdr *tcp, void *data_end)
     __u8 *base = (__u8 *)tcp + sizeof(*tcp);
     __u32 opt_len = ((__u32)tcp->doff * 4) - sizeof(*tcp);
     __u32 off = 0;
-#pragma unroll
+    /* Two groups of five retain the ten-option budget without duplicating
+     * every branch ten times. An explicit factor also handles early exits
+     * beyond LLVM's default upper-bound unrolling limit. */
+#pragma clang loop unroll_count(5)
     for (int i = 0; i < 10; i++) {
         if (off >= opt_len || base + off + 1 > (__u8 *)data_end)
             break;
@@ -277,18 +308,13 @@ static __always_inline int syncookie_v4(
 
     tcp_len = tcp->doff * 4;
     count(CNT_SYN_COOKIE_CHALLENGE);
-    /* The helper requires verifier-visible room for the maximum TCP header. */
-    if (bpf_xdp_adjust_tail(ctx, 60 - tcp_len)) {
-        *reason = CNT_SYN_COOKIE_ADJUST_ERROR;
+    struct syncookie_tcp_work tcp_work = {};
+    if (bpf_xdp_load_bytes(ctx, inner_offset, &tcp_work, tcp_len)) {
+        *reason = CNT_SYN_COOKIE_PACKET_INVALID;
         return XDP_DROP;
     }
-    data = (void *)(long)ctx->data;
-    data_end = (void *)(long)ctx->data_end;
-    ip = data + l3_offset;
-    tcp = data + inner_offset;
-    if ((void *)ip + 60 > data_end || (void *)tcp + 60 > data_end)
-        return XDP_DROP;
-    generated = bpf_tcp_raw_gen_syncookie_ipv4(ip, tcp, tcp_len);
+    generated = bpf_tcp_raw_gen_syncookie_ipv4(
+        ip, &tcp_work.tcp, tcp_len);
     if (generated < 0) {
         *reason = CNT_SYN_COOKIE_HELPER_ERROR;
         return XDP_DROP;
@@ -316,20 +342,16 @@ static __always_inline int syncookie_v4(
             count(CNT_SYN_COOKIE_STATE_STORE_ERROR);
     }
 
-    /* Move TCP to a plain IPv4 header when IPv4 options were present. */
-    if (ip->ihl > 5) {
-        struct tcphdr *new_tcp = (void *)ip + sizeof(*ip);
-        __builtin_memmove(new_tcp, tcp, sizeof(*tcp));
-        tcp = new_tcp;
+    /* The completed TCP workspace is stored after the plain IP header. */
+    if (ip->ihl > 5)
         ip->ihl = 5;
-    }
     data = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
     ip = data + l3_offset;
     tcp = data + l3_offset + sizeof(*ip);
     if (data + sizeof(struct ethhdr) > data_end ||
         (void *)ip + sizeof(*ip) > data_end ||
-        (void *)tcp + 60 > data_end)
+        (void *)tcp + sizeof(*tcp) > data_end)
         return XDP_DROP;
 
     {
@@ -342,6 +364,7 @@ static __always_inline int syncookie_v4(
         ip->saddr = ip->daddr;
         ip->daddr = addr;
     }
+    tcp = &tcp_work.tcp;
     {
         __be16 port = tcp->source;
         tcp->source = tcp->dest;
@@ -355,7 +378,7 @@ static __always_inline int syncookie_v4(
     tcp->fin = 0;
     __u16 tcp_opt_len = syncookie_write_synack_opts(tcp, &attrs);
     tcp->doff = 5 + tcp_opt_len / 4;
-    tcp->window = 0;
+    tcp->window = bpf_htons(SYNCOOKIE_INITIAL_WINDOW);
     tcp->urg_ptr = 0;
     tcp_len = sizeof(*tcp) + tcp_opt_len;
 
@@ -370,6 +393,10 @@ static __always_inline int syncookie_v4(
     new_len = l3_offset + sizeof(*ip) + tcp_len;
     if (bpf_xdp_adjust_tail(ctx, new_len - (int)(data_end - data))) {
         *reason = CNT_SYN_COOKIE_ADJUST_ERROR;
+        return XDP_DROP;
+    }
+    if (bpf_xdp_store_bytes(ctx, l3_offset + sizeof(*ip), &tcp_work, tcp_len)) {
+        *reason = CNT_SYN_COOKIE_PACKET_INVALID;
         return XDP_DROP;
     }
     count(CNT_SYN_COOKIE_SENT);
@@ -424,17 +451,13 @@ static __always_inline int syncookie_v6(
 
     tcp_len = tcp->doff * 4;
     count(CNT_SYN_COOKIE_CHALLENGE);
-    if (bpf_xdp_adjust_tail(ctx, 60 - tcp_len)) {
-        *reason = CNT_SYN_COOKIE_ADJUST_ERROR;
+    struct syncookie_tcp_work tcp_work = {};
+    if (bpf_xdp_load_bytes(ctx, inner_offset, &tcp_work, tcp_len)) {
+        *reason = CNT_SYN_COOKIE_PACKET_INVALID;
         return XDP_DROP;
     }
-    data = (void *)(long)ctx->data;
-    data_end = (void *)(long)ctx->data_end;
-    ip = data + l3_offset;
-    tcp = data + inner_offset;
-    if ((void *)ip + 60 > data_end || (void *)tcp + 60 > data_end)
-        return XDP_DROP;
-    generated = bpf_tcp_raw_gen_syncookie_ipv6(ip, tcp, tcp_len);
+    generated = bpf_tcp_raw_gen_syncookie_ipv6(
+        ip, &tcp_work.tcp, tcp_len);
     if (generated < 0) {
         *reason = CNT_SYN_COOKIE_HELPER_ERROR;
         return XDP_DROP;
@@ -462,19 +485,15 @@ static __always_inline int syncookie_v6(
         if (bpf_map_update_elem(&sync_handoff6, &handoff_key, &attrs, BPF_ANY))
             count(CNT_SYN_COOKIE_STATE_STORE_ERROR);
     }
-    if (inner_offset != l3_offset + sizeof(*ip)) {
-        struct tcphdr *new_tcp = (void *)ip + sizeof(*ip);
-        __builtin_memmove(new_tcp, tcp, sizeof(*tcp));
-        tcp = new_tcp;
+    if (inner_offset != l3_offset + sizeof(*ip))
         ip->nexthdr = IPPROTO_TCP;
-    }
     data = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
     ip = data + l3_offset;
     tcp = data + l3_offset + sizeof(*ip);
     if (data + sizeof(struct ethhdr) > data_end ||
         (void *)ip + sizeof(*ip) > data_end ||
-        (void *)tcp + 60 > data_end)
+        (void *)tcp + sizeof(*tcp) > data_end)
         return XDP_DROP;
     {
         struct ethhdr *eth = data;
@@ -486,6 +505,7 @@ static __always_inline int syncookie_v6(
         ip->saddr = ip->daddr;
         ip->daddr = addr;
     }
+    tcp = &tcp_work.tcp;
     {
         __be16 port = tcp->source;
         tcp->source = tcp->dest;
@@ -499,7 +519,7 @@ static __always_inline int syncookie_v6(
     tcp->fin = 0;
     __u16 tcp_opt_len = syncookie_write_synack_opts(tcp, &attrs);
     tcp->doff = 5 + tcp_opt_len / 4;
-    tcp->window = 0;
+    tcp->window = bpf_htons(SYNCOOKIE_INITIAL_WINDOW);
     tcp->urg_ptr = 0;
     tcp_len = sizeof(*tcp) + tcp_opt_len;
     ip->payload_len = bpf_htons(tcp_len);
@@ -511,6 +531,10 @@ static __always_inline int syncookie_v6(
     new_len = l3_offset + sizeof(*ip) + tcp_len;
     if (bpf_xdp_adjust_tail(ctx, new_len - (int)(data_end - data))) {
         *reason = CNT_SYN_COOKIE_ADJUST_ERROR;
+        return XDP_DROP;
+    }
+    if (bpf_xdp_store_bytes(ctx, l3_offset + sizeof(*ip), &tcp_work, tcp_len)) {
+        *reason = CNT_SYN_COOKIE_PACKET_INVALID;
         return XDP_DROP;
     }
     count(CNT_SYN_COOKIE_SENT);
