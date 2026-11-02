@@ -690,7 +690,7 @@ def _cmd_ports(args: argparse.Namespace) -> int:
 
     # Initial port read
     try:
-        tcp_ports, udp_ports = ports.collect_ports(backend, bpf_pin_dir, nft_family, nft_table)
+        tcp_ports, udp_ports = ports.collect_ports(backend, bpf_pin_dir, nft_family, nft_table, interfaces=ifaces)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -726,7 +726,7 @@ def _cmd_ports(args: argparse.Namespace) -> int:
             _time.sleep(args.interval)
             try:
                 new_backend = detect.detect_backend(Path(bpf_pin_dir), Path(run_state_dir), ifaces, nft_family, nft_table)
-                new_tcp, new_udp = ports.collect_ports(new_backend, bpf_pin_dir, nft_family, nft_table)
+                new_tcp, new_udp = ports.collect_ports(new_backend, bpf_pin_dir, nft_family, nft_table, interfaces=ifaces)
             except RuntimeError:
                 continue
 
@@ -1595,14 +1595,15 @@ def build_parser() -> argparse.ArgumentParser:
     stats_cmd.add_argument("--rates", action="store_true")
     stats_cmd.add_argument("--interval", type=float, default=1.0)
     stats_cmd.add_argument("--render", choices=["append", "screen"], default="append")
-    stats_cmd.add_argument("--interface", dest="iface")
+    # Keep the wrapper's global --iface unless explicitly overridden here.
+    stats_cmd.add_argument("--interface", dest="iface", default=argparse.SUPPRESS)
     stats_cmd.set_defaults(func=_cmd_stats)
 
     tui_cmd = subparsers.add_parser("tui")
     tui_cmd.add_argument("--interval", type=float, default=2.0)
     tui_cmd.add_argument("--socket")
     tui_cmd.add_argument("--max-events", dest="tui_max_events", type=int)
-    tui_cmd.add_argument("--interface", dest="iface")
+    tui_cmd.add_argument("--interface", dest="iface", default=argparse.SUPPRESS)
     tui_cmd.set_defaults(func=_cmd_tui)
 
     approval_api = subparsers.add_parser("approval-api")

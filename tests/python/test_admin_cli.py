@@ -22,6 +22,23 @@ from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, Runtim
 pytestmark = pytest.mark.component
 
 
+@pytest.mark.parametrize("command", ["tui", "stats"])
+@pytest.mark.parametrize("configured,override,expected", [
+    ("", None, ""),
+    ("lan0", None, "lan0"),
+    ("lan0 lan1", None, "lan0 lan1"),
+    ("wan0", "lan0", "lan0"),
+    ("lan0 lan1", "lan1", "lan1"),
+    ("", "lan0", "lan0"),
+])
+def test_monitor_interface_selection(command, configured, override, expected):
+    # The shell wrapper passes configured interfaces before the subcommand.
+    argv = ["--config", "/tmp/auto_xdp.toml", "--iface", configured, command]
+    if override is not None:
+        argv.extend(["--interface", override])
+    assert admin_cli.build_parser().parse_args(argv).iface == expected
+
+
 class AdminCliTests(unittest.TestCase):
     def test_shared_management_clients_work_without_importing_cli(self):
         # A fresh interpreter catches both direct and delayed imports of the CLI.
@@ -504,6 +521,62 @@ with tempfile.TemporaryDirectory() as directory:
         self.assertTrue(args.watch)
         self.assertTrue(args.rates)
         self.assertEqual(args.interval, 5.0)
+
+    def test_view_commands_preserve_wrapper_interfaces(self):
+        parser = admin_cli.build_parser()
+        for command in ("stats", "tui"):
+            for interfaces in ("enp8s0", "enp1s0 enp8s0"):
+                with self.subTest(command=command, interfaces=interfaces):
+                    args = parser.parse_args(
+                        ["--config", "/tmp/c.toml", "--iface", interfaces, command]
+                    )
+                    self.assertEqual(args.iface, interfaces)
+
+    def test_view_commands_explicit_interface_overrides_wrapper(self):
+        parser = admin_cli.build_parser()
+        for command in ("stats", "tui"):
+            with self.subTest(command=command):
+                args = parser.parse_args(
+                    ["--config", "/tmp/c.toml", "--iface", "enp1s0 enp8s0",
+                     command, "--interface", "enp8s0"]
+                )
+                self.assertEqual(args.iface, "enp8s0")
+
+    def test_view_commands_keep_global_default_without_interface(self):
+        parser = admin_cli.build_parser()
+        for command in ("stats", "tui"):
+            with self.subTest(command=command):
+                args = parser.parse_args(["--config", "/tmp/c.toml", command])
+                self.assertEqual(args.iface, "")
+
+    def test_selected_interface_ports_apply_zone_allows_and_denies(self):
+        zones = {(2, 22): True, (2, 443): True, (3, 22): False,
+                 (3, 18080): True, (4, 53): True}
+        self.assertEqual(ports._merge_zone_ports([22, 80], zones, {3}), [80, 18080])
+        self.assertEqual(ports._merge_zone_ports([22, 80], zones, {2}), [22, 80, 443])
+
+    def test_multiple_interface_ports_merge_effective_admission(self):
+        zones = {(2, 22): True, (3, 22): False, (3, 18080): True, (4, 53): True}
+        self.assertEqual(ports._merge_zone_ports([22], zones, {2, 3}), [22, 18080])
+
+    def test_zone_port_reader_preserves_explicit_denials_and_closes_map(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td, "tcp_zone_whitelist")
+            path.touch()
+            reader = mock.Mock()
+            reader.entries.return_value = {(3, 22), (3, 18080)}
+            reader.value.side_effect = lambda index, port: (int(port == 18080), 0, 0, 0)
+            with mock.patch.object(ports, "BpfZonePortMap", return_value=reader) as factory:
+                self.assertEqual(ports._read_zone_ports(path, "=IIQQ"),
+                                 {(3, 22): False, (3, 18080): True})
+            factory.assert_called_once_with(str(path), "=IIQQ")
+            reader.close.assert_called_once_with()
+
+    def test_xdp_port_collection_forwards_interface_selection(self):
+        with mock.patch.object(ports, "read_xdp_ports", return_value=([18080], [18081])) as read:
+            self.assertEqual(ports.collect_ports("xdp", "/tmp/bpf", "inet", "auto_xdp", interfaces=["enp8s0"]),
+                             ([18080], [18081]))
+            read.assert_called_once_with("/tmp/bpf", interfaces=["enp8s0"])
 
     def test_ports_parser_sets_expected_flags(self):
         parser = admin_cli.build_parser()

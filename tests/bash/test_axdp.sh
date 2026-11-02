@@ -272,17 +272,24 @@ test_main_loads_configured_ifaces_for_tui() (
     tmpdir=$(mktemp -d)
     CONFIG_FILE="$tmpdir/auto_xdp.env"
     cat >"$CONFIG_FILE" <<'EOF_CFG'
-IFACES="eth0 eth1"
-IFACE="eth0"
+IFACES="lan0 lan1"
+IFACE="lan0"
 EOF_CFG
 
-    local called=""
-    run_tui() {
-        called="$IFACES"
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    run_py_module() {
+        PYTHONPATH="$REPO_ROOT" python3 - "$@" <<'PY'
+import sys
+from auto_xdp.admin.cli import build_parser
+
+args = build_parser().parse_args(sys.argv[2:])
+print(args.iface)
+PY
     }
 
-    main tui || return 1
-    assert_eq "$called" "eth0 eth1"
+    local output
+    output=$(main tui) || return 1
+    assert_eq "$output" "lan0 lan1"
 )
 
 test_main_reports_stale_admin_cli_for_tui() (

@@ -6,6 +6,7 @@ import errno
 import json
 import os
 import shutil
+import socket
 import struct
 import subprocess
 from pathlib import Path
@@ -16,10 +17,43 @@ from auto_xdp.bpf.syscall import (
     bpf, map_max_entries, map_value_size, obj_get,
 )
 from auto_xdp.discovery.listeners import _build_systemd_socket_map
+from auto_xdp.bpf.maps import BpfZonePortMap
 
 
-def read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
-    """Returns (tcp_ports, udp_ports) from BPF whitelist maps via direct BPF syscalls."""
+def _read_zone_ports(path: Path, value_format: str) -> dict[tuple[int, int], bool]:
+    if not path.exists():
+        return {}
+    try:
+        zone_map = BpfZonePortMap(str(path), value_format)
+    except OSError as exc:
+        raise RuntimeError(f"Cannot open BPF map {path}: {exc}") from exc
+    try:
+        return {key: bool(value[0]) for key in zone_map.entries()
+                if (value := zone_map.value(*key)) is not None and 0 < key[1] <= 65535}
+    finally:
+        zone_map.close()
+
+
+def _merge_zone_ports(
+    global_ports: list[int], zone_ports: dict[tuple[int, int], bool], ifindices: set[int],
+) -> list[int]:
+    effective: set[int] = set()
+    for ifindex in ifindices:
+        allowed = set(global_ports)
+        for (index, port), allow in zone_ports.items():
+            if index == ifindex:
+                if allow:
+                    allowed.add(port)
+                else:
+                    allowed.discard(port)
+        effective.update(allowed)
+    return sorted(effective)
+
+
+def read_xdp_ports(
+    bpf_pin_dir: str, *, interfaces: list[str] | None = None,
+) -> tuple[list[int], list[int]]:
+    """Read global ports, or effective ports for explicitly selected interfaces."""
     tcp_path = str(Path(bpf_pin_dir) / "tcp_whitelist")
     udp_path = str(Path(bpf_pin_dir) / "udp_whitelist")
 
@@ -83,7 +117,17 @@ def read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
         finally:
             os.close(fd)
 
-    return _read_array_ports(tcp_path), _read_array_ports(udp_path)
+    tcp_ports, udp_ports = _read_array_ports(tcp_path), _read_array_ports(udp_path)
+    if not interfaces:
+        return tcp_ports, udp_ports
+    try:
+        indices = {socket.if_nametoindex(name) for name in interfaces}
+    except OSError as exc:
+        raise RuntimeError(f"Cannot resolve selected interface: {exc}") from exc
+    tcp_zone = _read_zone_ports(Path(bpf_pin_dir) / "tcp_zone_whitelist", "=IIQQ")
+    udp_zone = _read_zone_ports(Path(bpf_pin_dir) / "udp_zone_whitelist", "=I")
+    return (_merge_zone_ports(tcp_ports, tcp_zone, indices),
+            _merge_zone_ports(udp_ports, udp_zone, indices))
 
 
 def read_nft_ports(nft_family: str, nft_table: str) -> tuple[list[int], list[int]]:
@@ -239,9 +283,11 @@ def collect_ports(
     bpf_pin_dir: str,
     nft_family: str,
     nft_table: str,
+    *,
+    interfaces: list[str] | None = None,
 ) -> tuple[list[int], list[int]]:
     if backend == "xdp":
-        return read_xdp_ports(bpf_pin_dir)
+        return read_xdp_ports(bpf_pin_dir, interfaces=interfaces)
     if backend == "nftables":
         return read_nft_ports(nft_family, nft_table)
     raise RuntimeError("No active backend detected.")

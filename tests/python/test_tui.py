@@ -410,6 +410,16 @@ class TuiMapUsageTests(unittest.TestCase):
         self.assertEqual(rows[1][3], "-")
         lookup_procs.assert_not_called()
 
+    def test_port_rows_use_selected_interface_admission(self):
+        with mock.patch("auto_xdp.tui.app.collect_ports", return_value=([18080], [18081])) as collect, \
+            mock.patch("auto_xdp.tui.app._read_policy", return_value={}), \
+            mock.patch("auto_xdp.tui.app._read_global_udp_rate", return_value=0), \
+            mock.patch("auto_xdp.tui.app._safe_service", return_value="-"):
+            rows = _collect_port_rows("xdp", "/tmp/bpf", "inet", "auto_xdp",
+                                      include_processes=False, interfaces=["enp8s0"])
+        collect.assert_called_once_with("xdp", "/tmp/bpf", "inet", "auto_xdp", interfaces=["enp8s0"])
+        self.assertEqual([(r[0], r[1]) for r in rows], [("TCP", 18080), ("UDP", 18081)])
+
 
 class TuiSummaryTests(unittest.TestCase):
     def test_attach_target_uses_mode_highlight(self):
