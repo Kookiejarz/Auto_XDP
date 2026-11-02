@@ -501,8 +501,9 @@ def _collect_port_rows(
     nft_table: str,
     *,
     include_processes: bool = True,
+    interfaces: list[str] | None = None,
 ) -> list[tuple[str, int, str, str, str]]:
-    tcp_ports, udp_ports = collect_ports(backend, bpf_pin_dir, nft_family, nft_table)
+    tcp_ports, udp_ports = collect_ports(backend, bpf_pin_dir, nft_family, nft_table, interfaces=interfaces)
     tcp_procs = lookup_port_procs("tcp", tcp_ports) if include_processes else {}
     udp_procs = lookup_port_procs("udp", udp_ports) if include_processes else {}
     tcp_policy = _read_policy(str(Path(bpf_pin_dir) / "tcp_port_policies"))
@@ -700,6 +701,7 @@ def _collect_snapshot(
             args.nft_family,
             args.nft_table,
             include_processes=not fast,
+            interfaces=ifaces,
         ),
         excluded=_excluded_counts(args.config),
         under_attack=_under_attack_enabled(args.config),

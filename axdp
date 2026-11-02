@@ -582,6 +582,7 @@ run_ports() {
         --run-state-dir "$RUN_STATE_DIR" \
         --nft-family "$NFT_FAMILY" \
         --nft-table "$NFT_TABLE" \
+        --iface "${IFACES:-${IFACE:-}}" \
         ports "${args[@]}"
 }
 
