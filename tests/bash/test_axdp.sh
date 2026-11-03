@@ -389,7 +389,7 @@ _setup_reattach_test_env() {
     ensure_linux_conntrack() { return 0; }
     load_sock_state_tracker() { return 0; }
     load_syncookie_program() { return 0; }
-    load_minecraft_egress() { return 0; }
+    load_tc_egress_dispatch() { return 0; }
     xdp_maps_ready() { return 0; }
     load_port_handlers() { return 0; }
     auto_tune_interface_parallelism() { return 0; }
@@ -988,6 +988,26 @@ test_main_dispatches_uninstall_command() (
     assert_eq "$(main uninstall eth9)" "uninstall eth9"
 )
 
+# The shell contracts exercise the real loader and fake bpftool. Object and
+# pinned-map inspection are isolated here; actual ELF/ABI checks run on Linux.
+_mock_protocol_inspection() {
+    local root="$1"
+    cat >"$root/sitecustomize.py" <<'PY'
+from auto_xdp.admin import handlers
+abi = handlers.HandlerMapAbi(2, 4, 4, 1, 0)
+def declarations(obj):
+    names = ["slot_ctx_map"]
+    if obj.name == "sctp_handler.o":
+        names += ["sctp_whitelist", "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg"]
+    return {name: abi for name in names}
+handlers.handler_object_maps = declarations
+handlers.pinned_handler_map_abi = lambda path: abi
+handlers.handler_object_programs = lambda obj: ("entry", None)
+handlers._pinned_u32_lookup = lambda path, key: handlers.prog_array_entry_id(path, int.from_bytes(key, "little"))
+PY
+    PYTHON_LIB_DIR="$root:$REPO_ROOT"
+}
+
 test_slot_load_sctp_reuses_shared_maps() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -1032,6 +1052,7 @@ exit 0
 EOF_BPFSH
     chmod +x "$tmpdir/bin/bpftool"
 
+    _mock_protocol_inspection "$tmpdir"
     PATH="$tmpdir/bin:$BASE_PATH"
     run_slot load sctp >/dev/null || return 1
 
@@ -1100,6 +1121,7 @@ exit 0
 EOF_BPFSH
     chmod +x "$tmpdir/bin/clang" "$tmpdir/bin/bpftool"
 
+    _mock_protocol_inspection "$tmpdir"
     PATH="$tmpdir/bin:$BASE_PATH"
     run_slot load 99 "$tmpdir/custom_handler.c" >/dev/null || return 1
 

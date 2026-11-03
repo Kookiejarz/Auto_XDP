@@ -6,7 +6,7 @@
 #include <bpf/bpf_helpers.h>
 static long update(void *map, const void *key, const void *value, __u64 flags);
 #define bpf_map_update_elem update
-#include "bpf/include/minecraft.h"
+#include "handlers/minecraft_state.h"
 
 static struct mc_verified_val stored;
 static struct nf_conn connection;

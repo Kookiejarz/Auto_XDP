@@ -6,6 +6,9 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "common.h"
+#include "handler_state.h"
+
+AXDP_STATE_SCHEMA("sctp-stateless-v1", "[]");
 
 struct sctp_hdr {
     __be16 sport;
@@ -50,7 +53,7 @@ static __always_inline int check_sctp(struct xdp_md *ctx)
     return XDP_DROP;
 }
 
-SEC("xdp/sctp")
+SEC("xdp")
 int xdp_sctp_handler(struct xdp_md *ctx)
 {
     __u32 pkt_len = packet_length(ctx);

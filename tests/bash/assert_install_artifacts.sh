@@ -63,7 +63,7 @@ test -x /usr/local/lib/auto_xdp/current/auto_xdp_start.sh
 test -f /usr/local/lib/auto_xdp/current/auto_xdp_bpf_helpers.py
 test -f /usr/local/lib/auto_xdp/current/release.json
 test -s /usr/local/lib/auto_xdp/current/xdp_firewall.o
-test -s /usr/local/lib/auto_xdp/current/minecraft_egress.o
+test -s /usr/local/lib/auto_xdp/current/tc_egress_dispatch.o
 test -s /usr/local/lib/auto_xdp/current/xdp_map_abi.txt
 for module in admin/cli.py admin/approvals.py tui/app.py tui/widgets.py \
               telemetry/events.py telemetry/relay_client.py discovery/listeners.py bpf/conntrack.py; do

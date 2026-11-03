@@ -642,14 +642,11 @@ with tempfile.TemporaryDirectory() as directory:
                 path.touch()
             (handlers_dir / "sctp_handler.o").touch()
 
-            calls: list[list[str]] = []
-
-            def fake_run(cmd, capture_output=False, text=False):
-                calls.append(list(cmd))
-                return subprocess.CompletedProcess(cmd, 0, "", "")
-
-            with mock.patch("auto_xdp.admin.cli.subprocess.run", side_effect=fake_run), \
-                 mock.patch("auto_xdp.admin.handlers.transactional_file_prog_swap") as swap:
+            names = ("slot_ctx_map", "sctp_whitelist", "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg")
+            abi = handlers.HandlerMapAbi(2, 4, 4, 1, 0)
+            with mock.patch.object(handlers, "handler_object_maps", return_value={name: abi for name in names}), \
+                 mock.patch.object(handlers, "pinned_handler_map_abi", return_value=abi), \
+                 mock.patch.object(handlers, "_load_handler_object", return_value=False) as load:
                 rc = admin_cli.main(
                     [
                         "--config",
@@ -667,111 +664,13 @@ with tempfile.TemporaryDirectory() as directory:
                 )
 
             self.assertEqual(rc, 0)
-            self.assertEqual(len(calls), 1)
-            self.assertIn("slot_ctx_map", calls[0])
-            self.assertIn("sctp_whitelist", calls[0])
-            for name in ("pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg"):
-                self.assertIn(name, calls[0])
-            swap.assert_called_once()
-            self.assertEqual(swap.call_args.args[0], bpf_pin_dir / "proto_handlers")
-            self.assertEqual(swap.call_args.args[1], 132)
+            load.assert_called_once_with(
+                bpf_pin_dir / "proto_handlers", 132, handlers_dir / "sctp_handler.o",
+                bpf_pin_dir / "protocol_handlers/132", mock.ANY)
+            self.assertEqual(dict(load.call_args.args[4]), {name: bpf_pin_dir / name for name in names})
             text = config_path.read_text()
             self.assertIn('[slots]', text)
             self.assertIn('enabled = ["sctp"]', text)
-
-    def test_file_handler_swap_keeps_old_pin_until_verified_commit(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            map_path = root / "proto_handlers"
-            live_pin = root / "proto_47"
-            candidate_pin = root / "proto_47_next"
-            map_path.touch()
-            live_pin.write_text("old")
-            candidate_pin.write_text("new")
-            active = {47: 1}
-            operations: list[str] = []
-
-            def prog_id(path: Path) -> int:
-                return 1 if path.read_text() == "old" else 2
-
-            def update(_map: Path, key: int, pin: Path) -> None:
-                operations.append(f"update:{pin.read_text()}")
-                active[key] = prog_id(pin)
-
-            with mock.patch.object(handlers, "pinned_program_id", side_effect=prog_id), \
-                 mock.patch.object(handlers, "prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
-                 mock.patch.object(handlers, "prog_array_update", side_effect=update):
-                handlers.transactional_file_prog_swap(map_path, 47, candidate_pin, live_pin)
-
-            self.assertEqual(active[47], 2)
-            self.assertEqual(live_pin.read_text(), "new")
-            self.assertFalse(candidate_pin.exists())
-            self.assertEqual(operations, ["update:new"])
-            self.assertFalse(list(root.glob("proto_47_rollback_*")))
-
-    def test_file_handler_swap_restores_old_program_when_verification_fails(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            map_path = root / "proto_handlers"
-            live_pin = root / "proto_50"
-            candidate_pin = root / "proto_50_next"
-            map_path.touch()
-            live_pin.write_text("old")
-            candidate_pin.write_text("new")
-            active = {50: 1}
-            updates: list[int] = []
-
-            def prog_id(path: Path) -> int:
-                return 1 if path.read_text() == "old" else 2
-
-            def update(_map: Path, key: int, pin: Path) -> None:
-                active[key] = prog_id(pin)
-                updates.append(active[key])
-
-            verifies = [RuntimeError("candidate mismatch"), None]
-            with mock.patch.object(handlers, "pinned_program_id", side_effect=prog_id), \
-                 mock.patch.object(handlers, "prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
-                 mock.patch.object(handlers, "prog_array_update", side_effect=update), \
-                 mock.patch.object(handlers, "verify_prog_array_entry", side_effect=verifies):
-                with self.assertRaisesRegex(RuntimeError, "previous program restored"):
-                    handlers.transactional_file_prog_swap(map_path, 50, candidate_pin, live_pin)
-
-            self.assertEqual(active[50], 1)
-            self.assertEqual(updates, [2, 1])
-            self.assertEqual(live_pin.read_text(), "old")
-            self.assertFalse(candidate_pin.exists())
-
-    def test_directory_handler_swap_commits_candidate_then_removes_old_generation(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            map_path = root / "tcp_port_handlers"
-            live_dir = root / "443"
-            candidate_dir = root / "443_next"
-            map_path.touch()
-            live_dir.mkdir()
-            candidate_dir.mkdir()
-            (live_dir / "prog").write_text("old")
-            (live_dir / "private_map").write_text("old-map")
-            (candidate_dir / "prog").write_text("new")
-            (candidate_dir / "private_map").write_text("new-map")
-            active = {443: 10}
-
-            def prog_id(path: Path) -> int:
-                return 10 if path.read_text() == "old" else 20
-
-            def update(_map: Path, key: int, pin: Path) -> None:
-                active[key] = prog_id(pin)
-
-            with mock.patch.object(handlers, "pinned_program_id", side_effect=prog_id), \
-                 mock.patch.object(handlers, "prog_array_entry_id", side_effect=lambda _m, key: active.get(key)), \
-                 mock.patch.object(handlers, "prog_array_update", side_effect=update):
-                handlers.transactional_dir_prog_swap(map_path, 443, candidate_dir, live_dir)
-
-            self.assertEqual(active[443], 20)
-            self.assertEqual((live_dir / "prog").read_text(), "new")
-            self.assertEqual((live_dir / "private_map").read_text(), "new-map")
-            self.assertFalse(candidate_dir.exists())
-            self.assertFalse(list(root.glob("443_rollback_*")))
 
     def test_profile_handler_load_reuses_shared_maps_and_profile_array(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -782,8 +681,6 @@ with tempfile.TemporaryDirectory() as directory:
                 "tcp_profile_handlers",
                 "slot_ctx_map",
                 "profile_ctx_map",
-                "mc_l7_pending",
-                "mc_verified",
                 "pkt_counters",
                 "byte_counters",
                 "pkt_ringbuf",
@@ -793,8 +690,13 @@ with tempfile.TemporaryDirectory() as directory:
             handler = root / "minecraft_handler.o"
             handler.touch()
 
-            with mock.patch.object(handlers, "run_checked") as run, \
-                 mock.patch.object(handlers, "transactional_dir_prog_swap") as swap:
+            public = ["slot_ctx_map", "profile_ctx_map", "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg"]
+            abi = handlers.HandlerMapAbi(6, 4, 44, 1, 0)
+            with mock.patch.object(handlers, "handler_object_programs", return_value=("handler", None)), \
+                 mock.patch.object(handlers, "handler_object_maps", return_value={name: abi for name in [*public, "mc_l7_pending", "mc_verified"]}), \
+                 mock.patch.object(handlers, "pinned_handler_map_abi", return_value=abi), \
+                 mock.patch.object(handlers, "run_checked") as run, \
+                 mock.patch.object(handlers, "_transactional_handler_pair") as swap:
                 rc = admin_cli.main(
                     [
                         "--config",
@@ -811,10 +713,12 @@ with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(rc, 0)
             command = run.call_args.args[0]
             for name in (
-                "slot_ctx_map", "profile_ctx_map", "mc_l7_pending", "mc_verified",
+                "slot_ctx_map", "profile_ctx_map",
                 "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg",
             ):
                 self.assertIn(name, command)
+            self.assertNotIn("mc_l7_pending", command)
+            self.assertNotIn("mc_verified", command)
             self.assertEqual(swap.call_args.args[0], bpf_pin_dir / "tcp_profile_handlers")
             self.assertEqual(swap.call_args.args[1], 3)
             self.assertEqual(
@@ -832,7 +736,8 @@ with tempfile.TemporaryDirectory() as directory:
             handler_map.touch()
 
             with mock.patch.object(handlers, "pinned_program_id", return_value=42), \
-                 mock.patch.object(handlers, "prog_array_entry_id", return_value=42), \
+                 mock.patch.object(handlers, "_pinned_u32_lookup", return_value=42), \
+                 mock.patch.object(handlers, "prog_array_update"), \
                  mock.patch.object(handlers, "prog_array_delete", return_value=False):
                 rc = admin_cli.main(
                     [

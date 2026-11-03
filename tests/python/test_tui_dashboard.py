@@ -207,7 +207,7 @@ def test_compact_map_panel_shows_each_map_memory_when_it_fits():
 def test_handler_page_shows_live_ids_separately_from_configured_and_pin_only_entries(width, height):
     screen = Canvas(height, width)
     inventory = HandlerInventory([
-        HandlerRow("SLOT", 47, 15, "custom_gre", "loaded", "handlers/proto_47", "/custom/gre.c"),
+        HandlerRow("SLOT", 47, 15, "custom_gre", "loaded", "protocol_handlers/47/prog", "/custom/gre.c"),
         HandlerRow("UDP", 30120, 16, "private_udp", "pin only", "port_handlers/udp/30120/prog"),
         HandlerRow("TCP", 8080, None, "-", "configured", source="/srv/custom\nhandler.c"),
     ])
@@ -216,7 +216,7 @@ def test_handler_page_shows_live_ids_separately_from_configured_and_pin_only_ent
     assert "1 loaded" in rendered and "47/GRE" in rendered
     assert "15" in rendered and "custom_gre" in rendered
     assert "pin only" in rendered and "configured" in rendered
-    assert "config=/custom/gre.c" in rendered and "pin=handlers/proto_47" in rendered
+    assert "config=/custom/gre.c" in rendered and "pin=protocol_handlers/47/prog" in rendered
 
 
 def test_port_selection_scrolls_into_view_and_filter_is_applied():

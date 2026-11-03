@@ -557,8 +557,14 @@ xdp_required_map_names() {
 	abuseipdb_v4
 	slot_ctx_map
 	profile_ctx_map
-	mc_l7_pending
-	mc_verified
+	tc_handler_ctx
+	handler_egress
+	handler_flows
+	tc_profile_handlers
+	tc_tcp_handlers
+	tc_udp_handlers
+	tc_proto_handlers
+	handler_eg_stats
 	EOF
 }
 
@@ -1363,6 +1369,21 @@ transactional_reload_xdp() {
     fi
     BPF_PIN_DIR="$saved_pin_dir"
 
+    # One-time migration also recognizes the retired Minecraft-specific pin.
+    # Keep the preceding egress program pinned across the map-directory switch
+    # so a later dispatcher attach failure can restore it on every interface.
+    local previous_egress=""
+    for previous_egress in tc_egress_dispatch_prog minecraft_egress_prog; do
+        [[ -e "${live_dir}/${previous_egress}" ]] || continue
+        if ! bpftool prog pin pinned "${live_dir}/${previous_egress}" \
+                "${candidate_dir}/tc_egress_dispatch_prog" >/dev/null 2>&1; then
+            rm -rf "$candidate_dir"
+            _auto_xdp_warn "Cannot retain the previous TC dispatcher for rollback."
+            return 1
+        fi
+        break
+    done
+
     [[ -d "$live_dir" ]] && had_old=1
 
     for iface in "${switch_ifaces[@]}"; do
@@ -1410,26 +1431,7 @@ transactional_reload_xdp() {
     return 0
 }
 
-_auto_xdp_minecraft_profile_configured() {
-    local config_path="${TOML_CONFIG:-/etc/auto_xdp/config.toml}"
-    [[ -f "$config_path" ]] || return 1
-    "${PYTHON3_BIN:-python3}" - "$config_path" <<'PY'
-import sys
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib
-with open(sys.argv[1], "rb") as handle:
-    config = tomllib.load(handle)
-raise SystemExit(not any(
-    str(subject.get("protection", {}).get("profile", "")).strip().lower() == "minecraft"
-    for subject in config.get("subjects", {}).values()
-    if isinstance(subject, dict)
-))
-PY
-}
-
-cleanup_minecraft_egress() {
+cleanup_tc_egress_dispatch() {
     local iface_var="" iface=""
     command -v tc >/dev/null 2>&1 || return 0
     iface_var=$(_auto_xdp_iface_var_name) || return 0
@@ -1437,35 +1439,42 @@ cleanup_minecraft_egress() {
     for iface in "${cleanup_ifaces[@]}"; do
         tc filter del dev "$iface" egress protocol all pref 49153 handle 2 bpf 2>/dev/null || true
     done
-    rm -f "${BPF_PIN_DIR}/minecraft_egress_prog" \
+    rm -f "${BPF_PIN_DIR}/tc_egress_dispatch_prog" \
+          "${BPF_PIN_DIR}/tc_egress_dispatch_next" \
+          "${BPF_PIN_DIR}/minecraft_egress_prog" \
           "${BPF_PIN_DIR}/minecraft_egress_next" 2>/dev/null || true
 }
 
-load_minecraft_egress() {
-    local object_path="" next_pin="${BPF_PIN_DIR}/minecraft_egress_next"
-    local live_pin="${BPF_PIN_DIR}/minecraft_egress_prog" iface_var="" iface=""
+load_tc_egress_dispatch() {
+    local object_path="" next_pin="${BPF_PIN_DIR}/tc_egress_dispatch_next"
+    local live_pin="${BPF_PIN_DIR}/tc_egress_dispatch_prog" iface_var="" iface=""
     local -a switched=()
 
-    if ! _auto_xdp_minecraft_profile_configured; then
-        cleanup_minecraft_egress
-        return 0
-    fi
     command -v tc >/dev/null 2>&1 || {
-        _auto_xdp_warn "tc is required for the Minecraft dialogue profile."
+        _auto_xdp_warn "tc is required for handler egress dispatch."
         return 1
     }
-    object_path=$(_auto_xdp_first_value MC_EGRESS_OBJ_PATH MC_EGRESS_OBJ_INSTALLED) || object_path=""
+    object_path=$(_auto_xdp_first_value TC_EGRESS_OBJ_PATH TC_EGRESS_OBJ_INSTALLED) || object_path=""
     [[ -f "$object_path" ]] || {
-        _auto_xdp_warn "Minecraft egress observer object not found."
+        _auto_xdp_warn "Handler egress dispatcher object not found."
         return 1
     }
     rm -f "$next_pin"
-    if ! bpftool prog load "$object_path" "$next_pin" type classifier \
-            map name tcp_whitelist pinned "${BPF_PIN_DIR}/tcp_whitelist" \
-            map name tcp_zone_whitelist pinned "${BPF_PIN_DIR}/tcp_zone_whitelist" \
-            map name mc_l7_pending pinned "${BPF_PIN_DIR}/mc_l7_pending" \
-            map name mc_verified pinned "${BPF_PIN_DIR}/mc_verified" >/dev/null 2>&1; then
-        _auto_xdp_warn "Kernel rejected the Linux-conntrack Minecraft egress observer."
+    local name
+    local -a load_cmd=(bpftool prog load "$object_path" "$next_pin" type classifier)
+    for name in slot_ctx_map profile_ctx_map xdp_runtime_cfg pkt_counters byte_counters pkt_ringbuf \
+                endpoint_scopes tcp_whitelist udp_whitelist tcp_zone_whitelist udp_zone_whitelist \
+                tc_handler_ctx handler_egress handler_flows tc_profile_handlers tc_tcp_handlers \
+                tc_udp_handlers tc_proto_handlers handler_eg_stats; do
+        [[ -e "${BPF_PIN_DIR}/$name" ]] || {
+            _auto_xdp_warn "Missing shared dispatcher map: $name"
+            return 1
+        }
+        load_cmd+=(map name "$name" pinned "${BPF_PIN_DIR}/$name")
+    done
+    if ! "${load_cmd[@]}" >/dev/null 2>&1; then
+        _auto_xdp_warn "Kernel rejected the Linux-conntrack handler egress dispatcher."
+        rm -f "$next_pin"
         return 1
     fi
     iface_var=$(_auto_xdp_iface_var_name) || { rm -f "$next_pin"; return 1; }
@@ -1486,12 +1495,13 @@ load_minecraft_egress() {
             fi
         done
         rm -f "$next_pin"
-        _auto_xdp_warn "Failed to attach the Minecraft egress observer on $iface."
+        _auto_xdp_warn "Failed to attach the Handler egress dispatcher on $iface."
         return 1
     done
     rm -f "$live_pin"
     mv "$next_pin" "$live_pin"
-    _auto_xdp_info "Minecraft egress observer attached on ${egress_ifaces[*]}."
+    rm -f "${BPF_PIN_DIR}/minecraft_egress_prog" "${BPF_PIN_DIR}/minecraft_egress_next"
+    _auto_xdp_info "Handler egress dispatcher attached on ${egress_ifaces[*]}."
     return 0
 }
 
@@ -1579,91 +1589,30 @@ except (OSError, ValueError):
         return
     }
 
-    local slot_pin_dir="${BPF_PIN_DIR}/handlers"
-    mkdir -p "$slot_pin_dir"
-
-    "$py_bin" - "$enabled_json" "$handlers_dir" "$slot_pin_dir" \
+    PYTHONPATH="${INSTALL_DIR}:${PYTHONPATH:-}" "$py_bin" - "$enabled_json" "$handlers_dir" \
         "${BPF_PIN_DIR}" "$strict" <<'PYEOF'
-import sys, json, subprocess, os
+import sys, json
+from pathlib import Path
+from auto_xdp.admin import handlers
 
 enabled = json.loads(sys.argv[1])
-handlers_dir = sys.argv[2]
-slot_pin_dir = sys.argv[3]
-bpf_pin_dir = sys.argv[4]
-strict = sys.argv[5] == "1"
+handlers_dir, root = Path(sys.argv[2]), Path(sys.argv[3])
+strict = sys.argv[4] == "1"
 failures = 0
-
-BUILTIN = {"gre": (47, "gre_handler.o"),
-           "esp": (50, "esp_handler.o"),
-           "sctp": (132, "sctp_handler.o")}
-
 for entry in enabled:
-    if isinstance(entry, str):
-        if entry not in BUILTIN:
-            print(f"  [WARN] Unknown built-in handler: {entry}", file=sys.stderr)
-            failures += 1
-            continue
-        proto, obj_name = BUILTIN[entry]
-        obj_path = os.path.join(handlers_dir, obj_name)
-    elif isinstance(entry, dict):
-        proto = int(entry["proto"])
-        obj_path = entry["path"]
-    else:
-        continue
-
-    if not os.path.exists(obj_path):
-        print(f"  [WARN] Handler not found: {obj_path}", file=sys.stderr)
-        failures += 1
-        continue
-
-    pin_path = os.path.join(slot_pin_dir, f"proto_{proto}")
     try:
-        os.unlink(pin_path)
-    except FileNotFoundError:
-        pass
-    ctx_map = os.path.join(bpf_pin_dir, "slot_ctx_map")
-    load_cmd = [
-        "bpftool", "prog", "load", obj_path, pin_path,
-        "type", "xdp",
-        "map", "name", "slot_ctx_map", "pinned", ctx_map,
-    ]
-    if isinstance(entry, str):
-        telemetry_maps = ("pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg")
-        if any(not os.path.exists(os.path.join(bpf_pin_dir, name)) for name in telemetry_maps):
-            print("  [WARN] Shared telemetry maps not pinned; skipping built-in handler", file=sys.stderr)
-            failures += 1
-            continue
-        for name in telemetry_maps:
-            load_cmd.extend(["map", "name", name, "pinned", os.path.join(bpf_pin_dir, name)])
-    if proto == 132:
-        sctp_whitelist = os.path.join(bpf_pin_dir, "sctp_whitelist")
-        if not os.path.exists(sctp_whitelist):
-            print("  [WARN] Shared SCTP maps not pinned; skipping proto 132", file=sys.stderr)
-            failures += 1
-            continue
-        load_cmd.extend([
-            "map", "name", "sctp_whitelist", "pinned", sctp_whitelist,
-        ])
-
-    r = subprocess.run(load_cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"  [WARN] Failed to load proto {proto}: {r.stderr.strip()}", file=sys.stderr)
+        if isinstance(entry, str):
+            proto, name = handlers.BUILTIN_SLOT_INFO[entry]
+            obj = handlers_dir / name
+        elif isinstance(entry, dict):
+            proto, obj = int(entry["proto"]), Path(entry["path"])
+        else:
+            raise ValueError(f"Invalid handler entry: {entry!r}")
+        handlers.load_protocol_handler(root, proto, obj)
+        print(f"  Loaded slot handler: proto {proto} ({obj})")
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
+        print(f"  [WARN] Failed to load protocol handler {entry!r}: {exc}", file=sys.stderr)
         failures += 1
-        continue
-
-    k = f"{proto} 0 0 0"
-    r2 = subprocess.run(
-        ["bpftool", "map", "update", "pinned",
-         os.path.join(bpf_pin_dir, "proto_handlers"),
-         "key", *k.split(), "value", "pinned", pin_path],
-        capture_output=True, text=True)
-    if r2.returncode != 0:
-        print(f"  [WARN] Failed to register proto {proto}: {r2.stderr.strip()}", file=sys.stderr)
-        os.unlink(pin_path)
-        failures += 1
-    else:
-        print(f"  Loaded slot handler: proto {proto} ({obj_path})")
-
 if strict and failures:
     raise SystemExit(1)
 PYEOF

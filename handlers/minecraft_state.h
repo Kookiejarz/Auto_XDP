@@ -2,9 +2,9 @@
 
 #include "flow_keys.h"
 #include "linux_conntrack.h"
-#include "map_sizes.h"
 
 #define MC_PROFILE_ID 1
+#define MC_VERIFIED_MAX_ENTRIES 65536
 
 #define MC_PROTOCOL_DEADLINE_NS (10ULL * 1000000000ULL)
 #define MC_CHALLENGE_DEADLINE_NS (20ULL * 1000000000ULL)

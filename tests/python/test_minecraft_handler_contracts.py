@@ -16,7 +16,7 @@ def test_native_minecraft_session_proof(tmp_path: Path) -> None:
         pytest.skip("native C compiler and libbpf development headers required")
     binary = tmp_path / "minecraft-session-contract"
     subprocess.run(
-        [compiler, "-O2", "-Wall", "-Werror", "-Wno-unknown-attributes", f"-I{ROOT}",
+        [compiler, "-O2", "-Wall", "-Werror", "-Wno-unknown-attributes", f"-I{ROOT}", f"-I{ROOT / 'bpf/include'}",
          str(ROOT / "tests/c/minecraft_session_contract.c"), "-o", str(binary)],
         check=True, capture_output=True, text=True,
     )
@@ -25,7 +25,7 @@ def test_native_minecraft_session_proof(tmp_path: Path) -> None:
 
 def test_minecraft_transport_state_belongs_to_linux_conntrack() -> None:
     ingress = (ROOT / "handlers/minecraft_handler.c").read_text()
-    egress = (ROOT / "bpf/minecraft_egress.c").read_text()
+    egress = (ROOT / "handlers/minecraft_handler.c").read_text()
 
     for obsolete in (
         "MC_AWAIT_ACK",
@@ -51,7 +51,7 @@ def test_login_start_is_not_a_final_proof() -> None:
 
 
 def test_status_response_cannot_be_treated_as_login_disconnect() -> None:
-    egress = (ROOT / "bpf/minecraft_egress.c").read_text()
+    egress = (ROOT / "handlers/minecraft_handler.c").read_text()
 
     assert "packet_id == 0 && pending->intention != 1" in egress
 
@@ -62,7 +62,7 @@ def test_conntrack_api_is_lookup_only() -> None:
         for path in (
             "bpf/include/linux_conntrack.h",
             "handlers/minecraft_handler.c",
-            "bpf/minecraft_egress.c",
+            "bpf/tc_egress_dispatch.c",
         )
     )
     for forbidden in (

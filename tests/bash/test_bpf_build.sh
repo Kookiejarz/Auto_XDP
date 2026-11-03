@@ -60,8 +60,8 @@ XDP_OBJ_INSTALLED="$BUILD_STAGING_DIR/$XDP_OBJ"
     exit 1
 }
 
-[[ -s "$BUILD_STAGING_DIR/$MC_EGRESS_OBJ" ]] || {
-    echo "[ERROR] missing staged Minecraft egress object: $BUILD_STAGING_DIR/$MC_EGRESS_OBJ" >&2
+[[ -s "$BUILD_STAGING_DIR/$TC_EGRESS_OBJ" ]] || {
+    echo "[ERROR] missing staged handler egress dispatcher object: $BUILD_STAGING_DIR/$TC_EGRESS_OBJ" >&2
     exit 1
 }
 

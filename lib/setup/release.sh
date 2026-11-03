@@ -140,7 +140,7 @@ validate_runtime_release() {
         python/auto_xdp/__init__.py python/auto_xdp/install_state.py python/auto_xdp/xdp_link.py
         python/auto_xdp/default_config.toml
         bpf/include/common.h bpf/include/counters.h bpf/include/telemetry.h
-        handlers/minecraft_handler.o minecraft_egress.o xdp_required_maps.txt xdp_map_abi.txt auto_xdp_runtime_common.sh
+        handlers/minecraft_handler.o tc_egress_dispatch.o xdp_required_maps.txt xdp_map_abi.txt auto_xdp_runtime_common.sh
         auto_xdp_bpf_helpers.py xdp_port_sync.py pkt_relay.py axdp
         auto_xdp_start.sh release.json
     )
@@ -240,9 +240,10 @@ begin_install_transaction_step() {
 
 _remove_obsolete_install_layout() {
     local path bin_dir
+    # Retired Minecraft-specific artifacts appear only in this removal list.
     local -a obsolete_root=(
         python handlers xdp_required_maps.txt xdp_map_abi.txt xdp_firewall.o xdp_syncookie.o
-        tc_syncookie_handoff.o minecraft_egress.o
+        tc_syncookie_handoff.o minecraft_egress.o tc_egress_dispatch.o
         sock_state_track.o auto_xdp_runtime_common.sh auto_xdp_bpf_helpers.py
         xdp_port_sync.py pkt_relay.py axdp auto_xdp_start.sh release.json
     )

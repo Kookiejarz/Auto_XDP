@@ -132,7 +132,7 @@ BPF_PIN_DIR="${BPF_PIN_DIR}"
 XDP_OBJ_PATH="${CURRENT_LINK}/${XDP_OBJ}"
 SYNCOOKIE_OBJ_PATH="${CURRENT_LINK}/${SYNCOOKIE_OBJ}"
 TC_SYNCOOKIE_OBJ_PATH="${CURRENT_LINK}/${TC_SYNCOOKIE_OBJ}"
-MC_EGRESS_OBJ_PATH="${CURRENT_LINK}/${MC_EGRESS_OBJ}"
+TC_EGRESS_OBJ_PATH="${CURRENT_LINK}/${TC_EGRESS_OBJ}"
 SOCK_STATE_OBJ_PATH="${CURRENT_LINK}/${SOCK_STATE_OBJ}"
 BPFTOOL_BIN="${BPFTOOL_BIN:-}"
 PREFERRED_BACKEND="${REQUESTED_BACKEND}"
@@ -433,7 +433,7 @@ build_release_payload() {
     install_compiled_bpf_objects() {
         local object source
         for object in "$XDP_OBJ" "$SYNCOOKIE_OBJ" "$TC_SYNCOOKIE_OBJ" \
-                      "$MC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
+                      "$TC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
             source="${BUILD_STAGING_DIR}/${object}"
             [[ -f "$source" ]] || continue
             place_file "$source" "${INSTALL_DIR}/${object}" || return 1

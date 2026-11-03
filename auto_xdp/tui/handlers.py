@@ -17,6 +17,8 @@ HANDLER_REFRESH_INTERVAL = 5.0
 _TABLES = (
     ("proto_handlers", "SLOT"), ("tcp_port_handlers", "TCP"),
     ("udp_port_handlers", "UDP"), ("tcp_profile_handlers", "PROFILE"),
+    ("tc_tcp_handlers", "TC_TCP"), ("tc_udp_handlers", "TC_UDP"), ("tc_proto_handlers", "TC_SLOT"),
+    ("tc_profile_handlers", "TC_PROFILE"),
     ("syncookie_prog_array", "SYNCOOKIE"),
 )
 _BUILTINS = {"gre": 47, "esp": 50, "sctp": 132}
@@ -109,8 +111,10 @@ def _configured(config: dict[str, Any]) -> dict[tuple[str, int], str]:
 
 
 def _expected_pin(kind: str, key: int) -> str:
+    if kind.startswith("TC_"):
+        return _expected_pin(kind.removeprefix("TC_"), key).removesuffix("prog") + "egress"
     if kind == "SLOT":
-        return f"handlers/proto_{key}"
+        return f"protocol_handlers/{key}/prog"
     if kind in {"TCP", "UDP"}:
         return f"port_handlers/{kind.lower()}/{key}/prog"
     if kind == "PROFILE":
@@ -123,11 +127,14 @@ def _pin_key(pin: str) -> tuple[str, int] | None:
     try:
         if len(parts) == 2 and parts[0] == "handlers" and parts[1].startswith("proto_"):
             return "SLOT", int(parts[1].removeprefix("proto_"))
-        if len(parts) == 4 and parts[3] == "prog":
+        if len(parts) == 3 and parts[0] == "protocol_handlers" and parts[2] in {"prog", "egress"}:
+            return "TC_SLOT" if parts[2] == "egress" else "SLOT", int(parts[1])
+        if len(parts) == 4 and parts[3] in {"prog", "egress"}:
+            prefix = "TC_" if parts[3] == "egress" else ""
             if parts[0] == "port_handlers" and parts[1] in {"tcp", "udp"}:
-                return parts[1].upper(), int(parts[2])
+                return prefix + parts[1].upper(), int(parts[2])
             if parts[:2] == ("profile_handlers", "tcp"):
-                return "PROFILE", int(parts[2])
+                return prefix + "PROFILE", int(parts[2])
         if pin == "syncookie_prog":
             return "SYNCOOKIE", 0
     except ValueError:
@@ -191,6 +198,10 @@ def collect_handlers(bpf_pin_dir: str, config: dict[str, Any], cache: HandlerCac
     for kind, key in sorted(candidates, key=lambda item: (order[item[0]], item[1])):
         program_id = active.get((kind, key))
         pin = _expected_pin(kind, key)
+        if kind == "SLOT":
+            options = [pin, f"handlers/proto_{key}"]
+            pin = next((item for item in options if program_id and pins.get(item) == program_id),
+                       next((item for item in options if item in pins), pin))
         pinned_id = pins.get(pin)
         info = programs.get(program_id or pinned_id or -1, {})
         state = "loaded" if program_id else ("pin only" if pinned_id else "configured")

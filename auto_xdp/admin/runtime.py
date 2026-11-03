@@ -174,6 +174,45 @@ def _all_interface_names() -> list[str]:
     return [str(item["ifname"]) for item in value if isinstance(item, dict) and item.get("ifname")]
 
 
+def _detach_handler_egress(pin_root: Path, interfaces: list[str]) -> list[str]:
+    """Remove only the TC classifier identified by our retained program pin."""
+    # The retired name is recognized only to detach/clean a pre-migration hook.
+    program_ids = {
+        program_id for name in ("tc_egress_dispatch_prog", "minecraft_egress_prog")
+        if (pin_root / name).exists()
+        and (program_id := _pinned_xdp_program_id(pin_root / name)) is not None
+    }
+    if not program_ids:
+        return []
+    if not _command_exists("tc"):
+        raise RuntimeError("tc is required to detach the pinned handler egress dispatcher")
+    messages = []
+    for iface in sorted(set(interfaces)):
+        result = _run_text(["tc", "-j", "filter", "show", "dev", iface, "egress", "pref", "49153"])
+        if result.returncode:
+            raise RuntimeError(f"Cannot inspect handler egress on {iface}: {result.stderr.strip()}")
+        try:
+            filters = json.loads(result.stdout)
+            if not isinstance(filters, list):
+                raise ValueError("filter inventory is not an array")
+            owned = any(
+                row.get("kind") == "bpf"
+                and row.get("options", {}).get("id", row.get("options", {}).get("prog", {}).get("id")) in program_ids
+                and int(str(row.get("options", {}).get("handle", "0")), 0) == 2
+                for row in filters
+            )
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RuntimeError(f"Cannot decode handler egress filters on {iface}") from exc
+        if not owned:
+            continue
+        result = _run_text(["tc", "filter", "del", "dev", iface, "egress", "protocol", "all",
+                            "pref", "49153", "handle", "2", "bpf"])
+        if result.returncode:
+            raise RuntimeError(f"Cannot detach handler egress on {iface}: {result.stderr.strip()}")
+        messages.append(f"detached handler egress from {iface}")
+    return messages
+
+
 def deactivate_runtime(ctx: RuntimeContext) -> list[str]:
     """Detach only the pinned Auto XDP generation and remove its nft table."""
     pin_root = ctx.bpf_pin_dir
@@ -220,6 +259,12 @@ def deactivate_runtime(ctx: RuntimeContext) -> list[str]:
         if result.returncode != 0 or _iface_xdp_program_id(iface) is not None:
             raise RuntimeError(f"failed to detach Auto XDP from {iface}: {result.stderr.strip()}")
         messages.append(f"detached Auto XDP from {iface}")
+
+    tc_interfaces = list(attached)
+    if not ctx.interface and any((pin_root / name).exists() for name in
+                                 ("tc_egress_dispatch_prog", "minecraft_egress_prog")):
+        tc_interfaces.extend(_all_interface_names())
+    messages.extend(_detach_handler_egress(pin_root, tc_interfaces))
 
     backend_marker = ctx.run_state_dir / "backend"
     active_backend = backend_marker.read_text().strip() if backend_marker.exists() else ""

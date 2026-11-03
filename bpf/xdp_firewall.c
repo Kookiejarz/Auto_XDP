@@ -62,7 +62,7 @@ static __always_inline int check_tcp_policy(
         if (endpoint_policy.profile_id)
             return dispatch_tcp_profile(
                 ctx, key, l3_off, inner_off, &endpoint_policy);
-        try_tcp_port_dispatch(ctx, key, l3_off, inner_off, dest_port);
+        try_tcp_port_dispatch(ctx, key, l3_off, inner_off, dest_port, endpoint_policy.policy_generation);
         count(CNT_TCP_NEW_ALLOW);
         emit_allow(ctx, IPPROTO_TCP, key->family, key->saddr, key->daddr,
                    key->sport, key->dport, (__u8)CNT_TCP_NEW_ALLOW, now);
@@ -75,7 +75,7 @@ static __always_inline int check_tcp_policy(
     if (endpoint_policy.profile_id)
         return dispatch_tcp_profile(
             ctx, key, l3_off, inner_off, &endpoint_policy);
-    try_tcp_port_dispatch(ctx, key, l3_off, inner_off, dest_port);
+    try_tcp_port_dispatch(ctx, key, l3_off, inner_off, dest_port, endpoint_policy.policy_generation);
     count(CNT_TCP_PASS);
     return XDP_PASS;
 

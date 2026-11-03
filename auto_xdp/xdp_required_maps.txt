@@ -48,5 +48,11 @@ udp_hv6
 abuseipdb_v4
 slot_ctx_map
 profile_ctx_map
-mc_l7_pending
-mc_verified
+tc_handler_ctx
+handler_egress
+handler_flows
+tc_profile_handlers
+tc_tcp_handlers
+tc_udp_handlers
+tc_proto_handlers
+handler_eg_stats
