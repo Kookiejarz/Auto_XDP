@@ -69,24 +69,29 @@ target_vmlinux_header() {
 generate_xdp_map_abi() {
     local source_root="$1"
     local header="${source_root}/bpf/include/map_sizes.h"
-    local rate4 rate6 counters mc_verified
+    local rate4 rate6 counters
 
     [[ -f "$header" ]] || return 1
     rate4=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V4" { print $3; exit }' "$header")
     rate6=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V6" { print $3; exit }' "$header")
-    mc_verified=$(awk '$2 == "MC_VERIFIED_MAX_ENTRIES" { print $3; exit }' "$header")
     counters=$(awk '$1 == "CNT_MAX" { gsub(/,/, "", $3); print $3; exit }' \
         "${source_root}/bpf/include/counters.h")
     [[ "$rate4" =~ ^[0-9]+$ && "$rate6" =~ ^[0-9]+$ ]] || return 1
     [[ "$counters" =~ ^[0-9]+$ ]] || return 1
-    [[ "$mc_verified" =~ ^[0-9]+$ ]] || return 1
 
     cat >"${BUILD_STAGING_DIR}/xdp_map_abi.txt" <<EOF
 # Map capacities derived from bpf/include/map_sizes.h and counters.h.
 pkt_counters percpu_array 4 8 ${counters}
 byte_counters percpu_array 4 32 1
 endpoint_scopes hash 24 4 16384
-mc_verified lru_hash 40 24 ${mc_verified}
+tc_handler_ctx percpu_array 4 96 1
+handler_egress hash 8 4 4096
+handler_flows lru_hash 48 32 65536
+tc_profile_handlers prog_array 4 4 256
+tc_tcp_handlers prog_array 4 4 65536
+tc_udp_handlers prog_array 4 4 65536
+tc_proto_handlers prog_array 4 4 256
+handler_eg_stats percpu_array 4 8 6
 hblk4 ${rate4}
 hblk6 ${rate6}
 udp_hv4 ${rate4}
@@ -332,12 +337,12 @@ compile_xdp_program() {
             "$_vmlinux_dir" || \
             warn "Level 2 SYN-cookie listener handoff unavailable."
     fi
-    if ! stage_build_source "$MC_EGRESS_SRC" "$MC_EGRESS_SRC" "$MC_EGRESS_SRC" \
+    if ! stage_build_source "$TC_EGRESS_SRC" "$TC_EGRESS_SRC" "$TC_EGRESS_SRC" \
             || ! compile_bpf_object \
-                "${_source_root}/${MC_EGRESS_SRC}" \
-                "${BUILD_STAGING_DIR}/${MC_EGRESS_OBJ}" \
+                "${_source_root}/${TC_EGRESS_SRC}" \
+                "${BUILD_STAGING_DIR}/${TC_EGRESS_OBJ}" \
                 "$_source_root"; then
-        warn "Required Minecraft egress observer failed to build."
+        warn "Required Handler egress observer failed to build."
         return 1
     fi
 
@@ -440,7 +445,7 @@ cleanup_build_artifacts_step() {
 
     step_begin "Cleaning up build artifacts"
     for _f in "$XDP_OBJ" "$SYNCOOKIE_OBJ" "$TC_SYNCOOKIE_OBJ" \
-              "$MC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
+              "$TC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
         if [[ -f "$_f" ]]; then
             rm -f "$_f" && _cleaned+=("$_f")
         fi

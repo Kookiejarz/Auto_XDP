@@ -5,8 +5,6 @@ import datetime as _dt
 import json
 import os
 import re
-import secrets
-import shutil
 import socket
 import subprocess
 import sys
@@ -244,7 +242,6 @@ def _cmd_slot_disable(args: argparse.Namespace) -> int:
 def _cmd_slot_list(args: argparse.Namespace) -> int:
     bpf_pin_dir, _, _ = _slot_paths(args)
     handlers_dir = _builtin_handlers_dir(args)
-    slot_pin_dir = bpf_pin_dir / "handlers"
     proto_handlers = bpf_pin_dir / "proto_handlers"
 
     if not proto_handlers.exists():
@@ -252,12 +249,12 @@ def _cmd_slot_list(args: argparse.Namespace) -> int:
     else:
         print("Loaded handlers:")
         found = False
-        for pin in sorted(slot_pin_dir.glob("proto_*")):
-            if not pin.is_file():
+        for number in range(256):
+            pin = handlers.protocol_handler_pin(bpf_pin_dir, number)
+            if not pin.exists() or handlers.prog_array_entry_id(proto_handlers, number) != handlers.pinned_program_id(pin):
                 continue
-            proto = pin.name.removeprefix("proto_")
             name = handlers.slot_prog_name(pin)
-            print(f"  proto {proto:<5} {name}")
+            print(f"  proto {number:<5} {name}")
             found = True
         if not found:
             print("  (none)")
@@ -266,9 +263,9 @@ def _cmd_slot_list(args: argparse.Namespace) -> int:
     for name in handlers.BUILTIN_SLOT_INFO:
         proto_num, obj_name = handlers.BUILTIN_SLOT_INFO[name]
         obj_path = handlers_dir / obj_name
-        pin_path = slot_pin_dir / f"proto_{proto_num}"
+        pin_path = handlers.protocol_handler_pin(bpf_pin_dir, proto_num)
         if obj_path.exists():
-            if pin_path.exists():
+            if pin_path.exists() and handlers.prog_array_entry_id(proto_handlers, proto_num) == handlers.pinned_program_id(pin_path):
                 print(f"  {name:<6} (proto {proto_num})  [loaded]")
             else:
                 print(f"  {name:<6} (proto {proto_num})")
@@ -283,7 +280,6 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
     builtin_handlers_dir = _builtin_handlers_dir(args)
     slot_ctx_map = bpf_pin_dir / "slot_ctx_map"
     proto_handlers = bpf_pin_dir / "proto_handlers"
-    slot_pin_dir = bpf_pin_dir / "handlers"
 
     builtin_name = ""
     if args.name_or_proto in handlers.BUILTIN_SLOT_INFO:
@@ -320,59 +316,9 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
         print("XDP not loaded (proto_handlers map not found).", file=sys.stderr)
         return 1
 
-    slot_pin_dir.mkdir(parents=True, exist_ok=True)
-    pin_path = slot_pin_dir / f"proto_{proto}"
-    candidate_pin = slot_pin_dir / f"proto_{proto}_next_{secrets.token_hex(4)}"
-
-    load_cmd = [
-        "bpftool",
-        "prog",
-        "load",
-        str(obj_path),
-        str(candidate_pin),
-        "type",
-        "xdp",
-        "map",
-        "name",
-        "slot_ctx_map",
-        "pinned",
-        str(slot_ctx_map),
-    ]
-
-    if builtin_name:
-        for name in ("pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg"):
-            shared_path = bpf_pin_dir / name
-            if not shared_path.exists():
-                print(f"XDP not loaded completely ({name} map not found).", file=sys.stderr)
-                return 1
-            load_cmd.extend(["map", "name", name, "pinned", str(shared_path)])
-
-    if proto == 132 and builtin_name == "sctp":
-        sctp_whitelist = bpf_pin_dir / "sctp_whitelist"
-        if not sctp_whitelist.exists():
-            print("XDP not loaded completely (sctp_whitelist map not found).", file=sys.stderr)
-            return 1
-        load_cmd.extend(
-            [
-                "map",
-                "name",
-                "sctp_whitelist",
-                "pinned",
-                str(sctp_whitelist),
-            ]
-        )
-
     try:
-        handlers.run_checked(load_cmd, f"Failed to load {obj_path}")
-    except RuntimeError as exc:
-        if candidate_pin.exists():
-            candidate_pin.unlink()
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    try:
-        handlers.transactional_file_prog_swap(proto_handlers, proto, candidate_pin, pin_path)
-    except RuntimeError as exc:
+        handlers.load_protocol_handler(bpf_pin_dir, proto, obj_path)
+    except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -389,44 +335,29 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
 def _cmd_slot_unload(args: argparse.Namespace) -> int:
     path = Path(args.config)
     bpf_pin_dir, _, _ = _slot_paths(args)
-    slot_pin_dir = bpf_pin_dir / "handlers"
-    proto_handlers = bpf_pin_dir / "proto_handlers"
     target = args.name_or_proto
-
-    if target.isdigit():
+    if target in handlers.BUILTIN_SLOT_INFO:
+        proto = handlers.BUILTIN_SLOT_INFO[target][0]
+    elif target.isdigit():
         proto = int(target)
     else:
-        proto = None
-        for pin in sorted(slot_pin_dir.glob("proto_*")):
-            if not pin.is_file():
+        matches = []
+        for number in range(256):
+            pin = handlers.protocol_handler_pin(bpf_pin_dir, number)
+            if not pin.exists():
                 continue
             name = handlers.slot_prog_name(pin)
             if name == target or f"_{target}_" in name or name.endswith(f"_{target}"):
-                proto = int(pin.name.removeprefix("proto_"))
-                break
-        if proto is None:
-            print(f"No loaded handler matches: {target}", file=sys.stderr)
+                matches.append(number)
+        if len(matches) != 1:
+            print(f"No unique loaded handler matches: {target}", file=sys.stderr)
             return 1
-
-    subprocess.run(
-        [
-            "bpftool",
-            "map",
-            "delete",
-            "pinned",
-            str(proto_handlers),
-            "key",
-            str(proto),
-            "0",
-            "0",
-            "0",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    pin_path = slot_pin_dir / f"proto_{proto}"
-    if pin_path.exists():
-        pin_path.unlink()
+        proto = matches[0]
+    try:
+        handlers.unload_protocol_handler(bpf_pin_dir, proto)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     print(f"Unloaded handler for proto {proto}")
     if path.exists():
@@ -515,7 +446,7 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        shared_maps = handlers.port_handler_shared_maps(obj_path, bpf_pin_dir)
+        shared_maps = handlers.handler_shared_maps(obj_path, bpf_pin_dir)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -526,12 +457,6 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-
-    # Handler-specific validation caches must not survive a successful handler
-    # replacement. Flush only after the new program is committed so a failed
-    # candidate never mutates the active handler's state.
-    if proto == "udp":
-        handlers.flush_udp_validated_for_port(bpf_pin_dir, port)
 
     if not args.no_config_update:
         config_file.ensure_config_exists(path)
@@ -546,20 +471,12 @@ def _cmd_profile_handler_load(args: argparse.Namespace) -> int:
     bpf_pin_dir, _, _ = _slot_paths(args)
     profile_id = handlers.normalize_profile_id(int(args.profile_id))
     handler_map = bpf_pin_dir / "tcp_profile_handlers"
-    shared_maps = [
-        (name, bpf_pin_dir / name)
-        for name in (
-            "slot_ctx_map", "profile_ctx_map", "mc_l7_pending", "mc_verified",
-            "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg",
-        )
-    ]
-
     obj_path = Path(args.path)
     if not obj_path.is_file():
         print(f"Handler object not found: {obj_path}", file=sys.stderr)
         return 1
     obj_path = obj_path.resolve()
-    missing = [name for name, path in shared_maps if not path.exists()]
+    missing: list[str] = []
     if not handler_map.exists():
         missing.insert(0, handler_map.name)
     if missing:
@@ -571,6 +488,7 @@ def _cmd_profile_handler_load(args: argparse.Namespace) -> int:
 
     pin_dir = bpf_pin_dir / "profile_handlers" / "tcp" / str(profile_id)
     try:
+        shared_maps = handlers.handler_shared_maps(obj_path, bpf_pin_dir)
         handlers.load_handler_object(handler_map, profile_id, obj_path, pin_dir, shared_maps)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
@@ -585,49 +503,15 @@ def _cmd_profile_handler_unload(args: argparse.Namespace) -> int:
     profile_id = handlers.normalize_profile_id(int(args.profile_id))
     handler_map = bpf_pin_dir / "tcp_profile_handlers"
     pin_dir = bpf_pin_dir / "profile_handlers" / "tcp" / str(profile_id)
-    live_pin = pin_dir / "prog"
 
     if not handler_map.exists():
         print(f"XDP not loaded ({handler_map.name} map not found).", file=sys.stderr)
         return 1
-
-    active_id = handlers.prog_array_entry_id(handler_map, profile_id)
-    if not live_pin.exists():
-        if active_id is not None:
-            print(
-                f"Profile handler {profile_id} is active but its ownership pin is missing.",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"TCP profile handler {profile_id} is not loaded")
-        return 0
-
     try:
-        pinned_id = handlers.pinned_program_id(live_pin)
-    except RuntimeError as exc:
+        handlers.transactional_handler_pair(handler_map, profile_id, None, pin_dir)
+    except (OSError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    if active_id != pinned_id:
-        print(
-            f"Profile handler {profile_id} does not match its program-array entry; "
-            "retaining its pins.",
-            file=sys.stderr,
-        )
-        return 1
-    if not handlers.prog_array_delete(handler_map, profile_id):
-        print(
-            f"Failed to remove profile handler {profile_id}; retaining its pins.",
-            file=sys.stderr,
-        )
-        return 1
-    if handlers.prog_array_entry_id(handler_map, profile_id) is not None:
-        print(
-            f"Profile handler {profile_id} deletion could not be verified; retaining its pins.",
-            file=sys.stderr,
-        )
-        return 1
-
-    shutil.rmtree(pin_dir)
     print(f"Unloaded TCP profile handler {profile_id}")
     return 0
 

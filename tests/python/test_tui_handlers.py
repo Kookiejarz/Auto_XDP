@@ -20,13 +20,16 @@ def test_inventory_uses_dispatch_entries_instead_of_configuration_or_pin_presenc
         dict(id=11, name="actual_gre"),
         dict(id=12, name="custom_udp"),
         dict(id=13, name="tcp_profile", pinned=[str(tmp_path / "profile_handlers/tcp/1/prog")]),
+        dict(id=14, name="tc_profile", pinned=[str(tmp_path / "profile_handlers/tcp/1/egress")]),
+        dict(id=34, name="tc_orphan", pinned=[str(tmp_path / "port_handlers/tcp/8443/egress")]),
         dict(id=33, name="orphan", pinned=[str(tmp_path / "port_handlers/tcp/8443/prog")]),
         dict(id=99, name="stale_gre", pinned=[str(tmp_path / "handlers/proto_47")]),
         dict(id=100, name="unrelated", pinned=[str(tmp_path.parent / "other/handlers/proto_50")]),
     ]
     entries = {"proto_handlers": [{"key": ["0x2f", "0x00", "0x00", "0x00"], "value": ["0x0b", "0x00", "0x00", "0x00"]}],
                "udp_port_handlers": [{"key": 30120, "value": {"id": 12}}],
-               "tcp_profile_handlers": [{"key": 1, "value": 13}]}
+               "tcp_profile_handlers": [{"key": 1, "value": 13}],
+               "tc_profile_handlers": [{"key": 1, "value": 14}]}
 
     def query(*args):
         return programs if args[0] == "-f" else entries.get(args[-1].split("/")[-1], [])
@@ -40,9 +43,12 @@ def test_inventory_uses_dispatch_entries_instead_of_configuration_or_pin_presenc
     assert rows["TCP", 8443].state == "pin only" and rows["TCP", 8443].program_id == 33
     assert rows["UDP", 30120].state == "loaded" and rows["UDP", 30120].source == "/udp.c"
     assert rows["PROFILE", 1].state == "loaded" and rows["PROFILE", 1].program_id == 13
+    assert rows["TC_PROFILE", 1].state == "loaded" and rows["TC_PROFILE", 1].program_id == 14
+    assert rows["TC_TCP", 8443].state == "pin only" and rows["TC_TCP", 8443].program_id == 34
     assert ("SLOT", 50) not in rows
     assert inventory.tables == [("SLOT", "ready", 1), ("TCP", "ready", 0), ("UDP", "ready", 1),
-                                ("PROFILE", "ready", 1), ("SYNCOOKIE", "ready", 0)]
+                                ("PROFILE", "ready", 1), ("TC_TCP", "ready", 0), ("TC_UDP", "ready", 0),
+                                ("TC_SLOT", "ready", 0), ("TC_PROFILE", "ready", 1), ("SYNCOOKIE", "ready", 0)]
 
 
 def test_query_failure_is_unknown_and_does_not_claim_an_empty_dispatch_table(tmp_path):

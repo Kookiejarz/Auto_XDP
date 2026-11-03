@@ -55,20 +55,19 @@ def test_runtime_builtin_slot_telemetry_map_binding(tmp_path: Path) -> None:
     for name in (*maps, "gre_handler.o"):
         (tmp_path / name).touch()
     entries = ["gre", {"proto": 47, "path": str(tmp_path / "gre_handler.o")}]
-    commands: list[list[str]] = []
-
-    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        commands.append(command)
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    argv = ["slot-test", json.dumps(entries), str(tmp_path), str(tmp_path), str(tmp_path), "1"]
-    with mock.patch.object(sys, "argv", argv), mock.patch("subprocess.run", run):
+    from auto_xdp.admin import handlers
+    abi = handlers.HandlerMapAbi(2, 4, 4, 1, 0)
+    argv = ["slot-test", json.dumps(entries), str(tmp_path), str(tmp_path), "1"]
+    with mock.patch.object(sys, "argv", argv), \
+         mock.patch.object(handlers, "handler_object_maps", return_value={name: abi for name in maps}), \
+         mock.patch.object(handlers, "pinned_handler_map_abi", return_value=abi), \
+         mock.patch.object(handlers, "_load_handler_object", return_value=False) as load:
         exec(compile(script, "runtime-slot-loader", "exec"), {})
-    builtin, custom = [command for command in commands if command[1:3] == ["prog", "load"]]
-    for name in maps:
-        assert str(tmp_path / name) in builtin
-    for name in maps[1:]:
-        assert str(tmp_path / name) not in custom
+    assert load.call_count == 2
+    for call in load.call_args_list:
+        assert call.args[:4] == (tmp_path / "proto_handlers", 47, tmp_path / "gre_handler.o",
+                                tmp_path / "protocol_handlers/47")
+        assert dict(call.args[4]) == {name: tmp_path / name for name in maps}
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="production BPF headers require Linux")

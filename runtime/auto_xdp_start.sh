@@ -216,7 +216,7 @@ ensure_xdp_loaded() {
         # Strict cookie requirements and incompatible NAT both abort activation.
         # Keep XDP attached and forbid a silent nftables downgrade.
         load_syncookie_program || return 2
-        load_minecraft_egress || return 1
+        load_tc_egress_dispatch || return 1
         load_port_handlers || true
         auto_tune_interface_parallelism || true
         [[ $_any_missing -eq 1 ]] && echo "[auto_xdp] re-attached XDP to missing interfaces" >&2
@@ -248,7 +248,7 @@ ensure_xdp_loaded() {
 
     load_sock_state_tracker || true
     load_syncookie_program || return 2
-    load_minecraft_egress || return 1
+    load_tc_egress_dispatch || return 1
     auto_tune_interface_parallelism || true
     echo "$AUTO_XDP_SWITCH_MODE" > "${RUN_STATE_DIR}/xdp_mode"
     return 0
@@ -310,7 +310,7 @@ activate_nftables_backend() {
         done
     fi
 
-    cleanup_minecraft_egress
+    cleanup_tc_egress_dispatch
 
     echo "nftables" > "${RUN_STATE_DIR}/backend"
     _auto_xdp_record_nft_state

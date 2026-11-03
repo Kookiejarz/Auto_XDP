@@ -1,8 +1,8 @@
 #pragma once
-#include "maps.h"
+#include "endpoint_maps.h"
 
-static __always_inline bool endpoint_scope_allowed(
-    struct xdp_md *ctx, __u8 family, __u8 proto,
+static __always_inline bool endpoint_scope_allowed_on(
+    __u32 ifindex, __u8 family, __u8 proto,
     const __u32 *daddr, __u16 port)
 {
     struct xdp_runtime_cfg *cfg = runtime_cfg();
@@ -10,7 +10,7 @@ static __always_inline bool endpoint_scope_allowed(
         return true;
 
     struct endpoint_scope_key key = {
-        .ifindex = ctx->ingress_ifindex,
+        .ifindex = ifindex,
         .port = port,
         .proto = proto,
         .family = family,
@@ -33,11 +33,11 @@ static __always_inline bool endpoint_scope_allowed(
     return allow && *allow;
 }
 
-static __always_inline bool tcp_endpoint_policy_lookup(
-    struct xdp_md *ctx, __u32 dest_port, struct tcp_endpoint_policy *result)
+static __always_inline bool tcp_endpoint_policy_lookup_on(
+    __u32 ifindex, __u32 dest_port, struct tcp_endpoint_policy *result)
 {
     struct zone_port_key zone_key = {
-        .ifindex = ctx->ingress_ifindex,
+        .ifindex = ifindex,
         .port = dest_port,
     };
     struct tcp_endpoint_policy *policy;
@@ -55,10 +55,10 @@ static __always_inline bool tcp_endpoint_policy_lookup(
     return result->allow != 0;
 }
 
-static __always_inline bool udp_exposure_allowed(struct xdp_md *ctx, __u32 dest_port)
+static __always_inline bool udp_exposure_allowed_on(__u32 ifindex, __u32 dest_port)
 {
     struct zone_port_key zone_key = {
-        .ifindex = ctx->ingress_ifindex,
+        .ifindex = ifindex,
         .port = dest_port,
     };
     __u32 *zone_allow = bpf_map_lookup_elem(&udp_zone_whitelist, &zone_key);
@@ -66,6 +66,23 @@ static __always_inline bool udp_exposure_allowed(struct xdp_md *ctx, __u32 dest_
         return *zone_allow != 0;
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     return allow && *allow;
+}
+
+static __always_inline bool endpoint_scope_allowed(
+    struct xdp_md *ctx, __u8 family, __u8 proto, const __u32 *daddr, __u16 port)
+{
+    return endpoint_scope_allowed_on(ctx->ingress_ifindex, family, proto, daddr, port);
+}
+
+static __always_inline bool tcp_endpoint_policy_lookup(
+    struct xdp_md *ctx, __u32 port, struct tcp_endpoint_policy *result)
+{
+    return tcp_endpoint_policy_lookup_on(ctx->ingress_ifindex, port, result);
+}
+
+static __always_inline bool udp_exposure_allowed(struct xdp_md *ctx, __u32 port)
+{
+    return udp_exposure_allowed_on(ctx->ingress_ifindex, port);
 }
 
 static __always_inline void fill_flow_key_v4(

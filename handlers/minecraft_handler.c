@@ -14,7 +14,14 @@
 #include "common.h"
 #include "flow_keys.h"
 #include "map_sizes.h"
-#include "minecraft.h"
+#include "minecraft_state.h"
+#include "handler_state.h"
+
+#include "tc_handler_ctx.h"
+
+AXDP_STATE_SCHEMA("minecraft-session-v1",
+    "[\"mc_l7_pending\",\"mc_verified\",\"mc_status_rate4\",\"mc_status_rate6\","
+    "\"mc_login_rate4\",\"mc_login_rate6\"]");
 
 #define MC_STATUS_RATE_WINDOW_NS (10ULL * 1000000000ULL)
 #define MC_STATUS_RATE_MAX 30
@@ -359,7 +366,7 @@ static __always_inline bool pending_budget_ok(
     return true;
 }
 
-SEC("xdp/minecraft")
+SEC("xdp")
 int xdp_minecraft_handler(struct xdp_md *ctx)
 {
     struct xdp_slot_ctx *sc = get_slot_ctx(ctx);
@@ -614,6 +621,187 @@ parse_login_start: ;
         return profile_result(ctx, inner_off, XDP_DROP);
     }
     return profile_result(ctx, inner_off, XDP_PASS);
+}
+
+
+/* The service was selected by the generic TC dispatcher. Only Minecraft
+ * framing and dialogue state belong in this entry. */
+#define MC_SERVER_FRAME_MAX 8192U
+#define MC_SERVER_VARINT_MAX 5
+#define MC_SERVER_PACKET_LEN_MAX 3
+
+struct tc_mc_varint {
+    __s32 value;
+    __u8 bytes;
+};
+
+static __always_inline struct tc_mc_varint tc_varint(
+    __u8 *ptr, const __u8 *end, __u8 max_bytes, const void *data_end)
+{
+    __s32 value = 0;
+#define TC_MC_BYTE(index, shift)                                      \
+    do {                                                              \
+        if ((index) > max_bytes || ptr >= end)                        \
+            return (struct tc_mc_varint){};                           \
+        barrier_var(ptr);                                             \
+        __u8 *next = ptr + 1;                                         \
+        if ((const void *)next > data_end)                            \
+            return (struct tc_mc_varint){};                           \
+        __u8 byte = *(next - 1);                                      \
+        ptr = next;                                                    \
+        value |= ((__s32)(byte & 0x7f) << (shift));                  \
+        if (!(byte & 0x80))                                           \
+            return (struct tc_mc_varint){ .value = value, .bytes = index }; \
+    } while (0)
+    TC_MC_BYTE(1, 0);
+    TC_MC_BYTE(2, 7);
+    TC_MC_BYTE(3, 14);
+    TC_MC_BYTE(4, 21);
+    TC_MC_BYTE(5, 28);
+#undef TC_MC_BYTE
+    return (struct tc_mc_varint){};
+}
+
+static __always_inline int inspect_server_frame(
+    __u8 *payload, const __u8 *payload_end, const void *data_end,
+    struct mc_l7_pending_val *pending)
+{
+    struct tc_mc_varint value = tc_varint(
+        payload, payload_end, MC_SERVER_PACKET_LEN_MAX, data_end);
+    __u8 *cursor;
+    const __u8 *frame_end;
+    __u32 frame_len;
+
+    if (!value.bytes || value.value < 1)
+        return -1;
+    payload += value.bytes;
+    frame_len = (__u32)value.value;
+    barrier_var(frame_len);
+    if (frame_len > MC_SERVER_FRAME_MAX)
+        return -1;
+    frame_end = payload + frame_len;
+    if (frame_end > payload_end || (const void *)frame_end > data_end)
+        return -1;
+    cursor = payload;
+
+    if (pending->flags & MC_F_COMPRESSION_ENABLED) {
+        value = tc_varint(cursor, frame_end, MC_SERVER_VARINT_MAX, data_end);
+        if (!value.bytes)
+            return -1;
+        cursor += value.bytes;
+        if (value.value != 0)
+            return -1; /* zlib-compressed body is intentionally opaque to BPF */
+    }
+    value = tc_varint(cursor, frame_end, MC_SERVER_VARINT_MAX, data_end);
+    if (!value.bytes)
+        return -1;
+    return value.value;
+}
+
+SEC("tc")
+int tc_minecraft_handler(struct __sk_buff *skb)
+{
+    struct tc_handler_ctx *policy = get_tc_handler_ctx(skb);
+    if (!policy || policy->kind != HANDLER_ROUTE_PROFILE ||
+        policy->target != MC_PROFILE_ID || policy->ip_proto != IPPROTO_TCP ||
+        policy->ct_direction != NF_CT_DIR_REPLY ||
+        policy->ct_state != TCP_CONNTRACK_ESTABLISHED_LOCAL)
+        return tc_handler_continue();
+    struct flow_key key = policy->flow;
+    struct flow_key wire_key = {};
+    struct mc_l7_pending_val *pending;
+    struct linux_ct_snapshot snapshot;
+    struct bpf_ct_opts___local opts;
+    struct bpf_sock_tuple tuple;
+    struct nf_conn *ct;
+    __u32 payload_len = policy->payload_len;
+    __u32 payload_offset = policy->payload_offset;
+    void *data, *data_end;
+    __u8 *payload;
+    int packet_id;
+    __u64 now;
+    if (payload_offset > 0x3fff)
+        return tc_handler_continue();
+    if (!payload_len && (policy->tcp_flags & (TCP_FLAG_FIN | TCP_FLAG_RST))) {
+        bpf_map_delete_elem(&mc_l7_pending, &key);
+        bpf_map_delete_elem(&mc_verified, &key);
+        return tc_handler_continue();
+    }
+    pending = bpf_map_lookup_elem(&mc_l7_pending, &key);
+    if (!pending || pending->policy_generation != policy->policy_generation ||
+        pending->profile_generation != policy->profile_generation)
+        return tc_handler_continue();
+    if (!payload_len || pending->egress_bytes >= MC_PREVERIFY_BYTES ||
+        payload_len > MC_PREVERIFY_BYTES - pending->egress_bytes)
+        return tc_handler_continue();
+
+    /* TCP sendmsg may place even a two-byte reply in non-linear fragments.
+     * Pull only the bounded control frame, not an entire large GSO packet. */
+    __u32 inspect_len = payload_len;
+    if (inspect_len > MC_SERVER_FRAME_MAX + MC_SERVER_PACKET_LEN_MAX)
+        inspect_len = MC_SERVER_FRAME_MAX + MC_SERVER_PACKET_LEN_MAX;
+    if (bpf_skb_pull_data(skb, payload_offset + inspect_len))
+        return tc_handler_continue();
+    data = (void *)(long)skb->data;
+    data_end = (void *)(long)skb->data_end;
+    payload = data + payload_offset;
+    if ((void *)payload > data_end)
+        return tc_handler_continue();
+
+    wire_key.family = key.family;
+    wire_key.sport = key.dport;
+    wire_key.dport = key.sport;
+    __builtin_memcpy(wire_key.saddr, key.daddr, sizeof(wire_key.saddr));
+    __builtin_memcpy(wire_key.daddr, key.saddr, sizeof(wire_key.daddr));
+    linux_ct_fill_tuple(&tuple, &wire_key);
+    opts = linux_ct_opts(IPPROTO_TCP);
+    ct = bpf_skb_ct_lookup(skb, &tuple, linux_ct_tuple_size(&wire_key), &opts, sizeof(opts));
+    if (!ct)
+        return tc_handler_continue();
+    linux_ct_snapshot(ct, opts.dir, &snapshot);
+    if (snapshot.dir != NF_CT_DIR_REPLY || !linux_ct_established(&snapshot)) {
+        bpf_ct_release(ct);
+        return tc_handler_continue();
+    }
+
+    now = bpf_ktime_get_ns();
+    if (now >= pending->hard_deadline_ns) {
+        bpf_ct_release(ct);
+        bpf_map_delete_elem(&mc_l7_pending, &key);
+        return tc_handler_continue();
+    }
+    pending->egress_bytes += payload_len;
+
+    if (pending->state == MC_L7_ENCRYPTED_PROBATION) {
+        pending->flags |= MC_F_SERVER_AFTER_CHALLENGE;
+        pending->proof_level = MC_PROOF_CHALLENGE_DIALOGUE;
+        bpf_ct_release(ct);
+        return tc_handler_continue();
+    }
+
+    packet_id = inspect_server_frame(payload, payload + inspect_len, data_end, pending);
+    if (packet_id == 0 && pending->intention != 1) {
+        bpf_ct_release(ct);
+        bpf_map_delete_elem(&mc_l7_pending, &key);
+        return tc_handler_continue();
+    }
+    if (packet_id == 1 && pending->intention != 1) {
+        pending->state = MC_L7_SERVER_CHALLENGE;
+        pending->proof_level = MC_PROOF_SERVER_PROGRESS;
+        pending->hard_deadline_ns = pending->first_seen_ns + MC_CHALLENGE_DEADLINE_NS;
+    } else if (packet_id == 2 && pending->intention != 1) {
+        bool admitted = mc_mark_conn(ct, &key, policy->policy_generation,
+                                    policy->profile_generation, MC_PROOF_WIRE_VERIFIED);
+        bpf_ct_release(ct);
+        if (admitted)
+            bpf_map_delete_elem(&mc_l7_pending, &key);
+        return tc_handler_continue();
+    } else if (packet_id == 3 && pending->intention != 1) {
+        pending->flags |= MC_F_COMPRESSION_ENABLED;
+        pending->proof_level = MC_PROOF_SERVER_PROGRESS;
+    }
+    bpf_ct_release(ct);
+    return tc_handler_continue();
 }
 
 char _license[] SEC("license") = "GPL";

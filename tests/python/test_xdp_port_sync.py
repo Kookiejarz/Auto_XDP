@@ -334,6 +334,7 @@ class XdpPortSyncTests(unittest.TestCase):
                 "os.environ",
                 {"PYTHON_LIB_DIR": str(install_dir / "python"), "RUN_STATE_DIR": str(run_dir)},
             ), mock.patch.object(cfg, "BPF_PIN_DIR", str(pin_dir)), \
+                 mock.patch.object(backend, "_profile_egress_ready", return_value=True), \
                  mock.patch.object(backend, "_pinned_program_id", side_effect=[None, 42]), \
                  mock.patch.object(backend, "_profile_command", return_value=True) as command:
                 self.assertEqual(
@@ -355,6 +356,7 @@ class XdpPortSyncTests(unittest.TestCase):
 
             with mock.patch.dict("os.environ", {"RUN_STATE_DIR": str(run_dir)}), \
                  mock.patch.object(cfg, "BPF_PIN_DIR", str(pin_dir)), \
+                 mock.patch.object(backend, "_profile_egress_ready", return_value=True), \
                  mock.patch.object(backend, "_pinned_program_id", return_value=42), \
                  mock.patch.object(backend, "_profile_command", return_value=True) as command:
                 self.assertIsNone(backend._remove_stale_profile_handlers({}, dry_run=False))
@@ -367,6 +369,7 @@ class XdpPortSyncTests(unittest.TestCase):
                 {"PYTHON_LIB_DIR": str(install_dir / "python"), "RUN_STATE_DIR": str(run_dir)},
             ), \
                  mock.patch.object(cfg, "BPF_PIN_DIR", str(pin_dir)), \
+                 mock.patch.object(backend, "_profile_egress_ready", return_value=True), \
                  mock.patch.object(backend, "_pinned_program_id", return_value=77), \
                  mock.patch.object(backend, "_profile_command") as command:
                 self.assertEqual(
@@ -417,6 +420,7 @@ class XdpPortSyncTests(unittest.TestCase):
                 "PYTHON_LIB_DIR": str(install_dir / "python"),
                 "RUN_STATE_DIR": str(root / "run"),
             }), mock.patch.object(cfg, "BPF_PIN_DIR", str(root / "bpf")), \
+                 mock.patch.object(backend, "_profile_egress_ready", return_value=True), \
                  mock.patch.object(backend, "_pinned_program_id", side_effect=[42, 43]), \
                  mock.patch.object(backend, "_profile_command", side_effect=command):
                 failed, generation = backend._ensure_profile_handlers(

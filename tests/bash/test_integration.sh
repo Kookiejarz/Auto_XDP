@@ -520,8 +520,8 @@ test_loaded_map_abi() {
     _assert_map_abi tcp_zone_whitelist hash 8 24 4096 || return 1
     _assert_map_abi tcp_profile_handlers prog_array 4 4 256 || return 1
     _assert_map_abi profile_ctx_map percpu_array 4 24 1 || return 1
-    _assert_map_abi mc_verified lru_hash 40 24 \
-        "$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" MC_VERIFIED_MAX_ENTRIES)" || return 1
+    _assert_map_abi handler_flows lru_hash 48 32 65536 || return 1
+    _assert_map_abi tc_handler_ctx percpu_array 4 96 1 || return 1
     _assert_map_abi udp_global_rl array 4 40 1 || return 1
     _assert_map_abi udp_percpu_acc percpu_array 4 16 1 || return 1
     _assert_map_abi byte_counters percpu_array 4 32 1 || return 1
@@ -597,14 +597,14 @@ test_handler_transactional_hot_swap() {
         --bpf-pin-dir "$_PIN_DIR" \
         --handlers-dir /tmp \
         slot load 47 "$handler_obj" >/dev/null || return 1
-    old_id=$(_pinned_prog_id "$_PIN_DIR/handlers/proto_47") || return 1
+    old_id=$(_pinned_prog_id "$_PIN_DIR/protocol_handlers/47/prog") || return 1
 
     PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin.cli \
         --config "$config_path" \
         --bpf-pin-dir "$_PIN_DIR" \
         --handlers-dir /tmp \
         slot load 47 "$handler_obj" >/dev/null || return 1
-    new_id=$(_pinned_prog_id "$_PIN_DIR/handlers/proto_47") || return 1
+    new_id=$(_pinned_prog_id "$_PIN_DIR/protocol_handlers/47/prog") || return 1
     map_id=$(_map_lookup_u32 "$_PIN_DIR/proto_handlers" "$(_u32le 47)") || return 1
 
     [[ "$new_id" != "$old_id" ]] || {
@@ -615,18 +615,60 @@ test_handler_transactional_hot_swap() {
         echo "proto_handlers entry points to $map_id, expected candidate $new_id"
         return 1
     }
-    if find "$_PIN_DIR/handlers" -maxdepth 1 \
-            \( -name 'proto_47_next_*' -o -name 'proto_47_rollback_*' \) | grep -q .; then
+    if find "$_PIN_DIR/protocol_handlers" -maxdepth 1 \
+            \( -name '47_next_*' -o -name '47_rollback_*' \) | grep -q .; then
         echo "handler transaction left candidate or rollback pins after success"
         return 1
     fi
     rm -f "$handler_obj" "$config_path"
 }
 
+test_dual_handler_dispatch() {
+    local fixture=/tmp/axdp_dual_handler.o
+    local replacement=/tmp/axdp_dual_handler_next.o
+    local dispatcher=/tmp/axdp_handler_dispatcher.o
+    local chain=/tmp/axdp_handler_chain.o
+    local -a args=(-O2 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
+    [[ ! -d "/usr/include/$(uname -m)-linux-gnu" ]] || args+=(-I "/usr/include/$(uname -m)-linux-gnu")
+    clang "${args[@]}" -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$fixture" || return 1
+    clang "${args[@]}" -DMETRIC_STEP=2 -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$replacement" || return 1
+    clang "${args[@]}" -DCHAIN_ONLY -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$chain" || return 1
+    clang "${args[@]}" -c "$REPO_ROOT/bpf/tc_egress_dispatch.c" -o "$dispatcher" || return 1
+    PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 \
+        "$REPO_ROOT/tests/python/kernel_handler_dispatch.py" "$_PIN_DIR" "$_NS" "$_VETH" \
+        "$_HOST_IP" "$_NS_IP" "$_HOST_IP6" "$_NS_IP6" "$fixture" "$replacement" "$dispatcher" "$chain"
+}
+
+test_protocol_handler_migration() {
+    local objects=/tmp/axdp_protocol_objects name
+    mkdir -p "$objects"
+    local -a args=(-O2 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
+    [[ ! -d "/usr/include/$(uname -m)-linux-gnu" ]] || args+=(-I "/usr/include/$(uname -m)-linux-gnu")
+    for name in gre esp sctp; do
+        clang "${args[@]}" -c "$REPO_ROOT/handlers/${name}_handler.c" -o "$objects/$name.o" || return 1
+    done
+    clang "${args[@]}" -c "$REPO_ROOT/tests/c/protocol_handler_fixture.c" -o "$objects/fixture.o" || return 1
+    clang "${args[@]}" -DCHAIN_ONLY -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$objects/chain.o" || return 1
+    clang "${args[@]}" -c "$REPO_ROOT/bpf/tc_egress_dispatch.c" -o "$objects/dispatcher.o" || return 1
+    PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 \
+        "$REPO_ROOT/tests/python/kernel_protocol_handlers.py" "$_PIN_DIR" "$_VETH" "$objects"
+}
+
+test_minecraft_session_migration() {
+    local obj=/tmp/axdp_mc_reload.o dispatcher=/tmp/axdp_mc_reload_dispatcher.o
+    local -a args=(-O3 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
+    [[ ! -d "/usr/include/$(uname -m)-linux-gnu" ]] || args+=(-I "/usr/include/$(uname -m)-linux-gnu")
+    clang "${args[@]}" -c "$REPO_ROOT/handlers/minecraft_handler.c" -o "$obj" || return 1
+    clang "${args[@]}" -c "$REPO_ROOT/bpf/tc_egress_dispatch.c" -o "$dispatcher" || return 1
+    PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 \
+        "$REPO_ROOT/tests/python/kernel_minecraft_reload.py" "$_PIN_DIR" "$_NS" "$_VETH" \
+        "$_HOST_IP" "$_HOST_IP6" "$obj" "$dispatcher"
+}
+
 test_minecraft_profile_dataplane() {
     local port=25565
     local handler_obj="/tmp/axdp_integ_minecraft_handler.o"
-    local egress_obj="/tmp/axdp_integ_minecraft_egress.o"
+    local egress_obj="/tmp/axdp_integ_tc_egress_dispatch.o"
     local result_file="/tmp/axdp_integ_minecraft_result"
     local ready_file="/tmp/axdp_integ_minecraft_ready"
     local continue_file="/tmp/axdp_integ_minecraft_continue"
@@ -651,22 +693,25 @@ test_minecraft_profile_dataplane() {
         -c "$REPO_ROOT/handlers/minecraft_handler.c" -o "$handler_obj" || return 1
     clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
         "${include_args[@]}" -I "$REPO_ROOT" \
-        -c "$REPO_ROOT/bpf/minecraft_egress.c" -o "$egress_obj" || return 1
+        -c "$REPO_ROOT/bpf/tc_egress_dispatch.c" -o "$egress_obj" || return 1
     PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin.cli \
         --config /tmp/axdp_integ_missing.toml \
         --bpf-pin-dir "$_PIN_DIR" \
         --install-dir "$REPO_ROOT" \
         profile-handler load 1 "$handler_obj" \
         >/dev/null || return 1
-    bpftool prog load "$egress_obj" "$_PIN_DIR/minecraft_egress_test" type classifier \
-        map name tcp_whitelist pinned "$_PIN_DIR/tcp_whitelist" \
-        map name tcp_zone_whitelist pinned "$_PIN_DIR/tcp_zone_whitelist" \
-        map name mc_l7_pending pinned "$_PIN_DIR/mc_l7_pending" \
-        map name mc_verified pinned "$_PIN_DIR/mc_verified" \
-        >/dev/null || return 1
+    local name
+    local -a dispatcher_load=(bpftool prog load "$egress_obj" "$_PIN_DIR/tc_egress_dispatch_test" type classifier)
+    for name in slot_ctx_map profile_ctx_map xdp_runtime_cfg pkt_counters byte_counters pkt_ringbuf \
+                endpoint_scopes tcp_whitelist udp_whitelist tcp_zone_whitelist udp_zone_whitelist \
+                tc_handler_ctx handler_egress handler_flows tc_profile_handlers tc_tcp_handlers \
+                tc_udp_handlers tc_proto_handlers handler_eg_stats; do
+        dispatcher_load+=(map name "$name" pinned "$_PIN_DIR/$name")
+    done
+    "${dispatcher_load[@]}" >/dev/null || return 1
     tc qdisc add dev "$_VETH" clsact 2>/dev/null || true
     tc filter replace dev "$_VETH" egress pref 49153 handle 2 \
-        bpf direct-action object-pinned "$_PIN_DIR/minecraft_egress_test" \
+        bpf direct-action object-pinned "$_PIN_DIR/tc_egress_dispatch_test" \
         >/dev/null || return 1
     _set_tcp_policy "$port" 1 1 11 22 || return 1
 
@@ -850,10 +895,10 @@ PYEOF
         echo "Minecraft flow did not reach verified state"
         return 1
     }
-    [[ "$(bpftool -j map dump pinned "$_PIN_DIR/mc_l7_pending" \
+    [[ "$(bpftool -j map dump pinned "$_PIN_DIR/profile_handlers/tcp/1/maps/mc_l7_pending" \
         | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" == 0 ]] || {
         echo "wire verification did not clear the bounded parser state"
-        bpftool -j map dump pinned "$_PIN_DIR/mc_l7_pending" || true
+        bpftool -j map dump pinned "$_PIN_DIR/profile_handlers/tcp/1/maps/mc_l7_pending" || true
         grep 'dport=25565' /proc/net/nf_conntrack || true
         tc -s filter show dev "$_VETH" egress || true
         kill "$client_pid" "$server_pid" 2>/dev/null || true
@@ -942,7 +987,7 @@ PYEOF
         return 1
     }
     # Losing the bounded cache must revoke a still-marked live connection.
-    python3 - "$_PIN_DIR/mc_verified" <<'PYEOF' || return 1
+    python3 - "$_PIN_DIR/profile_handlers/tcp/1/maps/mc_verified" <<'PYEOF' || return 1
 import json, subprocess, sys
 
 path = sys.argv[1]

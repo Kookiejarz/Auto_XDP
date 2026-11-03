@@ -1,30 +1,13 @@
 #pragma once
 #include "keys.h"
 #include "map_sizes.h"
-#include "minecraft.h"
+#include "endpoint_maps.h"
+#include "handler_routing.h"
 #include "syncookie_maps.h"
 
 /* Note: pkt_counters (PERCPU_ARRAY) and pkt_ringbuf (RINGBUF) are declared
  * in counters.h and telemetry.h alongside the helpers that use them.
  * All other SEC(".maps") map definitions are below. */
-
-struct endpoint_scope_key {
-    __u32 ifindex;  // zero represents the global public scope
-    __u16 port;     // host byte order
-    __u8 proto;
-    __u8 family;
-    __u32 daddr[4]; // network byte order; zero represents a wildcard bind
-};
-
-_Static_assert(sizeof(struct endpoint_scope_key) == 24, "endpoint scope key ABI");
-_Static_assert(__builtin_offsetof(struct endpoint_scope_key, daddr) == 8, "endpoint address ABI");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 16384);
-    __type(key, struct endpoint_scope_key);
-    __type(value, __u32);
-} endpoint_scopes SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
@@ -41,37 +24,6 @@ struct {
     __type(value, __u32);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } trusted_ipv6 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 65536);
-    __type(key, __u32);   // port number (host byte order) as array index
-    __type(value, struct tcp_endpoint_policy);
-} tcp_whitelist SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 65536);
-    __type(key, __u32);   // port number (host byte order) as array index
-    __type(value, __u32); // 1 = allow
-} udp_whitelist SEC(".maps");
-
-// Zone-only exposure for ports that must not be globally public. A hit here
-// authorizes the port on the ingress interface; the global whitelist remains
-// the fast path for public grants.
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, struct zone_port_key);
-    __type(value, struct tcp_endpoint_policy);
-} tcp_zone_whitelist SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, struct zone_port_key);
-    __type(value, __u32);
-} udp_zone_whitelist SEC(".maps");
 
 // Shared SCTP whitelist map for the optional stateless slot handler.
 struct {

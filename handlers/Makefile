@@ -24,12 +24,12 @@ OBJS := $(SRCS:.c=.o)
 
 all: $(OBJS)
 
-%.o: %.c xdp_slot_ctx.h xdp_profile_ctx.h ../bpf/include/map_sizes.h \
+%.o: %.c xdp_slot_ctx.h xdp_profile_ctx.h tc_handler_ctx.h handler_state.h ../bpf/include/map_sizes.h \
      ../bpf/include/common.h ../bpf/include/counters.h ../bpf/include/telemetry.h
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
 minecraft_handler.o: ../bpf/include/counters.h ../bpf/include/flow_keys.h \
-                     ../bpf/include/linux_conntrack.h ../bpf/include/minecraft.h
+                     ../bpf/include/linux_conntrack.h minecraft_state.h
 
 clean:
 	rm -f $(OBJS)

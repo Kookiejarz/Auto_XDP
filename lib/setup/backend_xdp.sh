@@ -78,8 +78,8 @@ deploy_xdp_backend() {
         XDP_FALLBACK_BLOCKED=1
         return 1
     fi
-    if ! load_minecraft_egress; then
-        XDP_FALLBACK_REASON="Minecraft Linux conntrack/TC capability unavailable"
+    if ! load_tc_egress_dispatch; then
+        XDP_FALLBACK_REASON="Handler Linux conntrack/TC capability unavailable"
         XDP_FALLBACK_BLOCKED=1
         return 1
     fi

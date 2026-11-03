@@ -165,8 +165,11 @@ systemd / sockets / containers
 ```
 
 XDP consumes ingress-interface/protocol/port policy, source ACLs, rate limits,
-and handler state. The `minecraft` profile automatically binds a per-port XDP
-handler before exposure. It validates the Minecraft Java handshake and first
+and handler state. A service handler is one object with one XDP ingress entry
+and an optional TC egress entry, sharing private protocol maps. The generic
+TC dispatcher resolves the ingress service binding, rechecks current policy,
+then queries Linux conntrack before tail-calling the handler. The `minecraft`
+profile automatically binds both entries before exposure. It validates the Minecraft Java handshake and first
 status/login packets, rate-limits status and login attempts by source prefix,
 and uses Linux conntrack plus TC egress server progress to verify a session.
 The bounded `mc_verified` LRU stores full 64-bit policy/profile generations;
@@ -183,8 +186,18 @@ connections in REPLY direction receive this exception: inbound service traffic
 in ORIGINAL direction still traverses authorization, limits and handlers.
 The first UDP reply and TCP SYN-ACK need not have SEEN_REPLY/ESTABLISHED yet.
 XDP lookup neither creates nor refreshes entries; the normal stack owns their
-timeouts, TCP validation, NAT and teardown. No custom connection table or generic
-TC egress tracker is maintained.
+timeouts, TCP validation, NAT and teardown. The TC service-binding LRU stores
+only route metadata; it does not emulate transport state or authorize traffic.
+Unsupported NAT tuple translations are observation misses. Versioned compatible
+handler replacement reuses its pinned private state maps and retains the state
+epoch; object hashes independently trigger code reloads. Minecraft preserves
+pending dialogue, verified proof and rate limits. Incompatible state contracts
+reject replacement and retain the previous handler; explicit unload discards
+state. Both dispatch entries roll back on publication failure without losing
+in-flight updates. The cross-hook switch is not atomic, so the compatibility
+contract includes concurrent old/new access. Main firewall map recreation and
+cross-schema field conversion are outside this contract. See
+[the handler SDK](handlers/README.md).
 
 Startup activates namespace-local IPv4/IPv6 conntrack hooks using the owned
 `inet auto_xdp_conntrack` nftables table (an output counter, no packet verdict).
@@ -282,3 +295,20 @@ Deferred until separately evidenced: additional service-specific profiles,
 destination-CIDR policy selectors, strict
 per-packet workload authentication, full L7 inspection, custom BPF conntrack,
 and upstream volumetric mitigation.
+
+### Protocol handler lifecycle
+
+GRE (47), ESP (50), and SCTP (132) use the common handler object loader and
+transactional XDP/optional-TC publication. Their built-ins remain stateless,
+with explicit empty state contracts; SCTP policy stays in the public whitelist
+and endpoint-scope maps. Canonical pins live in `protocol_handlers/PROTO/`.
+Legacy flat pins are adopted only with verified ownership; unknown private
+state requires an explicit unload. Compatible custom protocol modules reuse
+versioned private maps across replacement, including in-flight updates.
+
+`tc_proto_handlers` dispatches complete outgoing GRE/ESP/SCTP datagrams by
+protocol capability. Its context carries the wire tuple and an explicit
+unavailable conntrack direction, without inferring a service or association.
+Protocol-specific correlation belongs to the module. TCP/UDP service handlers
+retain their existing ingress-policy and confirmed-reply checks. See the
+[handler SDK](handlers/README.md) for both context contracts and lifecycle.

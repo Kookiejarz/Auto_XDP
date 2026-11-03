@@ -18,16 +18,17 @@ test_log_colors_disable_for_non_tty_and_no_color() (
     assert_eq "$output" "✓ complete" "NO_COLOR output"
 )
 
-test_tc_cleanup_uses_filter_kind_including_minecraft_rollback() (
+test_tc_cleanup_uses_filter_kind_including_dispatcher_rollback() (
     source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
     set +e
     local tmpdir iface direction
     tmpdir=$(mktemp -d)
     local -a IFACES=(eth0 eth1)
     BPF_PIN_DIR="$tmpdir/pins"
-    MC_EGRESS_OBJ_PATH="$tmpdir/minecraft.o"
+    TC_EGRESS_OBJ_PATH="$tmpdir/dispatcher.o"
     mkdir "$BPF_PIN_DIR"
-    touch "$MC_EGRESS_OBJ_PATH"
+    touch "$TC_EGRESS_OBJ_PATH"
+    while read -r name; do touch "$BPF_PIN_DIR/$name"; done < "$REPO_ROOT/auto_xdp/xdp_required_maps.txt"
     tc() {
         case "$1:$2" in
             filter:del)
@@ -48,7 +49,7 @@ test_tc_cleanup_uses_filter_kind_including_minecraft_rollback() (
             touch "$tmpdir/tc-$iface-$direction"
         done
     done
-    cleanup_minecraft_egress || return 1
+    cleanup_tc_egress_dispatch || return 1
     cleanup_syncookie_handoff 1 || return 1
     [[ -e "$tmpdir/sysctl-released" ]] || return 1
     for iface in "${IFACES[@]}"; do
@@ -58,12 +59,11 @@ test_tc_cleanup_uses_filter_kind_including_minecraft_rollback() (
         done
     done
 
-    _auto_xdp_minecraft_profile_configured() { return 0; }
     bpftool() { touch "$4"; }
-    load_minecraft_egress >/dev/null 2>&1
+    load_tc_egress_dispatch >/dev/null 2>&1
     assert_eq "$?" 1 "second interface attach must fail" || return 1
     [[ ! -e "$tmpdir/tc-eth0-egress" ]] \
-        || { printf 'Minecraft rollback left the first interface attached\n'; return 1; }
+        || { printf 'Handler dispatcher rollback left the first interface attached\n'; return 1; }
 )
 
 test_detect_os_release_maps_supported_families() (
@@ -789,7 +789,9 @@ sources = (
     repo_root / "bpf/include/counters.h",
     repo_root / "bpf/include/telemetry.h",
     repo_root / "bpf/include/maps.h",
-    repo_root / "bpf/include/minecraft.h",
+    repo_root / "bpf/include/endpoint_maps.h",
+    repo_root / "bpf/include/handler_routing.h",
+    repo_root / "handlers/tc_handler_ctx.h",
     repo_root / "bpf/include/syncookie_maps.h",
     repo_root / "handlers/xdp_slot_ctx.h",
     repo_root / "handlers/xdp_profile_ctx.h",
@@ -799,6 +801,8 @@ declared = set()
 for source in sources:
     text = source.read_text()
     declared.update(re.findall(r"}\s*([A-Za-z_][A-Za-z0-9_]*)\s+SEC\(\"\.maps\"\);", text))
+    declared.update(re.findall(r"TC_HANDLER_TABLE\(([A-Za-z_][A-Za-z0-9_]*),", text))
+    declared.discard("name")
     declared.update(re.findall(r"DEFINE_RATE_OUTER_V[46]\(([A-Za-z_][A-Za-z0-9_]*)\);", text))
 
 manifest = {
@@ -1756,6 +1760,7 @@ test_deploy_backend_step_falls_back_to_nftables() (
     IFACES=("eth9")
     ACTIVE_BACKEND="xdp"
     ACTIVE_XDP_MODE="native"
+    _auto_xdp_resolve_preferred_backend() { printf 'auto\n'; }
 
     deploy_xdp_backend() { return 1; }
     ensure_nftables_available() { return 0; }

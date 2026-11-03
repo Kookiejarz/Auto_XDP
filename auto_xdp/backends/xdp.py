@@ -17,6 +17,7 @@ import sys
 from typing import Mapping
 
 from auto_xdp import config as cfg
+from auto_xdp.admin import handlers as handler_admin
 from auto_xdp.install_state import atomic_write_json
 from auto_xdp.backends.base import BackendStatus, PortBackend
 from auto_xdp.abuseipdb import AbuseIPDBSyncer, BpfRiskMaps
@@ -368,8 +369,7 @@ class XdpBackend(PortBackend):
 
     @staticmethod
     def _profile_generation(object_path: Path) -> int:
-        digest = hashlib.sha256(object_path.read_bytes()).digest()
-        return int.from_bytes(digest[:8], "little") or 1
+        return handler_admin.profile_state_generation(object_path)
 
     def _tcp_endpoint_value(
         self,
@@ -601,6 +601,19 @@ class XdpBackend(PortBackend):
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
+    def _retained_profile_generation(
+        self, profile_id: int, live_id: int | None, array_id: int | None,
+        managed: tuple[int, int] | None,
+    ) -> int | None:
+        if live_id is None or array_id != live_id or not self._profile_egress_ready(profile_id):
+            return None
+        marker = Path(self.config.BPF_PIN_DIR) / "profile_handlers" / "tcp" / str(profile_id) / "state_contract"
+        if marker.exists():
+            # The metadata pin commits with the programs. It remains authoritative
+            # if saving the daemon's separate object-hash record failed.
+            return int.from_bytes(handler_admin._state_marker(marker)[:8], "little") or 1
+        return managed[1] if managed is not None and managed[0] == live_id else None
+
     def _ensure_profile_handlers(
         self,
         desired: dict[tuple[str, int], str],
@@ -623,24 +636,41 @@ class XdpBackend(PortBackend):
             log.error("Minecraft profile object is missing: %s", object_path)
             return set(desired), 0
 
+        profile_generation = self._profile_generation(object_path)
+
         profile_id = _PROFILE_IDS[_MINECRAFT_PROFILE]
         live_pin = Path(self.config.BPF_PIN_DIR) / "profile_handlers" / "tcp" / str(profile_id) / "prog"
         live_id = self._pinned_program_id(live_pin)
         managed = self._managed_profile_handler()
+        object_digest = hashlib.sha256(object_path.read_bytes()).hexdigest()
+        try:
+            recorded_digest = json.loads(self._profile_marker().read_text(encoding="utf-8")).get("object_digest")
+        except (OSError, ValueError, AttributeError):
+            recorded_digest = None
         self.tcp_profile_map.verify()
         array_value = self.tcp_profile_map.value(profile_id)
         array_id = array_value[0] if array_value else None
-        if managed == (live_id, profile_generation) and array_id == live_id:
+        if (managed == (live_id, profile_generation) and recorded_digest == object_digest and array_id == live_id
+                and self._profile_egress_ready(profile_id)):
             return failures, profile_generation
         if dry_run:
             log.info("Would load Minecraft profile handler ID %d", profile_id)
             return failures, profile_generation
         if not self._profile_command("load", profile_id, object_path):
+            self.tcp_profile_map.refresh()
+            restored = self.tcp_profile_map.value(profile_id)
+            retained = self._retained_profile_generation(
+                profile_id, self._pinned_program_id(live_pin), restored[0] if restored else None, managed,
+            )
+            if retained is not None:
+                log.warning("Profile update rejected; retaining previous handler and session state")
+                return failures, retained
             return set(desired), 0
         live_id = self._pinned_program_id(live_pin)
         self.tcp_profile_map.refresh()
         array_value = self.tcp_profile_map.value(profile_id)
-        if live_id is None or array_value is None or array_value[0] != live_id:
+        if (live_id is None or array_value is None or array_value[0] != live_id
+                or not self._profile_egress_ready(profile_id)):
             self._profile_command("unload", profile_id)
             return set(desired), 0
         marker = self._profile_marker()
@@ -652,15 +682,29 @@ class XdpBackend(PortBackend):
                     "profile_id": profile_id,
                     "program_id": live_id,
                     "profile_generation": profile_generation,
+                    "object_digest": object_digest,
                 },
                 mode=0o600,
             )
         except OSError as exc:
             log.error("Cannot record Minecraft profile ownership: %s", exc)
-            self._profile_command("unload", profile_id)
-            return set(desired), 0
+            # The verified replacement is already serving traffic. A bookkeeping
+            # failure must not discard its shared live session state.
         log.info("Minecraft protection profile %d enabled", profile_id)
         return failures, profile_generation
+
+    def _profile_egress_ready(self, profile_id: int) -> bool:
+        root = Path(self.config.BPF_PIN_DIR)
+        pin = root / "profile_handlers" / "tcp" / str(profile_id) / "egress"
+        try:
+            egress_id = handler_admin.pinned_program_id(pin) if pin.exists() else None
+            return bool(
+                egress_id is not None
+                and handler_admin.prog_array_entry_id(root / "tc_profile_handlers", profile_id) == egress_id
+                and handler_admin.handler_egress_id(root, 1, profile_id) == egress_id
+            )
+        except (OSError, RuntimeError):
+            return False
 
     def _remove_stale_profile_handlers(
         self, desired: dict[tuple[str, int], str], dry_run: bool
@@ -1229,6 +1273,18 @@ class XdpBackend(PortBackend):
             tentative_profile_generation = (
                 self._profile_generation(profile_object) if profile_object.is_file() else 0
             )
+            managed = self._managed_profile_handler()
+            if (profile_object.is_file()
+                    and handler_admin.handler_state.object_contract(profile_object) is not None):
+                live_pin = Path(self.config.BPF_PIN_DIR) / "profile_handlers" / "tcp" / "1" / "prog"
+                array_value = self.tcp_profile_map.value(1)
+                retained = self._retained_profile_generation(
+                    1, self._pinned_program_id(live_pin), array_value[0] if array_value else None, managed,
+                )
+                if retained is not None:
+                    # Revoke policy changes, but keep the live state epoch until
+                    # the candidate has passed compatibility and publication.
+                    tentative_profile_generation = retained
             desired_global, desired_zone = self._desired_tcp_values(
                 projection, tentative_profile_generation
             )

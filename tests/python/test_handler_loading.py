@@ -40,12 +40,13 @@ def test_port_load_reuses_only_declared_public_maps(port_handler, shared):
     pins, _, obj, config, args = port_handler
     for name in shared:
         (pins / name).touch()
-    with mock.patch.object(handlers, "handler_object_maps",
+    with mock.patch.object(handlers, "handler_object_programs", return_value=("handler", None)), \
+         mock.patch.object(handlers, "handler_object_maps",
                            return_value={name: CONTEXT_ABI for name in
                                          ("rate_limit_map", "packet_count_map", *shared)}), \
          mock.patch.object(handlers, "pinned_handler_map_abi", return_value=CONTEXT_ABI), \
          mock.patch.object(handlers, "run_checked") as run, \
-         mock.patch.object(handlers, "transactional_dir_prog_swap") as swap, \
+         mock.patch.object(handlers, "_transactional_handler_pair") as swap, \
          mock.patch.object(handlers, "flush_udp_validated_for_port") as flush:
         assert cli.main(args) == 0
     command = run.call_args.args[0]
@@ -68,12 +69,13 @@ def test_failed_candidate_preserves_active_handler_config_and_validation(port_ha
     if failure in {"incompatible-map", "load-failure"}:
         (pins / "slot_ctx_map").touch()
     actual = CONTEXT_ABI._replace(value_size=48) if failure == "incompatible-map" else CONTEXT_ABI
-    with mock.patch.object(handlers, "handler_object_maps", return_value={"slot_ctx_map": CONTEXT_ABI},
+    with mock.patch.object(handlers, "handler_object_programs", return_value=("handler", None)), \
+         mock.patch.object(handlers, "handler_object_maps", return_value={"slot_ctx_map": CONTEXT_ABI},
                            side_effect=inspect_error), \
          mock.patch.object(handlers, "pinned_handler_map_abi", return_value=actual), \
          mock.patch.object(handlers, "run_checked",
                            side_effect=RuntimeError("kernel rejected candidate")) as run, \
-         mock.patch.object(handlers, "transactional_dir_prog_swap") as swap, \
+         mock.patch.object(handlers, "_transactional_handler_pair") as swap, \
          mock.patch.object(handlers, "flush_udp_validated_for_port") as flush:
         assert cli.main(args) == 1
     if failure == "load-failure":
@@ -122,7 +124,7 @@ def test_shared_map_rejects_each_incompatible_abi_field(tmp_path: Path, field: s
     with mock.patch.object(handlers, "handler_object_maps", return_value={"slot_ctx_map": CONTEXT_ABI}), \
          mock.patch.object(handlers, "pinned_handler_map_abi", return_value=actual), \
          pytest.raises(RuntimeError, match="Incompatible shared map slot_ctx_map"):
-        handlers.port_handler_shared_maps(tmp_path / "handler.o", tmp_path)
+        handlers.handler_shared_maps(tmp_path / "handler.o", tmp_path)
 
 
 def test_failed_pinned_map_inspection_closes_fd():
