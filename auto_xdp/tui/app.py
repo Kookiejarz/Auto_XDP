@@ -40,7 +40,8 @@ from auto_xdp.tui.widgets import (
     _CP_CYAN, _CP_BLACK_ON_CYAN, _CP_MUTED, _CP_TEXT, _CP_SELECTED,
 )
 from auto_xdp.tui.metrics import HostMetrics, NetworkMetrics, ResourceSampler
-from auto_xdp.tui.maps import _draw_maps
+from auto_xdp.tui.maps import _draw_maps, _cells
+from auto_xdp.tui.layout import Column, table_columns, table_line
 from auto_xdp.tui.handlers import HandlerCache, HandlerInventory, collect_handlers, draw_handlers, handler_capacity
 from auto_xdp.tui.dashboard import (
     _draw_network, _draw_system, _draw_header, _draw_footer, _number,
@@ -818,14 +819,14 @@ def _make_win_set(stdscr: Any) -> _WinSet | None:
     h, w = stdscr.getmaxyx()
     if h < 20 or w < 80:
         return None
-    right_w = min(56, max(30, int(w * 0.34)))
+    right_w = max(30, int(w * 0.34))
     left_w = w - right_w - 1
     content_h = h - 3
-    network_h = max(6, min(13, content_h // 3))
+    network_h = max(6, content_h // 3)
     ports_h = max(4, (content_h - network_h) // 2)
     events_h = content_h - network_h - ports_h
     summary_h = max(6, min(10, content_h // 3))
-    system_h = max(5, min(13, content_h // 3))
+    system_h = max(5, content_h // 3)
     return _WinSet(
         h=h, w=w,
         network=stdscr.derwin(network_h, left_w, 2, 0),
@@ -846,7 +847,7 @@ def _make_full_win(stdscr: Any) -> Any | None:
 
 
 def _draw_summary(win: Any, snap: TuiSnapshot) -> None:
-    h, _ = win.getmaxyx()
+    h, w = win.getmaxyx()
     _box(win, "Protection", accent=_CP_GREEN)
     _add(win, 1, 2, _display_mode(snap.attach_mode), _mode_attr(snap.attach_mode) | curses.A_BOLD)
     x = 2
@@ -859,19 +860,19 @@ def _draw_summary(win: Any, snap: TuiSnapshot) -> None:
         x += len(target)
     total = snap.rates.get("XDP_TOTAL", (None, None))[0]
     drop = snap.rates.get("XDP_DROP_TOTAL", (None, None))[0]
-    _add(win, 3, 2, f"Seen  {_number(total):>9} pps", _color(_CP_CYAN))
-    _add(win, 4, 2, f"Drop  {_number(drop):>9} pps", _color(_CP_RED) if drop else _color(_CP_MUTED))
+    columns = table_columns(w - 4, (Column("label", 12, 2), Column("value", 10, 1, True)))
+    _add(win, 3, 2, table_line(columns, dict(label="Seen", value=f"{_number(total)} pps")), _color(_CP_CYAN))
+    _add(win, 4, 2, table_line(columns, dict(label="Drop", value=f"{_number(drop)} pps")), _color(_CP_RED) if drop else _color(_CP_MUTED))
     if h >= 8:
         ratio = drop / total * 100 if drop is not None and total and 0 <= drop <= total else None
         text = "--" if ratio is None else f"{ratio:.1f}%"
-        _add(win, 5, 2, "Drop ratio", _color(_CP_MUTED))
-        _add(win, 5, 15, text, _color(_CP_RED) if ratio else _color(_CP_MUTED))
+        _add(win, 5, 2, table_line(columns, dict(label="Drop ratio", value=text)), _color(_CP_RED) if ratio else _color(_CP_MUTED))
         tcp = sum(row[0] == "TCP" for row in snap.ports)
         udp = sum(row[0] == "UDP" for row in snap.ports)
-        _add(win, 6, 2, f"Ports  {tcp} TCP / {udp} UDP", _color(_CP_MUTED))
+        _add(win, 6, 2, table_line(columns, dict(label="Ports", value=f"{tcp} TCP / {udp} UDP")), _color(_CP_MUTED))
     if h >= 10:
         cookie = "unknown" if snap.cookie_runtime is None else "on" if snap.cookie_runtime[0] else "off"
-        _add(win, 7, 2, f"SYN cookie runtime  {cookie}", _color(_CP_MUTED))
+        _add(win, 7, 2, table_line(columns, dict(label="SYN cookie runtime", value=cookie)), _color(_CP_MUTED))
     suppressed = _events_suppressed(snap)
     note = " packet records OFF " if suppressed else f" backend: {snap.backend} "
     _add(win, h - 1, 2, note, _color(_CP_YELLOW) if suppressed else _color(_CP_MUTED))
@@ -884,18 +885,21 @@ def _draw_audit_page(stdscr: Any, snap: TuiSnapshot, scroll: int, last_error: st
         stdscr.refresh()
         return
     _box(win, f"authorization audit  {sum(row['action'] == 'allow' for row in snap.audit_rows)} allowed / {sum(row['action'] == 'drop' for row in snap.audit_rows)} denied")
-    _add(win, 1, 1, "act  proto bind/address:port                         zone       subject              attribution reason")
+    columns = table_columns(win.getmaxyx()[1] - 4, (
+        Column("action", 5, 0), Column("protocol", 5, 0), Column("endpoint", 18, 4),
+        Column("zone", 8), Column("subject", 10, 3), Column("attribution", 8), Column("reason", 14, 4)))
+    _add(win, 1, 2, table_line(columns, dict(action="act", protocol="proto", endpoint="bind/address:port",
+                                          zone="zone", subject="subject", attribution="source", reason="reason")), _color(_CP_MUTED))
     visible = max(0, win.getmaxyx()[0] - 3)
     scroll = max(0, min(scroll, max(0, len(snap.audit_rows) - visible)))
     for idx, row in enumerate(snap.audit_rows[scroll:scroll + visible], start=2):
         action = str(row["action"]).upper()
         attr = curses.color_pair(_CP_GREEN) if action == "ALLOW" else curses.color_pair(_CP_RED) | curses.A_BOLD
         endpoint = f"{row['bind_scope']}/{row['address']}:{row['port']}"
-        line = (
-            f"{action:<5} {str(row['protocol']).upper():<5} {endpoint:<46.46} "
-            f"{row['zone']:<10.10} {row['subject']:<20.20} {row['attribution']:<10.10} {row['reason']}"
-        )
-        _add(win, idx, 1, line, attr)
+        line = table_line(columns, dict(action=action, protocol=str(row["protocol"]).upper(), endpoint=endpoint,
+                                        zone=str(row["zone"]), subject=str(row["subject"]),
+                                        attribution=str(row["attribution"]), reason=str(row["reason"])))
+        _add(win, idx, 2, line, attr)
     footer = "↑↓/PgUp/PgDn scroll  o:overview  p:approvals  v:traffic  q:quit"
     if len(snap.audit_rows) > visible:
         footer = f"{scroll + 1}-{min(scroll + visible, len(snap.audit_rows))}/{len(snap.audit_rows)}  " + footer
@@ -914,7 +918,11 @@ def _draw_approvals_page(stdscr: Any, snap: TuiSnapshot, cursor: int, scroll: in
         return
     privileged = os.geteuid() == 0
     _box(win, f"approval workflow  {'root actions enabled' if privileged else 'read-only'}")
-    _add(win, 1, 1, "id   status    proto subject              zone       ports             reason")
+    columns = table_columns(win.getmaxyx()[1] - 4, (
+        Column("id", 4, 0, True), Column("status", 8), Column("protocol", 5, 0),
+        Column("subject", 12, 3), Column("zone", 8), Column("ports", 12, 2), Column("reason", 16, 4)))
+    _add(win, 1, 2, table_line(columns, dict(id="id", status="status", protocol="proto", subject="subject",
+                                          zone="zone", ports="ports", reason="reason")), _color(_CP_MUTED))
     visible = max(0, win.getmaxyx()[0] - 3)
     rows = snap.approval_rows
     cursor = max(0, min(cursor, len(rows) - 1)) if rows else -1
@@ -933,8 +941,9 @@ def _draw_approvals_page(stdscr: Any, snap: TuiSnapshot, cursor: int, scroll: in
         if row_idx == cursor:
             attr = (attr & ~curses.A_COLOR) | _color(_CP_SELECTED) | curses.A_BOLD
         ports = ",".join(str(port) for port in row.get("ports", []))
-        line = f"{row['id']:>3}  {status:<8} {str(row['protocol']).upper():<5} {row['subject']:<20.20} {row['zone']:<10.10} {ports:<17.17} {row.get('reason', '-') }"
-        _add(win, idx, 1, line, attr)
+        line = table_line(columns, dict(id=str(row["id"]), status=status, protocol=str(row["protocol"]).upper(),
+                                        subject=str(row["subject"]), zone=str(row["zone"]), ports=ports, reason=str(row.get("reason", "-"))))
+        _add(win, idx, 2, line, attr)
     footer = "↑↓ select  n:new  enter:approve  d:reject  x:revoke  a:audit  o:overview  q:quit"
     if not privileged:
         footer = "↑↓ select  root required for changes  a:audit  o:overview  q:quit"
@@ -945,23 +954,74 @@ def _draw_approvals_page(stdscr: Any, snap: TuiSnapshot, cursor: int, scroll: in
 
 
 def _tui_prompt(stdscr: Any, label: str) -> str:
-    h, w = stdscr.getmaxyx()
+    previous_delay = stdscr.getdelay() if hasattr(stdscr, "getdelay") else 0
     stdscr.nodelay(False)
-    curses.echo()
+    curses.noecho()
     curses.curs_set(1)
     old_mouse_mask = 0
     try:
         _, old_mouse_mask = curses.mousemask(0)
     except curses.error:
         pass
+    value = ""
+    cursor = start = 0
     try:
-        _add(stdscr, h - 1, 0, _clip(label, w - 1), _color(_CP_SELECTED) | curses.A_BOLD)
-        stdscr.refresh()
-        return stdscr.getstr(h - 1, min(len(label), max(0, w - 2)), max(1, w - len(label) - 2)).decode(errors="replace").strip()
+        while True:
+            h, w = stdscr.getmaxyx()
+            stdscr.erase()
+            if h < 7 or w < 20:
+                _add(stdscr, 0, 0, "Resize to enter text · Esc cancels")
+            else:
+                _box(stdscr, "Input", focused=True)
+                _add(stdscr, 1, 2, label, _color(_CP_MUTED))
+                available = max(1, w - 5)
+                start, occupied = cursor, 0
+                while start > 0:
+                    cells = _cells(value[start - 1])
+                    if occupied + cells >= available:
+                        break
+                    occupied += cells
+                    start -= 1
+                _add(stdscr, 3, 2, _clip(value[start:], available + 1), _color(_CP_SELECTED))
+                _add(stdscr, h - 1, 2, " Enter confirm · Esc cancel · ←→ move · Ctrl-U clear ", _color(_CP_MUTED))
+                stdscr.move(3, min(w - 2, 2 + _cells(value[start:cursor])))
+            stdscr.refresh()
+            try:
+                key = stdscr.get_wch()
+            except curses.error:
+                continue
+            if key == curses.KEY_RESIZE:
+                stdscr.clearok(True)
+                continue
+            if key == "\x1b":
+                return ""
+            if h < 7 or w < 20:
+                continue
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                return value.strip()
+            if key in ("\b", "\x7f", curses.KEY_BACKSPACE) and cursor:
+                value = value[:cursor - 1] + value[cursor:]
+                cursor -= 1
+            elif key == curses.KEY_DC:
+                value = value[:cursor] + value[cursor + 1:]
+            elif key == curses.KEY_LEFT:
+                cursor = max(0, cursor - 1)
+            elif key == curses.KEY_RIGHT:
+                cursor = min(len(value), cursor + 1)
+            elif key in (curses.KEY_HOME, "\x01"):
+                cursor = 0
+            elif key in (curses.KEY_END, "\x05"):
+                cursor = len(value)
+            elif key == "\x15":
+                value = ""
+                cursor = start = 0
+            elif isinstance(key, str) and key.isprintable() and len(value) < 65536:
+                value = value[:cursor] + key + value[cursor:]
+                cursor += len(key)
     finally:
         curses.noecho()
         curses.curs_set(0)
-        stdscr.nodelay(True)
+        stdscr.timeout(previous_delay)
         if old_mouse_mask:
             curses.mousemask(old_mouse_mask)
 
@@ -999,11 +1059,11 @@ def _draw_ports(
     _box(win, title, focused=focused)
     interior = max(0, w - 4)
     with_limit = interior >= 64
-    service_width = 12 if with_limit else 10
-    process_width = min(24, max(10, interior - 12 - service_width - 18)) if with_limit else max(8, interior - 12 - service_width)
-    header = f"{'P':<4}{'PORT':>5}  {'SERVICE':<{service_width}} {'PROCESS':<{process_width}}"
+    specs = [Column("proto", 3, 0), Column("port", 5, 0, True), Column("service", 8, 2), Column("process", 10, 3)]
     if with_limit:
-        header += "  LIMIT"
+        specs.append(Column("limit", 14, 2))
+    columns = table_columns(interior, specs)
+    header = table_line(columns, dict(proto="P", port="PORT", service="SERVICE", process="PROCESS", limit="LIMIT"))
     _add(win, 1, 2, header, _color(_CP_MUTED))
     now = time.monotonic()
     display_rows = list(rows)
@@ -1030,9 +1090,7 @@ def _draw_ports(
             attr = (attr & ~curses.A_COLOR) | _color(_CP_SELECTED) | curses.A_BOLD
         if port == event_dport_filter:
             attr |= curses.A_BOLD
-        line = f"{proto:<4}{port:>5}  {svc:<{service_width}.{service_width}} {proc:<{process_width}.{process_width}}"
-        if with_limit:
-            line += f"  {limit}"
+        line = table_line(columns, dict(proto=proto, port=str(port), service=svc, process=proc, limit=limit))
         _add(win, idx, 2, line, attr)
     excl_ports, excl_cidrs = excluded
     excl_parts = []
@@ -1358,6 +1416,8 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 event_height = wins.h - 3 if page == "events" else wins.events.getmaxyx()[0]
                 event_visible = max(1, _event_capacity(event_height, compact=page != "events",
                     suppressed=_events_suppressed(snap), port_only=_only_socket_events(relay)))
+                if page in {"audit", "approvals"}:
+                    event_visible = max(1, wins.h - 6)
             else:
                 map_visible = 1
                 event_visible = 1
@@ -1480,6 +1540,9 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                     approval_cursor = min(len(snap.approval_rows) - 1, approval_cursor + max(1, event_visible))
                     ui_dirty = True
             elif page in {"traffic", "cookie"}:
+                content_height = stdscr.getmaxyx()[0] - 3
+                reasons_visible = (max(1, content_height - 11) if page == "cookie" else
+                                   max(1, (content_height - max(8, int(content_height * 0.60)) - 3) // 2))
                 if ch == curses.KEY_UP:
                     reasons_scroll = max(0, reasons_scroll - scroll_step)
                     ui_dirty = True
@@ -1487,10 +1550,10 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                     reasons_scroll += scroll_step
                     ui_dirty = True
                 elif ch == curses.KEY_PPAGE:
-                    reasons_scroll = max(0, reasons_scroll - 5)
+                    reasons_scroll = max(0, reasons_scroll - reasons_visible)
                     ui_dirty = True
                 elif ch == curses.KEY_NPAGE:
-                    reasons_scroll += 5
+                    reasons_scroll += reasons_visible
                     ui_dirty = True
             elif focus == "ports":
                 if ch == curses.KEY_UP:

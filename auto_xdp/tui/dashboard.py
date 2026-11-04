@@ -109,10 +109,11 @@ def _draw_system(win: Any, host: HostMetrics) -> None:
         load = " / ".join(f"{value:.2f}" for value in host.load) or "--"
         _add(win, 4, 2, f"Load {load}", _color(_CP_MUTED))
     if h >= 9 and host.cores:
-        column_width = max(1, (w - 4) // 2)
+        columns = max(1, (w - 4) // 28)
+        column_width = max(1, (w - 4) // columns)
         visible_rows = h - 7
-        for idx, (name, percent) in enumerate(host.cores[:visible_rows * 2]):
-            row, column = divmod(idx, 2)
+        for idx, (name, percent) in enumerate(host.cores[:visible_rows * columns]):
+            row, column = divmod(idx, columns)
             x = 2 + column * column_width
             _add(win, 6 + row, x, f"{name:>2}", _color(_CP_MUTED))
             _meter(win, 6 + row, x + 4, column_width - 11, percent, _usage_color(percent))
@@ -136,8 +137,8 @@ def page_tabs(width: int) -> list[tuple[int, str, str]]:
     short = {"Overview": "Home", "Requests": "Reqs"} if width < 90 else {}
     result = []
     x = 1
-    for key, label, target in _PAGES:
-        text = f" {key} {short.get(label, label)} "
+    texts = [f" {key} {short.get(label, label)} " for key, label, _ in _PAGES]
+    for (_, _, target), text in zip(_PAGES, texts):
         result.append((x, text, target))
         x += len(text)
     return result

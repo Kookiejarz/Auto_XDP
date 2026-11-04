@@ -487,7 +487,7 @@ class TuiObservationTests(unittest.TestCase):
         with mock.patch("auto_xdp.tui.app.curses.color_pair", return_value=0):
             _draw_top_traffic(win, relay, geo)
         rendered = "\n".join(win.lines.values())
-        self.assertEqual(geo.lookup.call_count, 10)
+        self.assertEqual(geo.lookup.call_count, 13)  # All rows fitting this terminal, without a fixed top-ten cap.
         self.assertIn("retained event samples", rendered)
         self.assertIn("US AS15169", rendered)
         self.assertIn("bytes* recorded only", rendered)

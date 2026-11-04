@@ -227,6 +227,13 @@ rows. Interface traffic comes from Linux network counters; XDP totals and drops
 come from dedicated BPF counters. Initial or unavailable rates display `--`.
 Fixed-size array maps display `fixed`, rather than a capacity warning; `~` marks
 sampled or cached map counts.
+All pages use the current terminal width and height, including Overview,
+Sources, Events, Health, Maps, Audit and Requests.
+Tables redistribute their columns as the window grows or shrinks; taller
+windows show more rows. Overview panels and the navigation bar also expand
+with the terminal. Input pages preserve typed text when resized, scroll long
+paths horizontally, and support Enter, Esc, arrow keys and Ctrl-U.
+
 The full Maps page sizes columns to the current terminal and map names. Wider
 screens show map IDs, count sources and occupancy bars; narrow screens retain
 the map name, type, used/max counts, usage and memory. Long names use an ellipsis
