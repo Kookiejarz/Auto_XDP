@@ -79,7 +79,8 @@ def _snapshot():
     )
 
 
-@pytest.mark.parametrize("width,height", [(80, 20), (80, 24), (100, 30), (140, 42), (200, 50)])
+@pytest.mark.parametrize("width,height", [(80, 20), (80, 24), (100, 30), (140, 42), (200, 50),
+                                         (80, 80), (120, 20), (240, 70), (320, 90), (360, 24), (160, 90)])
 @pytest.mark.parametrize("page", ["overview", "maps", "events", "traffic", "cookie", "audit", "approvals", "handlers"])
 def test_all_pages_fit_supported_terminal_sizes(width, height, page):
     screen = Canvas(height, width)
@@ -485,7 +486,8 @@ def mouse_main(monkeypatch, tmp_path):
 
 
 def test_copy_mode_freezes_display_drains_relay_and_restores_clicks(mouse_main):
-    draw = mouse_main(TuiSnapshot(), [(0, 29, 1, 0, curses.BUTTON1_CLICKED)],
+    x, label, _ = next(tab for tab in page_tabs(140) if tab[2] == "events")
+    draw = mouse_main(TuiSnapshot(), [(0, x + len(label) // 2, 1, 0, curses.BUTTON1_CLICKED)],
                       keys_override=[-1, curses.KEY_F2, -1, ord("e"), curses.KEY_DOWN,
                                      -1, curses.KEY_F2, curses.KEY_MOUSE])
     assert [call.args[10] for call in draw.call_args_list] == ["overview", "overview", "overview", "events"]
@@ -557,7 +559,8 @@ def test_mouse_can_select_approval_but_never_approve_or_revoke(mouse_main, monke
 
 
 def test_clicking_current_tab_does_not_toggle_to_overview(mouse_main):
-    clicks = [(0, 29, 1, 0, curses.BUTTON1_CLICKED)] * 2
+    x, label, _ = next(tab for tab in page_tabs(140) if tab[2] == "events")
+    clicks = [(0, x + len(label) // 2, 1, 0, curses.BUTTON1_CLICKED)] * 2
     draw = mouse_main(TuiSnapshot(), clicks, initial="events")
     assert [call.args[10] for call in draw.call_args_list] == ["events", "events"]
 
