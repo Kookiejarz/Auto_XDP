@@ -65,7 +65,7 @@ test -f /usr/local/lib/auto_xdp/current/release.json
 test -s /usr/local/lib/auto_xdp/current/xdp_firewall.o
 test -s /usr/local/lib/auto_xdp/current/tc_egress_dispatch.o
 test -s /usr/local/lib/auto_xdp/current/xdp_map_abi.txt
-for module in admin/cli.py admin/approvals.py tui/app.py tui/widgets.py \
+for module in admin/cli.py admin/approvals.py admin/handler_catalog.py tui/app.py tui/widgets.py tui/handler_editor.py \
               telemetry/events.py telemetry/relay_client.py discovery/listeners.py bpf/conntrack.py; do
     test -s "/usr/local/lib/auto_xdp/current/python/auto_xdp/$module"
 done

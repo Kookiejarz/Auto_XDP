@@ -299,10 +299,12 @@ def _handler_lock(root: Path):
         os.close(fd)
 
 
-def run_checked(cmd: list[str], fail_msg: str) -> subprocess.CompletedProcess[str]:
+def run_checked(cmd: list[str], fail_msg: str, *, include_detail: bool = False) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
+        if detail and include_detail:
+            raise RuntimeError(f"{fail_msg}\n{detail}")
         if detail:
             print(detail, file=sys.stderr)
         raise RuntimeError(fail_msg)
@@ -483,6 +485,7 @@ def compile_handler_source(
     port: int | None = None,
     *,
     sdk_dir: Path | None = None,
+    defines: dict[str, int] | None = None,
 ) -> Path:
     if not source_path.is_file():
         raise RuntimeError(f"Handler source not found: {source_path}")
@@ -508,6 +511,10 @@ def compile_handler_source(
     ]
     if host_arch_flag:
         cmd.append(host_arch_flag)
+    for name, value in sorted((defines or {}).items()):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or type(value) is not int:
+            raise ValueError("Handler compiler definitions must be named integer constants")
+        cmd.append(f"-D{name}={value}")
     cmd.extend(
         [
             "-fno-stack-protector",
@@ -526,7 +533,7 @@ def compile_handler_source(
             str(output_path),
         ]
     )
-    run_checked(cmd, f"Failed to compile {source_path}")
+    run_checked(cmd, f"Failed to compile {source_path}", include_detail=True)
     return output_path
 
 

@@ -85,6 +85,10 @@ Commands:
   port-handler list                          List loaded TCP/UDP port handlers
   port-handler load tcp|udp PORT PATH        Load custom handler .o or compile/load .c for a port
   port-handler unload tcp|udp PORT           Remove handler from a port
+  handler list [--json]                      Discover local modules and runtime programs
+  handler install PATH [--name NAME]         Install a local handler source/object/package
+  handler config NAME [--set KEY=VALUE]      Show or save module configuration
+  handler apply NAME [--set KEY=VALUE]       Apply module configuration
   exclude list                              List discovery exclusions
   exclude port add PORT [PORT...]           Exclude port(s) from discovery
   exclude port del PORT [PORT...]           Remove port exclusion(s)
@@ -716,6 +720,7 @@ run_tui() {
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
+        --handlers-dir "$HANDLERS_DIR" \
         --run-state-dir "$RUN_STATE_DIR" \
         --nft-family "$NFT_FAMILY" \
         --nft-table "$NFT_TABLE" \
@@ -1088,6 +1093,11 @@ main() {
         port-handler)
             shift || true
             run_port_handler "$@"
+            ;;
+        handler)
+            shift || true
+            require_admin_cli_runtime handler
+            run_admin_config handler "$@"
             ;;
         exclude)
             shift || true

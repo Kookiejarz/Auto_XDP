@@ -1,5 +1,130 @@
 # Handler SDK
 
+## Discover, install and configure
+
+Open `axdp tui`, press **h**, and use **↑/↓** or click to select a row. **Enter**
+or a double click opens its configuration page. **s** saves settings, **a**
+saves and applies them, and **Esc** closes the page without applying unsaved
+edits. **i** installs a local source, BPF object, or package directory; **r**
+refreshes the inventory. Changes require root; discovery and inspection do not.
+
+The list combines live dispatch entries and programs pinned under this
+application's BPF root with bundled modules, files in the configured handlers
+directory, installed packages, and paths referenced by the current config.
+Internal firewall, socket-tracking, TC-dispatch and SYN-handoff programs are
+excluded, including their pin aliases. Configurable modules such as SYN Cookie,
+Minecraft and the protocol handlers remain available.
+Source/object peers normally appear once; a source with a failed build can
+also appear separately from its existing object so it remains available for retry.
+An object without a matching source or
+manifest is still listed. BPF entry types and map compatibility are checked
+before activation. An unavailable artifact, an unreadable kernel table, a
+configured target and a loaded program are distinct states. A pin alone does
+not prove that a program is attached or dispatched. Unidentified runtime
+programs have an inspection page; installing their source/object enables
+configuration through a module entry.
+
+Detectable files remain visible after a failed compilation or object check,
+with a **⚠** icon and `build fail` state. If an older version is still running,
+its row retains `loaded` and its actual program ID alongside the warning.
+Open the configuration page and press **e** for scrollable compiler diagnostics;
+**↑/↓** and **PgUp/PgDn** scroll, and **e/Esc** returns to the form. Invalid
+manifests also receive a warning and diagnostic details.
+
+The latest failed install/apply check is recorded under `HANDLERS_DIR/.diagnostics`
+and is shared by TUI and `axdp handler list` (`build_error` in JSON output).
+An unsuccessful install publishes no partial package, but its original file
+remains a discoverable candidate while present. A successful retry clears the
+warning; saving a draft or editing the source alone does not clear it. Discovery
+does not compile every file: `available` means found, not build-verified, and
+failures from unrelated external compiler commands are not automatically known.
+
+The same operations are available from the command line:
+
+```sh
+axdp handler list
+axdp handler list --json
+sudo axdp handler install ./filter.c --name my-filter --kind udp --target 30120
+axdp handler config my-filter
+sudo axdp handler config my-filter --set target=30121
+sudo axdp handler apply my-filter
+sudo axdp handler apply my-filter --set enabled=false
+sudo axdp handler apply gre
+sudo axdp handler apply minecraft --set subject=paper
+sudo axdp handler apply syncookie --set enabled=true --set default_mode=auto
+```
+
+`install` accepts `.c`, `.o`, or a directory containing `handler.json`. It
+copies source and local quoted headers into `/etc/auto_xdp/handlers/catalog/`,
+validates the object and leaves it inactive unless `--apply` is supplied.
+Use a distinct module name to install another version alongside an existing
+package. `--handlers-dir` selects a different catalog root when calling the
+Python CLI directly. The installed `axdp` wrapper and TUI use `HANDLERS_DIR`
+from the runtime environment.
+
+Custom modules without a schema expose their binding and enable switch. A
+source module may declare typed compiler parameters in `filter.handler.json`
+beside `filter.c`, or in a package's `handler.json`:
+
+```json
+{
+  "version": 1,
+  "id": "my-filter",
+  "name": "UDP packet filter",
+  "entry": "filter.c",
+  "kind": "udp",
+  "target": 30120,
+  "fields": [
+    {
+      "name": "max_packet_bytes",
+      "label": "Maximum packet bytes",
+      "type": "int",
+      "default": 1200,
+      "minimum": 64,
+      "maximum": 65535,
+      "define": "MAX_PACKET_BYTES"
+    }
+  ]
+}
+```
+
+Use `#ifndef MAX_PACKET_BYTES` around the source's default definition, and
+consume that constant in the packet checks. Custom fields currently support
+`int` and `bool`, optional numeric bounds or choices, and a C identifier in
+`define`. They are compiled into a fresh object when applied; arbitrary
+configuration keys are rejected. Precompiled objects without source do not
+offer compiler parameters. Private map state still follows the declared
+state contract: a parameter change that alters its ABI must not reuse an
+incompatible schema.
+
+Draft values are stored in `[handler_settings.<id>]`. Applying a slot or
+port module writes the normal `[slots]` / `[port_handlers]` startup config
+and `[handler_bindings]` ownership metadata, then uses the common transaction
+to activate it. If activation fails, the command reports **configuration
+saved, activation failed**; the desired config remains available for retry,
+and the loader's rollback rules protect the previous running generation.
+Successful updates retire unreferenced catalog builds while preserving builds
+used by other bindings. Choosing a new target adds a binding; it does not
+remove the old target automatically.
+
+Minecraft config selects an existing policy subject and changes its
+`protection.profile`; it never creates exposure grants. SYN Cookie exposes its
+existing policy modes, thresholds and per-port/process/service overrides.
+These two managed modules apply through the installed runtime's normal
+reconciliation; observe/audit mode is reported as non-active. When the matching
+installed controller is running, Apply stops that watcher, performs one sync,
+and restarts it with the saved configuration. Existing BPF attachments remain
+active during this operation. This avoids concurrent writers using different
+policies. A running systemd event relay is also restored, because the service
+manager stops it with its controller; an inactive relay stays inactive.
+A failed sync also attempts to restart the controller, and reports
+both failures if recovery fails. Unrelated controllers are left alone.
+Activation errors, including both subprocess output streams, can be inspected
+with **e** in the configuration page; **PgUp/PgDn** scrolls the full error.
+Saving a draft retains the last activation error; a successful Apply clears it.
+SYN Cookie still
+uses its dedicated XDP/TC-ingress lifecycle, not the TC-egress handler ABI.
+
 A handler object contains exactly one XDP program and optionally one TC egress
 classifier. Use `SEC("xdp")` and `SEC("tc")` so libbpf can infer their different
 program types when loading the object together. The entries share maps declared

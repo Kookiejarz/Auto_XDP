@@ -43,6 +43,8 @@ from auto_xdp.tui.metrics import HostMetrics, NetworkMetrics, ResourceSampler
 from auto_xdp.tui.maps import _draw_maps, _cells
 from auto_xdp.tui.layout import Column, table_columns, table_line
 from auto_xdp.tui.handlers import HandlerCache, HandlerInventory, collect_handlers, draw_handlers, handler_capacity
+from auto_xdp.admin import handler_catalog
+from auto_xdp.tui.handler_editor import edit_handler
 from auto_xdp.tui.dashboard import (
     _draw_network, _draw_system, _draw_header, _draw_footer, _number,
 )
@@ -672,11 +674,12 @@ def _collect_snapshot(
     host, network = (resource_sampler.sample(iface, now) if resource_sampler is not None
                      else (HostMetrics(), NetworkMetrics(iface=iface)))
     handler_inventory = handler_cache.inventory if handler_cache is not None else HandlerInventory()
-    if backend != "xdp":
-        handler_inventory = HandlerInventory(status="XDP backend is not active")
-    elif include_handlers:
+    if include_handlers:
         handler_inventory = collect_handlers(args.bpf_pin_dir, _load_toml(args.config),
-                                             handler_cache or HandlerCache(), generation=map_id)
+                                             handler_cache or HandlerCache(), generation=map_id,
+                                             context=handler_catalog.Context.from_args(args))
+        if backend != "xdp" and "XDP backend inactive" not in handler_inventory.status:
+            handler_inventory.status = "XDP backend inactive · " + handler_inventory.status
     snap = TuiSnapshot(
         backend=backend,
         iface=iface,
@@ -755,6 +758,11 @@ class SnapshotWorker:
     def show_handlers(self, enabled: bool) -> None:
         with self._lock:
             self._include_handlers = enabled
+        self.wakeup()
+
+    def refresh_handlers(self) -> None:
+        with self._lock:
+            self._handler_cache.refreshed_at = None
         self.wakeup()
 
     def get(self) -> tuple[TuiSnapshot, str]:
@@ -1131,6 +1139,7 @@ def _draw(
     mouse_enabled: bool = False,
     handler_scroll: int = 0,
     map_bytes: bool = False,
+    handler_cursor: int = -1,
 ) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -1195,7 +1204,7 @@ def _draw(
     if page == "handlers":
         full_win = _make_full_win(stdscr)
         if full_win is not None:
-            draw_handlers(full_win, snap.handlers, handler_scroll)
+            draw_handlers(full_win, snap.handlers, handler_scroll, handler_cursor)
         stdscr.refresh()
         return
     if wins is None:
@@ -1241,6 +1250,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     map_scroll = 0
     map_bytes = False
     handler_scroll = 0
+    handler_cursor = 0
     handler_page_active = False
     event_top = 0
     previous_event_visible = 1
@@ -1325,6 +1335,9 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                     elif mouse.kind == "clear_filter":
                         event_dport_filter = None
                         event_filter_scroll = 0
+                    elif mouse.kind == "handler":
+                        handler_cursor = handler_scroll + mouse.index
+                        ch = curses.KEY_ENTER if mouse.key == curses.KEY_ENTER else -1
                     elif mouse.kind == "scroll":
                         if page == "overview" or mouse.target in {"maps", "events"}:
                             focus = mouse.target
@@ -1510,9 +1523,37 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 limit = max(0, len(snap.handlers.rows) - visible)
                 if ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
                     step = visible if ch in (curses.KEY_PPAGE, curses.KEY_NPAGE) else scroll_step
-                    handler_scroll = max(0, min(limit, handler_scroll + (-step if ch in (curses.KEY_UP, curses.KEY_PPAGE) else step)))
+                    handler_cursor += -step if ch in (curses.KEY_UP, curses.KEY_PPAGE) else step
                     ui_dirty = True
-                handler_scroll = min(handler_scroll, limit)
+                handler_cursor = max(0, min(max(0, len(snap.handlers.rows) - 1), handler_cursor))
+                handler_scroll = max(0, min(limit, max(handler_cursor - visible + 1, min(handler_scroll, handler_cursor))))
+                if ch in (10, 13, curses.KEY_ENTER) and snap.handlers.rows:
+                    try:
+                        ui_error = edit_handler(stdscr, snap.handlers.rows[handler_cursor], handler_catalog.Context.from_args(args), _tui_prompt)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        ui_error = str(exc)
+                    worker.refresh_handlers()
+                    ui_dirty = True
+                elif ch in (ord("i"), ord("I")):
+                    try:
+                        path = _tui_prompt(stdscr, "Install local .c/.o or package directory: ")
+                        if path:
+                            name = _tui_prompt(stdscr, "Module name (blank uses package/file name): ")
+                            _add(stdscr, stdscr.getmaxyx()[0] - 1, 0, "Installing and checking handler…", _color(_CP_SELECTED))
+                            stdscr.refresh()
+                            context = handler_catalog.Context.from_args(args)
+                            module = handler_catalog.install(context, Path(path), name=name)
+                            from auto_xdp.tui.handlers import HandlerRow
+                            row = HandlerRow("AVAILABLE", module.target, None, module.name, "available", source=module.path, module=module)
+                            ui_error = edit_handler(stdscr, row, context, _tui_prompt) or f"Installed {module.id}."
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        ui_error = str(exc)
+                    stdscr.clearok(True)
+                    worker.refresh_handlers()
+                    ui_dirty = True
+                elif ch in (ord("r"), ord("R")):
+                    worker.refresh_handlers()
+                    ui_dirty = True
             elif page == "audit":
                 if ch == curses.KEY_UP:
                     audit_scroll = max(0, audit_scroll - scroll_step)
@@ -1623,6 +1664,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 map_scroll,
                 map_bytes,
                 handler_scroll,
+                handler_cursor,
                 event_top,
                 focus,
                 port_filter,
@@ -1641,7 +1683,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             now = time.monotonic()
             if ui_dirty or draw_state != last_draw_state or now - last_draw_at >= TUI_IDLE_REDRAW_INTERVAL:
                 _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll, audit_scroll, approval_cursor, geoip, mouse_enabled,
-                      handler_scroll=handler_scroll, map_bytes=map_bytes)
+                      handler_scroll=handler_scroll, map_bytes=map_bytes, handler_cursor=handler_cursor)
                 if copy_mode:
                     _draw_footer(stdscr, snap, "", focus, page, copy_mode=True)
                     stdscr.refresh()

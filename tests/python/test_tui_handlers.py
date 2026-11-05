@@ -25,6 +25,12 @@ def test_inventory_uses_dispatch_entries_instead_of_configuration_or_pin_presenc
         dict(id=33, name="orphan", pinned=[str(tmp_path / "port_handlers/tcp/8443/prog")]),
         dict(id=99, name="stale_gre", pinned=[str(tmp_path / "handlers/proto_47")]),
         dict(id=100, name="unrelated", pinned=[str(tmp_path.parent / "other/handlers/proto_50")]),
+        dict(id=101, name="xdp_port_whitelist", pinned=[str(tmp_path / "prog"), str(tmp_path / "core_alias")]),
+        dict(id=102, name="trace_inet_sock_set_state", pinned=[str(tmp_path / "sock_state_prog")]),
+        dict(id=103, name="tc_egress_dispatch", pinned=[str(tmp_path / "tc_egress_dispatch_prog")]),
+        dict(id=104, name="tc_syncookie_handoff", pinned=[str(tmp_path / "tc_syncookie_handoff_prog")]),
+        # Program names alone must not hide a separately installed candidate.
+        dict(id=105, name="xdp_port_whitelist", pinned=[str(tmp_path / "custom_candidate")]),
     ]
     entries = {"proto_handlers": [{"key": ["0x2f", "0x00", "0x00", "0x00"], "value": ["0x0b", "0x00", "0x00", "0x00"]}],
                "udp_port_handlers": [{"key": 30120, "value": {"id": 12}}],
@@ -46,6 +52,8 @@ def test_inventory_uses_dispatch_entries_instead_of_configuration_or_pin_presenc
     assert rows["TC_PROFILE", 1].state == "loaded" and rows["TC_PROFILE", 1].program_id == 14
     assert rows["TC_TCP", 8443].state == "pin only" and rows["TC_TCP", 8443].program_id == 34
     assert ("SLOT", 50) not in rows
+    assert not {101, 102, 103, 104} & {row.program_id for row in inventory.rows}
+    assert rows["PROGRAM", 105].pin == "custom_candidate"
     assert inventory.tables == [("SLOT", "ready", 1), ("TCP", "ready", 0), ("UDP", "ready", 1),
                                 ("PROFILE", "ready", 1), ("TC_TCP", "ready", 0), ("TC_UDP", "ready", 0),
                                 ("TC_SLOT", "ready", 0), ("TC_PROFILE", "ready", 1), ("SYNCOOKIE", "ready", 0)]
@@ -123,3 +131,31 @@ def test_program_inventory_command_is_read_only_and_bounded():
         assert handlers._query("-f", "prog", "show") == []
     assert query.call_args.args[0] == ["bpftool", "-j", "-f", "prog", "show"]
     assert query.call_args.kwargs["timeout"] == 2
+
+
+def test_role_labels_separate_purpose_binding_and_observed_state():
+    from auto_xdp.admin.handler_catalog import Module
+
+    cases = [
+        (handlers.HandlerRow("SYNCOOKIE", 0, 11, "xdp_syncookie", "loaded"), ("SYN cookie", "XDP / SYN")),
+        (handlers.HandlerRow("TC_SYNCOOKIE", 0, 12, "handoff", "pin only"), ("SYN handoff", "TC in / SYN")),
+        (handlers.HandlerRow("SLOT", 47, 13, "gre", "loaded"), ("Protocol", "XDP / IP 47/GRE")),
+        (handlers.HandlerRow("TC_SLOT", 132, 14, "sctp", "loaded"), ("Protocol", "TC out / IP 132/SCTP")),
+        (handlers.HandlerRow("TCP", 8443, 15, "tcp", "loaded"), ("Port handler", "XDP / TCP 8443")),
+        (handlers.HandlerRow("TC_UDP", 30120, 16, "udp", "pin only"), ("Port handler", "TC out / UDP 30120")),
+        (handlers.HandlerRow("PROFILE", 1, 17, "minecraft", "loaded"), ("App profile", "XDP / TCP #1")),
+        (handlers.HandlerRow("PROGRAM", 18, 18, "main", "pin only", "prog"), ("Firewall", "XDP ingress")),
+        (handlers.HandlerRow("PROGRAM", 19, 19, "socket", "pin only", "sock_state_prog"), ("Socket trace", "Tracepoint")),
+        (handlers.HandlerRow("PROGRAM", 20, 20, "dispatch", "pin only", "tc_egress_dispatch_prog"), ("TC dispatch", "TC egress")),
+        (handlers.HandlerRow("PROGRAM", 21, 21, "unknown", "pin only", "custom_pin"), ("Pinned prog", "-")),
+        (handlers.HandlerRow("AVAILABLE", 47, None, "GRE", "available", module=Module("gre", "GRE", "/gre.o", "slot", 47)),
+         ("Protocol", "IP 47/GRE")),
+        (handlers.HandlerRow("AVAILABLE", 53, None, "Demo", "build fail", module=Module("demo", "Demo", "/demo.c"), binding_kind="udp"),
+         ("Port handler", "UDP 53")),
+        (handlers.HandlerRow("AVAILABLE", 0, None, "Demo", "available", module=Module("demo", "Demo", "/demo.c")),
+         ("Handler", "Not selected")),
+    ]
+    for row, labels in cases:
+        state = row.state
+        assert handlers.handler_labels(row) == labels
+        assert row.state == state

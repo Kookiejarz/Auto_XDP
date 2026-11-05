@@ -150,9 +150,9 @@ run_sync_script() {
     backend=$(cat "${RUN_STATE_DIR}/backend" 2>/dev/null || resolve_preferred_backend)
 
     if [[ "$mode" == "watch" ]]; then
-        exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --watch --backend "$backend" "$@"
+        exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --config "${TOML_CONFIG:-/etc/auto_xdp/config.toml}" --watch --backend "$backend" "$@"
     fi
-    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --backend "$backend" "$@"
+    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --config "${TOML_CONFIG:-/etc/auto_xdp/config.toml}" --backend "$backend" "$@"
 }
 
 ensure_xdp_loaded() {

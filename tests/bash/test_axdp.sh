@@ -78,6 +78,22 @@ test_main_dispatches_under_attack_command() (
     assert_eq "$called" "yes:on"
 )
 
+test_handler_catalog_wrapper_forwards_arguments_and_tui_directory() (
+    source "$REPO_ROOT/axdp"
+    local called="" arguments=""
+    require_admin_cli_runtime() { called="$1"; }
+    run_admin_config() { arguments="$*"; }
+    main handler install '/tmp/my handler.c' --name example --kind udp --target 1234 || return 1
+    assert_eq "$called" handler || return 1
+    assert_eq "$arguments" 'handler install /tmp/my handler.c --name example --kind udp --target 1234' || return 1
+    HANDLERS_DIR='/tmp/custom handlers'
+    run_py_module() { printf '%s\n' "$@"; }
+    local output
+    output=$(run_tui) || return 1
+    assert_contains "$output" '--handlers-dir' || return 1
+    assert_contains "$output" '/tmp/custom handlers'
+)
+
 test_main_dispatches_integrated_policy_commands() (
     source "$REPO_ROOT/axdp"
     set +e

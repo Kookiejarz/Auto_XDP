@@ -74,4 +74,6 @@ def _mouse_action(screen: Any, wins: Any, page: str, x: int, y: int, state: int)
             return MouseAction("scroll", page, key=key)
         if click and page == "approvals" and 4 <= y < height - 2:
             return MouseAction("approval", index=y - 4)
+        if click and page == "handlers" and 5 <= y < height - 3:
+            return MouseAction("handler", index=(y - 5) // 2, key=curses.KEY_ENTER if double else -1)
     return None

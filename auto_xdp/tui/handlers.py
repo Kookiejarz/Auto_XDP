@@ -1,16 +1,17 @@
-"""Read-only dispatch inventory and a handler/slot view built from snapshots."""
+"""Kernel program inventory, available modules, and their handler view."""
 from __future__ import annotations
 
 import json
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from auto_xdp.tui.maps import _field
-from auto_xdp.tui.widgets import _add, _box, _color, _CP_GREEN, _CP_MUTED, _CP_YELLOW
+from auto_xdp.admin import handler_catalog
+from auto_xdp.tui.layout import Column, table_columns, table_line
+from auto_xdp.tui.widgets import _add, _box, _color, _CP_GREEN, _CP_MUTED, _CP_YELLOW, _CP_SELECTED
 
 
 HANDLER_REFRESH_INTERVAL = 5.0
@@ -23,6 +24,7 @@ _TABLES = (
 )
 _BUILTINS = {"gre": 47, "esp": 50, "sctp": 132}
 _PROTOCOLS = {1: "ICMP", 6: "TCP", 17: "UDP", 41: "IPv6", 47: "GRE", 50: "ESP", 58: "ICMPv6", 132: "SCTP"}
+_INTERNAL_PROGRAM_PINS = {"prog", "sock_state_prog", "tc_egress_dispatch_prog", "tc_syncookie_handoff_prog"}
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,8 @@ class HandlerRow:
     pin: str = ""
     source: str = ""
     detail: str = ""
+    module: handler_catalog.Module | None = None
+    binding_kind: str = ""
 
 
 @dataclass
@@ -143,9 +147,10 @@ def _pin_key(pin: str) -> tuple[str, int] | None:
 
 
 def collect_handlers(bpf_pin_dir: str, config: dict[str, Any], cache: HandlerCache,
-                     *, generation: str = "", now: float | None = None) -> HandlerInventory:
+                     *, generation: str = "", now: float | None = None,
+                     context: handler_catalog.Context | None = None) -> HandlerInventory:
     now = time.monotonic() if now is None else now
-    token = str(Path(bpf_pin_dir).resolve()) + ":" + generation
+    token = str(Path(bpf_pin_dir).resolve()) + ":" + generation + ":" + str(context)
     if cache.refreshed_at is not None and cache.generation == token and now - cache.refreshed_at < HANDLER_REFRESH_INTERVAL:
         return cache.inventory
     root = Path(bpf_pin_dir).resolve()
@@ -210,33 +215,120 @@ def collect_handlers(bpf_pin_dir: str, config: dict[str, Any], cache: HandlerCac
         detail = f"pin refers to program {pinned_id}" if program_id and pinned_id and program_id != pinned_id else ""
         rows.append(HandlerRow(kind, key, program_id or pinned_id, str(info.get("name") or "-"), state,
                                pin if pinned_id else "", configured.get((kind, key), ""), detail))
+    # Runtime infrastructure is not an installable handler. Exclude every pin
+    # alias of those programs while retaining actual dispatch entries/modules.
+    represented = {row.program_id for row in rows} | {pins[pin] for pin in _INTERNAL_PROGRAM_PINS if pin in pins}
+    for pin, program_id in sorted(pins.items()):
+        if program_id in represented:
+            continue
+        info = programs.get(program_id, {})
+        rows.append(HandlerRow("PROGRAM", program_id, program_id, str(info.get("name") or "-"), "pin only", pin,
+                               detail="Program under this application's pin root; no module binding detected"))
+        represented.add(program_id)
     inventory = HandlerInventory(rows, tables, "; ".join(errors) or "Kernel dispatch tables · read only")
+    if context is not None:
+        _include_catalog(inventory, context, config)
     cache.inventory, cache.refreshed_at, cache.generation = inventory, now, token
     return inventory
+
+
+def _include_catalog(inventory: HandlerInventory, context: handler_catalog.Context, config: dict[str, Any]) -> None:
+    modules = handler_catalog.discover(context, config)
+    by_id = {module.id: module for module in modules if not module.error}
+    by_path = {str(Path(module.path).resolve()): module for module in modules}
+    configured = _configured(config)
+    represented: set[str] = set()
+    for index, row in enumerate(inventory.rows):
+        kind = row.kind.removeprefix("TC_")
+        binding_kind = "slot" if kind == "SLOT" else kind.lower()
+        binding = config.get("handler_bindings", {}).get(binding_kind, {}).get(str(row.key), {})
+        source = row.source or configured.get((kind, row.key), "")
+        binding_matches = bool(source) and bool(binding.get("path")) and Path(source).resolve() == Path(str(binding["path"])).resolve()
+        module = by_id.get(binding.get("module", "")) if binding_matches else None
+        if module is None and source:
+            module = by_id.get(source.removeprefix("builtin:")) if source.startswith("builtin:") else by_path.get(str(Path(source).resolve()))
+        if module is None and kind == "PROFILE" and row.key == 1 and "minecraft" in row.name:
+            module = by_id.get("minecraft")
+        if module is None and kind == "SYNCOOKIE":
+            module = by_id.get("syncookie")
+        if module is not None:
+            inventory.rows[index] = replace(row, module=module)
+            represented.add(module.id)
+    for module in modules:
+        if module.id in represented:
+            continue
+        values = handler_catalog.settings(module, config)
+        present = Path(module.path).is_file()
+        state = "invalid" if module.error else ("build fail" if module.build_error else ("available" if present else "missing"))
+        inventory.rows.append(HandlerRow("AVAILABLE", int(values.get("target", module.target)), None, module.name,
+                                         state, source=module.path,
+                                         detail=module.error or f"{module.id} · {module.hooks}", module=module,
+                                         binding_kind=str(values.get("kind", module.kind))))
+    inventory.status = inventory.status.replace("Kernel dispatch tables · read only", "Live dispatch + local module catalog")
 
 
 def handler_capacity(height: int) -> int:
     return max(0, (height - 5) // 2)
 
 
-def draw_handlers(win: Any, inventory: HandlerInventory, scroll: int) -> None:
+def handler_labels(row: HandlerRow) -> tuple[str, str]:
+    """Present program purpose and binding independently of observed state."""
+    if row.kind == "PROGRAM":
+        return {
+            "prog": ("Firewall", "XDP ingress"),
+            "sock_state_prog": ("Socket trace", "Tracepoint"),
+            "tc_egress_dispatch_prog": ("TC dispatch", "TC egress"),
+        }.get(row.pin, ("Pinned prog", "-"))
+    if row.kind == "TC_SYNCOOKIE":
+        return "SYN handoff", "TC in / SYN"
+    if row.kind == "SYNCOOKIE":
+        return "SYN cookie", "XDP / SYN"
+    kind = row.kind.removeprefix("TC_")
+    hook = "TC out" if row.kind.startswith("TC_") else "XDP"
+    if row.kind == "AVAILABLE":
+        kind = (row.binding_kind or row.module.kind).upper() if row.module else "CUSTOM"
+        kind = {"MINECRAFT": "PROFILE", "SYNCOOKIE": "SYNCOOKIE"}.get(kind, kind)
+        hook = ""  # Catalog candidates have no observed dispatch hook yet.
+    prefix = f"{hook} / " if hook else ""
+    if kind == "SYNCOOKIE":
+        return "SYN cookie", "SYN"
+    if kind == "SLOT":
+        protocol = f"/{_PROTOCOLS[row.key]}" if row.key in _PROTOCOLS else ""
+        return "Protocol", f"{prefix}IP {row.key}{protocol}"
+    if kind in {"TCP", "UDP"}:
+        target = str(row.key) if row.key else "unset"
+        return "Port handler", f"{prefix}{kind} {target}"
+    if kind == "PROFILE":
+        return "App profile", f"{prefix}TCP #{row.key}"
+    return "Handler", "Not selected"
+
+
+def draw_handlers(win: Any, inventory: HandlerInventory, scroll: int, cursor: int = -1) -> None:
     height, width = win.getmaxyx()
     active = sum(row.state == "loaded" for row in inventory.rows)
     _box(win, f"Handlers & slots / {active} loaded", focused=True)
     _add(win, 1, 2, inventory.status, _color(_CP_MUTED))
-    _add(win, 2, 2, f"{'TYPE':<10} {'TARGET':<12} {'STATE':<11} {'PROG ID':>8}  PROGRAM", _color(_CP_MUTED))
+    columns = table_columns(width - 4, (
+        Column("role", 12, 0), Column("binding", 21, 1), Column("state", 10, 0),
+        Column("id", 8, 0, True), Column("name", 15, 4)))
+    _add(win, 2, 2, table_line(columns, dict(role="ROLE", binding="HOOK / TARGET", state="STATE", id="PROG ID", name="PROGRAM")), _color(_CP_MUTED))
     visible = handler_capacity(height)
     scroll = max(0, min(scroll, max(0, len(inventory.rows) - visible)))
     for index, row in enumerate(inventory.rows[scroll:scroll + visible]):
         y = 3 + index * 2
-        target = f"{row.key}/{_PROTOCOLS[row.key]}" if row.kind == "SLOT" and row.key in _PROTOCOLS else str(row.key)
-        color = _CP_GREEN if row.state == "loaded" else _CP_YELLOW
-        _add(win, y, 2, f"{row.kind:<10} {target:<12} {row.state:<11} {str(row.program_id or '-'):>8}  "
-             + _field(row.name, max(1, width - 49)), _color(color))
-        details = [f"config={row.source}" if row.source else "", f"pin={row.pin}" if row.pin else "", row.detail]
+        role, binding = handler_labels(row)
+        warning = row.module.error or row.module.build_error if row.module else ""
+        color = _CP_GREEN if row.state == "loaded" and not warning else _CP_YELLOW
+        if warning:
+            _add(win, y, 1, "⚠", _color(_CP_YELLOW))
+        _add(win, y, 2, table_line(columns, dict(role=role, binding=binding, state=row.state,
+                                              id=str(row.program_id or "-"), name=row.name)),
+             _color(_CP_SELECTED if scroll + index == cursor else color))
+        details = (["Last build/check failed · Enter configure, e errors"] if row.module and row.module.build_error else [])
+        details += [f"config={row.source}" if row.source else "", f"pin={row.pin}" if row.pin else "", row.detail]
         _add(win, y + 1, 4, " · ".join(item for item in details if item) or "active dispatch entry; no ownership pin/config path", _color(_CP_MUTED))
     if not inventory.rows and visible:
         _add(win, 3, 2, "No loaded handlers, pinned candidates or configured slots.", _color(_CP_MUTED))
     summary = " · ".join(f"{kind.lower()} {count if count is not None else status}" for kind, status, count in inventory.tables)
     _add(win, height - 2, 2, summary, _color(_CP_MUTED))
-    _add(win, height - 1, 2, f" {scroll + bool(inventory.rows)}-{min(scroll + visible, len(inventory.rows))}/{len(inventory.rows)} · h back · loaded=dispatch entry · pin only=not dispatched ", _color(_CP_MUTED))
+    _add(win, height - 1, 2, f" {scroll + bool(inventory.rows)}-{min(scroll + visible, len(inventory.rows))}/{len(inventory.rows)} · ↑↓ select · Enter configure · i install · r refresh · h back ", _color(_CP_MUTED))

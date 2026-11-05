@@ -333,8 +333,9 @@ command_action = next(
     None,
 )
 choices = set(getattr(command_action, "choices", {}) or {})
-if "tui" not in choices:
-    raise SystemExit("installed auto_xdp.admin.cli does not expose the tui command")
+for required in ("tui", "handler"):
+    if required not in choices:
+        raise SystemExit(f"installed auto_xdp.admin.cli does not expose the {required} command")
 PY
 }
 
@@ -350,7 +351,7 @@ install_slot_handler_sdk() {
         local _staged=()
         mapfile -t -d '' _staged < <(
             find "${sdk_root}/handlers" -maxdepth 1 \
-                -type f \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) -print0
+                -type f \( -name 'Makefile' -o -name '*.c' -o -name '*.h' -o -name '*.handler.json' \) -print0
             find "${sdk_root}/bpf/include" -maxdepth 1 -type f -name '*.h' -print0
         )
         if [[ ${#_staged[@]} -gt 0 ]]; then
@@ -380,7 +381,7 @@ for e in json.load(sys.stdin).get('tree', []):
     if not p.startswith('handlers/'):
         continue
     tail = p.split('/')[-1]
-    if tail == 'Makefile' or p.endswith('.c') or p.endswith('.h'):
+    if tail == 'Makefile' or p.endswith(('.c', '.h', '.handler.json')):
         print(p)
 " | sort
         )

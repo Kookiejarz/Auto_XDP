@@ -14,7 +14,7 @@ from typing import Any
 from auto_xdp import config as cfg, policy
 from auto_xdp.admin import approvals
 from auto_xdp.discovery import listeners as discovery
-from auto_xdp.admin import config_file, detect, formatting, handlers, ports, stats
+from auto_xdp.admin import config_file, detect, formatting, handler_catalog, handlers, ports, stats
 
 
 _LOG_LEVELS = {"debug", "info", "warning", "error"}
@@ -1271,6 +1271,52 @@ def _cmd_tui(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_handler(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+
+    context = handler_catalog.Context.from_args(args)
+    if args.subcommand == "list":
+        from auto_xdp.tui.handlers import HandlerCache, collect_handlers
+        data = config_file.load_toml(context.config)
+        modules = handler_catalog.discover(context, data)
+        inventory = collect_handlers(str(context.bpf_pin_dir), data, HandlerCache())
+        if args.json:
+            print(json.dumps({"modules": [asdict(item) for item in modules],
+                              "programs": [asdict(row) for row in inventory.rows],
+                              "status": inventory.status}, indent=2))
+        else:
+            print("Available handler modules:")
+            for item in modules:
+                state = item.error or ("⚠ last build/check failed" if item.build_error else ("available" if Path(item.path).is_file() else "artifact missing"))
+                print(f"  {item.id:<28} {item.kind:<12} {state}\n    {item.path}")
+                if item.build_error:
+                    print("    " + item.build_error.replace("\n", "\n    "))
+            print("\nDetected runtime programs:")
+            for row in inventory.rows:
+                print(f"  {row.kind:<12} {row.key:<6} {row.state:<12} id={row.program_id or '-'} {row.name}")
+            if not inventory.rows:
+                print("  (none)")
+            print(f"  {inventory.status}")
+        return 0
+    if args.subcommand == "install":
+        module = handler_catalog.install(context, Path(args.path), name=args.name, kind=args.kind, target=args.target)
+        print(f"Installed {module.id}: {module.path}")
+        if args.apply:
+            print(handler_catalog.configure(context, module, handler_catalog.parse_assignments(args.set), apply=True))
+        elif args.set:
+            print(handler_catalog.configure(context, module, handler_catalog.parse_assignments(args.set)))
+        return 0
+    module = handler_catalog.select(context, args.name)
+    if args.subcommand in {"config", "configure"} and not args.set and not args.apply:
+        values = handler_catalog.settings(module, config_file.load_toml(context.config))
+        print(json.dumps({"module": module.id, "values": values,
+                          "fields": [asdict(item) for item in handler_catalog.fields_for(module)]}, indent=2))
+        return 0
+    print(handler_catalog.configure(context, module, handler_catalog.parse_assignments(args.set),
+                                    apply=args.subcommand == "apply" or args.apply))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="axdp")
     parser.add_argument("--config", required=True)
@@ -1282,6 +1328,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nft-table", default="auto_xdp")
     parser.add_argument("--iface", default="")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    handler_cmd = subparsers.add_parser("handler", help="Discover, install, configure and apply handler modules")
+    handler_sub = handler_cmd.add_subparsers(dest="subcommand", required=True)
+    handler_list = handler_sub.add_parser("list")
+    handler_list.add_argument("--json", action="store_true")
+    handler_list.set_defaults(func=_cmd_handler)
+    handler_install = handler_sub.add_parser("install")
+    handler_install.add_argument("path", help="Local .c/.o file or package directory with handler.json")
+    handler_install.add_argument("--name", default="")
+    handler_install.add_argument("--kind", choices=("custom", "slot", "tcp", "udp"), default="custom")
+    handler_install.add_argument("--target", type=int, default=0)
+    handler_install.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    handler_install.add_argument("--apply", action="store_true")
+    handler_install.set_defaults(func=_cmd_handler)
+    for operation in ("config", "apply"):
+        command = handler_sub.add_parser(operation, aliases=["configure"] if operation == "config" else [])
+        command.add_argument("name")
+        command.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+        command.add_argument("--apply", action="store_true", help="Activate the saved configuration")
+        command.set_defaults(func=_cmd_handler)
 
     config_cmd = subparsers.add_parser("config")
     config_sub = config_cmd.add_subparsers(dest="subcommand", required=True)
@@ -1519,6 +1585,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Permission denied: {exc}", file=sys.stderr)
         print("This command needs root; try re-running with sudo.", file=sys.stderr)
         return 77
+    except (OSError, RuntimeError) as exc:
+        if args.command != "handler":
+            raise
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
