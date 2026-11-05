@@ -2872,5 +2872,33 @@ test_main_orders_basic_info_checks_then_summary() (
     done
 )
 
+test_runtime_sync_uses_the_selected_toml_for_once_and_watch() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    local tmpdir output mode
+    tmpdir=$(mktemp -d)
+    RUN_STATE_DIR="$tmpdir/run"
+    mkdir -p "$RUN_STATE_DIR"
+    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
+    TOML_CONFIG="$tmpdir/custom policy.toml"
+    PYTHON3_BIN="/bin/bash"
+    SYNC_SCRIPT="$tmpdir/arguments.sh"
+    cat > "$SYNC_SCRIPT" <<'SCRIPT'
+printf '<%s>\n' "$@"
+SCRIPT
+    for mode in once watch; do
+        output=$(run_sync_script "$mode" --dry-run) || return 1
+        assert_contains "$output" "<--config>" || return 1
+        assert_contains "$output" "<$TOML_CONFIG>" || return 1
+        assert_contains "$output" "<--backend>" || return 1
+        assert_contains "$output" "<xdp>" || return 1
+        assert_contains "$output" "<--dry-run>" || return 1
+        if [[ "$mode" == watch ]]; then
+            assert_contains "$output" "<--watch>" || return 1
+        else
+            [[ "$output" != *"<--watch>"* ]] || return 1
+        fi
+    done
+)
+
 run_discovered_tests "${BASH_SOURCE[0]}" "setup_xdp"
 finish_tests

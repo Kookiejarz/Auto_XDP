@@ -248,7 +248,7 @@ prepare_slot_handler_sources() {
             fi
         done < <(
             find "${_source_dir}/handlers" -maxdepth 1 -type f \
-                \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) \
+                \( -name 'Makefile' -o -name '*.c' -o -name '*.h' -o -name '*.handler.json' \) \
                 | sed "s|^${_source_dir}/||" | sort
         )
     else

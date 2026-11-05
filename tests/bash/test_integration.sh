@@ -575,6 +575,11 @@ test_interrupted_candidate_restore() {
     }
 }
 
+test_handler_catalog() {
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_handler_catalog.py" \
+        "$_PIN_DIR" "$_VETH" "$REPO_ROOT"
+}
+
 test_handler_transactional_hot_swap() {
     local handler_obj="/tmp/axdp_integ_gre_handler.o"
     local config_path="/tmp/axdp_integ_handler.toml"

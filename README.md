@@ -228,7 +228,7 @@ come from dedicated BPF counters. Initial or unavailable rates display `--`.
 Fixed-size array maps display `fixed`, rather than a capacity warning; `~` marks
 sampled or cached map counts.
 All pages use the current terminal width and height, including Overview,
-Sources, Events, Health, Maps, Audit and Requests.
+Sources, Events, Health, Maps, Audit, Requests, Handlers and handler forms.
 Tables redistribute their columns as the window grows or shrinks; taller
 windows show more rows. Overview panels and the navigation bar also expand
 with the terminal. Input pages preserve typed text when resized, scroll long
@@ -254,6 +254,12 @@ observation health. `h` opens Handlers & slots: actual protocol slots, TCP/UDP
 port handlers, TCP profiles and the SYN-cookie dispatch entry, with program IDs,
 names, ownership pins and configured paths. `loaded` means a live dispatch-map
 entry; `pin only` and `configured` do not imply that packets reach the program.
+`ROLE` describes the handler's purpose (for example, SYN cookie, App profile
+or Protocol); `HOOK / TARGET` shows its hook and protocol, port or
+profile binding. Catalog candidates show their intended target without claiming
+an active hook. Navigation tabs stay compact even on wide terminals.
+The main firewall, socket tracker, TC dispatcher and SYN handoff infrastructure
+are hidden from this handler list; configurable modules remain visible.
 The inventory refreshes while this page is open, without changing attachments.
 `a` opens the authorization audit, `p` approval requests,
 `o` returns to the overview, and `q` exits.

@@ -4,8 +4,11 @@ from unittest import mock
 
 import pytest
 
+from auto_xdp.admin import handler_catalog as catalog
 from auto_xdp.tui import app
 from auto_xdp.tui.dashboard import page_tabs
+from auto_xdp.tui.handler_editor import draw_form
+from auto_xdp.tui.handlers import HandlerInventory, HandlerRow
 from auto_xdp.tui.layout import wrap_cells
 from auto_xdp.tui.maps import _cells
 from auto_xdp.telemetry.relay_client import RelayClient
@@ -13,12 +16,13 @@ from test_tui_dashboard import Canvas, _snapshot
 
 
 @pytest.mark.parametrize("width", [80, 110, 180, 280, 360])
-@pytest.mark.parametrize("page,header_y", [("events", 3), ("cookie", 6), ("traffic", 3),
+@pytest.mark.parametrize("page,header_y", [("handlers", 4), ("events", 3), ("cookie", 6), ("traffic", 3),
                                          ("audit", 3), ("approvals", 3), ("maps", 3)])
 def test_every_table_distributes_columns_across_actual_terminal_width(width, page, header_y):
     screen = Canvas(50, width)
     snap = _snapshot()
     snap.stats = [("SYN_COOKIE_HANDOFF_SUCCESS", 123456, -1, "123 pps")]
+    snap.handlers = HandlerInventory([HandlerRow("TC_SYNCOOKIE", 0, 123456, "handler_" * 80, "loaded")])
     snap.audit_rows = [dict(action="allow", protocol="tcp", bind_scope="exact", address="2001:db8::1", port=443,
                             zone="public", subject="web", attribution="process", reason="reason_" * 80)]
     snap.approval_rows = [dict(id=1234, status="pending", protocol="tcp", subject="web", zone="public",
@@ -32,11 +36,13 @@ def test_every_table_distributes_columns_across_actual_terminal_width(width, pag
     assert _cells(header) == width - 4
     # Numeric / final data fields reach the right side rather than stopping
     # at the former fixed 70-120-column layout.
-    data_y = {"events": 4, "cookie": 7, "traffic": 4, "audit": 4, "approvals": 4, "maps": 4}[page]
+    data_y = {"handlers": 5, "events": 4, "cookie": 7, "traffic": 4, "audit": 4, "approvals": 4, "maps": 4}[page]
     data = next(text for y, x, text, _ in screen.calls if y == data_y and x == 2)
     assert _cells(data) == width - 4
     if page != "maps":
         assert _cells(data.rstrip()) >= width - 6
+    if page == "handlers":
+        assert "SYN handoff" in data and "TC in / SYN" in data
 
 
 @pytest.mark.parametrize("width", [80, 140, 280, 360])
@@ -68,6 +74,17 @@ def test_overview_panels_grow_with_both_dimensions():
     assert wins.system.getmaxyx()[1] > 56
     assert wins.network.getmaxyx()[0] > 13
     assert wins.system.getmaxyx()[0] > 13
+
+
+@pytest.mark.parametrize("width", [80, 140, 280, 360])
+def test_form_label_and_value_columns_follow_terminal_width_with_cjk_labels(width):
+    module = catalog.Module("demo", "Demo", "/demo.c", fields=(catalog.Field("value", "参数名称" * 10, default="VALUE" * 200),))
+    row = HandlerRow("AVAILABLE", 0, None, "Demo", "available", module=module)
+    screen = Canvas(24, width)
+    draw_form(screen, row, catalog.fields_for(module), catalog.settings(module, {}), 3)
+    line = next(text for y, x, text, _ in screen.calls if y == 11 and x == 2)
+    assert _cells(line) == width - 4
+    assert _cells(line[:line.index("VALUE")]) >= (width - 6) * 2 // 5
 
 
 def test_diagnostic_wrapping_preserves_all_wide_characters_and_indentation():

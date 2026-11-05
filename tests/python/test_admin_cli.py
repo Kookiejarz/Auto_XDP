@@ -88,6 +88,7 @@ with tempfile.TemporaryDirectory() as directory:
                 handlers.compile_handler_source(source, 47, root / "output", sdk_dir=sdk)
             self.assertIn(f"-I{sdk}", run.call_args.args[0])
             self.assertIn(f"-I{sdk.parent / 'bpf' / 'include'}", run.call_args.args[0])
+            self.assertTrue(run.call_args.kwargs["include_detail"])
 
     def test_approval_store_supports_persistent_axdp_path(self):
         with mock.patch.dict(

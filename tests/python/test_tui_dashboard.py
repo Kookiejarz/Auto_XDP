@@ -476,7 +476,8 @@ def mouse_main(monkeypatch, tmp_path):
         monkeypatch.setattr(app.curses, "getmouse", lambda: next(events))
         monkeypatch.setattr(app, "_draw", draw)
         args = SimpleNamespace(config=str(tmp_path / "config.toml"), run_state_dir=str(tmp_path),
-                               socket="/unused", tui_max_events=500)
+                               socket="/unused", tui_max_events=500, bpf_pin_dir=str(tmp_path / "bpffs"),
+                               handlers_dir=str(tmp_path / "handlers"), install_dir=str(tmp_path / "release"))
         assert app._curses_main(Screen(42, 140), args) == 0
         draw.worker, draw.relay = worker, relay
         draw.enable_mouse, draw.disable_mouse = enable_mouse, disable_mouse
@@ -587,7 +588,155 @@ def test_handler_page_keyboard_requests_inventory_and_scrolls_it(mouse_main):
     draw = mouse_main(TuiSnapshot(handlers=HandlerInventory(rows)), keys_override=[ord("h"), curses.KEY_DOWN])
     draw.worker.show_handlers.assert_called_once_with(True)
     assert draw.call_args.args[10] == "handlers"
-    assert draw.call_args.kwargs["handler_scroll"] == 1
+    assert draw.call_args.kwargs["handler_cursor"] == 1
+    assert draw.call_args.kwargs["handler_scroll"] == 0
+
+
+def test_handler_selection_opens_editor_and_refreshes_inventory(mouse_main, monkeypatch):
+    from auto_xdp.tui import app
+    rows = [HandlerRow("UDP", port, port, "handler", "loaded") for port in (8080, 9090)]
+    editor = mock.Mock(return_value="Configuration saved")
+    monkeypatch.setattr(app, "edit_handler", editor)
+    draw = mouse_main(TuiSnapshot(handlers=HandlerInventory(rows)),
+                      keys_override=[ord("h"), curses.KEY_DOWN, 10])
+    assert editor.call_args.args[1] == rows[1]
+    draw.worker.refresh_handlers.assert_called_once()
+
+
+@pytest.mark.parametrize("state,opens", [(curses.BUTTON1_CLICKED, False), (curses.BUTTON1_DOUBLE_CLICKED, True)])
+def test_handler_mouse_selects_or_opens_without_applying(mouse_main, monkeypatch, state, opens):
+    from auto_xdp.tui import app
+    editor = mock.Mock(return_value="")
+    monkeypatch.setattr(app, "edit_handler", editor)
+    rows = [HandlerRow("UDP", port, port, "handler", "loaded") for port in (8080, 9090)]
+    draw = mouse_main(TuiSnapshot(handlers=HandlerInventory(rows)), [(0, 10, 7, 0, state)], initial="handlers")
+    assert draw.call_args.kwargs["handler_cursor"] == 1
+    assert editor.called == opens
+
+
+@pytest.mark.parametrize("width,height", [(80, 20), (80, 24), (100, 30), (140, 42), (200, 50)])
+def test_handler_configuration_pages_fit_terminal_and_show_module_options(width, height, tmp_path):
+    from auto_xdp.admin import handler_catalog as catalog
+    from auto_xdp.tui.handler_editor import draw_form
+    context = catalog.Context(tmp_path / "config", tmp_path, tmp_path / "custom", tmp_path / "bpf", tmp_path / "run")
+    module = catalog.select(context, "syncookie")
+    row = HandlerRow("AVAILABLE", 0, None, module.name, "available", module=module)
+    screen = Canvas(height, width)
+    fields = catalog.fields_for(module)
+    draw_form(screen, row, fields, catalog.settings(module, {}), 2)
+    output = "\n".join(item[2] for item in screen.calls)
+    assert "SYN Cookie" in output and "Activation threshold" in output
+    assert "TC ingress" in output
+    draw_form(screen, row, fields, catalog.settings(module, {}), len(fields) - 1)
+    assert "Rate limits by service" in "\n".join(item[2] for item in screen.calls)
+
+
+@pytest.mark.parametrize("keys,expected", [([ord(" "), 27], []), ([ord("s"), ord("a"), 27], [False, True])])
+def test_handler_editor_save_apply_and_cancel_are_distinct(tmp_path, monkeypatch, keys, expected):
+    from auto_xdp.admin import handler_catalog as catalog
+    from auto_xdp.tui.handler_editor import edit_handler
+    context = catalog.Context(tmp_path / "config", tmp_path, tmp_path / "custom", tmp_path / "bpf", tmp_path / "run")
+    module = catalog.select(context, "gre")
+    class EditorScreen(Canvas):
+        def timeout(self, value):
+            pass
+        def nodelay(self, value):
+            pass
+        def getch(self):
+            return next(sequence)
+    sequence = iter(keys)
+    configure = mock.Mock(return_value="Saved")
+    monkeypatch.setattr(catalog, "configure", configure)
+    edit_handler(EditorScreen(24, 80), HandlerRow("AVAILABLE", 47, None, "GRE", "available", module=module), context, lambda *args: "")
+    assert [call.kwargs["apply"] for call in configure.call_args_list] == expected
+
+
+def test_runtime_row_edits_its_binding_instead_of_last_saved_target():
+    from auto_xdp.admin import handler_catalog as catalog
+    from auto_xdp.tui.handler_editor import form_values
+    module = catalog.Module("custom", "Custom", "/custom.o")
+    row = HandlerRow("TC_UDP", 5353, 10, "egress", "loaded", module=module)
+    values = form_values(row, {"handler_settings": {"custom": {"target": 80, "kind": "tcp"}}})
+    assert values["target"] == 5353 and values["kind"] == "udp"
+
+
+def test_unbound_runtime_program_does_not_invent_a_dispatch_target():
+    screen = Canvas(24, 100)
+    draw_handlers(screen, HandlerInventory([HandlerRow("PROGRAM", 1234, 1234, "unbound", "pin only")]), 0)
+    line = next(text for _, _, text, _ in screen.calls if text.startswith("Pinned prog"))
+    assert line.split() == ["Pinned", "prog", "-", "pin", "only", "1234", "unbound"]
+
+
+@pytest.mark.parametrize("width,height", [(80, 20), (80, 24), (100, 30), (140, 42), (200, 50)])
+def test_handler_build_warning_keeps_live_id_and_exposes_scrollable_diagnostics(width, height):
+    from auto_xdp.admin import handler_catalog as catalog
+    from auto_xdp.tui.handler_editor import draw_form, draw_errors
+    error = "source.c:7: error: expected expression\n" + "long compiler diagnostic " * 30 + "\nLAST ERROR LINE"
+    module = catalog.Module("failed", "Failed rebuild", "/source.c", "tcp", 8080, build_error=error)
+    row = HandlerRow("TCP", 8080, 42, module.name, "loaded", module=module)
+    screen = Canvas(height, width)
+    draw_handlers(screen, HandlerInventory([row]), 0)
+    output = "\n".join(text for _, _, text, _ in screen.calls)
+    assert "⚠" in output and "loaded" in output and "42" in output and "Last build/check failed" in output
+    draw_form(screen, row, catalog.fields_for(module), catalog.settings(module, {}), 0)
+    assert "e errors" in "\n".join(text for _, _, text, _ in screen.calls)
+    draw_errors(screen, row, 0)
+    assert "source.c:7: error: expected expression" in "\n".join(text for _, _, text, _ in screen.calls)
+    draw_errors(screen, row, 10000)
+    assert "LAST ERROR LINE" in "\n".join(text for _, _, text, _ in screen.calls)
+
+
+def test_handler_error_view_returns_to_form_without_applying(tmp_path, monkeypatch):
+    from auto_xdp.admin import handler_catalog as catalog
+    from auto_xdp.tui import handler_editor
+    context = catalog.Context(tmp_path / "config", tmp_path, tmp_path / "custom", tmp_path / "bpf", tmp_path / "run")
+    module = catalog.Module("failed", "Failed", "/source.c", build_error="compiler error")
+    sequence = iter([ord("e"), curses.KEY_NPAGE, 27, ord("s"), 27])
+    class EditorScreen(Canvas):
+        def timeout(self, value):
+            pass
+        def nodelay(self, value):
+            pass
+        def getch(self):
+            return next(sequence)
+    configure = mock.Mock(return_value="Saved")
+    monkeypatch.setattr(catalog, "configure", configure)
+    with mock.patch.object(handler_editor, "draw_errors", wraps=handler_editor.draw_errors) as diagnostics:
+        handler_editor.edit_handler(EditorScreen(20, 80), HandlerRow("AVAILABLE", 0, None, "Failed", "build fail", module=module),
+                                    context, lambda *args: "")
+    assert diagnostics.called
+    configure.assert_called_once()
+    assert configure.call_args.kwargs["apply"] is False
+
+
+@pytest.mark.parametrize("width,height", [(80, 20), (140, 42), (280, 70)])
+def test_activation_errors_are_scrollable_without_build_failures(tmp_path, monkeypatch, width, height):
+    from auto_xdp.admin import handler_catalog as catalog
+    from auto_xdp.tui import handler_editor
+    context = catalog.Context(tmp_path / "config", tmp_path, tmp_path / "custom", tmp_path / "bpf", tmp_path / "run")
+    module = catalog.Module("minecraft", "Minecraft Java", "/minecraft.o", "minecraft", 1)
+    error = "Configuration saved, but activation failed:\ntracepoint fallback warning\n" + "detail line\n" * 100 + "ACTUAL FAILURE AT END"
+    sequence = iter([ord("a"), ord("e"), *([curses.KEY_NPAGE] * 30), 27, ord("s"), ord("e"), 27, ord("a"), 27])
+    class EditorScreen(Canvas):
+        def timeout(self, value):
+            pass
+        def getch(self):
+            return next(sequence)
+    configure = mock.Mock(side_effect=[RuntimeError(error), "Saved draft", "Applied"])
+    monkeypatch.setattr(catalog, "configure", configure)
+    monkeypatch.setattr(catalog, "discover", lambda *args: [module])
+    screen = EditorScreen(height, width)
+    with mock.patch.object(handler_editor, "draw_errors", wraps=handler_editor.draw_errors) as diagnostics, \
+            mock.patch.object(handler_editor, "draw_form", wraps=handler_editor.draw_form) as forms:
+        result = handler_editor.edit_handler(screen, HandlerRow("AVAILABLE", 1, None, module.name, "available", module=module),
+                                            context, lambda *args: "")
+    assert result == "Applied"
+    assert any(call.kwargs.get("operation_error") == error for call in diagnostics.call_args_list)
+    assert forms.call_args.kwargs["operation_error"] == ""
+    assert [call.kwargs["apply"] for call in configure.call_args_list] == [True, False, True]
+    handler_editor.draw_errors(screen, HandlerRow("AVAILABLE", 1, None, module.name, "available", module=module),
+                               10000, operation_error=error)
+    assert "ACTUAL FAILURE AT END" in "\n".join(text for _, _, text, _ in screen.calls)
 
 
 def test_maps_byte_toggle_is_available_from_keyboard(mouse_main):
