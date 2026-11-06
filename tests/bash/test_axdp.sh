@@ -527,6 +527,11 @@ test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails() (
     mkdir -p "${BPF_PIN_DIR}_next"
     touch "${BPF_PIN_DIR}_next/prog"
     _IFACES=(eth0)
+    # The restored stable generation is still attached natively; nothing else may call ip.
+    ip() {
+        [[ "$*" == "-j -d link show dev eth0" ]] || return 1
+        printf '%s\n' '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":77}}}]'
+    }
 
     _auto_xdp_finish_interrupted_reload() {
         printf 'resume\n' >> "$tmpdir/recovery.log"
@@ -566,7 +571,8 @@ test_ensure_xdp_blocks_fallback_when_required_syncookie_is_unavailable() (
     _setup_reattach_test_env "$tmpdir"
     _IFACES=(eth0)
     _auto_xdp_verify_iface_program() { return 0; }
-    ip() { printf '\n'; }
+    # eth0 already runs the program natively, so only the SYN-cookie gate can fail.
+    ip() { printf '%s\n' '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":77}}}]'; }
     load_syncookie_program() { return 1; }
 
     ensure_xdp_loaded >/dev/null 2>&1
