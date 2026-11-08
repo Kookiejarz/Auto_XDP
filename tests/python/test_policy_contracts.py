@@ -122,6 +122,46 @@ def test_syncookie_port_overrides_process_and_service() -> None:
     assert desired.tcp_syncookie_rate_limits == {22: 900}
 
 
+def test_syncookie_port_rate_default_is_port_wide_not_per_source() -> None:
+    # sshd resolves a strict per-source SYN limit of 5/s; the cookie guard
+    # measures the whole port and must not inherit that unit.
+    cfg.SYNCOOKIE_ENABLED = True
+    cfg._SYN_RATE_BY_SERVICE["ssh"] = 2
+
+    desired = desired_for_ports(
+        ObservedState(tcp={22, 8080}, tcp_processes={22: "sshd", 8080: "app"})
+    )
+
+    assert desired.tcp_syn_rate_limits[22] == cfg.XDP_DEFAULT_TCP_SYN_RATE_STRICT
+    assert desired.tcp_syncookie_rate_limits == {
+        22: cfg.SYNCOOKIE_PORT_RATE_BUILTIN,
+        8080: cfg.SYNCOOKIE_PORT_RATE_BUILTIN,
+    }
+
+
+def test_syncookie_port_rate_default_keeps_a_high_per_source_limit_as_floor() -> None:
+    # A load balancer port whose single source may legitimately open 5000/s
+    # must not shed at the built-in 1000/s.
+    cfg.SYNCOOKIE_ENABLED = True
+    cfg._SYN_RATE_BY_PROC["haproxy"] = 5000
+
+    desired = desired_for_ports(ObservedState(tcp={443}, tcp_processes={443: "haproxy"}))
+
+    assert desired.tcp_syncookie_rate_limits == {443: 5000}
+
+
+def test_syncookie_port_rate_default_and_explicit_zero() -> None:
+    cfg.SYNCOOKIE_ENABLED = True
+    cfg.SYNCOOKIE_PORT_RATE_DEFAULT = 4000
+    cfg._SYNCOOKIE_PORT_RATE_BY_PORT[9090] = 0
+
+    desired = desired_for_ports(
+        ObservedState(tcp={8080, 9090}, tcp_processes={8080: "app", 9090: "bench"})
+    )
+
+    assert desired.tcp_syncookie_rate_limits == {8080: 4000, 9090: 0}
+
+
 def test_syncookie_config_rejects_invalid_port_table() -> None:
     with pytest.raises(ValueError, match="port_rate_by_port must be a table"):
         cfg.apply_toml_config({"syncookie": {"port_rate_by_port": 42}})

@@ -47,7 +47,7 @@ def parse_options(compiler, tmp_path_factory):
     # kfuncs in its translation unit. No separate parser implementation lives
     # in the fixture, so these checks exercise production parsing decisions.
     start = production.index("struct syncookie_syn_opts {")
-    end = production.index("static __always_inline __u16\nsyncookie_write_synack_opts", start)
+    end = production.index("/* Accept classic ECN", start)
     c_file = directory / "options.c"
     c_file.write_text(
         "#include <linux/tcp.h>\n#include <bpf/bpf_helpers.h>\n"
@@ -85,7 +85,7 @@ def parse_options(compiler, tmp_path_factory):
 
 @pytest.mark.parametrize("options,flags,expected", [
     ([], 2, (0, 0, 0, 0, 0, 0)),
-    ([], 0xC2, (0, 0, 0, 0, 0, 1)),
+    ([], 0xC2, (0, 0, 0, 0, 0, 0)),
     ([], 0x42, (0, 0, 0, 0, 0, 0)),
     ([3, 3, 7], 2, (0, 7, 0, 1, 0, 0)),
     ([3, 3, 255], 2, (0, 14, 0, 1, 0, 0)),
@@ -93,7 +93,7 @@ def parse_options(compiler, tmp_path_factory):
     ([8, 10, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0], 2,
      (0x12345678, 0, 1, 0, 0, 0)),
     ([2, 4, 5, 180, 4, 2, 8, 10, 0x12, 0x34, 0x56, 0x78,
-      0, 0, 0, 0, 1, 3, 3, 7], 0xC2, (0x12345678, 7, 1, 1, 1, 1)),
+      0, 0, 0, 0, 1, 3, 3, 7], 0xC2, (0x12345678, 7, 1, 1, 1, 0)),
     ([1] * 8 + [3, 3, 12], 2, (0, 12, 0, 1, 0, 0)),
     ([1] * 9 + [3, 3, 13], 2, (0, 13, 0, 1, 0, 0)),
     ([1] * 10 + [3, 3, 13], 2, (0, 0, 0, 0, 0, 0)),

@@ -46,6 +46,18 @@ struct vlan_hdr {
 #define TCP_FLAG_SYN  0x02
 #define TCP_FLAG_RST  0x04
 #define TCP_FLAG_ACK  0x10
+#define TCP_FLAG_ECE  0x40
+/* The connection-control bits. PSH, URG and ECN feedback (CWR, ECE, and AE in
+ * the previous byte) do not change what kind of segment a packet is. */
+#define TCP_CONTROL_FLAGS (TCP_FLAG_SYN | TCP_FLAG_ACK | TCP_FLAG_RST | TCP_FLAG_FIN)
+
+/* A pure ACK carries no payload and, among the control bits, only ACK. ECN
+ * clients set ECE/CWR/AE on ordinary ACKs, and a flood could set them or
+ * PSH/URG at will, so none of those may move a packet off the ACK checks. */
+static __always_inline bool tcp_pure_ack(__u8 tcp_flags, __u32 l4_len, __u32 doff)
+{
+    return (tcp_flags & TCP_CONTROL_FLAGS) == TCP_FLAG_ACK && l4_len == doff * 4U;
+}
 
 
 // cfg_flags bits for xdp_runtime_cfg.cfg_flags.
@@ -55,6 +67,7 @@ struct vlan_hdr {
 #define XDP_CFG_FLAG_DROP_EVENTS_DISABLED (1U << 2)  // ring-buf events off (default: on)
 #define XDP_CFG_FLAG_SLOT_DROP            (1U << 3)  // unknown proto → drop (default: pass)
 #define XDP_CFG_FLAG_ENDPOINT_POLICY      (1U << 4)  // exact address/family/interface admission
+#define XDP_CFG_FLAG_ECN_REFUSED          (1U << 5)  // listener netns has net.ipv4.tcp_ecn=0
 
 // Runtime tunables. Userspace writes this map from config.toml; zero fields
 // fall back to defaults so old loaders remain compatible.

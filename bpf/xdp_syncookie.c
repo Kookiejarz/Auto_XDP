@@ -20,7 +20,15 @@ _Static_assert(sizeof(struct syncookie_tcp_work) == 60, "TCP header workspace");
  * SYN windows are unscaled, even when the SYN-ACK negotiates window scaling. */
 #define SYNCOOKIE_INITIAL_WINDOW 4096U
 
-static __always_inline bool syncookie_linux_established(
+/* Linux's default net.ipv4.ip_default_ttl / IPv6 hop limit. */
+#define SYNCOOKIE_SYNACK_TTL 64
+
+/* True when the ACK belongs to a flow Linux already knows, so it is not a
+ * cookie answer. Any ORIGINAL-direction conntrack entry counts, whatever its
+ * TCP state: half-closed transfers and final ACKs of closing flows must pass.
+ * The main program checks conntrack first; repeating it here keeps an older
+ * main object safe during a mixed reload. */
+static __always_inline bool syncookie_known_flow(
     struct xdp_md *ctx, const struct xdp_slot_ctx *sc)
 {
     struct flow_key key = {
@@ -36,26 +44,26 @@ static __always_inline bool syncookie_linux_established(
     struct nf_conn *ct = bpf_xdp_ct_lookup(
         ctx, &tuple, linux_ct_tuple_size(&key), &opts, sizeof(opts));
     if (ct) {
-        struct linux_ct_snapshot snapshot;
-        linux_ct_snapshot(ct, opts.dir, &snapshot);
+        bool original = opts.dir == NF_CT_DIR_ORIGINAL;
         bpf_ct_release(ct);
-        if (snapshot.dir == NF_CT_DIR_ORIGINAL &&
-            linux_ct_established(&snapshot))
+        if (original)
             return true;
     }
-    /* XDP_TX SYN-ACKs do not traverse conntrack. A reused tuple can retain
-     * CLOSE/TIME_WAIT state even after reqsk handoff created a live socket.
-     * Do not revalidate its data ACKs as handshake cookies. The exact tuple
-     * must name a real established socket; Linux still checks TCP sequence
-     * numbers. Listeners, request sockets and timewait sockets never qualify.
+    /* Conntrack can miss live flows: XDP_TX SYN-ACKs bypass it, and NOTRACK,
+     * other zones, loose=0 or a flushed table leave no entry. Any socket that
+     * owns the exact tuple, other than a listener, proves a known flow:
+     * established and closing sockets, TIME_WAIT, and kernel request sockets
+     * (NEW_SYN_RECV) for handshakes Linux answered itself. Linux still checks
+     * TCP sequence numbers. A listener match means no flow owns the tuple, so
+     * the ACK must carry a valid cookie.
      */
-    struct bpf_sock *sk = bpf_sk_lookup_tcp(
+    struct bpf_sock *skc = bpf_skc_lookup_tcp(
         ctx, &tuple, linux_ct_tuple_size(&key), BPF_F_CURRENT_NETNS, 0);
-    if (!sk)
+    if (!skc)
         return false;
-    bool established = sk->state == BPF_TCP_ESTABLISHED;
-    bpf_sk_release(sk);
-    return established;
+    bool known = skc->state != BPF_TCP_LISTEN;
+    bpf_sk_release(skc);
+    return known;
 }
 
 struct syncookie_syn_opts {
@@ -109,9 +117,42 @@ syncookie_parse_syn_opts(struct tcphdr *tcp, void *data_end)
         }
         off += len;
     }
-    __u8 flags = ((__u8 *)tcp)[13];
-    out.ecn_ok = (flags & 0xc0) == 0xc0;
     return out;
+}
+
+/* Accept classic ECN exactly where the Linux listener would
+ * (tcp_ecn_create_request): the SYN asks for it with both ECE and CWR, the
+ * host allows ECN (net.ipv4.tcp_ecn != 0, mirrored by the control plane), and
+ * the SYN is Not-ECT unless it also carries AE or reserved bits. An ECT- or
+ * CE-marked classic SYN points to a path that rewrites the ECN field.
+ */
+static __always_inline __u8 syncookie_ecn_ok(const struct tcphdr *tcp, __u8 ip_ecn)
+{
+    const __u8 *bytes = (const __u8 *)tcp;
+    if ((bytes[13] & 0xc0) != 0xc0)
+        return 0;
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    if (cfg && (cfg->cfg_flags & XDP_CFG_FLAG_ECN_REFUSED))
+        return 0;
+    return ip_ecn == 0 || (bytes[12] & 0x0f);
+}
+
+/* The SYN-ACK is rewritten from the SYN in place, so every flag bit must be
+ * set explicitly rather than inherited. Answer like a classic RFC 3168
+ * listener: an ECN-setup SYN-ACK carries ECE alone. The handed-off socket's
+ * ECN mode is attrs.ecn_ok (masked again by Linux with tcp_ecn and route
+ * features), upgraded to AccECN when the completing ACK has ACE > 1
+ * (cookie_accecn_ok). Classic clients, and AccECN clients falling back from
+ * this SYN-ACK, send that ACK with ACE 0, so both ends use classic ECN.
+ * Echoing CWR|ECE signalled AccECN to classic clients; echoing AE|CWR|ECE
+ * made AccECN clients disable ECN while the socket kept sending ECT.
+ * AE and the reserved bits share byte 12 with doff, which is set later.
+ */
+static __always_inline void syncookie_synack_flags(struct tcphdr *tcp, __u8 ecn_ok)
+{
+    __u8 *bytes = (__u8 *)tcp;
+    bytes[12] &= 0xf0;
+    bytes[13] = TCP_FLAG_SYN | TCP_FLAG_ACK | (ecn_ok ? TCP_FLAG_ECE : 0);
 }
 
 static __always_inline __u16
@@ -283,7 +324,7 @@ static __always_inline int syncookie_v4(
     if (tcp->ack || !tcp->syn || tcp->rst || tcp->fin) {
         if (tcp->syn || !tcp->ack || tcp->rst || tcp->fin)
             return XDP_DROP;
-        if (syncookie_linux_established(ctx, sc))
+        if (syncookie_known_flow(ctx, sc))
             return XDP_PASS;
         struct syncookie_runtime_cfg *runtime =
             bpf_map_lookup_elem(&sync_run_cfg, &(__u32){0});
@@ -322,6 +363,7 @@ static __always_inline int syncookie_v4(
     old_seq = bpf_ntohl(tcp->seq);
     struct syncookie_syn_opts syn_opts =
         syncookie_parse_syn_opts(tcp, data_end);
+    syn_opts.ecn_ok = syncookie_ecn_ok(tcp, ip->tos & 0x03);
     struct axdp_tcp_req_attrs attrs = {
         .rcv_tsval = syn_opts.tsval,
         .rcv_tsecr = (__u32)(bpf_ktime_get_ns() / 1000000ULL),
@@ -363,6 +405,11 @@ static __always_inline int syncookie_v4(
         __be32 addr = ip->saddr;
         ip->saddr = ip->daddr;
         ip->daddr = addr;
+        /* Like the listener (and upstream xdp_synproxy): no TOS/DSCP or ECN
+         * reflected from the SYN, and a fresh TTL. The SYN's remaining TTL
+         * would expire on the way back to clients 32+ hops away. */
+        ip->tos = 0;
+        ip->ttl = SYNCOOKIE_SYNACK_TTL;
     }
     tcp = &tcp_work.tcp;
     {
@@ -372,10 +419,7 @@ static __always_inline int syncookie_v4(
     }
     tcp->seq = bpf_htonl((__u32)generated);
     tcp->ack_seq = bpf_htonl(old_seq + 1);
-    tcp->ack = 1;
-    tcp->syn = 1;
-    tcp->rst = 0;
-    tcp->fin = 0;
+    syncookie_synack_flags(tcp, syn_opts.ecn_ok);
     __u16 tcp_opt_len = syncookie_write_synack_opts(tcp, &attrs);
     tcp->doff = 5 + tcp_opt_len / 4;
     tcp->window = bpf_htons(SYNCOOKIE_INITIAL_WINDOW);
@@ -425,7 +469,7 @@ static __always_inline int syncookie_v6(
     if (tcp->ack || !tcp->syn || tcp->rst || tcp->fin) {
         if (tcp->syn || !tcp->ack || tcp->rst || tcp->fin)
             return XDP_DROP;
-        if (syncookie_linux_established(ctx, sc))
+        if (syncookie_known_flow(ctx, sc))
             return XDP_PASS;
         struct syncookie_runtime_cfg *runtime =
             bpf_map_lookup_elem(&sync_run_cfg, &(__u32){0});
@@ -465,6 +509,7 @@ static __always_inline int syncookie_v6(
     old_seq = bpf_ntohl(tcp->seq);
     struct syncookie_syn_opts syn_opts =
         syncookie_parse_syn_opts(tcp, data_end);
+    syn_opts.ecn_ok = syncookie_ecn_ok(tcp, (ip->flow_lbl[0] >> 4) & 0x03);
     struct axdp_tcp_req_attrs attrs = {
         .rcv_tsval = syn_opts.tsval,
         .rcv_tsecr = (__u32)(bpf_ktime_get_ns() / 1000000ULL),
@@ -504,6 +549,13 @@ static __always_inline int syncookie_v6(
         struct in6_addr addr = ip->saddr;
         ip->saddr = ip->daddr;
         ip->daddr = addr;
+        /* As for IPv4: traffic class (DSCP+ECN) 0, no reflected flow label,
+         * a fresh hop limit. */
+        ip->priority = 0;
+        ip->flow_lbl[0] = 0;
+        ip->flow_lbl[1] = 0;
+        ip->flow_lbl[2] = 0;
+        ip->hop_limit = SYNCOOKIE_SYNACK_TTL;
     }
     tcp = &tcp_work.tcp;
     {
@@ -513,10 +565,7 @@ static __always_inline int syncookie_v6(
     }
     tcp->seq = bpf_htonl((__u32)generated);
     tcp->ack_seq = bpf_htonl(old_seq + 1);
-    tcp->ack = 1;
-    tcp->syn = 1;
-    tcp->rst = 0;
-    tcp->fin = 0;
+    syncookie_synack_flags(tcp, syn_opts.ecn_ok);
     __u16 tcp_opt_len = syncookie_write_synack_opts(tcp, &attrs);
     tcp->doff = 5 + tcp_opt_len / 4;
     tcp->window = bpf_htons(SYNCOOKIE_INITIAL_WINDOW);

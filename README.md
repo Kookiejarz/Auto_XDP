@@ -60,6 +60,12 @@ Optional SYN-cookie listener handoff requires the kernel request-socket helper
 can discard the assigned request socket before TCP accepts it; Auto XDP refuses
 this combination instead of changing host NAT. Strict cookie mode fails closed.
 
+SYN-cookie rate budgets count SYNs for the entire port. The default base is
+`max(1000, per-source SYN limit)`; an explicit per-port base of zero disables
+rate triggering while `always` still challenges every SYN. ACK validation keeps
+a grace window after challenges, preserves existing and closing connections,
+and negotiates ECN consistently with the host listener.
+
 ## Auto XDP compared with other firewalls
 
 | Solution | How it gets its policy | Where it filters | Who maintains the rules |

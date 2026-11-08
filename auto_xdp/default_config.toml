@@ -126,6 +126,10 @@ activation_percent = 90
 auto_max_percent = 200
 challenge_cooldown_seconds = 5
 invalid_ack_rate_pps = 1000
+# Whole-port SYN/s per rate window. auto: CHALLENGE at activation_percent,
+# SHED at auto_max_percent. always: every SYN is challenged and SYNs above
+# 100% of this base are dropped for the rest of the window.
+# 0 = max(1000, the port's per-source SYN limit).
 port_rate_default = 0
 
 [syncookie.by_proc]
@@ -135,6 +139,8 @@ port_rate_default = 0
 [syncookie.by_port]
 # "25565" = "always"
 
+# port_rate_by_*: explicit whole-port SYN/s. An explicit 0 disables the rate
+# trigger: auto never challenges, always challenges every SYN without shedding.
 [syncookie.port_rate_by_proc]
 
 [syncookie.port_rate_by_service]

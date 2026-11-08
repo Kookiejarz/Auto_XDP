@@ -141,7 +141,19 @@ def _syncookie_port_rate_limit(port: int, proc: str = "", *, config: cfg.ConfigS
     svc = service_name(port, "tcp")
     if svc and svc in config._SYNCOOKIE_PORT_RATE_BY_SERVICE:
         return config._SYNCOOKIE_PORT_RATE_BY_SERVICE[svc]
-    return config.SYNCOOKIE_PORT_RATE_DEFAULT or _port_rate_limit(port, proc, config=config)
+    # The guard compares this with SYNs to the whole port. A per-source SYN
+    # limit (e.g. 5/s for sshd) is the wrong unit and would shed the port at a
+    # trivial aggregate rate, so 0 selects the built-in port-wide default. One
+    # legitimate source may already send its per-source limit, so that limit
+    # still acts as a floor. An explicit 0 above disables the rate trigger
+    # (always mode keeps challenging every SYN).
+    return config.SYNCOOKIE_PORT_RATE_DEFAULT or derived_syncookie_port_rate(
+        _port_rate_limit(port, proc, config=config))
+
+
+def derived_syncookie_port_rate(per_source_syn_rate: int) -> int:
+    """Default whole-port cookie base for a port with this per-source SYN limit."""
+    return max(cfg.SYNCOOKIE_PORT_RATE_BUILTIN, per_source_syn_rate)
 
 
 def rate_map_entries_v6(_v4_entries: int, *, config: cfg.ConfigSnapshot | None = None) -> int:

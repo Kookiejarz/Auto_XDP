@@ -343,6 +343,24 @@ print(" ".join(f"{byte:02x}" for byte in payload[:size]))
         key hex 00 00 00 00 value hex $value_hex >/dev/null
 }
 
+# Set or clear one XDP_CFG_FLAG_* bit, as the control plane would.
+_set_runtime_cfg_flag() {
+    local bit="$1" state="$2"
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR/xdp_runtime_cfg" "$bit" "$state" <<'PYEOF'
+import sys
+from auto_xdp.bpf.maps import BpfRuntimeConfigMap
+path, bit, state = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+runtime = BpfRuntimeConfigMap(path)
+try:
+    flags = runtime.get_cfg_flags() or 0
+    flags = flags | bit if state == "on" else flags & ~bit
+    if not runtime.set(runtime.get(), flags):
+        raise SystemExit(f"cannot update runtime flags: {runtime.last_error}")
+finally:
+    runtime.close()
+PYEOF
+}
+
 # Send TCP SYN from inside the namespace to _HOST_IP:PORT.
 # Returns 0 if XDP passes (kernel sends RST or accepts), 1 if XDP drops (timeout).
 _tcp_probe() {
@@ -1592,7 +1610,7 @@ test_syncookie_listener_handoff() (
         echo "SKIP: kernel lacks bpf_sk_assign_tcp_reqsk"
         return 0
     }
-    local port=7710 value_hex ready_file recv_file listener_pid="" live_counters gate_output mode
+    local port=7710 value_hex ready_file recv_file listener_pid="" sniff_pid="" live_counters gate_output mode
     local attach_mode="${1:-generic}" detach_mode=xdpgeneric
     local TOML_CONFIG="$_RUN_DIR/syncookie.toml"
     local SYNCOOKIE_OBJ_PATH="$_SYNCOOKIE_OBJ" TC_SYNCOOKIE_OBJ_PATH="$_TC_SYNCOOKIE_OBJ"
@@ -1604,7 +1622,10 @@ test_syncookie_listener_handoff() (
     cleanup_cookie() {
         [[ -z "$listener_pid" ]] || kill "$listener_pid" 2>/dev/null || true
         [[ -z "$listener_pid" ]] || wait "$listener_pid" 2>/dev/null || true
+        [[ -z "$sniff_pid" ]] || kill "$sniff_pid" 2>/dev/null || true
+        [[ -z "$sniff_pid" ]] || wait "$sniff_pid" 2>/dev/null || true
         nft delete table ip axdp_cookie_nat 2>/dev/null || true
+        nft delete table inet axdp_cookie_ct 2>/dev/null || true
         bpftool map delete pinned "$_PIN_DIR/syncookie_prog_array" \
             key hex 00 00 00 00 >/dev/null 2>&1 || true
         cleanup_syncookie_handoff 1
@@ -1738,6 +1759,133 @@ PYEOF
         "$REPO_ROOT/tests/python/kernel_syncookie_latency.py" client "$port" || return 1
     wait "$listener_pid" || return 1
     listener_pid=""
+
+    # Known flows must not reach the cookie validator. After the client
+    # half-closes, the server socket is CLOSE_WAIT and conntrack has left
+    # ESTABLISHED; every client pure ACK of the server's bulk reply must pass.
+    # Round "socket": no ct reference in this netns, so conntrack misses and the
+    # validator must recognise the CLOSE_WAIT/LAST_ACK socket. Round
+    # "conntrack": a fixture table registers the hooks, so the main program
+    # skips the validator for the ORIGINAL-direction entry.
+    local round invalid_before invalid_after
+    for round in socket conntrack; do
+        if [[ $round == conntrack ]]; then
+            nft add table inet axdp_cookie_ct || return 1
+            nft add chain inet axdp_cookie_ct track \
+                '{ type filter hook input priority filter; policy accept; }' || return 1
+            nft add rule inet axdp_cookie_ct track ct state established counter || return 1
+        fi
+        invalid_before=$(PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 -c \
+            'import sys; from pathlib import Path; from kernel_packet_telemetry import counter; print(counter(Path(sys.argv[1]) / "pkt_counters", 41))' \
+            "$_PIN_DIR") || return 1
+        rm -f "$ready_file"
+        python3 - "$port" "$ready_file" <<'PYEOF' &
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("10.99.0.1", int(sys.argv[1])))
+s.listen()
+open(sys.argv[2], "w").write("ready")
+s.settimeout(5)
+c, _ = s.accept()
+c.settimeout(5)
+data = b""
+while chunk := c.recv(65536):
+    data += chunk
+if data != b"half-close":
+    raise SystemExit(f"unexpected request {data!r}")
+c.sendall(b"x" * (2 << 20))
+c.close()
+PYEOF
+        listener_pid=$!
+        for _ in {1..50}; do
+            [[ -s "$ready_file" ]] && break
+            sleep 0.02
+        done
+        ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" "$round" <<'PYEOF' || return 1
+import socket, sys
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)
+s.sendall(b"half-close")
+s.shutdown(socket.SHUT_WR)
+total = 0
+try:
+    while chunk := s.recv(1 << 16):
+        total += len(chunk)
+except socket.timeout:
+    pass
+if total != 2 << 20:
+    raise SystemExit(f"{sys.argv[3]} round: half-closed transfer stalled at {total} bytes: "
+                     "client ACKs were dropped")
+print(f"{sys.argv[3]} round: half-closed bulk reply delivered with cookie validation active")
+PYEOF
+        wait "$listener_pid" || return 1
+        listener_pid=""
+        invalid_after=$(PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 -c \
+            'import sys; from pathlib import Path; from kernel_packet_telemetry import counter; print(counter(Path(sys.argv[1]) / "pkt_counters", 41))' \
+            "$_PIN_DIR") || return 1
+        [[ $round == conntrack ]] && { nft delete table inet axdp_cookie_ct || return 1; }
+        [[ "$invalid_after" == "$invalid_before" ]] || {
+            printf '%s round: SYN_COOKIE_INVALID advanced %s -> %s\n' \
+                "$round" "$invalid_before" "$invalid_after"
+            return 1
+        }
+    done
+
+    # Cookie handshakes negotiate ECN like a classic-ECN Linux listener: ECE
+    # alone in the SYN-ACK for classic and AccECN requests, plain ACKs
+    # afterwards, ECT data only when ECN was negotiated, and no ECN at all when
+    # the host refuses it (net.ipv4.tcp_ecn=0, mirrored into the runtime
+    # flags by the control plane). Echoing the SYN's CWR/AE used to pull
+    # classic clients into AccECN and make AccECN clients disable ECN while
+    # the handed-off socket kept sending ECT. Kernels before 7.0 have no
+    # AccECN (tcp_ecn=3); those rounds are skipped there.
+    local client_ecn host_ecn ecn_round ecn_mode host_refuses
+    local -a ecn_rounds=(0 1 1:host-refuses)
+    client_ecn=$(ip netns exec "$_NS" sysctl -n net.ipv4.tcp_ecn) || return 1
+    host_ecn=$(sysctl -n net.ipv4.tcp_ecn) || return 1
+    if ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_ecn=3 2>/dev/null; then
+        ecn_rounds+=(3)
+    else
+        printf 'SKIP: kernel lacks AccECN (tcp_ecn=3); AccECN round not run\n'
+    fi
+    for ecn_round in "${ecn_rounds[@]}"; do
+        ecn_mode=${ecn_round%%:*}
+        host_refuses=""
+        [[ $ecn_round == *:host-refuses ]] && host_refuses=host-refuses
+        ip netns exec "$_NS" sysctl -q -w "net.ipv4.tcp_ecn=$ecn_mode" || return 1
+        if [[ -n $host_refuses ]]; then
+            sysctl -q -w net.ipv4.tcp_ecn=0 || return 1
+            _set_runtime_cfg_flag 32 on || return 1
+        fi
+        rm -f "$ready_file" "$_RUN_DIR/cookie-ecn.json" "$_RUN_DIR/cookie-ecn.ready"
+        ip netns exec "$_NS" python3 "$REPO_ROOT/tests/python/kernel_syncookie_ecn.py" \
+            sniff "$_VETH_IN" "$port" "$_RUN_DIR/cookie-ecn.json" "$_RUN_DIR/cookie-ecn.ready" &
+        sniff_pid=$!
+        for _ in {1..100}; do
+            [[ -s "$_RUN_DIR/cookie-ecn.ready" ]] && break
+            sleep 0.02
+        done
+        python3 "$REPO_ROOT/tests/python/kernel_syncookie_ecn.py" \
+            server "$port" "$ready_file" $((4 << 20)) &
+        listener_pid=$!
+        for _ in {1..50}; do
+            [[ -s "$ready_file" ]] && break
+            sleep 0.02
+        done
+        ip netns exec "$_NS" python3 "$REPO_ROOT/tests/python/kernel_syncookie_ecn.py" \
+            client "$_HOST_IP" "$port" $((4 << 20)) || return 1
+        wait "$listener_pid" || return 1
+        listener_pid=""
+        wait "$sniff_pid" || return 1
+        sniff_pid=""
+        if [[ -n $host_refuses ]]; then
+            sysctl -q -w "net.ipv4.tcp_ecn=$host_ecn" || return 1
+            _set_runtime_cfg_flag 32 off || return 1
+        fi
+        python3 "$REPO_ROOT/tests/python/kernel_syncookie_ecn.py" \
+            check "$_RUN_DIR/cookie-ecn.json" "$ecn_mode" $host_refuses || return 1
+    done
+    ip netns exec "$_NS" sysctl -q -w "net.ipv4.tcp_ecn=$client_ecn" || return 1
     python3 - "$_PIN_DIR" "$live_counters" <<'PYEOF' || return 1
 import json, subprocess, sys
 def counter(key):
@@ -1755,10 +1903,10 @@ def counter(key):
     return scalar(values) if values else 0
 before = json.loads(sys.argv[2])
 counts = {key: counter(key) - before[str(key)] for key in (39, 40, 59, 60, 61, 62)}
-# In generic/veth mode Linux conntrack can admit the ACK before the XDP cookie
-# path; TC still independently validates it. The controlled kernel probe below
-# separately proves the XDP VALID event, while these deltas prove real handoff.
-for key in (39, 59, 60):
+# Live handshake ACKs (plain after classic negotiation) reach the XDP
+# validator (VALID) and TC hands every one of them to the listener. Routing of
+# ECN/PSH-flagged ACKs is covered by the kernel_packet_telemetry cookie cases.
+for key in (39, 40, 59, 60):
     if counts[key] <= 0:
         raise SystemExit(f"SYN-cookie stage counter {key} did not advance: {counts}")
 if counts[61] or counts[62] or counts[59] != counts[60]:

@@ -418,6 +418,7 @@ XDP_CFG_FLAG_BOGON_DISABLED       = 1 << 0  # bogon filter off (default: on)
 XDP_CFG_FLAG_ABUSEIPDB_ENABLED    = 1 << 1  # AbuseIPDB active (default: off)
 XDP_CFG_FLAG_DROP_EVENTS_DISABLED = 1 << 2  # ring-buf events off (default: on)
 XDP_CFG_FLAG_SLOT_DROP            = 1 << 3  # unknown proto → drop (default: pass)
+XDP_CFG_FLAG_ECN_REFUSED          = 1 << 5  # listener netns has net.ipv4.tcp_ecn=0
 
 
 class BpfRuntimeConfigMap(BpfFdMap):

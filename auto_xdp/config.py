@@ -129,6 +129,9 @@ SYNCOOKIE_ACTIVATION_PERCENT = 90
 SYNCOOKIE_AUTO_MAX_PERCENT = 200
 SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS = 5.0
 SYNCOOKIE_INVALID_ACK_RATE_PPS = 1000
+# Whole-port SYN/s that the cookie guard measures against. port_rate_default = 0
+# selects this built-in value; it is never the per-source SYN limit.
+SYNCOOKIE_PORT_RATE_BUILTIN = 1000
 SYNCOOKIE_PORT_RATE_DEFAULT = 0
 _SYNCOOKIE_BY_PROC: dict[str, str] = {}
 _SYNCOOKIE_BY_SERVICE: dict[str, str] = {}
