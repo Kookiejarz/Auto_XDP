@@ -10,7 +10,7 @@ awk -v phase="$phase" '
             if ($i == "size") static_insns = $(i + 1)
     }
     /^verification time [0-9]+ usec$/ { verification_time_usec = $3 }
-    /^stack depth [0-9]+(\+[0-9]+)?$/ {
+    /^stack depth [0-9]+(\+[0-9]+)*( max [0-9]+)?$/ {
         stack_depth = $3
         sub(/\+.*/, "", stack_depth)
     }

@@ -1199,17 +1199,19 @@ test_bpftool_resolver_prefers_exact_kernel_then_usable_fallback() (
 )
 
 test_extract_verifier_metrics_normalizes_bpftool_summary() (
-    local output expected
-    output=$(
-        bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "integration setup" <<'EOF_METRICS'
+    local output expected stack_summary
+    expected=$'integration_setup\t13481\t282798\t27\t11892\t4610\t1519394\t288'
+    for stack_summary in '288' '288+48' '288+48 max 352' '288+48+0 max 352'; do
+        output=$(
+            bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "integration setup" <<EOF_METRICS
 libbpf: sec 'xdp': found program 'xdp_port_whitelist' at insn offset 0 (0 bytes), code size 13481 insns (107848 bytes)
 verification time 1519394 usec
-stack depth 288
+stack depth $stack_summary
 processed 282798 insns (limit 1000000) max_states_per_insn 27 total_states 11892 peak_states 4610 mark_read 0
 EOF_METRICS
-    )
-    expected=$'integration_setup\t13481\t282798\t27\t11892\t4610\t1519394\t288'
-    assert_eq "$output" "$expected"
+        ) || return 1
+        assert_eq "$output" "$expected" "$stack_summary" || return 1
+    done
 )
 
 test_verifier_summary_prints_processed_and_stack() (
