@@ -137,7 +137,8 @@ _load_xdp_program() {
         if [[ $status -eq 0 && $metrics_status -ne 0 ]]; then
             printf 'error: unable to parse bpftool verifier metrics during %s\n' "$phase" >&2
             printf '%s\n' '--- program sizes and verifier summary ---' >&2
-            grep 'found program .*code size' "$load_log" >&2 || true
+            grep -E 'found program .*code size|verification time|stack depth|processed [0-9]+ insns' \
+                "$load_log" >&2 || true
             tail -n 40 "$load_log" >&2
             rm -f "$load_log"
             return 1
