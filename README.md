@@ -50,6 +50,11 @@ Static firewall rules drift as services come and go. Auto XDP watches runtime en
 
 This keeps the firewall tied to both operator intent and current runtime state. Legacy `permanent_ports` configuration is rejected; exposure must use workload grants and zones.
 
+A grant restricted to named zone interfaces waits while those interfaces are
+absent; it never becomes an unrestricted grant. Other grants keep working. The
+next reconciliation applies it when the interface appears, while interface
+lookup errors remain explicit failures. This does not attach XDP to new devices.
+
 Optional SYN-cookie listener handoff requires the kernel request-socket helper
 (normally Linux 6.11+) and a verifiably NAT-free network namespace. NAT LOCAL_IN
 can discard the assigned request socket before TCP accepts it; Auto XDP refuses

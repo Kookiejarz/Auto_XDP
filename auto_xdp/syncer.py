@@ -101,6 +101,8 @@ def sync_once(
                           failure.operation.operation, failure.reason)
             for endpoint_key, reason in result.blocked_endpoints.items():
                 log.warning("Endpoint target blocked %s: %s", endpoint_key, reason)
+            for endpoint_key, reason in result.deferred_endpoints.items():
+                log.info("Endpoint target deferred %s: %s", endpoint_key, reason)
             for resource, reason in result.unconfirmed.items():
                 log.warning("Applied state unconfirmed %s: %s", resource, reason)
     elapsed = time.monotonic() - started

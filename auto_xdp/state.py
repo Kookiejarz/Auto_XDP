@@ -223,11 +223,14 @@ class ApplyResult:
     blocked_endpoints: dict[EndpointKey, str] = field(default_factory=dict)
     unconfirmed: dict[str, str] = field(default_factory=dict)
     applied: AppliedState | None = None
+    # Named interfaces may appear later. Their grants stay closed meanwhile.
+    deferred_endpoints: dict[EndpointKey, str] = field(default_factory=dict)
 
     @property
     def successful(self) -> bool:
         return self.applied is not None and self.plan is not None and not (
             self.dry_run or self.failures or self.blocked_endpoints or self.unconfirmed
+            or self.deferred_endpoints.keys() - self.closed_endpoints
         )
 
 
