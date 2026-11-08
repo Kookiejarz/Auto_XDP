@@ -114,18 +114,16 @@ source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
 _load_xdp_program() {
     local phase="${1:-load}"
     local load_log status debug_status metrics_tmp metrics_status
-    local -a pipe_status
     load_log=$(mktemp)
 
     if [[ -n "${VERIFIER_METRICS_FILE:-}" && ! -s "$VERIFIER_METRICS_FILE" ]]; then
         metrics_tmp=$(mktemp)
         bpftool -d prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
-            pinmaps "$_PIN_DIR" 2>&1 \
-            | bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "$phase" \
-                >"$metrics_tmp"
-        pipe_status=("${PIPESTATUS[@]}")
-        status=${pipe_status[0]}
-        metrics_status=${pipe_status[1]}
+            pinmaps "$_PIN_DIR" >"$load_log" 2>&1
+        status=$?
+        bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "$phase" \
+            <"$load_log" >"$metrics_tmp"
+        metrics_status=$?
         if [[ $status -eq 0 && $metrics_status -eq 0 ]]; then
             {
                 printf '# kernel\t%s\n' "$(uname -r)"
@@ -138,6 +136,9 @@ _load_xdp_program() {
         rm -f "$metrics_tmp"
         if [[ $status -eq 0 && $metrics_status -ne 0 ]]; then
             printf 'error: unable to parse bpftool verifier metrics during %s\n' "$phase" >&2
+            printf '%s\n' '--- program sizes and verifier summary ---' >&2
+            grep 'found program .*code size' "$load_log" >&2 || true
+            tail -n 40 "$load_log" >&2
             rm -f "$load_log"
             return 1
         fi
