@@ -2139,6 +2139,40 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
         backend.verify_kernel_state.return_value = 0
         return backend
 
+    def _watch_conntrack_checks(self, *, dry_run, step, failing=False):
+        backend = self._backend()
+        if failing:
+            backend.ensure_conntrack_activation.return_value = None
+        notifications = mock.MagicMock()
+        clock = [100.0]
+        waits = [None, None, KeyboardInterrupt()]
+
+        def wait(timeout):
+            clock[0] += step
+            outcome = waits.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        notifications.wait.side_effect = wait
+        with mock.patch.object(syncer_mod, "open_backend", return_value=backend), \
+             mock.patch.object(syncer_mod, "NotificationReceiver", return_value=notifications), \
+             mock.patch.object(syncer_mod, "sync_once"):
+            syncer_mod.watch(dry_run=dry_run, backend_name="xdp",
+                             monotonic=lambda: clock[0], mode="enforce")
+        return backend.ensure_conntrack_activation.call_count
+
+
+    def test_watch_rechecks_conntrack_activation_on_its_interval(self):
+        interval = syncer_mod.CONNTRACK_CHECK_INTERVAL_SECONDS
+        self.assertEqual(self._watch_conntrack_checks(dry_run=False, step=0.0), 1)
+        self.assertEqual(self._watch_conntrack_checks(dry_run=False, step=interval + 1), 2)
+        self.assertEqual(self._watch_conntrack_checks(dry_run=True, step=interval + 1), 0)
+        # A failing check doubles its interval, so the next one is not yet due.
+        self.assertEqual(
+            self._watch_conntrack_checks(dry_run=False, step=interval + 1, failing=True), 1)
+
+
     def test_failed_apply_triggers_verify_and_corrective_sync(self):
         from auto_xdp.discovery.notifications import Notification
         backend = self._backend()

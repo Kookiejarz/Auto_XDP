@@ -21,6 +21,7 @@ from auto_xdp.admin import handlers as handler_admin
 from auto_xdp.install_state import atomic_write_json
 from auto_xdp.backends.base import BackendStatus, PortBackend
 from auto_xdp.abuseipdb import AbuseIPDBSyncer, BpfRiskMaps
+from auto_xdp.bpf import conntrack as linux_conntrack
 from auto_xdp.bpf.syscall import map_id, obj_get, probe_inner_map_support
 from auto_xdp.bpf.maps import (
     BpfAclMaps,
@@ -91,6 +92,8 @@ def _cfg_flag_drop_events(m: BpfRuntimeConfigMap | None) -> bool | None:
 
 class XdpBackend(PortBackend):
     name = cfg.BACKEND_XDP
+    # Last conntrack activation check error, to log each distinct failure once.
+    _conntrack_check_error: str | None = None
 
     @classmethod
     def probe(cls, config: cfg.ConfigSnapshot | None = None) -> BackendStatus:
@@ -752,6 +755,36 @@ class XdpBackend(PortBackend):
             return
         log.info("Minecraft protection profile %d disabled", profile_id)
         return
+
+    def ensure_conntrack_activation(self) -> bool | None:
+        """Repair the conntrack activation table that the XDP data path needs.
+
+        Without it, conntrack hooks may be inactive and XDP drops replies to
+        connections this host initiated. Returns True after a repair, False
+        when the table was intact, and None when the check itself failed.
+        Errors are logged once per distinct message and never interrupt
+        policy reconciliation.
+        """
+        try:
+            repaired = linux_conntrack.ensure_active()
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+            detail = getattr(exc, "stderr", "") or str(exc)
+            if detail != self._conntrack_check_error:
+                log.error("Cannot verify Linux conntrack activation table inet %s: %s",
+                          linux_conntrack.TABLE, detail)
+            else:
+                log.debug("Linux conntrack activation check still failing: %s", detail)
+            self._conntrack_check_error = detail
+            return None
+        if self._conntrack_check_error is not None:
+            log.info("Linux conntrack activation check recovered.")
+            self._conntrack_check_error = None
+        if repaired:
+            log.warning("Linux conntrack activation table inet %s was missing or incomplete; "
+                        "re-created it so XDP keeps admitting outbound replies.",
+                        linux_conntrack.TABLE)
+        return repaired
+
 
     def is_stale(self) -> bool:
         """Return True if the pinned tcp_whitelist map has been replaced since init."""

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from auto_xdp.bpf.conntrack import OWNER, TABLE, configure, verify_lookup_abi
+from auto_xdp.bpf.conntrack import OWNER, TABLE, configure, ensure_active, verify_lookup_abi
 
 
 @pytest.mark.parametrize("exists,remove", [(False, False), (True, False),
@@ -75,3 +75,53 @@ def test_direction_abi_is_required_even_when_lookup_kfunc_exists(direction_offse
             with pytest.raises(RuntimeError, match="REPLY direction ABI"):
                 verify_lookup_abi()
     assert run.call_args.args[0][5] == "/sys/kernel/btf/" + ("nf_conntrack" if module else "vmlinux")
+
+
+def _table_rows(*, owned=True, chain=True, rule=True):
+    rows = [{"table": {"family": "inet", "name": TABLE, **({"comment": OWNER} if owned else {})}}]
+    if chain:
+        rows.append({"chain": {"family": "inet", "table": TABLE, "name": "track", "hook": "output"}})
+    if rule:
+        rows.append({"rule": {"family": "inet", "table": TABLE, "chain": "track", "expr": []}})
+    return json.dumps({"nftables": rows})
+
+
+def _listing(exists):
+    table = {"table": {"family": "inet", "name": TABLE, "comment": OWNER}}
+    return subprocess.CompletedProcess([], 0, json.dumps({"nftables": [table] if exists else []}))
+
+
+def test_intact_activation_table_is_left_alone():
+    with patch("auto_xdp.bpf.conntrack.subprocess.run", side_effect=[
+        _listing(True), subprocess.CompletedProcess([], 0, _table_rows()),
+    ]) as run:
+        assert ensure_active() is False
+    assert all(call.args[0][:2] == ["nft", "-j"] for call in run.call_args_list)
+
+
+@pytest.mark.parametrize("damage", ["flushed", "no_chain", "no_rule"])
+def test_missing_or_emptied_activation_table_is_recreated(damage):
+    if damage == "flushed":
+        replies = [_listing(False), _listing(False)]
+    else:
+        rows = _table_rows(chain=damage != "no_chain", rule=damage == "no_chain")
+        replies = [_listing(True), subprocess.CompletedProcess([], 0, rows),
+                   _listing(True), subprocess.CompletedProcess([], 0, rows)]
+    replies.append(subprocess.CompletedProcess([], 0, ""))
+    with patch("auto_xdp.bpf.conntrack.subprocess.run", side_effect=replies) as run:
+        assert ensure_active() is True
+    mutations = [call for call in run.call_args_list if call.args[0] == ["nft", "-f", "-"]]
+    assert len(mutations) == 1
+    commands = mutations[0].kwargs["input"]
+    assert "ct state established counter" in commands and "flush ruleset" not in commands
+
+
+def test_unowned_table_is_not_repaired():
+    rows = _table_rows(owned=False, chain=False, rule=False)
+    with patch("auto_xdp.bpf.conntrack.subprocess.run", side_effect=[
+        _listing(True), subprocess.CompletedProcess([], 0, rows),
+        _listing(True), subprocess.CompletedProcess([], 0, rows),
+    ]) as run:
+        with pytest.raises(RuntimeError, match="unowned"):
+            ensure_active()
+    assert all(call.args[0][:2] == ["nft", "-j"] for call in run.call_args_list)

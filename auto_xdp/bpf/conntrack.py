@@ -35,6 +35,36 @@ def verify_lookup_abi() -> None:
     raise RuntimeError("kernel bpf_ct_opts lacks the supported REPLY direction ABI")
 
 
+def _list_tables() -> list[dict]:
+    result = subprocess.run(["nft", "-j", "list", "tables"],
+                            capture_output=True, text=True, check=True, timeout=10)
+    return json.loads(result.stdout)["nftables"]
+
+
+def ensure_active() -> bool:
+    """Re-create the activation table if something removed or emptied it.
+
+    Operators and tools routinely run `nft flush ruleset` (for example a
+    restart of nftables.service). That silently releases the ct reference, so
+    XDP conntrack lookups stop finding replies to host-initiated connections.
+    Returns True when a repair was needed. An unowned table is never changed.
+    """
+    exists = any(row.get("table", {}).get("family") == "inet" and
+                 row["table"].get("name") == TABLE for row in _list_tables())
+    if exists:
+        result = subprocess.run(["nft", "-j", "list", "table", "inet", TABLE],
+                                capture_output=True, text=True, check=True, timeout=10)
+        rows = json.loads(result.stdout)["nftables"]
+        owned = any(row.get("table", {}).get("comment") == OWNER for row in rows)
+        hooked = any(row.get("chain", {}).get("name") == "track" and
+                     row["chain"].get("hook") == "output" for row in rows)
+        tracked = any(row.get("rule", {}).get("chain") == "track" for row in rows)
+        if owned and hooked and tracked:
+            return False
+    configure()
+    return True
+
+
 def configure(*, remove: bool = False) -> None:
     # Listing all tables distinguishes absence from permission/tooling errors.
     result = subprocess.run(["nft", "-j", "list", "tables"],
