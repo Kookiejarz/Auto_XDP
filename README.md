@@ -82,6 +82,10 @@ it does not replace your firewall or NAT rules. Full disable/uninstall removes
 this table. Lookup currently supports conntrack zone 0 in the ingress network
 namespace; NOTRACK and other conntrack zones do not receive this exception.
 
+While enforcement is active, the daemon checks this activation table every five
+seconds and restores it if removed or emptied. It leaves tables owned by other
+software untouched and backs off failed checks, up to five minutes.
+
 The installer checks and installs the required toolchain, including `clang`, `llvm`, `libbpf`, `bpftool`, and `iproute2`, on supported distributions. See the [compatibility notes](https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade) before installing on a production host.
 
 `interfaces.xdp_mode = "auto"` prefers generic XDP on explicitly included veth

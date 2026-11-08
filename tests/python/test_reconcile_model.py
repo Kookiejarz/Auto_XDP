@@ -3,6 +3,7 @@ from dataclasses import replace
 import errno
 import socket
 import struct
+import subprocess
 from unittest import mock
 
 import pytest
@@ -361,3 +362,31 @@ def test_canonical_listener_identity_changes_profile_generation_without_legacy_d
 def test_candidate_rejects_limits_outside_the_native_rate_abi(value):
     with pytest.raises(ValueError):
         cfg.parse_toml_config({"rate_limits": {"udp_by_proc": {"web": value}}})
+
+
+@pytest.mark.parametrize("outcome,expected", [(False, False), (True, True), ("error", None)])
+def test_conntrack_activation_check_reports_repairs_and_never_raises(outcome, expected, caplog):
+    backend = XdpBackend.__new__(XdpBackend)
+    effect = (subprocess.CalledProcessError(1, ["nft"], stderr="nft: permission denied")
+              if outcome == "error" else None)
+    with mock.patch("auto_xdp.backends.xdp.linux_conntrack.ensure_active",
+                    return_value=outcome, side_effect=effect):
+        assert backend.ensure_conntrack_activation() is expected
+    if outcome == "error":
+        assert "permission denied" in caplog.text
+    elif outcome:
+        assert "re-created" in caplog.text
+
+
+
+def test_conntrack_activation_check_logs_each_distinct_failure_once(caplog):
+    backend = XdpBackend.__new__(XdpBackend)
+    failure = subprocess.CalledProcessError(1, ["nft"], stderr="nft: permission denied")
+    with mock.patch("auto_xdp.backends.xdp.linux_conntrack.ensure_active", side_effect=failure):
+        for _ in range(3):
+            assert backend.ensure_conntrack_activation() is None
+    errors = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1
+    with mock.patch("auto_xdp.backends.xdp.linux_conntrack.ensure_active", return_value=False):
+        assert backend.ensure_conntrack_activation() is False
+    assert backend._conntrack_check_error is None

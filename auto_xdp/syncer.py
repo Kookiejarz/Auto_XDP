@@ -30,6 +30,11 @@ DEBOUNCE_MAX_WAIT_SECONDS = 1.0
 # Event-triggered reconciles also perform a full discovery, so this interval is
 # the maximum time the daemon may go without re-reading the system state.
 FULL_RECONCILE_INTERVAL_SECONDS = 30.0
+# `nft flush ruleset` (e.g. restarting nftables.service) removes the conntrack
+# activation table the XDP data path depends on; re-check it this often, and
+# back off up to the maximum while the check itself keeps failing.
+CONNTRACK_CHECK_INTERVAL_SECONDS = 5.0
+CONNTRACK_CHECK_MAX_INTERVAL_SECONDS = 300.0
 
 
 def observe_system_state(*, config: cfg.ConfigSnapshot | None = None):
@@ -171,6 +176,8 @@ def watch(
     immediate = False
     last_reconcile_t = 0.0
     last_stale_check_t = 0.0
+    last_conntrack_check_t: float | None = None
+    conntrack_check_interval = CONNTRACK_CHECK_INTERVAL_SECONDS
     reload_requested = False
     mode_only_synced = False
 
@@ -321,6 +328,17 @@ def watch(
                     # Arm debounce so a corrective sync runs shortly.
                     last_event_t = monotonic()
                     first_event_t = last_event_t
+
+            if (backend is not None and not dry_run
+                    and hasattr(backend, "ensure_conntrack_activation")
+                    and (last_conntrack_check_t is None
+                         or monotonic() - last_conntrack_check_t >= conntrack_check_interval)):
+                last_conntrack_check_t = monotonic()
+                if backend.ensure_conntrack_activation() is None:
+                    conntrack_check_interval = min(
+                        conntrack_check_interval * 2, CONNTRACK_CHECK_MAX_INTERVAL_SECONDS)
+                else:
+                    conntrack_check_interval = CONNTRACK_CHECK_INTERVAL_SECONDS
 
             if monotonic() - last_stale_check_t >= 30.0:
                 last_stale_check_t = monotonic()
