@@ -521,6 +521,11 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
          * before policy/cookie dispatch, then bound all transport parsing by
          * its declared payload as well as the verifier's physical data_end. */
         __u32 ip_len = bpf_ntohs(ip->tot_len);
+        /* Some vendor verifiers lose scalar bounds at BPF_END. Keep an
+         * explicit 16-bit bound before packet-pointer arithmetic; the
+         * compiler barrier prevents LLVM from removing this redundant mask. */
+        barrier_var(ip_len);
+        ip_len &= 0xffffU;
         if (ip->version != 4 || ip_len < ip_hlen)
             return drop_unclassified(ctx, CNT_IP_HEADER_INVALID);
         if ((void *)ip + ip_len > data_end)
@@ -628,6 +633,8 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
 
         void *trans_data = (void *)(ipv6 + 1);
         __u32 payload_len = bpf_ntohs(ipv6->payload_len);
+        barrier_var(payload_len);
+        payload_len &= 0xffffU;
         if (trans_data + payload_len > data_end)
             return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
 

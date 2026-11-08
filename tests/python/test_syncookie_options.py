@@ -128,10 +128,19 @@ def test_production_object_builds_without_failed_unroll_requests(compiler, tmp_p
                            capture_output=True, text=True)
     if probe.returncode:
         pytest.skip("Clang BPF target is unavailable")
+    # Match the installer: BPF's target macros alone can make Linux/glibc
+    # headers select a different host ABI (for example x86's 32-bit stubs).
+    arch_flags = subprocess.check_output([
+        "bash", "-c",
+        'source "$1"; resolve_bpf_target_arch; '
+        'printf "%s\\n" "-D__TARGET_ARCH_${TARGET_ARCH}" "$HOST_ARCH_FLAG"',
+        "bash", str(ROOT / "lib/setup/build.sh"),
+    ], text=True).splitlines()
     multiarch = Path("/usr/include") / (platform.machine() + "-linux-gnu")
     command = [compiler, "-O3", "-g", "-target", "bpf", "-mcpu=v3",
                "-fno-stack-protector", "-Wall", "-Werror=pass-failed",
                "-I" + str(ROOT / "bpf/include")]
+    command.extend(flag for flag in arch_flags if flag)
     if multiarch.is_dir():
         command.append("-I" + str(multiarch))
     command.extend(["-c", str(SOURCE), "-o", str(tmp_path / "xdp_syncookie.o")])
