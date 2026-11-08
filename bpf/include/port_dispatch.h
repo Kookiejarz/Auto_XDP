@@ -115,7 +115,13 @@ static __always_inline int dispatch_tcp_profile(
     return XDP_DROP;
 }
 
-static __always_inline int dispatch_syncookie(
+/* Returns only when the optional cookie program is absent, for example while a
+ * reload installs it into the new generation. Cookies are mitigation, not
+ * authorization: the caller continues on its normal (rate-limited) path. If
+ * the program is not installed, the runtime (after a reload) or the daemon
+ * (on its next sync) closes the cookie endpoints.
+ */
+static __always_inline void try_dispatch_syncookie(
     struct xdp_md *ctx, const struct flow_key *ct,
     __u16 l3_off, __u16 inner_off)
 {
@@ -134,11 +140,6 @@ static __always_inline int dispatch_syncookie(
     }
     bpf_tail_call(ctx, &syncookie_prog_array, 0);
     count(CNT_SYN_COOKIE_TAILCALL_MISS);
-    count(CNT_TCP_DROP);
-    emit_drop(ctx, IPPROTO_TCP, ct->family, ct->saddr, ct->daddr,
-              ct->sport, ct->dport, CNT_SYN_COOKIE_TAILCALL_MISS,
-              bpf_ktime_get_ns());
-    return XDP_DROP;
 }
 
 /* Same as try_tcp_port_dispatch but for UDP. */

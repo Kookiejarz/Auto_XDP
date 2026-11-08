@@ -42,8 +42,9 @@ from auto_xdp.bpf.maps import (
     XDP_CFG_FLAG_BOGON_DISABLED,
     XDP_CFG_FLAG_DROP_EVENTS_DISABLED,
     XDP_CFG_FLAG_SLOT_DROP,
+    XDP_CFG_FLAG_ECN_REFUSED,
 )
-from auto_xdp.policy import rate_map_entries_v6
+from auto_xdp.policy import derived_syncookie_port_rate, rate_map_entries_v6
 from auto_xdp.discovery.services import service_name
 from auto_xdp.state import (AppliedState, BackendProjection, DesiredState, ObservedState, ReconcilePlan,
                             ApplyResult, ApplyFailure, ApplyOperation, EndpointKey,
@@ -90,10 +91,19 @@ def _cfg_flag_drop_events(m: BpfRuntimeConfigMap | None) -> bool | None:
     return None if flags is None else not bool(flags & XDP_CFG_FLAG_DROP_EVENTS_DISABLED)
 
 
+def _legacy_syncookie_policy(policy: EndpointPolicy) -> EndpointPolicy:
+    """The endpoint policy as earlier releases derived its default cookie base."""
+    if policy.syncookie_rate == derived_syncookie_port_rate(policy.syn_rate):
+        return replace(policy, syncookie_rate=policy.syn_rate)
+    return policy
+
+
 class XdpBackend(PortBackend):
     name = cfg.BACKEND_XDP
     # Last conntrack activation check error, to log each distinct failure once.
     _conntrack_check_error: str | None = None
+    # SYN-cookie SYN-ACKs must decline ECN where the listener would.
+    _TCP_ECN_SYSCTL = Path("/proc/sys/net/ipv4/tcp_ecn")
 
     @classmethod
     def probe(cls, config: cfg.ConfigSnapshot | None = None) -> BackendStatus:
@@ -316,7 +326,8 @@ class XdpBackend(PortBackend):
         return values
 
     def _policy_fingerprint(
-        self, desired: BackendProjection, endpoint: tuple[str, int], profile: str
+        self, desired: BackendProjection, endpoint: tuple[str, int], profile: str,
+        *, legacy_syncookie_base: bool = False,
     ) -> str:
         zone, port = endpoint
         material = [
@@ -342,6 +353,18 @@ class XdpBackend(PortBackend):
             for (protocol, cidr), ports in desired.acl_rules.items()
             if protocol == "tcp" and port in ports
         )
+        policies = [(key, value) for key, value in desired.endpoint_policies.items()
+                    if key[0] == "tcp" and key[2] == port and key[3] == zone]
+        cookie_rate = desired.tcp_syncookie_rate_limits.get(port)
+        if legacy_syncookie_base and not desired.config.SYNCOOKIE_PORT_RATE_DEFAULT:
+            # Earlier releases derived the default cookie base from the
+            # per-source SYN limit. Recreate that value so an upgrade can keep
+            # the generation of an otherwise unchanged endpoint.
+            policies = [(key, _legacy_syncookie_policy(value)) for key, value in policies]
+            syn_rate = desired.tcp_syn_rate_limits.get(port)
+            if (cookie_rate is not None and syn_rate is not None
+                    and cookie_rate == derived_syncookie_port_rate(syn_rate)):
+                cookie_rate = syn_rate
         payload = (
             zone,
             port,
@@ -350,12 +373,11 @@ class XdpBackend(PortBackend):
             desired.tcp_syn_rate_limits.get(port),
             desired.tcp_syn_agg_rate_limits.get(port),
             desired.tcp_syncookie_modes.get(port),
-            desired.tcp_syncookie_rate_limits.get(port),
+            cookie_rate,
             endpoint_acl,
             desired.bogon_filter_enabled,
             sorted(material),
-            tuple(sorted((key, value) for key, value in desired.endpoint_policies.items()
-                         if key[0] == "tcp" and key[2] == port and key[3] == zone)),
+            tuple(sorted(policies)),
         )
         return hashlib.sha256(repr(payload).encode()).hexdigest()
 
@@ -365,6 +387,12 @@ class XdpBackend(PortBackend):
         fingerprint = self._policy_fingerprint(desired, endpoint, profile)
         current = self._policy_generations.get(endpoint)
         if current is not None and current[0] == fingerprint:
+            return current[1]
+        if current is not None and current[0] == self._policy_fingerprint(
+                desired, endpoint, profile, legacy_syncookie_base=True):
+            # Only the derivation of the default cookie base changed; the
+            # authorization is identical, so verified sessions stay valid.
+            self._policy_generations[endpoint] = (fingerprint, current[1])
             return current[1]
         generation = secrets.randbits(64) or 1
         self._policy_generations[endpoint] = (fingerprint, generation)
@@ -755,6 +783,22 @@ class XdpBackend(PortBackend):
             return
         log.info("Minecraft protection profile %d disabled", profile_id)
         return
+
+    def _cfg_flags(self, desired: BackendProjection) -> int:
+        """Runtime gate flags plus host facts the data path must mirror.
+
+        With net.ipv4.tcp_ecn=0 the listener refuses ECN, and Linux clears
+        ecn_ok on handed-off cookie sockets too; the XDP SYN-ACK must then not
+        offer ECN either, or only the client would use it.
+        """
+        flags = _compute_cfg_flags(desired)
+        try:
+            if self._TCP_ECN_SYSCTL.read_text(encoding="ascii").strip() == "0":
+                flags |= XDP_CFG_FLAG_ECN_REFUSED
+        except OSError:
+            pass
+        return flags
+
 
     def ensure_conntrack_activation(self) -> bool | None:
         """Repair the conntrack activation table that the XDP data path needs.
@@ -1189,7 +1233,7 @@ class XdpBackend(PortBackend):
             self._apply_acl_delta(plan, dry_run)
 
         if self.runtime_config_map is not None:
-            cfg_flags = _compute_cfg_flags(desired_state)
+            cfg_flags = self._cfg_flags(desired_state)
             current = self.runtime_config_map.get()
             current_flags = self.runtime_config_map.get_cfg_flags() or 0
             if desired_state.xdp_runtime_config != current or cfg_flags != current_flags:
@@ -1511,7 +1555,7 @@ class XdpBackend(PortBackend):
         if not dry_run and self.runtime_config_map is not None:
             timing = self.runtime_config_map.get()
             flags = self.runtime_config_map.get_cfg_flags()
-            if timing == desired_state.xdp_runtime_config and flags == _compute_cfg_flags(desired_state):
+            if timing == desired_state.xdp_runtime_config and flags == self._cfg_flags(desired_state):
                 result.applied.evidence["runtime_config"] = "confirmed"
             else:
                 result.applied.evidence["runtime_config"] = "unknown"

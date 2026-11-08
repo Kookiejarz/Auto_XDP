@@ -22,8 +22,9 @@ static __always_inline int check_tcp_policy(
     struct xdp_runtime_cfg *cfg = runtime_cfg();
     struct tcp_endpoint_policy endpoint_policy = {};
     __u8 reason = CNT_PORT_NOT_AUTHORIZED;
+    enum linux_ct_class ct_class = linux_ct_classify(ctx, key, IPPROTO_TCP);
 
-    if (linux_ct_reply(ctx, key, IPPROTO_TCP)) {
+    if (ct_class == LINUX_CT_REPLY) {
         count(CNT_TCP_PASS);
         return XDP_PASS;
     }
@@ -50,7 +51,7 @@ static __always_inline int check_tcp_policy(
             enum syncookie_guard_verdict cookie =
                 syncookie_guard_check(now, dest_port, cfg);
             if (cookie == SYN_GUARD_COOKIE)
-                return dispatch_syncookie(ctx, key, l3_off, inner_off);
+                try_dispatch_syncookie(ctx, key, l3_off, inner_off);
             if (cookie == SYN_GUARD_DROP) {
                 count(CNT_SYN_COOKIE_BUDGET_DROP);
                 reason = CNT_SYN_COOKIE_PORT_BUDGET_DROP;
@@ -69,8 +70,13 @@ static __always_inline int check_tcp_policy(
         return XDP_PASS;
     }
 
-    if (pure_ack && syncookie_ack_enabled(dest_port))
-        return dispatch_syncookie(ctx, key, l3_off, inner_off);
+    /* Flows conntrack already knows, in any TCP state, never reach the cookie
+     * validator: pure ACKs of half-closed and closing flows and of handshakes
+     * Linux answered itself must pass. A cookie answer on a reused tuple with a
+     * stale ORIGINAL entry also skips it; the TC handoff validates that cookie. */
+    if (pure_ack && ct_class != LINUX_CT_ORIGINAL &&
+        syncookie_ack_enabled(dest_port, now))
+        try_dispatch_syncookie(ctx, key, l3_off, inner_off);
 
     if (endpoint_policy.profile_id)
         return dispatch_tcp_profile(
@@ -112,7 +118,7 @@ static __always_inline int check_tcp_ipv4(
 
     __u8  tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
-    bool pure_ack = tcp_flags == TCP_FLAG_ACK && l4_len == (__u32)tcp->doff * 4U;
+    bool pure_ack = tcp_pure_ack(tcp_flags, l4_len, tcp->doff);
     fill_flow_key_v4(&key, ip->saddr, ip->daddr, tcp->source, tcp->dest);
 
     // Malformed-packet check already ran above; fragments dropped before we arrive.
@@ -151,7 +157,7 @@ static __always_inline int check_tcp_ipv6(
 
     __u8 tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
-    bool pure_ack = tcp_flags == TCP_FLAG_ACK && l4_len == (__u32)tcp->doff * 4U;
+    bool pure_ack = tcp_pure_ack(tcp_flags, l4_len, tcp->doff);
     fill_flow_key_v6(&key, &ipv6->saddr, &ipv6->daddr, tcp->source, tcp->dest);
 
     // Malformed-packet check already ran above; fragments dropped before we arrive.

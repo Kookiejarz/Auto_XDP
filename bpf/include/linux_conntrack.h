@@ -89,12 +89,24 @@ static __always_inline struct bpf_ct_opts___local linux_ct_opts(__u8 l4proto)
     };
 }
 
-/* Lookup is read-only: never create state from an unsolicited ingress packet.
- * REPLY is relative to the connection initiator, not the interface direction.
- * Do not require SEEN_REPLY/ESTABLISHED: the first DNS reply/SYN-ACK precedes
- * those transitions. The stack still validates packets after XDP_PASS.
+/* The lookup kfunc reports a missing entry as -ENOENT in opts.error. */
+#define LINUX_CT_ENOENT 2
+
+enum linux_ct_class {
+    LINUX_CT_MISS = 0,     /* no entry for this tuple */
+    LINUX_CT_ORIGINAL = 1, /* known flow, packet sent by its initiator */
+    LINUX_CT_REPLY = 2,    /* confirmed reply to a flow this host initiated */
+    LINUX_CT_ERROR = 3,    /* lookup failed; callers treat it like a miss */
+};
+
+/* One read-only lookup classifies the packet; never create state from an
+ * unsolicited ingress packet. Directions are relative to the connection
+ * initiator, not the interface. REPLY does not require SEEN_REPLY or
+ * ESTABLISHED: the first DNS reply/SYN-ACK precedes those transitions.
+ * ORIGINAL accepts any TCP state, so half-closed and closing flows stay known.
+ * The stack still validates packets after XDP_PASS.
  */
-static __always_inline bool linux_ct_reply(
+static __always_inline enum linux_ct_class linux_ct_classify(
     struct xdp_md *ctx, const struct flow_key *key, __u8 l4proto)
 {
     struct bpf_sock_tuple tuple;
@@ -103,11 +115,22 @@ static __always_inline bool linux_ct_reply(
     struct nf_conn *ct = bpf_xdp_ct_lookup(
         ctx, &tuple, linux_ct_tuple_size(key), &opts, sizeof(opts));
     if (!ct)
-        return false;
-    bool reply = opts.dir == NF_CT_DIR_REPLY &&
-                 (ct->status & IPS_CONFIRMED_LOCAL);
+        return opts.error == -LINUX_CT_ENOENT ? LINUX_CT_MISS : LINUX_CT_ERROR;
+    enum linux_ct_class cls = LINUX_CT_MISS;
+    if (opts.dir == NF_CT_DIR_REPLY) {
+        if (ct->status & IPS_CONFIRMED_LOCAL)
+            cls = LINUX_CT_REPLY;
+    } else if (opts.dir == NF_CT_DIR_ORIGINAL) {
+        cls = LINUX_CT_ORIGINAL;
+    }
     bpf_ct_release(ct);
-    return reply;
+    return cls;
+}
+
+static __always_inline bool linux_ct_reply(
+    struct xdp_md *ctx, const struct flow_key *key, __u8 l4proto)
+{
+    return linux_ct_classify(ctx, key, l4proto) == LINUX_CT_REPLY;
 }
 
 static __always_inline void linux_ct_snapshot(

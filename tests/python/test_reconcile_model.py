@@ -514,3 +514,51 @@ def test_conntrack_activation_check_logs_each_distinct_failure_once(caplog):
     with mock.patch("auto_xdp.backends.xdp.linux_conntrack.ensure_active", return_value=False):
         assert backend.ensure_conntrack_activation() is False
     assert backend._conntrack_check_error is None
+
+
+def _minecraft_projection(**policy):
+    fields = {"profile": "minecraft", "syn_rate": 100, "syncookie_rate": 100, **policy}
+    projection, _ = project_endpoint_policies(target({KEY: EndpointPolicy(True, "grant", **fields)}))
+    return projection
+
+
+@pytest.mark.parametrize("syncookie_mode", ["off", "auto"])
+def test_upgrade_to_port_wide_cookie_base_keeps_verified_session_generation(syncookie_mode):
+    # Earlier releases stored syncookie_rate = per-source syn_rate (100); the
+    # same endpoint now derives the built-in 1000. Nothing about authorization
+    # changed, so the generation that verified Minecraft sessions carry stays.
+    backend = XdpBackend.__new__(XdpBackend)
+    endpoint = ("public", KEY[2])
+    old = _minecraft_projection(syncookie_mode=syncookie_mode)
+    backend._policy_generations = {
+        endpoint: (backend._policy_fingerprint(old, endpoint, "minecraft"), 42)}
+    new = _minecraft_projection(syncookie_mode=syncookie_mode,
+                                syncookie_rate=cfg.SYNCOOKIE_PORT_RATE_BUILTIN)
+
+    assert backend._endpoint_generation(new, endpoint, "minecraft") == 42
+    assert backend._policy_generations[endpoint] == (
+        backend._policy_fingerprint(new, endpoint, "minecraft"), 42)
+
+
+def test_real_policy_changes_still_roll_the_generation_after_upgrade():
+    backend = XdpBackend.__new__(XdpBackend)
+    endpoint = ("public", KEY[2])
+    old = _minecraft_projection()
+    backend._policy_generations = {
+        endpoint: (backend._policy_fingerprint(old, endpoint, "minecraft"), 42)}
+    changed = _minecraft_projection(syn_rate=50, syncookie_rate=cfg.SYNCOOKIE_PORT_RATE_BUILTIN)
+
+    assert backend._endpoint_generation(changed, endpoint, "minecraft") != 42
+
+
+@pytest.mark.component
+@pytest.mark.parametrize("content,refused", [("0\n", True), ("2\n", False), ("3\n", False), (None, False)])
+def test_runtime_flags_mirror_host_ecn_refusal(tmp_path, content, refused):
+    from auto_xdp.bpf.maps import XDP_CFG_FLAG_ECN_REFUSED
+    backend = XdpBackend.__new__(XdpBackend)
+    backend._TCP_ECN_SYSCTL = tmp_path / "tcp_ecn"
+    if content is not None:
+        backend._TCP_ECN_SYSCTL.write_text(content)
+    projection, _ = project_endpoint_policies(target())
+    flags = backend._cfg_flags(projection)
+    assert bool(flags & XDP_CFG_FLAG_ECN_REFUSED) is refused

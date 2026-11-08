@@ -242,13 +242,14 @@ syncookie_guard_check(__u64 now, __u32 dest_port,
     __u32 *mode = bpf_map_lookup_elem(&tcp_synck_policy, &dest_port);
     if (!mode || !*mode)
         return SYN_GUARD_ALLOW;
+    /* The base is a whole-port SYN rate. Never fall back to the per-source SYN
+     * limit: that unit is far smaller and would shed a port at trivial rates.
+     * A base of 0 disables rate triggers; it never drops: always mode still
+     * challenges every SYN, auto mode stays NORMAL. */
     __u32 *configured = bpf_map_lookup_elem(&sync_port_limit, &dest_port);
-    struct tcp_port_policy_cfg *policy =
-        bpf_map_lookup_elem(&tcp_port_policies, &dest_port);
-    __u32 base = configured && *configured ? *configured :
-        (policy ? policy->syn_rate_max : 0);
+    __u32 base = configured ? *configured : 0;
     if (!base)
-        return *mode == 2 ? SYN_GUARD_DROP : SYN_GUARD_ALLOW;
+        return *mode == 2 ? SYN_GUARD_COOKIE : SYN_GUARD_ALLOW;
 
     int port_count = syncookie_port_count(dest_port, now, cfg);
     if (port_count < 0)
@@ -283,7 +284,14 @@ syncookie_guard_check(__u64 now, __u32 dest_port,
     return SYN_GUARD_ALLOW;
 }
 
-static __always_inline bool syncookie_ack_enabled(__u32 dest_port)
+/* Linux accepts a cookie for up to two minutes (MAX_SYNCOOKIE_AGE), plus slack. */
+#define SYNCOOKIE_ACK_GRACE_NS (125ULL * 1000000000ULL)
+
+/* ACK validation follows issued cookies, not the momentary guard state.
+ * cooldown_until_ns is refreshed while CHALLENGE or SHED holds, and cookies are
+ * only issued up to it, so the window stays open through SHED and for a full
+ * cookie lifetime after the last challenge, then closes without a write. */
+static __always_inline bool syncookie_ack_enabled(__u32 dest_port, __u64 now)
 {
     __u32 zero = 0;
     struct syncookie_runtime_cfg *runtime =
@@ -295,7 +303,10 @@ static __always_inline bool syncookie_ack_enabled(__u32 dest_port)
         return true;
     struct syncookie_port_state *state =
         bpf_map_lookup_elem(&sync_port_state, &dest_port);
-    return state && state->state == 1;
+    if (!state)
+        return false;
+    __u64 until = *(volatile __u64 *)&state->cooldown_until_ns;
+    return until && now < until + SYNCOOKIE_ACK_GRACE_NS;
 }
 
 static __always_inline int udp_rate_check(struct flow_key *key, __u64 now,
