@@ -100,14 +100,16 @@ def test_xdp_scope_abi_and_private_tombstone_do_not_widen_ipv4_address():
     backend = XdpBackend.__new__(XdpBackend)
     desired = target(ZONES={"public": {"interfaces": []}, "trusted": {"interfaces": ["wg0"]}})
     with mock.patch.object(socket, "if_nametoindex", return_value=7):
-        values, blocked = backend._scope_values(desired)
+        values, blocked, deferred = backend._scope_values(desired)
     assert not blocked
+    assert not deferred
     assert values[struct.pack("=IHBB16s", 0, 8080, 6, 2, socket.inet_aton(KEY[1]) + bytes(12))] == 1
     assert values[struct.pack("=IHBB16s", 7, 8080, 6, 2, bytes(16))] == 0
     assert all(len(raw) == 24 and raw[7] == 2 for raw in values)
     private = target({("udp", "::", 53, "trusted"): EndpointPolicy(True, "grant")}, ZONES={})
-    values, blocked = backend._scope_values(private)
+    values, blocked, deferred = backend._scope_values(private)
     assert not values and blocked
+    assert not deferred
 
 
 class ScopeMap:
@@ -156,6 +158,128 @@ def xdp_backend():
     backend.endpoint_map = ScopeMap()
     backend._save_policy_generations = lambda: None
     return backend
+
+
+class ZoneMap:
+    path = "zone_ports"
+
+    def __init__(self):
+        self.values = {}
+
+    def entries(self):
+        return set(self.values)
+
+    def active_entries(self):
+        return {key for key, value in self.values.items() if value[0]}
+
+    def value(self, ifindex, port):
+        return self.values.get((ifindex, port))
+
+    def set(self, ifindex, port, value, dry_run=False):
+        if not dry_run:
+            self.values[(ifindex, port)] = value if isinstance(value, tuple) else (value,)
+        return True
+
+    def delete(self, ifindex, port, dry_run=False):
+        if not dry_run:
+            self.values.pop((ifindex, port), None)
+        return True
+
+    def verify(self):
+        return 0
+
+@pytest.mark.parametrize("protocol", ["tcp", "udp"])
+@pytest.mark.parametrize("address", ["0.0.0.0", "::"])
+def test_xdp_grants_wait_for_zone_interfaces_and_follow_their_lifecycle(monkeypatch, protocol, address):
+    interfaces = {}
+
+    def index(name):
+        if name not in interfaces:
+            raise OSError("no interface with this name")
+        return interfaces[name]
+
+    monkeypatch.setattr(socket, "if_nametoindex", index)
+    monkeypatch.setattr(socket, "if_nameindex", lambda: [(1, "lo"), (8, "eth0")] +
+                        [(value, name) for name, value in interfaces.items()])
+    private = (protocol, address, 443, "trusted")
+    desired = target({KEY: EndpointPolicy(True, "public grant"),
+                      private: EndpointPolicy(True, "VPN grant")},
+                     ZONES={"public": {"interfaces": []},
+                            "trusted": {"interfaces": ["tailscale0", "wg0"]}})
+    backend = xdp_backend()
+    backend.tcp_zone_map, backend.udp_zone_map = ZoneMap(), ZoneMap()
+    for current in ({}, {"wg0": 7}, {"wg0": 7, "tailscale0": 9}, {}):
+        interfaces.clear()
+        interfaces.update(current)
+        result = backend.reconcile(desired, False)
+        assert result.successful, (result.blocked_endpoints, result.unconfirmed)
+        assert result.applied.endpoint_admission[KEY] == "admitted"
+        allowed_indexes = {
+            struct.unpack("=IHBB16s", raw)[0]
+            for raw, allow in backend.endpoint_map.active().items()
+            if allow and struct.unpack("=IHBB16s", raw)[1] == 443
+        }
+        assert allowed_indexes == set(current.values())  # Never becomes a wildcard grant.
+        assert desired.endpoint_policies[private].allow  # Preserve future intent.
+        if current:
+            assert not result.deferred_endpoints
+            assert result.applied.endpoint_admission[private] == "admitted"
+        else:
+            assert set(result.deferred_endpoints) == {private}
+            assert private in result.closed_endpoints
+            assert result.applied.endpoint_admission[private] == "closed"
+            assert not result.applied.endpoint_policies[private].allow
+
+@pytest.mark.parametrize("failure", ["enumeration", "present_lookup", "map_read", "map_write", "gate", "dry_run"])
+def test_deferred_grants_never_hide_real_apply_or_readback_failures(monkeypatch, failure):
+    private = ("tcp", "0.0.0.0", 443, "trusted")
+    desired = target({KEY: EndpointPolicy(True, "public grant"),
+                      private: EndpointPolicy(True, "VPN grant")},
+                     ZONES={"public": {"interfaces": []}, "trusted": {"interfaces": ["wg0"]}})
+    backend = xdp_backend()
+    monkeypatch.setattr(socket, "if_nametoindex", mock.Mock(side_effect=OSError("lookup failed")))
+    monkeypatch.setattr(socket, "if_nameindex", mock.Mock(
+        side_effect=OSError(errno.EPERM, "enumeration denied") if failure == "enumeration" else None,
+        return_value=[(7, "wg0")] if failure == "present_lookup" else [(1, "lo")]))
+    if failure == "map_read":
+        backend.endpoint_map.unreadable = True
+    elif failure == "map_write":
+        backend.endpoint_map.fail_admit = True
+    elif failure == "gate":
+        backend.runtime_config_map.get_cfg_flags = lambda: 0
+    result = backend.reconcile(desired, failure == "dry_run")
+    assert not result.successful
+    if failure in {"enumeration", "present_lookup"}:
+        assert private in result.blocked_endpoints and not result.deferred_endpoints
+    else:
+        assert private in result.deferred_endpoints
+        assert result.failures or result.unconfirmed or result.dry_run
+
+def test_deferred_grant_is_not_confirmed_if_interface_appears_during_readback(monkeypatch):
+    private = ("tcp", "0.0.0.0", 443, "trusted")
+    desired = target({KEY: EndpointPolicy(True, "public grant"),
+                      private: EndpointPolicy(True, "VPN grant")},
+                     ZONES={"public": {"interfaces": []}, "trusted": {"interfaces": ["wg0"]}})
+    backend = xdp_backend()
+    reads = 0
+
+    def index(name):
+        if reads < 2:
+            raise OSError("no interface with this name")
+        return 7
+
+    def readback():
+        nonlocal reads
+        reads += 1
+        return 0
+
+    monkeypatch.setattr(socket, "if_nametoindex", index)
+    monkeypatch.setattr(socket, "if_nameindex", lambda: [(1, "lo")] + ([(7, "wg0")] if reads >= 2 else []))
+    backend.endpoint_map.verify = readback
+    result = backend.reconcile(desired, False)
+    assert not result.successful
+    assert private in result.deferred_endpoints and private not in result.closed_endpoints
+    assert result.applied.endpoint_admission[private] == "unknown"
 
 
 def test_xdp_reports_partial_failure_and_confirms_closed_admission():
@@ -313,7 +437,7 @@ def test_nft_scope_precedes_trust_and_limits_and_transaction_failure_retains_sta
 def test_revocation_failure_preserves_protection_and_is_not_reported_closed():
     backend = xdp_backend()
     desired = target({KEY: EndpointPolicy(True, "grant", instance_id="new")})
-    values, _ = backend._scope_values(desired)
+    values, _, _ = backend._scope_values(desired)
     backend.endpoint_map.cache = values
     backend.endpoint_map.fail_revoke = True
     backend._endpoint_cache = {KEY: EndpointPolicy(True, "grant", instance_id="old")}

@@ -896,17 +896,40 @@ class XdpBackend(PortBackend):
             result.succeeded.append(operation)
         return ok
 
-    def _scope_values(self, desired: DesiredState) -> tuple[dict[bytes, int], dict[EndpointKey, str]]:
+    @staticmethod
+    def _scope_indexes(interfaces: tuple[str, ...]) -> list[int]:
+        if not interfaces:
+            return [0]
+        indexes = []
+        present = None
+        for name in interfaces:
+            try:
+                indexes.append(socket.if_nametoindex(name))
+            except OSError:
+                # Only a confirmed absence is deferred. Lookup/enumeration
+                # failures on a present interface must still fail closed.
+                if present is None:
+                    present = {name for _, name in socket.if_nameindex()}
+                if name in present:
+                    raise
+        return indexes
+
+    def _scope_values(self, desired: DesiredState) -> tuple[
+        dict[bytes, int], dict[EndpointKey, str], dict[EndpointKey, str],
+    ]:
         values: dict[bytes, int] = {}
         blocked: dict[EndpointKey, str] = {}
+        deferred: dict[EndpointKey, str] = {}
         for key, policy in desired.endpoint_policies.items():
             try:
                 interfaces, families, address = endpoint_scope(key, desired.config)
-                indexes = [socket.if_nametoindex(name) for name in interfaces] if interfaces else [0]
+                indexes = self._scope_indexes(interfaces)
             except (OSError, ValueError) as exc:
                 if policy.allow:
                     blocked[key] = str(exc)
                 continue
+            if not indexes and policy.allow:
+                deferred[key] = "waiting for zone interfaces: " + ", ".join(interfaces)
             for family in families:
                 packed = ipaddress.ip_address(address).packed.ljust(16, b"\0") if address else bytes(16)
                 for index in indexes:
@@ -931,7 +954,7 @@ class XdpBackend(PortBackend):
                         continue
                     deny = struct.pack("=IHBB16s", ifindex, port, proto, family, bytes(16))
                     values.setdefault(deny, 0)
-        return values, blocked
+        return values, blocked, deferred
 
     @staticmethod
     def _unresolved_scope_closed(
@@ -1236,10 +1259,11 @@ class XdpBackend(PortBackend):
         result.plan = self.build_reconcile_plan(projection, self.get_applied_state())
         result.plan.target = original
         result.blocked_endpoints.update(blocked)
-        scope_values, scope_blocked = self._scope_values(projection) if projection.endpoint_policy_enabled else ({}, {})
+        scope_values, scope_blocked, deferred = self._scope_values(projection) if projection.endpoint_policy_enabled else ({}, {}, {})
         result.blocked_endpoints.update(scope_blocked)
+        result.deferred_endpoints.update(deferred)
         for endpoint_key, policy in projection.endpoint_policies.items():
-            if not policy.allow:
+            if not policy.allow or endpoint_key in deferred:
                 continue
             required = []
             if endpoint_key[0] == "sctp":
@@ -1262,12 +1286,13 @@ class XdpBackend(PortBackend):
             if missing:
                 scope_blocked[endpoint_key] = "required protection unavailable: " + ", ".join(missing)
         result.blocked_endpoints.update(scope_blocked)
-        if scope_blocked:
+        closed_scopes = {**deferred, **scope_blocked}
+        if closed_scopes:
             projection = replace(projection, endpoint_policies={
-                key: replace(policy, allow=False, reason=scope_blocked[key]) if key in scope_blocked else policy
+                key: replace(policy, allow=False, reason=closed_scopes[key]) if key in closed_scopes else policy
                 for key, policy in projection.endpoint_policies.items()})
             projection, _ = project_endpoint_policies(projection)
-            scope_values, _ = self._scope_values(projection)
+            scope_values, _, _ = self._scope_values(projection)
         if not hasattr(self, "_policy_generations"):
             self._policy_generations = {}
         if not hasattr(self, "_persisted_policy_generations"):
@@ -1503,7 +1528,7 @@ class XdpBackend(PortBackend):
             for key, policy in checked_policies.items():
                 if key in result.blocked_endpoints:
                     policy = replace(policy, allow=False)
-                values, errors = self._scope_values(replace(desired_state, endpoint_policies={key: policy}))
+                values, errors, _ = self._scope_values(replace(desired_state, endpoint_policies={key: policy}))
                 known = bool(values) and key not in errors and all(scope_map.active().get(raw) == value or
                     (not value and raw not in scope_map.active() and not any(scope_map.active().values()))
                     for raw, value in values.items())
@@ -1518,11 +1543,13 @@ class XdpBackend(PortBackend):
                     if proto in {"tcp", "udp"} and interfaces:
                         zone_map = getattr(self, f"{proto}_zone_map", None)
                         admitted = admitted and result.applied.evidence.get(f"{proto}_zone_map") == "confirmed"
-                        for interface in interfaces:
-                            try:
-                                zone_value = zone_map.value(socket.if_nametoindex(interface), port) if zone_map is not None else None
-                            except OSError:
-                                zone_value = None
+                        try:
+                            indexes = self._scope_indexes(tuple(interfaces))
+                        except OSError:
+                            indexes = []
+                        admitted = admitted and bool(indexes)
+                        for ifindex in indexes:
+                            zone_value = zone_map.value(ifindex, port) if zone_map is not None else None
                             admitted = admitted and bool(zone_value and zone_value[0])
                     else:
                         admitted = admitted and port in getattr(result.applied, f"{proto}_ports")
