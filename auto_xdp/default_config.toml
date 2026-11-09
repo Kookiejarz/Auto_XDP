@@ -117,7 +117,7 @@ exclude_bind_cidrs = []
 source_cidr_v4 = 32
 source_cidr_v6 = 128
 
-[syncookie]
+[modules.syncookie]
 # Optional per-service XDP SYN-cookie challenge. Full listener handoff requires
 # Linux 6.11+; unsupported kernels keep this path disabled.
 enabled = false
@@ -132,20 +132,20 @@ invalid_ack_rate_pps = 1000
 # 0 = max(1000, the port's per-source SYN limit).
 port_rate_default = 0
 
-[syncookie.by_proc]
+[modules.syncookie.by_proc]
 
-[syncookie.by_service]
+[modules.syncookie.by_service]
 
-[syncookie.by_port]
+[modules.syncookie.by_port]
 # "25565" = "always"
 
 # port_rate_by_*: explicit whole-port SYN/s. An explicit 0 disables the rate
 # trigger: auto never challenges, always challenges every SYN without shedding.
-[syncookie.port_rate_by_proc]
+[modules.syncookie.port_rate_by_proc]
 
-[syncookie.port_rate_by_service]
+[modules.syncookie.port_rate_by_service]
 
-[syncookie.port_rate_by_port]
+[modules.syncookie.port_rate_by_port]
 # "25565" = 1000
 
 [rate_limits.syn_by_proc]

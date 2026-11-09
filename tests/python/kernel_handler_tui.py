@@ -102,7 +102,7 @@ def main(root, iface, repository):
             assert run_packet(root, ifindex, packet)[0] == 2
             keys("Down", "Down", "Right", "s")
             wait(lambda s: "Configuration saved" in s, "saved changed compiler parameter")
-            assert config_file.load_toml(config)["handler_settings"]["tui-demo"]["verdict"] == 1
+            assert config_file.load_toml(config)["modules"]["tui-demo"]["draft"]["verdict"] == 1
             assert handlers.pinned_program_id(live / "prog") == first
             assert run_packet(root, ifindex, packet)[0] == 2
             keys("a")

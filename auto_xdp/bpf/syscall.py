@@ -78,6 +78,11 @@ def map_id(fd: int) -> int:
     return _map_info_u32(fd, 4)
 
 
+def program_id(fd: int) -> int:
+    """Return a program's ID; bpf_prog_info shares the type/ID prefix."""
+    return _map_info_u32(fd, 4)
+
+
 def map_create(map_type: int, key_size: int, value_size: int,
                max_entries: int, map_flags: int = 0,
                inner_map_fd: int = 0, name: bytes = b"") -> int:

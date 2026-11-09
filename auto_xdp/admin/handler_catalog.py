@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from auto_xdp import config as configuration
-from auto_xdp.admin import config_file, handlers
+from auto_xdp.admin import config_file, handlers, module_runtime
 
 
 _IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
@@ -89,6 +89,7 @@ class Module:
     error: str = ""
     hooks: str = "XDP; optional TC egress (checked on install/apply)"
     build_error: str = ""
+    companions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -113,11 +114,11 @@ _COOKIE_FIELDS = (
     Field("auto_max_percent", "Auto maximum (%)", "int", 200, 100, 10000),
     Field("challenge_cooldown_seconds", "Challenge cooldown (seconds)", "number", 5, 0),
     Field("invalid_ack_rate_pps", "Invalid ACK limit (pps)", "int", 1000, 1),
-    Field("port_rate_default", "Default port limit (pps; 0 = inherit)", "int", 0, 0),
+    Field("port_rate_default", "Port SYN/s (0 = built-in)", "int", 0, 0),
     *(Field(name, label, "json", {}) for name, label in (
         ("by_port", "Modes by port"), ("by_proc", "Modes by process"), ("by_service", "Modes by service"),
-        ("port_rate_by_port", "Rate limits by port"), ("port_rate_by_proc", "Rate limits by process"),
-        ("port_rate_by_service", "Rate limits by service"))),
+        ("port_rate_by_port", "Port SYN/s by port"), ("port_rate_by_proc", "Port SYN/s by process"),
+        ("port_rate_by_service", "Port SYN/s by service"))),
 )
 
 
@@ -139,7 +140,7 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[Field, ...]]:
         if not isinstance(spec, dict):
             raise ValueError("manifest fields must be objects")
         name, define = str(spec.get("name", "")), str(spec.get("define", ""))
-        if not _IDENTIFIER.fullmatch(name) or name in seen or name in {"enabled", "kind", "target", "subject"}:
+        if not _IDENTIFIER.fullmatch(name) or name in seen or name in {"enabled", "kind", "target", "subject", "draft"}:
             raise ValueError(f"invalid/duplicate parameter: {name}")
         if not _IDENTIFIER.fullmatch(define) or define in definitions:
             raise ValueError(f"invalid/duplicate compiler definition: {define}")
@@ -265,7 +266,7 @@ def discover(context: Context, data: dict[str, Any] | None = None) -> list[Modul
                hooks="XDP + TC egress"),
         Module("syncookie", "SYN Cookie", str(context.install_dir / "xdp_syncookie.o"), "syncookie", 0,
                "TCP handshake protection with Linux listener handoff.", _COOKIE_FIELDS,
-               hooks="XDP + TC ingress"),
+               hooks="XDP + TC ingress", companions=(str(context.install_dir / "tc_syncookie_handoff.o"),)),
     ))
     seen = {str(Path(module.path).resolve()) for module in modules}
     # Treat matching source/object peers as one module. Prefer source when its
@@ -358,15 +359,16 @@ def fields_for(module: Module) -> tuple[Field, ...]:
 
 def settings(module: Module, data: dict[str, Any]) -> dict[str, Any]:
     values = {item.name: copy.deepcopy(item.default) for item in fields_for(module)}
-    if module.kind == "syncookie":
-        values.update({key: value for key, value in data.get("syncookie", {}).items() if key in values})
-        values["enabled"] = data.get("syncookie", {}).get("enabled", False)
+    saved = configuration.module_configs(data).get(module.id, {})
+    if module.kind in {"syncookie"}:
+        values["enabled"] = False
     if module.kind == "minecraft":
         subjects = [name for name, spec in data.get("subjects", {}).items()
                     if spec.get("protection", {}).get("profile") == "minecraft"]
         if len(subjects) == 1:
             values["subject"] = subjects[0]
-    values.update(data.get("handler_settings", {}).get(module.id, {}))
+    values.update({key: value for key, value in saved.items() if key in values})
+    values.update(saved.get("draft", {}))
     return values
 
 
@@ -463,12 +465,10 @@ def _collect_unused_builds(context: Context, data: dict[str, Any]) -> None:
 
 def _effective_config(module: Module, values: dict[str, Any], data: dict[str, Any], obj: Path | None) -> dict[str, Any]:
     result = copy.deepcopy(data)
-    result.setdefault("handler_settings", {})[module.id] = values
+    result.setdefault("modules", {})[module.id] = copy.deepcopy(values)
     kind = values.get("kind", module.kind)
     enabled = values["enabled"]
-    if kind == "syncookie":
-        result.setdefault("syncookie", {}).update(values)
-    elif kind == "minecraft":
+    if kind == "minecraft":
         subject = result.get("subjects", {}).get(values["subject"])
         if not isinstance(subject, dict):
             raise ValueError(f"Unknown policy subject: {values['subject']}")
@@ -476,7 +476,7 @@ def _effective_config(module: Module, values: dict[str, Any], data: dict[str, An
         if current not in {"", "minecraft"}:
             raise ValueError(f"Subject already uses protection profile {current}")
         subject["protection"]["profile"] = "minecraft" if enabled else ""
-    else:
+    elif kind not in {"syncookie"}:
         target = values["target"]
         bindings = result.setdefault("handler_bindings", {}).setdefault(kind, {})
         current = bindings.get(str(target), {})
@@ -622,39 +622,21 @@ def _refresh_managed_runtime(context: Context) -> dict[str, str]:
 
 
 def _managed_result(context: Context, module: Module, values: dict[str, Any], env: dict[str, str]) -> str:
+    if module.kind == "syncookie":
+        interfaces = env.get("IFACES", env.get("IFACE", "")).split()
+        program_id = module_runtime.verify_syncookie(context.bpf_pin_dir, interfaces, enabled=values["enabled"])
+        if not values["enabled"]:
+            return f"{module.name} disabled; all module hooks were removed."
+        return f"{module.name} applied; program {program_id} and TC ingress are active."
     if not values["enabled"]:
         return f"{module.name} disabled in the applied policy."
     root = context.bpf_pin_dir
-    if module.kind == "minecraft":
-        pin, table, key = root / "profile_handlers/tcp/1/prog", root / "tcp_profile_handlers", 1
-        if not pin.exists():
-            return f"Configuration applied; waiting for an eligible TCP endpoint for subject {values['subject']}."
-    else:
-        pin, table, key = root / "syncookie_prog", root / "syncookie_prog_array", 0
-        if not pin.exists():
-            raise RuntimeError("SYN Cookie was not activated; check kernel capability and runtime diagnostics")
+    pin, table, key = root / "profile_handlers/tcp/1/prog", root / "tcp_profile_handlers", 1
+    if not pin.exists():
+        return f"Configuration applied; waiting for an eligible TCP endpoint for subject {values['subject']}."
     program_id = handlers.pinned_program_id(pin)
     if handlers._pinned_u32_lookup(table, struct.pack("=I", key)) != program_id:
         raise RuntimeError(f"{module.name} dispatch entry does not match the loaded program")
-    if module.kind == "syncookie":
-        tc_id = handlers.pinned_program_id(root / "tc_syncookie_handoff_prog")
-        interfaces = env.get("IFACES", env.get("IFACE", "")).split()
-        if not interfaces:
-            raise RuntimeError("Cannot verify SYN Cookie TC ingress: no configured interfaces")
-        for iface in interfaces:
-            result = subprocess.run(["tc", "-j", "filter", "show", "dev", iface, "ingress"],
-                                    capture_output=True, text=True, timeout=5)
-            try:
-                filters = json.loads(result.stdout)
-            except ValueError as exc:
-                raise RuntimeError(f"Cannot verify SYN Cookie TC ingress on {iface}") from exc
-            if result.returncode or not isinstance(filters, list) or not any(
-                isinstance(row, dict) and row.get("kind") == "bpf" and isinstance(row.get("options"), dict)
-                and (row["options"].get("id") == tc_id or
-                     isinstance(row["options"].get("prog"), dict) and row["options"]["prog"].get("id") == tc_id)
-                for row in filters
-            ):
-                raise RuntimeError(f"SYN Cookie TC ingress is not attached on {iface}")
     return f"{module.name} applied; program {program_id} is in the dispatch table."
 
 
@@ -672,8 +654,8 @@ def configure(context: Context, module: Module, updates: dict[str, Any], *, appl
             obj = _checked_object(context, module, values)
         try:
             candidate = _effective_config(module, values, data, obj) if apply else copy.deepcopy(data)
-            candidate.setdefault("handler_settings", {})[module.id] = values
             if not apply:
+                candidate.setdefault("modules", {}).setdefault(module.id, {})["draft"] = values
                 # Validate built-in configuration fields even when saving a draft.
                 if module.kind in {"minecraft", "syncookie"}:
                     _effective_config(module, values, data, Path(module.path))

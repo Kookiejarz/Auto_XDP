@@ -66,16 +66,31 @@ if ! ip netns exec "${_NS}_chk" true 2>/dev/null; then
 fi
 ip netns del "${_NS}_chk" 2>/dev/null || true
 
+# A fresh audit-only host may not have loaded nf_conntrack yet. Use the
+# production activation path in this isolated namespace to load its kfuncs,
+# then release the hooks so individual tests can control conntrack themselves.
+PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.bpf.conntrack \
+    || _kernel_unavailable "Linux conntrack activation/ABI check failed"
+PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.bpf.conntrack --remove \
+    || _kernel_unavailable "cannot remove the conntrack prerequisite table"
+
 # ---------------------------------------------------------------------------
 # Compile XDP object from current sources. Never reuse a leftover /tmp object
 # after the repository has changed.
 # ---------------------------------------------------------------------------
+# Match the installer's host macros when BPF sources include glibc headers.
+# Without these, clang's BPF target can select 32-bit stubs on x86_64 RHEL.
+# shellcheck source=lib/setup/build.sh
+source "$REPO_ROOT/lib/setup/build.sh"
+resolve_bpf_target_arch
+_arch_args=("-D__TARGET_ARCH_${TARGET_ARCH}")
+[[ -z "$HOST_ARCH_FLAG" ]] || _arch_args+=("$HOST_ARCH_FLAG")
 _src="$REPO_ROOT/bpf/xdp_firewall.c"
 [[ -f "$_src" ]] || _kernel_unavailable "$_src not found"
 _asm_inc=$(clang -print-file-name=include 2>/dev/null) || {
     _kernel_unavailable "clang include path not found"
 }
-_include_args=(-I "$REPO_ROOT/bpf/include" -I "$_asm_inc")
+_include_args=("${_arch_args[@]}" -I "$REPO_ROOT/bpf/include" -I "$_asm_inc")
 _multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
 [[ ! -d "$_multiarch_inc" ]] || _include_args+=(-I "$_multiarch_inc")
 rm -f "$_XDP_OBJ"
@@ -607,6 +622,7 @@ test_handler_transactional_hot_swap() {
     asm_inc=$(clang -print-file-name=include) || return 1
     multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
     local -a include_args=(
+        "${_arch_args[@]}"
         -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include"
         -I /usr/include -I /usr/include/bpf -I "$asm_inc"
     )
@@ -653,7 +669,7 @@ test_dual_handler_dispatch() {
     local replacement=/tmp/axdp_dual_handler_next.o
     local dispatcher=/tmp/axdp_handler_dispatcher.o
     local chain=/tmp/axdp_handler_chain.o
-    local -a args=(-O2 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
+    local -a args=("${_arch_args[@]}" -O2 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
     [[ ! -d "/usr/include/$(uname -m)-linux-gnu" ]] || args+=(-I "/usr/include/$(uname -m)-linux-gnu")
     clang "${args[@]}" -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$fixture" || return 1
     clang "${args[@]}" -DMETRIC_STEP=2 -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$replacement" || return 1
@@ -667,7 +683,7 @@ test_dual_handler_dispatch() {
 test_protocol_handler_migration() {
     local objects=/tmp/axdp_protocol_objects name
     mkdir -p "$objects"
-    local -a args=(-O2 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
+    local -a args=("${_arch_args[@]}" -O2 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
     [[ ! -d "/usr/include/$(uname -m)-linux-gnu" ]] || args+=(-I "/usr/include/$(uname -m)-linux-gnu")
     for name in gre esp sctp; do
         clang "${args[@]}" -c "$REPO_ROOT/handlers/${name}_handler.c" -o "$objects/$name.o" || return 1
@@ -681,7 +697,7 @@ test_protocol_handler_migration() {
 
 test_minecraft_session_migration() {
     local obj=/tmp/axdp_mc_reload.o dispatcher=/tmp/axdp_mc_reload_dispatcher.o
-    local -a args=(-O3 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
+    local -a args=("${_arch_args[@]}" -O3 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
     [[ ! -d "/usr/include/$(uname -m)-linux-gnu" ]] || args+=(-I "/usr/include/$(uname -m)-linux-gnu")
     clang "${args[@]}" -c "$REPO_ROOT/handlers/minecraft_handler.c" -o "$obj" || return 1
     clang "${args[@]}" -c "$REPO_ROOT/bpf/tc_egress_dispatch.c" -o "$dispatcher" || return 1
@@ -705,6 +721,7 @@ test_minecraft_profile_dataplane() {
     asm_inc=$(clang -print-file-name=include) || return 1
     multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
     local -a include_args=(
+        "${_arch_args[@]}"
         -I "$REPO_ROOT/handlers"
         -I "$REPO_ROOT/bpf/include"
         -I /usr/include
@@ -1148,6 +1165,7 @@ test_minecraft_profile_syncer_lifecycle() (
     asm_inc=$(clang -print-file-name=include) || return 1
     multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
     local -a include_args=(
+        "${_arch_args[@]}"
         -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include"
         -I /usr/include -I /usr/include/bpf -I "$asm_inc"
     )
@@ -1638,14 +1656,13 @@ test_syncookie_listener_handoff() (
     nft add chain ip axdp_cookie_nat output \
         '{ type nat hook output priority dstnat; policy accept; }' || return 1
     for mode in auto always; do
-        printf '[syncookie]\nenabled = true\ndefault_mode = "%s"\n' "$mode" >"$TOML_CONFIG"
+        printf '[modules.syncookie]\nenabled = true\ndefault_mode = "%s"\n' "$mode" >"$TOML_CONFIG"
         if gate_output=$(load_syncookie_program 2>&1); then
             echo "SYN-cookie runtime bypassed the NAT compatibility check in mode=$mode"
             return 1
         fi
         [[ "$gate_output" == *'error: refusing SYN-cookie enablement:'*NAT* \
-            && ! -e "$_PIN_DIR/syncookie_prog" \
-            && ! -e "$_PIN_DIR/tc_syncookie_handoff_prog" ]] || {
+            && ! -d "$_PIN_DIR/modules/syncookie" ]] || {
             printf 'SYN-cookie NAT rejection failed in mode=%s: %s\n' "$mode" "$gate_output"
             return 1
         }
@@ -1653,6 +1670,8 @@ test_syncookie_listener_handoff() (
     done
     nft delete table ip axdp_cookie_nat || return 1
     load_syncookie_program || return 1
+    python3 "$REPO_ROOT/tests/python/kernel_syncookie_module.py" \
+        "$_PIN_DIR" "$_SYNCOOKIE_OBJ" "$_TC_SYNCOOKIE_OBJ" "$TOML_CONFIG" "$_VETH" || return 1
 
     if [[ "$attach_mode" == native ]]; then
         # Native veth XDP_TX needs the peer's XDP/NAPI receive path as well.

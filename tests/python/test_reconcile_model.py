@@ -11,6 +11,7 @@ import pytest
 from auto_xdp import config as cfg, policy, syncer
 from auto_xdp.backends.nftables import NftablesBackend
 from auto_xdp.backends.xdp import XdpBackend
+from auto_xdp.admin import module_runtime
 from auto_xdp.bpf.maps import BpfEndpointScopeMap, CacheVerifyMixin
 from auto_xdp.state import (
     AppliedState, BackendProjection, DesiredState, EndpointPolicy, ObservedState, RuntimeEndpoint, ReconcileStep,
@@ -188,6 +189,7 @@ class ZoneMap:
     def verify(self):
         return 0
 
+
 @pytest.mark.parametrize("protocol", ["tcp", "udp"])
 @pytest.mark.parametrize("address", ["0.0.0.0", "::"])
 def test_xdp_grants_wait_for_zone_interfaces_and_follow_their_lifecycle(monkeypatch, protocol, address):
@@ -230,6 +232,7 @@ def test_xdp_grants_wait_for_zone_interfaces_and_follow_their_lifecycle(monkeypa
             assert result.applied.endpoint_admission[private] == "closed"
             assert not result.applied.endpoint_policies[private].allow
 
+
 @pytest.mark.parametrize("failure", ["enumeration", "present_lookup", "map_read", "map_write", "gate", "dry_run"])
 def test_deferred_grants_never_hide_real_apply_or_readback_failures(monkeypatch, failure):
     private = ("tcp", "0.0.0.0", 443, "trusted")
@@ -254,6 +257,7 @@ def test_deferred_grants_never_hide_real_apply_or_readback_failures(monkeypatch,
     else:
         assert private in result.deferred_endpoints
         assert result.failures or result.unconfirmed or result.dry_run
+
 
 def test_deferred_grant_is_not_confirmed_if_interface_appears_during_readback(monkeypatch):
     private = ("tcp", "0.0.0.0", 443, "trusted")
@@ -280,6 +284,57 @@ def test_deferred_grant_is_not_confirmed_if_interface_appears_during_readback(mo
     assert not result.successful
     assert private in result.deferred_endpoints and private not in result.closed_endpoints
     assert result.applied.endpoint_admission[private] == "unknown"
+
+
+class CookieMap:
+    path = "syncookie"
+
+    def __init__(self):
+        self.ops = []
+        self.values = {}
+
+    def set(self, *args, **kwargs):
+        self.ops.append(("set", args))
+        if len(args) == 3:  # port, value, dry_run
+            self.values[args[0]] = args[1]
+        return True
+
+    def delete(self, *args, **kwargs):
+        self.ops.append(("delete", args))
+        self.values.pop(args[0], None)
+        return True
+
+    def active_values(self):
+        return dict(self.values)
+
+    def verify(self):
+        return 0
+
+
+@pytest.mark.component
+@pytest.mark.parametrize("pinned,expected,admitted", [
+    (False, False, False),  # program truly unavailable: keep the endpoint closed
+    (False, True, True),    # reload pre-seed: the runtime will load it next
+    (True, False, True),    # steady state: the pinned program exists
+])
+def test_syncookie_endpoint_follows_program_or_reload_expectation(tmp_path, monkeypatch, pinned, expected, admitted):
+    monkeypatch.setattr(module_runtime, "program_available", lambda root: pinned)
+    if pinned:
+        (tmp_path / "modules/syncookie").mkdir(parents=True)
+        (tmp_path / "modules/syncookie/prog").touch()
+    policies = {KEY: EndpointPolicy(True, "grant", syncookie_mode="auto", syncookie_rate=1000)}
+    desired = target(policies, BPF_PIN_DIR=str(tmp_path), SYNCOOKIE_ENABLED=True)
+    backend = xdp_backend()
+    backend.tcp_syncookie_mode_map = CookieMap()
+    backend.tcp_syncookie_rate_map = CookieMap()
+    backend.syncookie_runtime_map = runtime = CookieMap()
+    backend.syncookie_program_expected = expected
+
+    result = backend.reconcile(desired, False)
+
+    assert (KEY in result.blocked_endpoints) is not admitted
+    assert result.applied.endpoint_admission[KEY] == ("admitted" if admitted else "closed")
+    assert runtime.ops[-1][1][0] is admitted
 
 
 def test_xdp_reports_partial_failure_and_confirms_closed_admission():
@@ -500,7 +555,6 @@ def test_conntrack_activation_check_reports_repairs_and_never_raises(outcome, ex
         assert "permission denied" in caplog.text
     elif outcome:
         assert "re-created" in caplog.text
-
 
 
 def test_conntrack_activation_check_logs_each_distinct_failure_once(caplog):

@@ -23,12 +23,12 @@ def test_inventory_uses_dispatch_entries_instead_of_configuration_or_pin_presenc
         dict(id=14, name="tc_profile", pinned=[str(tmp_path / "profile_handlers/tcp/1/egress")]),
         dict(id=34, name="tc_orphan", pinned=[str(tmp_path / "port_handlers/tcp/8443/egress")]),
         dict(id=33, name="orphan", pinned=[str(tmp_path / "port_handlers/tcp/8443/prog")]),
-        dict(id=99, name="stale_gre", pinned=[str(tmp_path / "handlers/proto_47")]),
+        dict(id=99, name="stale_gre", pinned=[str(tmp_path / "protocol_handlers/47/prog")]),
         dict(id=100, name="unrelated", pinned=[str(tmp_path.parent / "other/handlers/proto_50")]),
         dict(id=101, name="xdp_port_whitelist", pinned=[str(tmp_path / "prog"), str(tmp_path / "core_alias")]),
         dict(id=102, name="trace_inet_sock_set_state", pinned=[str(tmp_path / "sock_state_prog")]),
         dict(id=103, name="tc_egress_dispatch", pinned=[str(tmp_path / "tc_egress_dispatch_prog")]),
-        dict(id=104, name="tc_syncookie_handoff", pinned=[str(tmp_path / "tc_syncookie_handoff_prog")]),
+        dict(id=104, name="tc_syncookie_handoff", pinned=[str(tmp_path / "modules/syncookie/ingress")]),
         # Program names alone must not hide a separately installed candidate.
         dict(id=105, name="xdp_port_whitelist", pinned=[str(tmp_path / "custom_candidate")]),
     ]
@@ -74,6 +74,25 @@ def test_query_failure_is_unknown_and_does_not_claim_an_empty_dispatch_table(tmp
     assert inventory.rows[0].state == "unknown"
     assert ("TCP", "unreadable", None) in inventory.tables
     assert "tcp_port_handlers unreadable" in inventory.status
+
+
+@pytest.mark.parametrize("tc_id,state", [(12, "loaded"), (99, "incomplete"), (None, "incomplete")])
+def test_syncookie_is_one_module_and_status_includes_real_tc_attachment(tmp_path, tc_id, state):
+    prepare(tmp_path)
+    context = handlers.handler_catalog.Context(tmp_path / "config.toml", tmp_path, tmp_path / "custom", tmp_path, tmp_path / "run", "eth0")
+    xdp_pin = "modules/syncookie/prog"
+    tc_pin = "modules/syncookie/ingress"
+    programs = [dict(id=11, name="xdp_syncookie", pinned=[str(tmp_path / xdp_pin)]),
+                dict(id=12, name="handoff", pinned=[str(tmp_path / tc_pin), str(tmp_path / "handoff_alias")])]
+    def query(*args):
+        return programs if args[0] == "-f" else ([{"key": 0, "value": 11}] if args[-1].endswith("syncookie_prog_array") else [])
+    with mock.patch.object(handlers, "_query", side_effect=query), \
+            mock.patch.object(handlers.module_runtime, "tc_program_id", return_value=tc_id):
+        inventory = handlers.collect_handlers(str(tmp_path), {}, handlers.HandlerCache(), context=context)
+    rows = [row for row in inventory.rows if row.module and row.module.id == "syncookie"]
+    assert len(rows) == 1 and rows[0].state == state
+    assert rows[0].program_id == 11 and rows[0].pin == xdp_pin
+    assert all(row.program_id != 12 for row in inventory.rows)
 
 
 def test_missing_dispatch_map_does_not_make_a_configured_slot_loaded(tmp_path):
@@ -137,7 +156,7 @@ def test_role_labels_separate_purpose_binding_and_observed_state():
     from auto_xdp.admin.handler_catalog import Module
 
     cases = [
-        (handlers.HandlerRow("SYNCOOKIE", 0, 11, "xdp_syncookie", "loaded"), ("SYN cookie", "XDP / SYN")),
+        (handlers.HandlerRow("SYNCOOKIE", 0, 11, "xdp_syncookie", "loaded"), ("SYN cookie", "XDP + TC in / SYN")),
         (handlers.HandlerRow("TC_SYNCOOKIE", 0, 12, "handoff", "pin only"), ("SYN handoff", "TC in / SYN")),
         (handlers.HandlerRow("SLOT", 47, 13, "gre", "loaded"), ("Protocol", "XDP / IP 47/GRE")),
         (handlers.HandlerRow("TC_SLOT", 132, 14, "sctp", "loaded"), ("Protocol", "TC out / IP 132/SCTP")),

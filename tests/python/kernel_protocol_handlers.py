@@ -1,4 +1,4 @@
-"""Real GRE/ESP/SCTP migration and optional dual-entry protocol dispatch.
+"""Real GRE/ESP/SCTP ownership and optional dual-entry protocol dispatch.
 
 Runs exclusively inside the integration suite's private network/mount namespace.
 """
@@ -69,10 +69,35 @@ def main(root, iface, objects):
             for suffix in ("next_deadbeef", "rollback_1234abcd"):
                 run("bpftool", "prog", "pin", "pinned", legacy, legacy.with_name(f"proto_{proto}_{suffix}"))
             old_id = handlers.pinned_program_id(legacy)
+            live = handlers.protocol_handler_dir(root, proto)
+            binding = handlers.program_array_binding(root / "proto_handlers", proto)
+            old_pins = list(legacy.parent.iterdir())
+            # Flat pins do not authorize takeover or removal. Both operations
+            # must preserve the active program and all of its recovery pins.
+            for operation in (
+                lambda: handlers.load_protocol_handler(root, proto, obj),
+                lambda: handlers.unload_protocol_handler(root, proto),
+            ):
+                try:
+                    operation()
+                except RuntimeError as exc:
+                    assert "ownership pin" in str(exc), str(exc)
+                else:
+                    raise AssertionError("flat protocol pin authorized a generation change")
+                assert binding.read() == old_id
+                assert all(handlers.pinned_program_id(pin) == old_id for pin in old_pins)
+                assert not (live / "prog").exists()
+                assert not list(live.parent.glob(f"{proto}_next_*"))
+            # The fixture owns this old installation and explicitly tears it
+            # down before exercising a fresh canonical generation.
+            assert handlers.prog_array_delete(root / "proto_handlers", proto)
+            assert binding.read() is None
+            for pin in old_pins:
+                pin.unlink()
+            legacy.parent.rmdir()
             if proto == 47:
                 (root / "tc_proto_handlers").rename(root / "saved_tc_proto")
             handlers.load_protocol_handler(root, proto, obj)
-            live = handlers.protocol_handler_dir(root, proto)
             assert not legacy.parent.exists() and (live / "state_contract").exists()
             assert handlers.pinned_program_id(live / "prog") != old_id
             if proto == 47:
@@ -110,7 +135,7 @@ def main(root, iface, objects):
                     update(root, "xdp_runtime_cfg", bytes(4), bytes(64) + struct.pack("=II", 1, 0))
             handlers.unload_protocol_handler(root, proto)
             assert not live.exists()
-            print(f"PASS {name}: legacy adoption, compatible replacement, IPv4/IPv6 verdicts and unload", flush=True)
+            print(f"PASS {name}: flat ownership rejected, fresh load, compatible replacement, IPv4/IPv6 verdicts and unload", flush=True)
 
             handlers.load_protocol_handler(root, proto, fixture)
             private_id = handlers._pinned_map_id(live / "maps/proto_metrics")

@@ -164,7 +164,7 @@ def test_syncookie_port_rate_default_and_explicit_zero() -> None:
 
 def test_syncookie_config_rejects_invalid_port_table() -> None:
     with pytest.raises(ValueError, match="port_rate_by_port must be a table"):
-        cfg.apply_toml_config({"syncookie": {"port_rate_by_port": 42}})
+        cfg.apply_toml_config({"modules": {"syncookie": {"port_rate_by_port": 42}}})
 
 
 def test_service_aware_policy_requires_explicit_grant_and_runtime_owner() -> None:
