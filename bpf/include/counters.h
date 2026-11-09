@@ -74,7 +74,8 @@ enum xdp_counter_idx {
     CNT_GRE_VERSION_INVALID          = 63,
     CNT_ESP_SPI_RESERVED             = 64,
     CNT_SCTP_PORT_NOT_AUTHORIZED      = 65,
-    CNT_MAX                          = 66,
+    CNT_ICMP_REPLY_UNTRACKED          = 66,
+    CNT_MAX                          = 67,
 };
 
 struct {

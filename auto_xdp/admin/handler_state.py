@@ -15,7 +15,7 @@ class StateContract(NamedTuple):
     maps: tuple[str, ...]
 
 
-def object_contract(path: Path) -> StateContract | None:
+def object_section(path: Path, section_name: bytes) -> bytes | None:
     """Read a bounded opt-in section without loading or executing an ELF object."""
     data = path.read_bytes()
     if not data.startswith(b"\x7fELF"):
@@ -46,13 +46,23 @@ def object_contract(path: Path) -> StateContract | None:
             name, payload = section(index)
             if name >= len(names):
                 raise ValueError("invalid section name")
-            if names[name:].split(b"\0", 1)[0] == b".axdp_state":
+            if names[name:].split(b"\0", 1)[0] == section_name:
                 payloads.append(payload)
         if not payloads:
             return None
         if len(payloads) != 1 or len(payloads[0]) > 4096:
-            raise ValueError("invalid state section length/count")
-        contract = json.loads(payloads[0].rstrip(b"\0"))
+            raise ValueError("invalid metadata section length/count")
+        return payloads[0].rstrip(b"\0")
+    except (ValueError, KeyError, IndexError, struct.error, UnicodeError) as exc:
+        raise RuntimeError(f"Invalid handler metadata in {path}: {exc}") from exc
+
+
+def object_contract(path: Path) -> StateContract | None:
+    payload = object_section(path, b".axdp_state")
+    if payload is None:
+        return None
+    try:
+        contract = json.loads(payload)
         if not isinstance(contract, dict) or set(contract) != {"version", "schema", "maps"}:
             raise ValueError("invalid state contract fields")
         schema, maps = contract["schema"], contract["maps"]

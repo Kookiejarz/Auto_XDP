@@ -50,6 +50,7 @@ sudo axdp handler config my-filter --set target=30121
 sudo axdp handler apply my-filter
 sudo axdp handler apply my-filter --set enabled=false
 sudo axdp handler apply gre
+sudo axdp handler apply icmp --set enabled=true
 sudo axdp handler apply minecraft --set subject=paper
 sudo axdp handler apply syncookie --set enabled=true --set default_mode=auto
 ```
@@ -112,6 +113,9 @@ remove the old target automatically.
 Minecraft config selects an existing policy subject and changes its
 `protection.profile`; it never creates exposure grants. SYN Cookie exposes its
 existing policy modes, thresholds and per-port/process/service overrides.
+ICMP exposes one Enabled switch for IPv4 and IPv6 Echo Reply checks together,
+stored in `[modules.icmp]`. Its sources live beside SCTP and GRE; `axdp_icmp.c` is the
+kernel dependency of `icmp_handler.c`, not a second configurable handler.
 These managed modules apply through the installed runtime's normal
 reconciliation; observe/audit mode is reported as non-active. When the matching
 installed controller is running, Apply stops that watcher, performs one sync,
@@ -139,6 +143,23 @@ Old root-level program pins are not adopted. Pins are retired only
 after a verified switch/removal. New generations live under
 `BPF_PIN_DIR/modules/syncookie/` (`prog` and `ingress`). Capability checks and
 namespace-scoped sysctl ownership remain requirements of this module.
+
+ICMP uses the same generation transaction for protocol slots 1 and 58, with
+one ownership pin under `BPF_PIN_DIR/modules/icmp/prog`. Disable clears its
+runtime gate before removing both bindings. When enabled, a missing dispatch
+entry drops Echo Replies even if the default slot action is pass. See
+[ICMP dependencies and limits](ICMP.md).
+
+A handler can declare kernel dependencies with
+`AXDP_KERNEL_MODULES("[\"axdp_icmp\"]")` from `handler_state.h`. This metadata
+travels in the object's `.axdp_kmods` ELF section, including precompiled objects.
+The common loader runs `modprobe` before loading or publishing any BPF entry;
+modprobe resolves the kernel module's own dependencies. The bundled `axdp_icmp`
+can be built and installed automatically for the running kernel when missing.
+Missing development files or a rejected module signature abort activation with
+an actionable error. Dependency failure preserves the previous handler bindings.
+Disabling a handler releases its BPF references but does not forcibly unload
+kernel modules that other users may share.
 
 A handler object contains exactly one XDP program and optionally one TC egress
 classifier. Use `SEC("xdp")` and `SEC("tc")` so libbpf can infer their different
@@ -243,8 +264,7 @@ restores both previous entries; if rollback itself fails it retains recovery
 pins. Unload removes XDP, the egress capability and TC before removing the
 private-map pins. After a verified commit or unload, it also retires obsolete
 staging and rollback generations for that target. Failed switches retain
-recovery pins; foreign names are not swept. Protocol migration removes the
-old flat pin, its recognized temporary pins, and the old directory once empty.
+recovery pins; foreign names and old flat protocol pins are not swept.
 A private map lives under the generation's `maps/` directory
 for dual-entry objects; single-entry objects retain their existing layout.
 

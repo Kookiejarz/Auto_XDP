@@ -13,8 +13,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from auto_xdp.admin import config_file, handlers
+from auto_xdp.admin import config_file, handlers, kernel_modules
 from auto_xdp import config as configuration
+from auto_xdp.bpf.maps import BpfRuntimeConfigMap, XDP_CFG_FLAG_ICMP_REPLY
 from auto_xdp.bpf.syncookie import acquire_sysctl, probe_syncookie_capability, release_sysctl
 from auto_xdp.bpf.syscall import obj_get, program_id
 
@@ -22,6 +23,98 @@ from auto_xdp.bpf.syscall import obj_get, program_id
 _PROGRAM_PINS = ("prog", "ingress")
 TC_PRIORITY = 49151
 TC_HANDLE = 2
+
+
+def load_icmp(root: Path, obj: Path) -> None:
+    """Publish IPv4 and IPv6 together, after the common loader resolves .ko dependencies."""
+    with handlers._handler_lock(root):
+        handlers._load_handler_bundle(
+            root / "proto_handlers", 1, [("prog", obj, "xdp")], root / "modules/icmp",
+            [handlers.program_array_binding(root / "proto_handlers", 58)],
+        )
+
+
+def prepare_icmp(root: Path, *, enabled: bool) -> None:
+    """Reconcile config reloads before the backend publishes the runtime gate."""
+    if not enabled:
+        remove_icmp(root)
+        return
+    pin, table = root / "modules/icmp/prog", root / "proto_handlers"
+    if pin.exists():
+        fd = obj_get(str(pin))
+        try:
+            ident = program_id(fd)
+        finally:
+            os.close(fd)
+        if all(handlers.program_array_binding(table, key).read() == ident for key in (1, 58)):
+            return
+    load_icmp(root, kernel_modules.sdk_directory() / "icmp_handler.o")
+
+
+def remove_icmp(root: Path) -> None:
+    table, live = root / "proto_handlers", root / "modules/icmp"
+    if not table.exists():
+        if live.exists():
+            raise RuntimeError("ICMP dispatch table is missing; ownership pins retained")
+        return
+    with handlers._handler_lock(root):
+        # Withdraw the main program's requirement before removing its handlers.
+        # A failed removal restores both dispatch entries and the old flag.
+        runtime = BpfRuntimeConfigMap(str(root / "xdp_runtime_cfg"))
+        try:
+            old = runtime.get_cfg_flags()
+            values = runtime.get()
+            if old is None or values is None:
+                raise RuntimeError("Cannot read ICMP runtime state")
+            if old & XDP_CFG_FLAG_ICMP_REPLY and not runtime.set(values, old & ~XDP_CFG_FLAG_ICMP_REPLY):
+                raise RuntimeError("Cannot disable ICMP dispatch")
+            try:
+                handlers._transactional_handler_bindings(
+                    [handlers.program_array_binding(table, key) for key in (1, 58)], "icmp", None, live,
+                )
+            except BaseException:
+                if not runtime.set(values, old):
+                    raise RuntimeError("ICMP removal failed and its runtime flag could not be restored")
+                raise
+        finally:
+            runtime.close()
+
+
+def verify_icmp(root: Path, *, enabled: bool = True) -> int | None:
+    table, pin = root / "proto_handlers", root / "modules/icmp/prog"
+    ids = [handlers.program_array_binding(table, key).read() if table.exists() else None for key in (1, 58)]
+    if not enabled:
+        if any(value is not None for value in ids) or pin.exists():
+            raise RuntimeError("ICMP is still dispatched after Disable")
+        if (root / "xdp_runtime_cfg").exists():
+            runtime = BpfRuntimeConfigMap(str(root / "xdp_runtime_cfg"))
+            try:
+                flags = runtime.get_cfg_flags()
+                if flags is None or flags & XDP_CFG_FLAG_ICMP_REPLY:
+                    raise RuntimeError("ICMP runtime gate was not confirmed disabled")
+            finally:
+                runtime.close()
+        return None
+    if not pin.exists():
+        raise RuntimeError("ICMP module has not been loaded")
+    ident = handlers.pinned_program_id(pin)
+    if ids != [ident, ident]:
+        raise RuntimeError("ICMP IPv4/IPv6 bindings do not match their ownership pin")
+    runtime = BpfRuntimeConfigMap(str(root / "xdp_runtime_cfg"))
+    try:
+        if not (runtime.get_cfg_flags() or 0) & XDP_CFG_FLAG_ICMP_REPLY:
+            raise RuntimeError("ICMP handler is loaded but reply protection is not enabled")
+    finally:
+        runtime.close()
+    return ident
+
+
+def reconcile_icmp(root: Path, obj: Path, config: Path) -> None:
+    settings = configuration.parse_toml_config(config_file.load_toml(config))
+    if settings.ICMP_REPLY_ENABLED:
+        load_icmp(root, obj)
+    else:
+        remove_icmp(root)
 
 
 class ForeignHookError(RuntimeError):
@@ -237,7 +330,7 @@ def reconcile_syncookie(root: Path, xdp: Path, tc: Path, interfaces: list[str],
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("apply", "remove", "retain", "verify"))
-    parser.add_argument("module", choices=("syncookie",))
+    parser.add_argument("module", choices=("syncookie", "icmp"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--iface", action="append", default=[])
     parser.add_argument("--config", type=Path)
@@ -248,7 +341,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--candidate", type=Path)
     args = parser.parse_args(argv)
     try:
-        if args.action == "retain":
+        if args.module == "icmp":
+            if args.action == "apply":
+                if args.config is None or args.xdp is None:
+                    parser.error("ICMP apply requires --config and --xdp")
+                reconcile_icmp(args.root, args.xdp, args.config)
+            elif args.action == "remove":
+                remove_icmp(args.root)
+            elif args.action == "verify":
+                verify_icmp(args.root)
+            else:
+                parser.error("ICMP has no external hook to retain")
+        elif args.action == "retain":
             if args.candidate is None:
                 parser.error("retain requires --candidate")
             retain_syncookie(args.root, args.candidate)

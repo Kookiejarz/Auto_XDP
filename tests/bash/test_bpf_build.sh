@@ -98,4 +98,16 @@ for src in "$REPO_ROOT"/handlers/*_handler.c; do
     }
 done
 
+PYTHONPATH="$REPO_ROOT" python3 - "$BUILD_STAGING_DIR" <<'PY'
+from pathlib import Path
+import sys
+from auto_xdp.admin.kernel_modules import dependencies
+root = Path(sys.argv[1])
+assert dependencies(root / 'handlers/icmp_handler.o') == ('axdp_icmp',)
+assert dependencies(root / 'xdp_firewall.o') == ()
+for name in ('axdp_icmp.c', 'Kbuild', 'Makefile.kmod'):
+    assert (root / 'handlers' / name).is_file(), f'missing kernel dependency source: {name}'
+assert (root / 'bpf/include/icmp_ct_tuple.h').is_file()
+PY
+
 echo "[INFO] native distro build succeeded"

@@ -43,6 +43,43 @@ def write_manifest(path, **overrides):
     path.write_text(json.dumps(data))
 
 
+def test_icmp_catalog_has_one_managed_entry_and_hides_native_dependency(context):
+    sdk = context.install_dir / "handlers"
+    for name in ("icmp_handler.c", "icmp_handler.o", "axdp_icmp.c", "axdp_icmp.o", "axdp_icmp.mod.c", "axdp_icmp.mod.o"):
+        (sdk / name).touch()
+    modules = catalog.discover(context, {})
+    icmp = [module for module in modules if module.id == "icmp"]
+    assert len(icmp) == 1 and icmp[0].kernel_dependencies == ("axdp_icmp",)
+    assert [field.name for field in catalog.fields_for(icmp[0])] == ["enabled"]
+    assert not any("axdp_icmp" in module.path for module in modules)
+    assert not any(module.id != "icmp" and "icmp_handler" in module.path for module in modules)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_icmp_apply_uses_managed_runtime_and_both_family_readback(context, monkeypatch, enabled):
+    context.config.write_text('[policy]\nmode="enforce"\n')
+    module = next(item for item in catalog.discover(context) if item.id == "icmp")
+    refresh = mock.Mock(return_value={})
+    verify = mock.Mock(return_value=42 if enabled else None)
+    monkeypatch.setattr(catalog, "_refresh_managed_runtime", refresh)
+    monkeypatch.setattr(catalog.module_runtime, "verify_icmp", verify)
+    result = catalog.configure(context, module, {"enabled": enabled}, apply=True)
+    assert config_file.load_toml(context.config)["modules"]["icmp"]["enabled"] is enabled
+    refresh.assert_called_once_with(context)
+    verify.assert_called_once_with(context.bpf_pin_dir, enabled=enabled)
+    assert ("IPv4 and IPv6" if enabled else "disabled") in result
+
+
+def test_icmp_audit_apply_saves_preference_without_claiming_protection(context, monkeypatch):
+    context.config.write_text('[policy]\nmode="audit"\n')
+    module = next(item for item in catalog.discover(context) if item.id == "icmp")
+    monkeypatch.setattr(catalog, "_refresh_managed_runtime", lambda context: {})
+    monkeypatch.setattr(catalog.module_runtime, "verify_icmp", lambda *args, **kwargs: pytest.fail("audit readback"))
+    result = catalog.configure(context, module, {"enabled": True}, apply=True)
+    assert "does not activate" in result
+    assert config_file.load_toml(context.config)["modules"]["icmp"]["enabled"] is True
+
+
 def test_discovery_lists_unloaded_builtins_bare_objects_sources_and_external_config(context):
     sdk = context.install_dir / "handlers"
     (sdk / "gre_handler.c").touch()
@@ -278,7 +315,7 @@ def test_save_is_a_draft_and_apply_uses_validated_values_and_common_loader(conte
         assert "handler_settings" not in active
 
 
-@pytest.mark.parametrize("name", ["syncookie"])
+@pytest.mark.parametrize("name", ["icmp", "syncookie"])
 def test_managed_module_save_keeps_current_settings_until_apply(context, monkeypatch, name):
     config_file.write_toml(context.config, {"modules": {name: {"enabled": False}}})
     module = catalog.select(context, name)

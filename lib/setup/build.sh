@@ -276,7 +276,7 @@ prepare_slot_handler_sources() {
             fi
         done < <(
             find "${_source_dir}/handlers" -maxdepth 1 -type f \
-                \( -name 'Makefile' -o -name '*.c' -o -name '*.h' -o -name '*.handler.json' \) \
+                \( -name 'Makefile*' -o -name 'Kbuild' -o -name '*.c' -o -name '*.h' -o -name '*.handler.json' \) \
                 | sed "s|^${_source_dir}/||" | sort
         )
     else
@@ -394,6 +394,10 @@ compile_xdp_program() {
     fi
     if [[ ! -s "${_handlers_dir}/minecraft_handler.o" ]]; then
         step_error "Required Minecraft protection profile failed to build."
+        return 1
+    fi
+    if [[ ! -s "${_handlers_dir}/icmp_handler.o" ]]; then
+        step_error "Required ICMP module failed to build."
         return 1
     fi
     return 0

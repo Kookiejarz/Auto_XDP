@@ -44,6 +44,7 @@ from auto_xdp.bpf.maps import (
     XDP_CFG_FLAG_DROP_EVENTS_DISABLED,
     XDP_CFG_FLAG_SLOT_DROP,
     XDP_CFG_FLAG_ECN_REFUSED,
+    XDP_CFG_FLAG_ICMP_REPLY,
 )
 from auto_xdp.policy import derived_syncookie_port_rate, rate_map_entries_v6
 from auto_xdp.discovery.services import service_name
@@ -75,6 +76,8 @@ def _compute_cfg_flags(desired: BackendProjection) -> int:
         flags |= XDP_CFG_FLAG_ABUSEIPDB_ENABLED
     if desired.config.SLOT_DEFAULT_ACTION == "drop":
         flags |= XDP_CFG_FLAG_SLOT_DROP
+    if desired.config.ICMP_REPLY_ENABLED:
+        flags |= XDP_CFG_FLAG_ICMP_REPLY
     return flags
 
 
@@ -1101,6 +1104,12 @@ class XdpBackend(PortBackend):
             desired_state, _ = project_endpoint_policies(desired_state)
         if not getattr(self, "_defer_global_admission", False):
             self._apply_result = ApplyResult(dry_run=dry_run, plan=plan)
+        if not dry_run and self.runtime_config_map is not None:
+            root = Path(desired_state.config.BPF_PIN_DIR)
+            enabled = desired_state.config.ICMP_REPLY_ENABLED
+            if (enabled or (self.runtime_config_map.get_cfg_flags() or 0) & XDP_CFG_FLAG_ICMP_REPLY
+                    or (root / "modules/icmp").exists()):
+                module_runtime.prepare_icmp(root, enabled=enabled)
         changed = False
         for port in sorted(plan.tcp_ports_to_remove):
             if self._map_operation(self.tcp_map, 'set', port, 0, dry_run):

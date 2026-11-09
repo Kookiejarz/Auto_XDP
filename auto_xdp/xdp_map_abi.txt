@@ -1,5 +1,5 @@
 # Map capacities derived from bpf/include/map_sizes.h and counters.h.
-pkt_counters percpu_array 4 8 66
+pkt_counters percpu_array 4 8 67
 byte_counters percpu_array 4 32 1
 endpoint_scopes hash 24 4 16384
 tc_handler_ctx percpu_array 4 96 1

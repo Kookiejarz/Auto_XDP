@@ -20,6 +20,7 @@ readonly _PIN_DIR="/sys/fs/bpf/axdp_integ"
 readonly _DEBUG_PIN_DIR="/sys/fs/bpf/axdp_integ_debug"
 readonly _RUN_DIR="/run/axdp_integ"
 readonly _XDP_OBJ="/tmp/axdp_integ_fw.o"
+readonly _ICMP_OBJ="/tmp/axdp_integ_icmp.o"
 readonly _SYNCOOKIE_OBJ="/tmp/axdp_integ_syncookie.o"
 readonly _TC_SYNCOOKIE_OBJ="/tmp/axdp_integ_tc_syncookie.o"
 readonly _VMLINUX_DIR="/tmp/axdp_integ_btf"
@@ -100,6 +101,8 @@ if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
     test_log_error "XDP compile failed"
     exit 1
 fi
+clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector "${_include_args[@]}" \
+    -c "$REPO_ROOT/handlers/icmp_handler.c" -o "$_ICMP_OBJ" || exit 1
 if bpftool btf dump file /sys/kernel/btf/vmlinux format raw 2>/dev/null \
         | grep -F bpf_sk_assign_tcp_reqsk >/dev/null; then
     rm -rf "$_VMLINUX_DIR"
@@ -478,6 +481,94 @@ test_linux_conntrack_native_replies() {
     ip link set dev "$_VETH" xdpgeneric off || return 1
     ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
     test_linux_conntrack_replies
+}
+
+test_icmp_dispatch_gate() {
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" "$REPO_ROOT/tests/python" <<'PY'
+from pathlib import Path
+import socket, sys
+sys.path.insert(0, sys.argv[2])
+from kernel_icmp_conntrack import frame
+from kernel_packet_telemetry import run_packet
+from auto_xdp.admin.module_runtime import remove_icmp, verify_icmp
+from auto_xdp.bpf.maps import BpfRuntimeConfigMap, XDP_CFG_FLAG_ICMP_REPLY
+root = Path(sys.argv[1])
+index = socket.if_nametoindex('axdp_v0')
+packets = [frame(socket.AF_INET, '10.99.0.2', '10.99.0.1', 59999),
+           frame(socket.AF_INET6, '2001:db8:99::2', '2001:db8:99::1', 59999)]
+controls = [frame(socket.AF_INET, '10.99.0.2', '10.99.0.1', 0, kind=3),
+            frame(socket.AF_INET6, '2001:db8:99::2', '2001:db8:99::1', 0, kind=2)]
+runtime = BpfRuntimeConfigMap(str(root / 'xdp_runtime_cfg'))
+try:
+    flags = (runtime.get_cfg_flags() or 0) & ~XDP_CFG_FLAG_ICMP_REPLY
+    assert runtime.set(runtime.get(), flags)
+    assert all(run_packet(root, index, packet)[0] == 2 for packet in packets)
+    assert runtime.set(runtime.get(), flags | XDP_CFG_FLAG_ICMP_REPLY)
+    assert all(run_packet(root, index, packet)[0] == 1 for packet in packets)
+    assert all(run_packet(root, index, packet)[0] == 2 for packet in controls)
+finally:
+    runtime.close()
+remove_icmp(root)
+verify_icmp(root, enabled=False)
+assert all(run_packet(root, index, packet)[0] == 2 for packet in packets)
+print('IPv4/IPv6 missing handler drops only enabled Echo Replies; Disable clears the gate')
+PY
+}
+
+test_icmp_native_dispatch_gate() {
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+    test_icmp_dispatch_gate
+}
+
+test_icmp_conntrack_replies() {
+    if [[ "${KERNEL_TEST_ICMP:-0}" != 1 ]]; then
+        test_log_warning "SKIP optional ICMP kernel dependency: set KERNEL_TEST_ICMP=1 to test automatic loading"
+        return 0
+    fi
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" "$_ICMP_OBJ" <<'PY' || return 1
+from pathlib import Path
+import sys
+from auto_xdp.admin.module_runtime import load_icmp, verify_icmp
+from auto_xdp.bpf.maps import BpfRuntimeConfigMap, XDP_CFG_FLAG_ICMP_REPLY
+root = Path(sys.argv[1])
+load_icmp(root, Path(sys.argv[2]))
+runtime = BpfRuntimeConfigMap(str(root / 'xdp_runtime_cfg'))
+try:
+    assert runtime.set(runtime.get(), (runtime.get_cfg_flags() or 0) | XDP_CFG_FLAG_ICMP_REPLY)
+finally:
+    runtime.close()
+verify_icmp(root)
+PY
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_icmp_conntrack.py" \
+        "$_PIN_DIR" "$_NS" || return 1
+    # The extension must not disturb existing TCP/UDP reply admission.
+    test_linux_conntrack_replies || return 1
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" "$REPO_ROOT/tests/python" <<'PY'
+from pathlib import Path
+import socket, sys
+sys.path.insert(0, sys.argv[2])
+from kernel_icmp_conntrack import frame, expect
+from auto_xdp.admin.module_runtime import remove_icmp, verify_icmp
+from auto_xdp.admin.handlers import prog_array_delete
+root = Path(sys.argv[1])
+index = socket.if_nametoindex('axdp_v0')
+packet = frame(socket.AF_INET6, '2001:db8:99::2', '2001:db8:99::1', 59999)
+# An enabled module whose dispatch entry disappears must fail closed.
+prog_array_delete(root / 'proto_handlers', 58)
+from kernel_packet_telemetry import run_packet
+assert run_packet(root, index, packet)[0] == 1
+remove_icmp(root)
+verify_icmp(root, enabled=False)
+expect(root, index, packet, 2)
+print('Missing handler fails closed; Disable removes both bindings and restores normal Echo Reply handling')
+PY
+}
+
+test_icmp_conntrack_native_replies() {
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+    test_icmp_conntrack_replies
 }
 
 test_named_interfaces_use_json_and_real_unsupported_mode_fallback() (

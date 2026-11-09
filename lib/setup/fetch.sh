@@ -170,7 +170,7 @@ _check_update_candidate_files() {
         [[ -f "$path" ]] && printf '%s\n' "$path"
     done
 
-    for path in lib/setup/*.sh runtime/*.sh bpf/*.c bpf/include/*.h handlers/Makefile handlers/*.c handlers/*.h; do
+    for path in lib/setup/*.sh runtime/*.sh bpf/*.c bpf/include/*.h handlers/Makefile* handlers/Kbuild handlers/*.c handlers/*.h; do
         [[ -f "$path" ]] && printf '%s\n' "$path"
     done | sort -u
     find auto_xdp -type f \( -name '*.py' -o -name '*.toml' -o -name '*.txt' \) | sort

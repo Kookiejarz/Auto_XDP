@@ -31,5 +31,7 @@ all: $(OBJS)
 minecraft_handler.o: ../bpf/include/counters.h ../bpf/include/flow_keys.h \
                      ../bpf/include/linux_conntrack.h minecraft_state.h
 
+icmp_handler.o: ../bpf/include/icmp_ct_tuple.h
+
 clean:
 	rm -f $(OBJS)

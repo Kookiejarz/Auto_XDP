@@ -139,8 +139,9 @@ validate_runtime_release() {
     local required_paths=(
         python/auto_xdp/__init__.py python/auto_xdp/install_state.py python/auto_xdp/xdp_link.py
         python/auto_xdp/default_config.toml
-        bpf/include/common.h bpf/include/counters.h bpf/include/telemetry.h
-        handlers/minecraft_handler.o tc_egress_dispatch.o xdp_required_maps.txt xdp_map_abi.txt auto_xdp_runtime_common.sh
+        bpf/include/common.h bpf/include/counters.h bpf/include/telemetry.h bpf/include/icmp_ct_tuple.h
+        handlers/minecraft_handler.o handlers/icmp_handler.o handlers/axdp_icmp.c handlers/Kbuild handlers/Makefile.kmod
+        tc_egress_dispatch.o xdp_required_maps.txt xdp_map_abi.txt auto_xdp_runtime_common.sh
         auto_xdp_bpf_helpers.py xdp_port_sync.py pkt_relay.py axdp
         auto_xdp_start.sh release.json
     )

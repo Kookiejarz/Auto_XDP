@@ -255,11 +255,179 @@ test_package_lists_cover_all_supported_managers() (
         assert_contains "$packages" "curl" "$pm packages" || return 1
         assert_contains "$packages" "findutils" "$pm packages" || return 1
         assert_contains "$packages" "python" "$pm packages" || return 1
+        case "$pm" in
+            dnf|yum|zypper) assert_contains "$packages" "dwarves" "$pm BTF tooling" || return 1 ;;
+            *) assert_contains "$packages" "pahole" "$pm BTF tooling" || return 1 ;;
+        esac
         [[ -n "$optional" ]] || {
             printf 'optional package list empty for [%s]\n' "$pm"
             return 1
         }
     done
+)
+
+setup_rpm_repo_fixture() {
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    PKG_MANAGER=dnf
+    DISTRO_ID=rhel
+    DISTRO_LIKE=fedora
+    RPM_TEST_DIR=$(mktemp -d)
+    trap 'rm -rf "$RPM_TEST_DIR"' EXIT
+    RPM_TEST_REPOS=""
+    RPM_TEST_FAIL=""
+    RPM_TEST_ENABLED=""
+    dnf() { :; }
+    as_root() {
+        printf '%s\n' "$*" >>"$RPM_TEST_DIR/commands"
+        if [[ "$*" == "$RPM_TEST_FAIL" ]]; then
+            printf 'repository command failed\n' >&2
+            return 1
+        fi
+        case "$*" in
+            'env LC_ALL=C dnf -q repolist --all') printf '%s\n' "$RPM_TEST_REPOS" ;;
+            'subscription-manager repos --enable '*) RPM_TEST_ENABLED="$4" ;;
+            'dnf config-manager --set-enabled '*) RPM_TEST_ENABLED="$4" ;;
+        esac
+        return 0
+    }
+}
+
+test_rhel_install_enables_subscription_build_repo_before_packages() (
+    setup_rpm_repo_fixture
+    RPM_TEST_REPOS='Updating Subscription Management repositories.
+repo id repo name status
+codeready-builder-for-rhel-10-x86_64-debug-rpms CodeReady Debug disabled
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady Builder disabled
+codeready-builder-for-rhel-10-x86_64-source-rpms CodeReady Source disabled
+rhel-10-for-x86_64-baseos-rpms RHEL 10 BaseOS enabled
+rhui-codeready-builder-for-rhel-10-x86_64-rhui-rpms RHUI CodeReady disabled
+rhui-rhel-10-for-x86_64-baseos-rhui-rpms RHUI BaseOS disabled'
+    pkg_update() { :; }
+    pkg_install() {
+        [[ "$RPM_TEST_ENABLED" == codeready-builder-for-rhel-10-x86_64-rpms ]] || return 1
+        printf '%s\n' "$*" >>"$RPM_TEST_DIR/packages"
+    }
+    install_packages >"$RPM_TEST_DIR/output" 2>&1 || return 1
+    assert_contains "$(cat "$RPM_TEST_DIR/packages")" "libbpf-devel" || return 1
+    assert_contains "$(cat "$RPM_TEST_DIR/commands")" \
+        "subscription-manager repos --enable codeready-builder-for-rhel-10-x86_64-rpms" || return 1
+    [[ "$(cat "$RPM_TEST_DIR/commands")" != *config-manager* ]]
+)
+
+test_rhel_cloud_build_repo_uses_actual_rhui_provider_and_architecture() (
+    setup_rpm_repo_fixture
+    local baseos builder commands
+    while read -r baseos builder; do
+        RPM_TEST_REPOS="repo id repo name status
+$baseos RHEL BaseOS enabled
+$builder CodeReady Builder disabled
+codeready-builder-for-rhel-10-x86_64-rpms Subscription CodeReady disabled
+rhel-10-for-x86_64-baseos-rpms Subscription BaseOS disabled
+$builder-debug Debug disabled
+$builder-source Source disabled"
+        : >"$RPM_TEST_DIR/commands"
+        enable_rpm_build_repos >/dev/null || return 1
+        commands=$(cat "$RPM_TEST_DIR/commands")
+        assert_contains "$commands" "dnf config-manager --set-enabled $builder" || return 1
+        assert_eq "$RPM_TEST_ENABLED" "$builder" || return 1
+        [[ "$commands" != *subscription-manager* && "$commands" != *--enable\ crb* ]] || return 1
+    done <<'EOF_RHUI'
+rhel-10-baseos-rhui-rpms codeready-builder-for-rhel-10-rhui-rpms
+rhui-rhel-10-for-x86_64-baseos-rhui-rpms rhui-codeready-builder-for-rhel-10-x86_64-rhui-rpms
+rhel-9-for-aarch64-baseos-rhui-rpms codeready-builder-for-rhel-9-aarch64-rhui-rpms
+EOF_RHUI
+)
+
+test_rhel_build_repo_preserves_active_update_channel() (
+    setup_rpm_repo_fixture
+    RPM_TEST_REPOS='repo id repo name status
+rhel-9-for-x86_64-baseos-eus-rpms BaseOS EUS enabled
+codeready-builder-for-rhel-9-x86_64-eus-rpms CodeReady EUS disabled
+codeready-builder-for-rhel-9-x86_64-rpms CodeReady disabled
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady 10 disabled
+rhel-10-for-x86_64-baseos-rpms BaseOS 10 disabled'
+    enable_rpm_build_repos >/dev/null || return 1
+    assert_eq "$RPM_TEST_ENABLED" codeready-builder-for-rhel-9-x86_64-eus-rpms
+)
+
+test_rpm_derivatives_enable_available_crb_or_powertools() (
+    setup_rpm_repo_fixture
+    DISTRO_LIKE=""
+    local distro builder
+    while read -r distro builder; do
+        DISTRO_ID="$distro"
+        RPM_TEST_REPOS="repo id repo name status
+baseos BaseOS enabled
+$builder Build Repository disabled"
+        enable_rpm_build_repos >/dev/null || return 1
+        assert_eq "$RPM_TEST_ENABLED" "$builder" "$distro" || return 1
+    done <<'EOF_DERIVATIVES'
+almalinux crb
+rocky powertools
+centos PowerTools
+EOF_DERIVATIVES
+)
+
+test_enabled_rpm_build_repo_does_not_mutate_configuration() (
+    setup_rpm_repo_fixture
+    RPM_TEST_REPOS='repo id repo name status
+rhel-9-for-x86_64-baseos-rpms Old BaseOS enabled
+codeready-builder-for-rhel-9-x86_64-rpms Old CodeReady disabled
+rhel-10-baseos-rhui-rpms RHUI BaseOS enabled
+codeready-builder-for-rhel-10-rhui-rpms RHUI CodeReady disabled
+rhel-10-for-x86_64-baseos-rpms BaseOS enabled
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady enabled'
+    enable_rpm_build_repos >/dev/null || return 1
+    assert_eq "$(cat "$RPM_TEST_DIR/commands")" 'env LC_ALL=C dnf -q repolist --all'
+)
+
+test_missing_or_ambiguous_rpm_build_repo_is_reported_without_guessing() (
+    setup_rpm_repo_fixture
+    local output
+    RPM_TEST_REPOS='repo id repo name status
+rhel-10-for-x86_64-baseos-rpms BaseOS enabled
+codeready-builder-for-rhel-10-x86_64-debug-rpms CodeReady Debug disabled
+codeready-builder-for-rhel-10-x86_64-source-rpms CodeReady Source disabled'
+    output=$(enable_rpm_build_repos) || return 1
+    assert_contains "$output" 'No matching CodeReady Builder/CRB' || return 1
+    assert_contains "$output" 'dnf repolist --all' || return 1
+    RPM_TEST_REPOS+='
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady disabled
+rhel-10-baseos-rhui-rpms RHUI BaseOS enabled
+codeready-builder-for-rhel-10-rhui-rpms RHUI CodeReady disabled'
+    output=$(enable_rpm_build_repos) || return 1
+    assert_contains "$output" 'Multiple build repositories match' || return 1
+    [[ "$(cat "$RPM_TEST_DIR/commands")" != *--enable* ]]
+)
+
+test_rpm_repo_failures_preserve_diagnostics_and_custom_package_install() (
+    setup_rpm_repo_fixture
+    RPM_TEST_REPOS='repo id repo name status
+rhel-10-for-x86_64-baseos-rpms BaseOS enabled
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady disabled'
+    pkg_update() { :; }
+    pkg_install() { printf '%s\n' "$*" >>"$RPM_TEST_DIR/packages"; }
+    local output
+    for RPM_TEST_FAIL in 'env LC_ALL=C dnf -q repolist --all' \
+        'subscription-manager repos --enable codeready-builder-for-rhel-10-x86_64-rpms'; do
+        output=$(install_packages 2>&1) || return 1
+        assert_contains "$output" 'repository command failed' || return 1
+        assert_contains "$output" 'WARN' || return 1
+        assert_contains "$(cat "$RPM_TEST_DIR/packages")" libbpf-devel || return 1
+    done
+)
+
+test_rpm_build_repos_do_not_modify_other_distributions() (
+    setup_rpm_repo_fixture
+    DISTRO_ID=fedora
+    DISTRO_LIKE=""
+    enable_rpm_build_repos || return 1
+    DISTRO_ID=ubuntu
+    DISTRO_LIKE=debian
+    PKG_MANAGER=apt-get
+    enable_rpm_build_repos || return 1
+    [[ ! -e "$RPM_TEST_DIR/commands" ]]
 )
 
 test_dry_run_report_emits_ci_fields() (
@@ -1120,6 +1288,52 @@ test_conntrack_activation_rejects_reserved_fallback_table() (
     fi
 )
 
+test_required_icmp_module_failure_preserves_attachment() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BPF_PIN_DIR="$tmpdir/pins"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    TOML_CONFIG="$tmpdir/config.toml"
+    IFACES=(eth0)
+    mkdir -p "$BPF_PIN_DIR"
+    touch "$TOML_CONFIG" "$XDP_OBJ_INSTALLED"
+    printf 'old\n' >"$BPF_PIN_DIR/prog"
+    ensure_linux_conntrack() { return 0; }
+    xdp_maps_ready() { return 0; }
+    preseed_xdp_candidate_policy() { return 0; }
+    load_slot_handlers() { return 0; }
+    python3() { return 1; } # dependency rejection in the ICMP module loader
+    bpftool() { touch "$4"; }
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    _auto_xdp_attach_candidate() { touch "$tmpdir/unexpected-attach"; }
+    transactional_reload_xdp >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 1 || return 1
+    assert_eq "$AUTO_XDP_ATTACH_FATAL" 1 || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" old || return 1
+    [[ ! -e "$tmpdir/unexpected-attach" && ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
+test_boot_missing_icmp_module_blocks_automatic_fallback() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    RUN_STATE_DIR="$tmpdir"
+    TOML_CONFIG="$tmpdir/config.toml"
+    printf '[modules.icmp]\nenabled=true\n' >"$TOML_CONFIG"
+    ensure_xdp_loaded() { return 1; }
+    activate_nftables_backend() { touch "$tmpdir/unexpected-fallback"; }
+    status=0
+    select_backend >/dev/null 2>&1 || status=$?
+    assert_eq "$status" 1 || return 1
+    [[ ! -e "$tmpdir/unexpected-fallback" ]]
+)
+
 test_runtime_module_switches_use_current_values_and_ignore_drafts() (
     source "$REPO_ROOT/setup_xdp.sh"
     local tmpdir output
@@ -1137,6 +1351,32 @@ test_runtime_module_switches_use_current_values_and_ignore_drafts() (
     if _auto_xdp_resolve_preferred_backend "$TOML_CONFIG" auto >"$tmpdir/error" 2>&1; then return 1; fi
     assert_file_contains "$tmpdir/error" 'Unsupported module configuration'
 )
+
+test_candidate_uses_module_config_and_ignores_retired_enable_sources() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    CONFIG_DIR="$tmpdir/config"
+    CURRENT_LINK="$tmpdir/current"
+    SOURCE_ROOT="$REPO_ROOT"
+    mkdir -p "$CONFIG_DIR" "$CURRENT_LINK"
+    printf '[policy]\nmode="audit"\n[modules.icmp]\nenabled = false\n' >"$CONFIG_DIR/config.toml"
+    touch "$CURRENT_LINK/icmp_conntrack.required"
+    AUTO_XDP_ICMP_CT=1
+    prepare_candidate_config || return 1
+    cmp "$CONFIG_DIR/config.toml" "$CANDIDATE_TOML_CONFIG" || return 1
+    printf '\n# keep this edit\n[daemon]\nlog_level="debug"\n' >>"$CONFIG_DIR/config.toml"
+    as_root() { [[ "$1" == chown ]] || "$@"; }
+    install_toml_config >/dev/null || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml" 'enabled = false' || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml" '# keep this edit' || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml" 'log_level="debug"' || return 1
+    printf '[icmp]\nenabled = true\n' >"$CONFIG_DIR/config.toml"
+    if prepare_candidate_config >"$tmpdir/error" 2>&1; then return 1; fi
+    assert_file_contains "$tmpdir/error" 'Unsupported module configuration'
+)
+
 
 test_transactional_xdp_validation_failure_keeps_current_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
@@ -2955,6 +3195,28 @@ test_check_required_tools_step_dies_when_install_fails() (
     assert_contains "$output" "Package installation failed."
 )
 
+test_check_required_tools_step_installs_missing_kernel_btf_tools() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local installed output missing_tool
+    PKG_MANAGER=apt-get
+    _tool_present() { [[ "$1" != "$missing_tool" || "$installed" == 1 ]]; }
+    bpf_header_exists() { return 0; }
+    install_packages() { installed=1; printf 'installed BTF tooling\n'; }
+    ensure_python_runtime() { :; }
+    ensure_psutil() { :; }
+    ensure_curses() { :; }
+    ensure_tomli_for_python310() { :; }
+
+    for missing_tool in pahole llvm-objcopy; do
+        installed=0
+        output=$(check_required_tools_step 2>&1) || return 1
+        assert_contains "$output" 'installed BTF tooling' || return 1
+        assert_contains "$output" "$missing_tool (after install)" || return 1
+        [[ "$output" != *"$missing_tool still missing"* ]] || return 1
+    done
+)
+
 test_check_required_tools_step_installs_when_bpf_headers_missing() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -3151,7 +3413,6 @@ SCRIPT
         fi
     done
 )
-
 
 run_discovered_tests "${BASH_SOURCE[0]}" "setup_xdp"
 finish_tests
