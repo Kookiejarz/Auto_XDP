@@ -1865,8 +1865,22 @@ PYEOF
         [[ -s "$ready_file" ]] && break
         sleep 0.02
     done
-    ip netns exec "$_NS" python3 \
-        "$REPO_ROOT/tests/python/kernel_syncookie_latency.py" client "$port" || return 1
+    if ! ip netns exec "$_NS" python3 \
+        "$REPO_ROOT/tests/python/kernel_syncookie_latency.py" client "$port"; then
+        test_log_error "SYN-cookie $attach_mode payload probe failed; server result and counters follow"
+        wait "$listener_pid" || true
+        listener_pid=""
+        [[ ! -s "$recv_file" ]] || cat "$recv_file"
+        PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 - "$_PIN_DIR" <<'PYEOF' || true
+import json, sys
+from pathlib import Path
+from kernel_packet_telemetry import counter
+print(json.dumps({key: counter(Path(sys.argv[1]) / "pkt_counters", key)
+                  for key in (*range(38, 46), 59, 60, 61, 62)}))
+PYEOF
+        ss -tin || true
+        return 1
+    fi
     wait "$listener_pid" || return 1
     listener_pid=""
 
