@@ -106,6 +106,17 @@ class RelayClient:
             except (ValueError, UnicodeDecodeError, RecursionError):
                 continue
 
+    def _connected_status(self) -> str:
+        state = self.telemetry_status.get("packet_state")
+        if state in ("waiting", "inactive"):
+            mode = self.telemetry_status.get("policy_mode")
+            suffix = f" ({mode})" if mode in ("audit", "observe") else ""
+            return f"relay: waiting for XDP{suffix}"
+        if state == "error":
+            error = self.telemetry_status.get("packet_error")
+            return "relay: ring buffer error" + (f": {error}" if isinstance(error, str) and error else "")
+        return "relay: connected"
+
     def poll(self) -> None:
         now = time.monotonic()
         if self._sock is None:
@@ -119,6 +130,7 @@ class RelayClient:
                 pending.connect(self.path)
             except BlockingIOError:
                 self._sock = pending
+                self.telemetry_status = {}
                 self.status = "relay: connecting"
             except OSError as exc:
                 if pending is not None:
@@ -128,6 +140,7 @@ class RelayClient:
                 return
             else:
                 self._sock = pending
+                self.telemetry_status = {}
                 self.status = "relay: connected"
 
         sock = self._sock
@@ -161,7 +174,7 @@ class RelayClient:
                 self.status = "relay: message exceeds buffer limit"
                 break
             self._consume()
-            self.status = "relay: connected"
+            self.status = self._connected_status()
 
     def _append(self, event: dict[str, Any]) -> None:
         if not isinstance(event, dict):

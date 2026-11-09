@@ -120,6 +120,43 @@ class RelayClientTests(unittest.TestCase):
             relay.poll()
         sock.close.assert_called_once()
 
+    def test_waiting_health_recovers_to_connected_without_reconnect(self):
+        relay = RelayClient("unused")
+        for state, mode, expected in [
+            ("waiting", "", "relay: waiting for XDP"),
+            ("inactive", "audit", "relay: waiting for XDP (audit)"),
+            ("inactive", "observe", "relay: waiting for XDP (observe)"),
+            ("ready", "", "relay: connected"),
+        ]:
+            with self.subTest(state=state, mode=mode):
+                health = dict(type="telemetry_status", session_id="run-a", packet_state=state, policy_mode=mode)
+                self.poll_chunks(relay, [(json.dumps(health) + "\n").encode()])
+                self.assertEqual(relay.status, expected)
+
+    def test_ring_error_is_visible_while_transport_is_connected(self):
+        relay = RelayClient("unused")
+        health = dict(type="telemetry_status", packet_state="error", packet_error="Permission denied")
+        self.poll_chunks(relay, [(json.dumps(health) + "\n").encode()])
+        self.assertIn("ring buffer error", relay.status)
+        self.assertIn("Permission denied", relay.status)
+
+    def test_unknown_health_fields_keep_legacy_connection_status(self):
+        relay = RelayClient("unused")
+        for state in (None, [], {}, "future"):
+            health = dict(type="telemetry_status", packet_state=state, policy_mode=[])
+            self.poll_chunks(relay, [(json.dumps(health) + "\n").encode()])
+            self.assertEqual(relay.status, "relay: connected")
+
+    def test_reconnect_discards_stale_health_before_new_server_replies(self):
+        relay = RelayClient("unused")
+        relay.telemetry_status = dict(packet_state="error", packet_error="old error")
+        sock = mock.Mock()
+        with mock.patch("auto_xdp.telemetry.relay_client.socket.socket", return_value=sock), \
+             mock.patch("auto_xdp.telemetry.relay_client.select.select", return_value=([], [], [])):
+            relay.poll()
+        self.assertEqual(relay.status, "relay: connected")
+        self.assertEqual(relay.telemetry_status, {})
+
 
 if __name__ == "__main__":
     unittest.main()
