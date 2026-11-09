@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import errno
 import hashlib
 import struct
 import ipaddress
@@ -32,6 +33,7 @@ from auto_xdp.bpf.maps import (
     BpfGlobalRlMap,
     BpfPortPolicyMap,
     BpfPortPolicyViewMap,
+    BpfUdpPortPolicyMap,
     BpfRateOuterMap,
     BpfRuntimeConfigMap,
     BpfSyncookieRuntimeMap,
@@ -64,6 +66,12 @@ _PROFILE_STATE_DIR = "profile-handlers"
 _POLICY_GENERATION_STATE = "policy-generations.json"
 _TCP_ENDPOINT_VALUE_FORMAT = "=IIQQ"
 _TCP_ALLOW = 1
+
+
+def _map_open_log_level(exc: OSError) -> int:
+    # A missing optional map is expected; any other failure (for example a
+    # value_size mismatch) silently disables a protection, so surface it.
+    return logging.DEBUG if exc.errno == errno.ENOENT else logging.WARNING
 
 
 def _compute_cfg_flags(desired: BackendProjection) -> int:
@@ -192,7 +200,7 @@ class XdpBackend(PortBackend):
         self._persisted_policy_generations = dict(self._policy_generations)
         self.trusted_map = BpfTrustedMaps(self.config.TRUSTED_IPS_MAP_PATH4, self.config.TRUSTED_IPS_MAP_PATH6)
         self._tcp_policy_map: BpfPortPolicyMap | None = None
-        self._udp_policy_map: BpfPortPolicyMap | None = None
+        self._udp_policy_map: BpfUdpPortPolicyMap | None = None
         self.syn_rate_map: RateLimitMap | None = None
         self.syn_agg_rate_map: RateLimitMap | None = None
         self.udp_rate_map: RateLimitMap | None = None
@@ -210,14 +218,16 @@ class XdpBackend(PortBackend):
             self.syn_agg_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 1, self.config.TCP_PORT_POLICY_MAP_PATH)
             log.debug("tcp_port_policies map opened; TCP per-port policy active.")
         except OSError as exc:
-            log.debug("tcp_port_policies map unavailable (%s); TCP per-port policy inactive.", exc)
+            log.log(_map_open_log_level(exc),
+                    "tcp_port_policies map unavailable (%s); TCP per-port policy inactive.", exc)
         try:
-            self._udp_policy_map = BpfPortPolicyMap(self.config.UDP_PORT_POLICY_MAP_PATH)
+            self._udp_policy_map = BpfUdpPortPolicyMap(self.config.UDP_PORT_POLICY_MAP_PATH)
             self.udp_rate_map = BpfPortPolicyViewMap(self._udp_policy_map, 0, self.config.UDP_PORT_POLICY_MAP_PATH)
             self.udp_agg_rate_map = BpfPortPolicyViewMap(self._udp_policy_map, 1, self.config.UDP_PORT_POLICY_MAP_PATH)
             log.debug("udp_port_policies map opened; UDP per-port policy active.")
         except OSError as exc:
-            log.debug("udp_port_policies map unavailable (%s); UDP per-port policy inactive.", exc)
+            log.log(_map_open_log_level(exc),
+                    "udp_port_policies map unavailable (%s); UDP per-port policy inactive.", exc)
         try:
             self.acl_maps = BpfAclMaps(
                 self.config.TCP_ACL_MAP_PATH4, self.config.TCP_ACL_MAP_PATH6,

@@ -1120,12 +1120,30 @@ class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
 
 
 class BpfPortPolicyMap(CacheVerifyMixin, BpfFdMap):
+    """Hash map: dest port → struct tcp_port_policy_cfg (8 × u32).
+
+    Rate fields come first. An entry whose rate fields are all zero is deleted.
+    """
+
     _STRUCT_FMT = "=IIIIIIII"
     _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
+    # syn_rate_max, syn_agg_rate_max and the retained _reserved2 slot.
+    _RATE_FIELDS = 3
+    _PREFIX_V4_INDEX = 3
+    _PREFIX_V6_INDEX = 4
+    _ZERO_INDICES: tuple[int, ...] = ()
+    DEFAULT_FIELDS: tuple[int, ...] = (0, 0, 0, 32, 128, 0, 0, 0)
 
     def __init__(self, path: str) -> None:
         super().__init__(path)
         self._max_entries: int = map_max_entries(self.fd)
+        actual_value_size = map_value_size(self.fd)
+        if actual_value_size != self._STRUCT_SIZE:
+            self.close()
+            raise OSError(
+                errno.EINVAL,
+                f"BPF map {path} value_size={actual_value_size}, expected {self._STRUCT_SIZE}",
+            )
         self._cache: dict[int, tuple[int, ...]] = {}
         self._key = ctypes.create_string_buffer(4)
         self._val = ctypes.create_string_buffer(self._STRUCT_SIZE)
@@ -1190,11 +1208,16 @@ class BpfPortPolicyMap(CacheVerifyMixin, BpfFdMap):
             if current is None:
                 continue
             updated = list(current)
-            updated[3] = prefix_v4
-            updated[4] = prefix_v6
+            updated[self._PREFIX_V4_INDEX] = prefix_v4
+            updated[self._PREFIX_V6_INDEX] = prefix_v6
+            for index in self._ZERO_INDICES:
+                updated[index] = 0
             fields = tuple(updated)
             if fields != current:
                 self.set_fields(port, fields, dry_run)
+
+    def rates_cleared(self, fields: tuple[int, ...]) -> bool:
+        return not any(fields[:self._RATE_FIELDS])
 
     def delete(self, port: int, dry_run: bool = False) -> bool:
         if dry_run:
@@ -1212,6 +1235,20 @@ class BpfPortPolicyMap(CacheVerifyMixin, BpfFdMap):
                 return True
             log.warning("BPF port policy delete failed path=%s port=%d: %s", self.path, port, exc)
             return False
+
+
+class BpfUdpPortPolicyMap(BpfPortPolicyMap):
+    """Hash map: dest port → struct udp_port_policy_cfg (6 × u32)."""
+
+    _STRUCT_FMT = "=IIIIII"
+    _STRUCT_SIZE = struct.calcsize(_STRUCT_FMT)
+    # rate_max, agg_rate_max.
+    _RATE_FIELDS = 2
+    _PREFIX_V4_INDEX = 2
+    _PREFIX_V6_INDEX = 3
+    # Releases that wrote this map with the TCP layout left 128 in _pad0.
+    _ZERO_INDICES = (4, 5)
+    DEFAULT_FIELDS = (0, 0, 32, 128, 0, 0)
 
 
 class BpfPortPolicyViewMap:
@@ -1232,14 +1269,11 @@ class BpfPortPolicyViewMap:
         }
 
     def set(self, port: int, rate_max: int, dry_run: bool = False) -> bool:
-        current = self._backing.active_structs().get(
-            port,
-            (0, 0, 0, 32, 128, 0, 0, 0),
-        )
+        current = self._backing.active_structs().get(port, self._backing.DEFAULT_FIELDS)
         updated = list(current)
         updated[self._field_index] = rate_max
         fields = tuple(updated)
-        if fields[:3] == (0, 0, 0):
+        if self._backing.rates_cleared(fields):
             return self._backing.delete(port, dry_run)
         return self._backing.set_fields(port, fields, dry_run)
 
@@ -1250,7 +1284,7 @@ class BpfPortPolicyViewMap:
         updated = list(current)
         updated[self._field_index] = 0
         fields = tuple(updated)
-        if fields[:3] == (0, 0, 0):
+        if self._backing.rates_cleared(fields):
             return self._backing.delete(port, dry_run)
         return self._backing.set_fields(port, fields, dry_run)
 
