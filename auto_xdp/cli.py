@@ -116,8 +116,9 @@ def main() -> None:
                 cli_log_level=args.log_level, mode=args.mode, explain=args.explain,
             )
     else:
-        if args.mode in {"observe", "audit"}:
-            sync_once(None, False, mode=args.mode, explain=True if args.explain else False)
+        effective_mode = args.mode or cfg.POLICY_MODE
+        if effective_mode in {"observe", "audit"}:
+            sync_once(None, args.dry_run, mode=effective_mode, explain=args.explain)
             return
         with open_backend(args.backend) as backend:
             if args.mode is None and not args.explain:

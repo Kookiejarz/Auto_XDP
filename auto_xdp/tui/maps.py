@@ -105,9 +105,15 @@ def _short_count(value: int | None) -> str:
 
 
 def _draw_maps(win: Any, rows: list[MapUsage], scroll: int, focused: bool, *, expanded: bool = False,
-               exact_bytes: bool = False) -> None:
+               exact_bytes: bool = False, empty_reason: str = "") -> None:
     h, w = win.getmaxyx()
     _box(win, f"BPF maps / {len(rows)} pinned", focused=focused)
+    if not rows:
+        _add(win, 1, 2, "No pinned BPF maps.", _color(_CP_MUTED))
+        if empty_reason:
+            _add(win, 2, 2, empty_reason, _color(_CP_MUTED))
+        _add(win, h - 1, 2, " m back" if expanded else " m expand", _color(_CP_MUTED))
+        return
     wide = expanded or w >= 90
     available = max(0, w - 4)
     values = [_values(row, exact_bytes) for row in rows]

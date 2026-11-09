@@ -352,19 +352,19 @@ def draw_handlers(win: Any, inventory: HandlerInventory, scroll: int, cursor: in
     _box(win, f"Handlers & slots / {active} loaded", focused=True)
     _add(win, 1, 2, inventory.status, _color(_CP_MUTED))
     columns = table_columns(width - 4, (
-        Column("role", 12, 0), Column("binding", 21, 1), Column("state", 10, 0),
-        Column("id", 8, 0, True), Column("name", 15, 4)))
-    _add(win, 2, 2, table_line(columns, dict(role="ROLE", binding="HOOK / TARGET", state="STATE", id="PROG ID", name="PROGRAM")), _color(_CP_MUTED))
+        Column("name", 18, 3), Column("state", 10, 0), Column("binding", 21, 2),
+        Column("id", 8, 0, True)))
+    _add(win, 2, 2, table_line(columns, dict(name="PROGRAM", state="STATE", binding="HOOK / TARGET", id="PROG ID")), _color(_CP_MUTED))
     visible = handler_capacity(height)
     scroll = max(0, min(scroll, max(0, len(inventory.rows) - visible)))
     for index, row in enumerate(inventory.rows[scroll:scroll + visible]):
         y = 3 + index * 2
-        role, binding = handler_labels(row)
+        _, binding = handler_labels(row)
         warning = row.module.error or row.module.build_error if row.module else ""
         color = _CP_GREEN if row.state == "loaded" and not warning else _CP_YELLOW
         if warning:
             _add(win, y, 1, "⚠", _color(_CP_YELLOW))
-        _add(win, y, 2, table_line(columns, dict(role=role, binding=binding, state=row.state,
+        _add(win, y, 2, table_line(columns, dict(binding=binding, state=row.state,
                                               id=str(row.program_id or "-"), name=row.name)),
              _color(_CP_SELECTED if scroll + index == cursor else color))
         details = (["Last build/check failed · Enter configure, e errors"] if row.module and row.module.build_error else [])

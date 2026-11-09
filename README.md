@@ -242,6 +242,11 @@ rows. Interface traffic comes from Linux network counters; XDP totals and drops
 come from dedicated BPF counters. Initial or unavailable rates display `--`.
 Fixed-size array maps display `fixed`, rather than a capacity warning; `~` marks
 sampled or cached map counts.
+In audit and observe mode, the dashboard remains available without an active
+firewall. Its mode badge says `not filtering`, discovered ports are marked
+`not active`, and Maps explains when XDP is inactive. Enforcement failures
+remain visible as errors. Audit and observe commands use the configured mode
+without requiring a packet-filtering backend.
 All pages use the current terminal width and height, including Overview,
 Sources, Events, Health, Maps, Audit, Requests, Handlers and handler forms.
 Tables redistribute their columns as the window grows or shrinks; taller
@@ -269,15 +274,21 @@ observation health. `h` opens Handlers & slots: actual protocol slots, TCP/UDP
 port handlers, TCP profiles and the SYN-cookie dispatch entry, with program IDs,
 names, ownership pins and configured paths. `loaded` means a live dispatch-map
 entry; `pin only` and `configured` do not imply that packets reach the program.
-`ROLE` describes the handler's purpose (for example, SYN cookie, App profile
-or Protocol); `HOOK / TARGET` shows its hook and protocol, port or
-profile binding. Catalog candidates show their intended target without claiming
+`PROGRAM`, `STATE`, `HOOK / TARGET` and `PROG ID` show each module
+and its hook, protocol, port or profile binding. Catalog candidates
+show their intended target without claiming
 an active hook. Navigation tabs stay compact even on wide terminals.
 The main firewall, socket tracker, TC dispatcher and SYN handoff infrastructure
 are hidden from this handler list; configurable modules remain visible.
 The inventory refreshes while this page is open, without changing attachments.
 `a` opens the authorization audit, `p` approval requests,
 `o` returns to the overview, and `q` exits.
+In Audit, select a denied endpoint and press Enter to review an approval.
+Root access and explicit confirmation are required. The prompt identifies
+the workload, zone, protocol and port and states that the grant covers all
+addresses. Unknown identities and policy conflicts must be resolved first;
+the endpoint is checked again after confirmation to reject stale selections.
+Approval preserves audit or observe mode; enabling enforcement is separate.
 Events retain live following across page changes and resizes; scrolling up
 pauses the list, and scrolling back to the bottom resumes it.
 Mouse support is enabled when the terminal supports it: click a tab to switch

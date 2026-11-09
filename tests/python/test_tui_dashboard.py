@@ -62,7 +62,7 @@ class Canvas:
 
 def _snapshot():
     return TuiSnapshot(
-        backend="xdp", iface="enp1s0", attach_mode="xdp native", attach_target="enp1s0",
+        backend="xdp", policy_mode="enforce", iface="enp1s0", attach_mode="xdp native", attach_target="enp1s0",
         attach_targets=[("enp1s0", "xdp native")], status="updated 12:34:56",
         rates={"XDP_TOTAL": (1500000, None), "XDP_DROP_TOTAL": (1400000, None)},
         host=HostMetrics("perf", 72.5, tuple((str(i), 20 + i * 10) for i in range(8)),
@@ -663,8 +663,8 @@ def test_runtime_row_edits_its_binding_instead_of_last_saved_target():
 def test_unbound_runtime_program_does_not_invent_a_dispatch_target():
     screen = Canvas(24, 100)
     draw_handlers(screen, HandlerInventory([HandlerRow("PROGRAM", 1234, 1234, "unbound", "pin only")]), 0)
-    line = next(text for _, _, text, _ in screen.calls if text.startswith("Pinned prog"))
-    assert line.split() == ["Pinned", "prog", "-", "pin", "only", "1234", "unbound"]
+    line = next(text for _, _, text, _ in screen.calls if text.startswith("unbound"))
+    assert line.split() == ["unbound", "pin", "only", "-", "1234"]
 
 
 @pytest.mark.parametrize("width,height", [(80, 20), (80, 24), (100, 30), (140, 42), (200, 50)])
@@ -807,3 +807,57 @@ def test_unavailable_metrics_are_unknown_and_history_is_bounded(tmp_path):
         _, network = sampler.sample("eth0", tick)
     assert len(network.rx_history) == 240
     assert len(network.tx_history) == 240
+
+
+@pytest.mark.parametrize("mode,backend,expected", [
+    ("audit", "inactive", "Mode AUDIT | not filtering"),
+    ("observe", "inactive", "Mode OBSERVE | not filtering"),
+    ("enforce", "xdp", "Mode ENFORCE | filtering"),
+    ("enforce", "inactive", "Mode ENFORCE | not active"),
+    ("audit", "xdp", "Mode AUDIT | check backend"),
+    ("unknown", "xdp", "Mode UNKNOWN | check config"),
+])
+def test_overview_mode_badge_separates_policy_from_active_backend(mode, backend, expected):
+    from auto_xdp.tui.dashboard import _draw_header
+    snap = _snapshot()
+    snap.policy_mode, snap.backend = mode, backend
+    snap.under_attack, snap.packet_events_enabled = True, False
+    for width in (80, 140, 240):
+        screen = Canvas(24, width)
+        with mock.patch("curses.color_pair", side_effect=lambda pair: pair << 8):
+            _draw_header(screen, snap, "overview", "12:34:56")
+        assert any(y == 0 and text == expected for y, _, text, _ in screen.calls)
+
+
+def test_handlers_put_program_name_first_and_omit_role_column():
+    screen = Canvas(24, 100)
+    draw_handlers(screen, HandlerInventory([HandlerRow("PROGRAM", 1234, 1234, "unbound", "pin only")]), 0)
+    header = next(text for y, x, text, _ in screen.calls if y == 2 and x == 2)
+    assert header.startswith("PROGRAM") and "ROLE" not in header
+    assert next(text for y, x, text, _ in screen.calls if y == 3 and x == 2).startswith("unbound")
+
+
+@pytest.mark.parametrize("answer,approved", [("y", True), ("", False), ("n", False)])
+def test_audit_enter_requires_confirmation(mouse_main, monkeypatch, answer, approved):
+    from auto_xdp.tui import app
+    snap = _snapshot()
+    snap.audit_rows = [{"action": "drop", "subject": "sshd.service", "port": 22, "protocol": "tcp", "zone": "public",
+                        "attribution": "exact", "reason": "unknown or unapproved workload ownership",
+                        "approval": {"subject": "sshd", "resolve": {"systemd_unit": "sshd.service"}}}]
+    approve = mock.Mock(return_value="approved")
+    monkeypatch.setattr(app.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(app, "_tui_prompt", lambda *args: answer)
+    monkeypatch.setattr(app, "_approve_audit_row", approve)
+    mouse_main(snap, initial="audit", keys_override=[10])
+    assert approve.call_count == int(approved)
+
+
+def test_audit_mouse_selects_without_approving(mouse_main, monkeypatch):
+    from auto_xdp.tui import app
+    snap = _snapshot()
+    snap.audit_rows = [{"action": "drop"}, {"action": "drop"}]
+    approve = mock.Mock()
+    monkeypatch.setattr(app, "_approve_audit_row", approve)
+    draw = mouse_main(snap, [(0, 10, 5, 0, curses.BUTTON1_DOUBLE_CLICKED)], initial="audit")
+    approve.assert_not_called()
+    assert draw.call_args.args[15] == 1

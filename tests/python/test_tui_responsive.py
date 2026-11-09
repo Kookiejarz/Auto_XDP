@@ -42,7 +42,7 @@ def test_every_table_distributes_columns_across_actual_terminal_width(width, pag
     if page != "maps":
         assert _cells(data.rstrip()) >= width - 6
     if page == "handlers":
-        assert "SYN handoff" in data and "TC in / SYN" in data
+        assert data.startswith("handler_") and "TC in / SYN" in data
 
 
 @pytest.mark.parametrize("width", [80, 140, 280, 360])

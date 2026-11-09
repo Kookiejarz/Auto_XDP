@@ -194,7 +194,10 @@ test_enable_waits_for_health_and_rolls_back_on_timeout() (
                 printf 'config:%s\n' "$*" >> "$tmpdir/calls"
                 [[ "$*" != 'policy mode' ]] || printf 'enforce\n'
             }
-            run_service_cmd() { printf 'service:%s\n' "$*" >> "$tmpdir/calls"; }
+            run_service_cmd() {
+                printf 'service:%s\n' "$*" >> "$tmpdir/calls"
+                [[ "$1" != status ]] || printf 'pager:%s:%s\n' "${SYSTEMD_PAGER:-}" "${PAGER:-}" >> "$tmpdir/calls"
+            }
             run_admin_runtime() { printf 'runtime:%s\n' "$*" >> "$tmpdir/calls"; }
             run_backend() {
                 if (( attempts == 0 )); then
@@ -217,6 +220,7 @@ test_enable_waits_for_health_and_rolls_back_on_timeout() (
                 assert_eq "$status" 1 "$output" || exit 1
                 [[ "$output" != *'Auto XDP enforcement enabled.'* ]] || exit 1
                 assert_contains "$output" 'Health    : degraded' || exit 1
+                assert_file_contains "$tmpdir/calls" 'pager:cat:cat' || exit 1
                 assert_file_contains "$tmpdir/calls" $'config:policy mode audit\nservice:stop\nruntime:deactivate\nservice:start' || exit 1
             else
                 assert_eq "$status" 0 "$output" || exit 1
