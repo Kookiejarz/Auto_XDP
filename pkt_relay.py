@@ -7,7 +7,8 @@ and fans out to TUI clients via a Unix domain socket.
 Protocol: line-delimited JSON.
   On connect: {"type":"history","events":[...]}  (up to max_history_on_connect)
   Live:       {"type":"event",...}
-  Health:     {"type":"telemetry_status",...} (once per second)
+  Health:     {"type":"telemetry_status","packet_state":..., ...} (once per second)
+              packet_state is ready, waiting, inactive, or error.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import argparse
 import collections
 import ctypes
 import ctypes.util
+import errno
 import fcntl
 import json
 import itertools
@@ -302,7 +304,7 @@ class RelayServer:
 
     def __init__(
         self,
-        ringbuf: RingBufReader,
+        ringbuf: RingBufReader | None,
         *,
         sock_path: str = SOCKET_PATH,
         retention_seconds: float = RETENTION_SECONDS,
@@ -310,12 +312,24 @@ class RelayServer:
         max_history_send: int = MAX_HISTORY_SEND,
         sock_state_reader: SockStateReader | None = None,
         sock_state_pin_path: str | None = None,
+        packet_pin_path: str | None = None,
+        config_path: str = TOML_CONFIG_PATH,
+        retry_interval: float = 2.0,
     ) -> None:
         if type(max_events) is not int or max_events < 1:
             raise ValueError("max_events must be a positive integer")
         if type(max_history_send) is not int or max_history_send < 0:
             raise ValueError("max_history_send must be a non-negative integer")
+        if ringbuf is None and not packet_pin_path:
+            raise ValueError("a packet ring or its pin path is required")
         self._rb = ringbuf
+        self._rb_pin = packet_pin_path
+        self._config_path = config_path
+        self._retry_interval = max(retry_interval, 0.1)
+        self._packet_status = {
+            "packet_state": "ready" if ringbuf is not None else "waiting",
+            "policy_mode": "", "packet_error": "",
+        }
         self._ss = sock_state_reader
         self._ss_pin = sock_state_pin_path
         self._ss_perf_fds: list[int] = []
@@ -479,6 +493,7 @@ class RelayServer:
         rejected = rejected if isinstance(rejected, int) else 0
         return {
             "type": "telemetry_status", "session_id": self._session_id,
+            **self._packet_status,
             "decoded_events": self._decoded_events,
             "queue_dropped": self._queue_dropped,
             "port_events_dropped": self._port_events_dropped,
@@ -515,26 +530,63 @@ class RelayServer:
         self._ss = SockStateReader(rb)
         log.info("sock_state_rb opened; port_change events enabled.")
 
+    def _connect_packet_ring(self) -> None:
+        if self._rb is not None or self._rb_pin is None:
+            return
+        try:
+            rb = RingBufReader(self._rb_pin)
+        except OSError as exc:
+            # Re-read policy while waiting so enforcement failures cannot be
+            # hidden by an earlier audit/observe decision.
+            mode = _inactive_policy_mode(self._config_path) if exc.errno == errno.ENOENT else None
+            status = {
+                "packet_state": "inactive" if mode else "error",
+                "policy_mode": mode or "", "packet_error": str(exc),
+            }
+            if mode:
+                if status != self._packet_status:
+                    log.info("Waiting for ring buffer %s: policy.mode=%s; packet events are inactive",
+                             self._rb_pin, mode)
+            else:
+                log.warning("Cannot open ring buffer %s: %s; retrying in %.1fs",
+                            self._rb_pin, exc, self._retry_interval)
+            self._packet_status = status
+        else:
+            self._rb = rb
+            self._packet_status = {"packet_state": "ready", "policy_mode": "", "packet_error": ""}
+            log.info("Packet ring buffer opened: %s", self._rb_pin)
+
+    def close_packet_ring(self) -> None:
+        if self._rb is not None:
+            self._rb.close()
+            self._rb = None
+
     def _reader_loop(self) -> None:
-        next_retry = 0.0
+        next_socket_retry = next_packet_retry = 0.0
         while self._running:
             now = time.monotonic()
-            if self._ss is None and now >= next_retry:
+            if self._rb is None and now >= next_packet_retry:
+                self._connect_packet_ring()
+                next_packet_retry = now + self._retry_interval
+            if self._ss is None and now >= next_socket_retry:
                 self._connect_sock_state()
-                next_retry = now + 1.0
-            watch_fds = [self._rb.fileno()]
+                next_socket_retry = now + 1.0
+            rb = self._rb
+            watch_fds = [rb.fileno()] if rb is not None else []
             if self._ss is not None:
                 watch_fds.append(self._ss.fileno())
+            timeout = 0.5 if rb is not None else min(0.5, max(0.0, next_packet_retry - time.monotonic()))
             try:
-                select.select(watch_fds, [], [], 0.5)
+                select.select(watch_fds, [], [], timeout)
             except (ValueError, OSError):
                 break
-            for raw in self._rb.drain():
-                ev = decode_event(raw)
-                if ev:
-                    self._enqueue(ev)
-                else:
-                    self._invalid_records += 1
+            if rb is not None:
+                for raw in rb.drain():
+                    ev = decode_event(raw)
+                    if ev:
+                        self._enqueue(ev)
+                    else:
+                        self._invalid_records += 1
             if self._ss is not None:
                 for ev in self._ss.drain():
                     self._enqueue(ev)
@@ -594,6 +646,7 @@ class RelayServer:
         self._wake_broadcaster()
 
     def _cleanup(self) -> None:
+        self.close_packet_ring()
         if self._ss is not None:
             self._ss.close()
             self._ss = None
@@ -670,6 +723,19 @@ def _remove_pid(path: str, fd: int) -> None:
 
 # entry point
 
+def _inactive_policy_mode(config_path: str) -> str | None:
+    """Only treat a missing packet ring as expected for a readable inactive policy."""
+    try:
+        config = load_toml_config(config_path, strict=True)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    policy = config.get("policy", {})
+    if not isinstance(policy, dict):
+        return None
+    mode = str(policy.get("mode", "audit")).lower()
+    return mode if mode in {"audit", "observe"} else None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="BPF ring buffer relay — streams DROP events to TUI clients",
@@ -708,21 +774,13 @@ def main() -> None:
     retention  = args.retention or cfg.get("retention_seconds", RETENTION_SECONDS)
     max_events = args.max_events or cfg.get("max_events",       MAX_EVENTS)
 
-    while True:
+    rb = None
+    if not args.wait_for_ringbuf:
         try:
             rb = RingBufReader(args.pin_path)
-            break
         except OSError as exc:
-            if not args.wait_for_ringbuf:
-                log.error("Cannot open ring buffer %s: %s", args.pin_path, exc)
-                sys.exit(1)
-            log.warning(
-                "Cannot open ring buffer %s: %s; retrying in %.1fs",
-                args.pin_path,
-                exc,
-                args.retry_interval,
-            )
-            time.sleep(max(args.retry_interval, 0.1))
+            log.error("Cannot open ring buffer %s: %s", args.pin_path, exc)
+            sys.exit(1)
 
     max_history_send = cfg.get("max_history_send", MAX_HISTORY_SEND)
 
@@ -733,6 +791,9 @@ def main() -> None:
         max_events=int(max_events),
         max_history_send=int(max_history_send),
         sock_state_pin_path=args.sock_state_rb,
+        packet_pin_path=args.pin_path if args.wait_for_ringbuf else None,
+        config_path=args.config,
+        retry_interval=args.retry_interval,
     )
 
     def _on_signal(signum: int, _frame: object) -> None:
@@ -748,7 +809,7 @@ def main() -> None:
         relay.run()
     finally:
         _remove_pid(args.pid_file, pid_fd)
-        rb.close()
+        relay.close_packet_ring()
 
 
 

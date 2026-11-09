@@ -326,6 +326,10 @@ packet recording.
 Packet totals come from dedicated BPF counters. Event lists and source rankings
 are bounded, potentially lossy samples, not full traffic or attacker attribution.
 The health page separates BPF event loss, relay queue loss, and truncated replay.
+With `--wait-for-ringbuf`, the relay serves its local socket while waiting
+for XDP packet events. Audit and observe mode report `waiting for XDP`;
+enforcement failures and permission errors remain visible. The relay retries
+automatically and reports connected once the packet ring becomes available.
 Cookie ACK validation and successful TC handoff do **not** prove application
 acceptance. These changes do not enable SYN cookies or alter exposure grants.
 
