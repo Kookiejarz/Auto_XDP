@@ -1,3 +1,4 @@
+import copy
 import json
 import socket
 import struct
@@ -1682,7 +1683,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             "office",
             "--log-level",
             "debug",
-        ]), mock.patch.object(cli_mod, "load_toml_config", return_value={}), \
+        ]), mock.patch.object(cli_mod, "load_toml_config", return_value={"policy": {"mode": "enforce"}}), \
              mock.patch.object(cfg, "TRUSTED_SRC_IPS", trusted_ips), \
              mock.patch.object(cli_mod, "open_backend", return_value=backend) as open_backend, \
              mock.patch.object(cli_mod, "sync_once") as sync_once:
@@ -1727,7 +1728,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         ]), mock.patch.object(
             cli_mod,
             "load_toml_config",
-            return_value={"daemon": {"preferred_backend": "nftables"}},
+            return_value={"daemon": {"preferred_backend": "nftables"}, "policy": {"mode": "enforce"}},
         ), mock.patch.object(cli_mod, "open_backend", return_value=backend) as open_backend, \
              mock.patch.object(cli_mod, "sync_once") as sync_once:
             old_backend = cfg.PREFERRED_BACKEND
@@ -2173,7 +2174,6 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
                              monotonic=lambda: clock[0], mode="enforce")
         return backend.ensure_conntrack_activation.call_count
 
-
     def test_watch_rechecks_conntrack_activation_on_its_interval(self):
         interval = syncer_mod.CONNTRACK_CHECK_INTERVAL_SECONDS
         self.assertEqual(self._watch_conntrack_checks(dry_run=False, step=0.0), 1)
@@ -2182,7 +2182,6 @@ class SyncerVerifyTriggerTests(unittest.TestCase):
         # A failing check doubles its interval, so the next one is not yet due.
         self.assertEqual(
             self._watch_conntrack_checks(dry_run=False, step=interval + 1, failing=True), 1)
-
 
     def test_failed_apply_triggers_verify_and_corrective_sync(self):
         from auto_xdp.discovery.notifications import Notification
@@ -2242,6 +2241,57 @@ class ConfigReloadTests(unittest.TestCase):
                 self.assertFalse(syncer_mod._reload_config(config_file.name))
         self.assertEqual(cfg.POLICY_MODE, "audit")
         self.assertTrue(any("retaining previous" in line for line in logs.output))
+
+
+@pytest.mark.parametrize("configured,override,effective,flags", [
+    (None, None, "audit", []),
+    ("audit", None, "audit", []),
+    ("observe", None, "observe", []),
+    ("audit", None, "audit", ["--dry-run", "--explain"]),
+    ("enforce", None, "enforce", []),
+    ("enforce", "audit", "audit", []),
+    ("enforce", "observe", "observe", []),
+    ("audit", "enforce", "enforce", []),
+    ("observe", "enforce", "enforce", []),
+])
+@pytest.mark.parametrize("icmp_enabled", [False, True])
+def test_once_cli_uses_effective_policy_before_opening_backend(
+    tmp_path, monkeypatch, configured, override, effective, flags, icmp_enabled,
+):
+    # Exercise real TOML loading without leaking compatibility globals to
+    # other tests; apply_toml_config updates their mutable containers in place.
+    for name in cfg._SETTING_NAMES:
+        monkeypatch.setattr(cfg, name, copy.deepcopy(getattr(cfg, name)))
+    path = tmp_path / "config.toml"
+    contents = f"[modules.icmp]\nenabled = {str(icmp_enabled).lower()}\n"
+    if configured is not None:
+        contents += f'[policy]\nmode = "{configured}"\n'
+    path.write_text(contents)
+    argv = ["xdp_port_sync.py", "--config", str(path), *flags]
+    if override is not None:
+        argv += ["--mode", override]
+    monkeypatch.setattr(sys, "argv", argv)
+    backend = mock.MagicMock()
+    backend.__enter__.return_value = backend
+    opener = mock.Mock(return_value=backend)
+    if effective != "enforce":
+        opener.side_effect = AssertionError("non-filtering mode must not open a backend")
+    sync = mock.Mock(return_value={"apply_result": None})
+    monkeypatch.setattr(cli_mod, "open_backend", opener)
+    monkeypatch.setattr(cli_mod, "sync_once", sync)
+
+    cli_mod.main()
+
+    assert sync.call_count == 1
+    assert sync.call_args.args == (backend if effective == "enforce" else None, "--dry-run" in flags)
+    assert (sync.call_args.kwargs.get("mode") or cfg.POLICY_MODE) == effective
+    assert sync.call_args.kwargs.get("explain", False) == ("--explain" in flags)
+    assert path.read_text() == contents
+    if effective == "enforce":
+        opener.assert_called_once_with("auto")
+        backend.__exit__.assert_called_once()
+    else:
+        opener.assert_not_called()
 
 
 if __name__ == "__main__":

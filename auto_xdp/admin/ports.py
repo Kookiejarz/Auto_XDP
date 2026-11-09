@@ -146,11 +146,12 @@ def read_nft_ports(nft_family: str, nft_table: str) -> tuple[list[int], list[int
             return []
         ports: set[int] = set()
         for item in data.get("nftables", []):
-            e = item.get("element")
+            # `list set` embeds members in set.elem; retain legacy element records.
+            e = item.get("set") or item.get("element")
             if not e:
                 continue
             for v in e.get("elem", []):
-                if isinstance(v, int) and 0 < v <= 65535:
+                if type(v) is int and 0 < v <= 65535:
                     ports.add(v)
         return sorted(ports)
 

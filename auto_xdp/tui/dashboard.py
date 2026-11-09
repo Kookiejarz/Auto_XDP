@@ -144,13 +144,31 @@ def page_tabs(width: int) -> list[tuple[int, str, str]]:
     return result
 
 
+def _policy_badge(snap: Any) -> tuple[str, int]:
+    mode = snap.policy_mode
+    if mode in {"audit", "observe"}:
+        if snap.backend == "inactive":
+            return f"Mode {mode.upper()} | not filtering", _CP_YELLOW
+        return f"Mode {mode.upper()} | check backend", _CP_RED
+    if mode == "enforce":
+        active = snap.backend == "nftables" or (
+            snap.backend == "xdp" and bool(snap.attach_targets)
+            and all(value in {"xdp native", "xdp generic", "xdp offload"} for _, value in snap.attach_targets)
+        )
+        return ("Mode ENFORCE | filtering", _CP_GREEN) if active else ("Mode ENFORCE | not active", _CP_RED)
+    return "Mode UNKNOWN | check config", _CP_RED
+
+
 def _draw_header(stdscr: Any, snap: Any, page: str, clock: str) -> None:
     _, w = stdscr.getmaxyx()
     _add(stdscr, 0, 1, "AUTO XDP", _color(_CP_CYAN) | curses.A_BOLD)
+    badge, badge_color = _policy_badge(snap)
+    _add(stdscr, 0, 12, badge, _color(badge_color) | curses.A_BOLD)
     identity = snap.host.hostname or snap.attach_target or snap.iface
     suppressed = _events_suppressed(snap)
-    identity_width = w - 54 if suppressed else w - len(clock) - 17
-    _add(stdscr, 0, 12, identity[:max(0, identity_width)], _color(_CP_MUTED))
+    identity_x = 14 + len(badge)
+    identity_right = w - 39 if suppressed else w - len(clock) - 4
+    _add(stdscr, 0, identity_x, identity[:max(0, identity_right - identity_x)], _color(_CP_MUTED))
     if suppressed:
         _add(stdscr, 0, max(24, w - 37), " EVENTS SUPPRESSED ", _color(_CP_RED))
     _add(stdscr, 0, max(0, w - len(clock) - 2), clock, _color(_CP_MUTED))

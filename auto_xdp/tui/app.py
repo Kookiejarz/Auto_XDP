@@ -101,6 +101,8 @@ class MapUsage:
 @dataclass
 class TuiSnapshot:
     backend: str = "-"
+    policy_mode: str = "unknown"
+    protection_error: str = ""
     iface: str = "-"
     map_id: str = "-"
     attach_mode: str = "-"
@@ -258,7 +260,7 @@ def _collect_map_usage(
 ) -> list[MapUsage]:
     pin_dir = Path(bpf_pin_dir)
     if not pin_dir.exists():
-        return [MapUsage(str(pin_dir), "-", None, None, None, "missing")]
+        return []
     now = time.monotonic() if now is None else now
     cache = cache or MapUsageCache()
 
@@ -527,6 +529,18 @@ def _collect_audit_rows(config_path: str) -> list[dict[str, Any]]:
     rows = []
     for decision in desired.exposure_decisions:
         endpoint = decision.endpoint
+        approval: dict[str, Any] = {}
+        if endpoint.attribution_state in {"exact", "delegated"}:
+            if decision.subject:
+                approval = {"subject": decision.subject}
+            elif endpoint.container_id and endpoint.container_runtime in {"docker", "podman"}:
+                approval = {"subject": f"{endpoint.container_runtime}-{endpoint.container_id[:12]}",
+                            "resolve": {"container_runtime": endpoint.container_runtime, "container_id": endpoint.container_id}}
+            elif endpoint.attribution_source.startswith("systemd") and endpoint.subject.endswith(".service"):
+                approval = {"subject": endpoint.subject.removesuffix(".service").replace("@", "-"),
+                            "resolve": {"systemd_unit": endpoint.subject}}
+            elif endpoint.attribution_source == "process-name" and endpoint.subject:
+                approval = {"subject": endpoint.subject, "resolve": {"process_name": endpoint.subject}}
         rows.append({
             "action": decision.action,
             "address": endpoint.host_address,
@@ -539,11 +553,24 @@ def _collect_audit_rows(config_path: str) -> list[dict[str, Any]]:
             "source": endpoint.attribution_source,
             "profile": decision.protection_profile or "-",
             "reason": decision.reason,
+            "approval": approval,
         })
     return sorted(
         rows,
         key=lambda row: (row["action"], row["protocol"], row["port"], row["address"], row["subject"]),
     )
+
+
+def _observed_port_rows(audit_rows: list[dict[str, Any]]) -> list[tuple[str, int, str, str, str]]:
+    """Reuse discovered endpoints, merging address families and ingress zones."""
+    owners: dict[tuple[str, int], set[str]] = {}
+    for row in audit_rows:
+        protocol = str(row["protocol"]).upper()
+        if protocol not in {"TCP", "UDP"}:
+            continue
+        owners.setdefault((protocol, row["port"]), set()).add(str(row.get("subject") or "unknown"))
+    return [(protocol, port, _safe_service(port, protocol), ",".join(sorted(names)), "not active")
+            for (protocol, port), names in sorted(owners.items())]
 
 
 def _actionable_approval_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -564,6 +591,42 @@ def _approve_tui_request(args: Any, request: dict[str, Any]) -> str:
     )
     approvals.reload_daemon()
     return f"approved request #{request_id}"
+
+
+def _audit_request(row: dict[str, Any]) -> dict[str, Any]:
+    if row.get("action") == "allow":
+        raise ValueError("This endpoint is already allowed")
+    if row.get("attribution") not in {"exact", "delegated"} or not row.get("approval"):
+        raise ValueError("Workload identity is unknown or ambiguous; select an explicit identity in Requests")
+    if row.get("reason") not in {
+        "unknown or unapproved workload ownership", "no exposure grant for ingress zone",
+        "no exposure grant for protocol", "port is not listed in the exposure grant",
+    }:
+        raise ValueError(f"Review the policy conflict before approval: {row.get('reason', 'unknown')}")
+    return {**row["approval"], "zone": row["zone"], "protocol": row["protocol"].lower(), "ports": [int(row["port"])]}
+
+
+def _approve_audit_row(args: Any, row: dict[str, Any]) -> str:
+    if os.geteuid() != 0:
+        raise PermissionError("approval changes require root")
+    # Re-read live ownership after the confirmation prompt. A stale row must
+    # not authorize a different listener that has since taken over the port.
+    if row not in _collect_audit_rows(args.config):
+        raise ValueError("Endpoint or policy changed; refresh Audit and review the selection again")
+    request = _audit_request(row)
+    config = load_toml_config(args.config, strict=True)
+    request.setdefault("resolve", config.get("subjects", {}).get(request["subject"], {}).get("resolve", {}))
+    store = approvals.store_path(args.run_state_dir)
+    pending = next((item for item in approvals.list_requests(store, "pending")
+                    if all(item.get(key) == value for key, value in request.items())), None)
+    if pending is None:
+        pending = approvals.create_request(store, args.config, **request,
+            reason=f"Audit approval for {row['subject']} {row['protocol']}/{row['port']} in {row['zone']}", actor="tui")
+    approvals.approve_request(store, args.config, int(pending["id"]), actor="tui")
+    approvals.reload_daemon()
+    mode = config.get("policy", {}).get("mode", "audit")
+    suffix = f"; {mode} mode remains non-filtering" if mode in {"audit", "observe"} else ""
+    return f"approved {row['subject']} {row['protocol']}/{row['port']} zone={row['zone']}{suffix}"
 
 
 def _audit_fingerprint(rows: list[dict[str, Any]]) -> str:
@@ -618,10 +681,24 @@ def _collect_snapshot(
     if not ifaces:
         ifaces = [autodetect_iface()]
     iface = ifaces[0]
-    backend = detect_backend(Path(args.bpf_pin_dir), Path(args.run_state_dir), ifaces, args.nft_family, args.nft_table)
+    config = parse_toml_config(load_toml_config(args.config, strict=True))
+    inactive_mode = ""
+    protection_error = ""
+    try:
+        backend = detect_backend(Path(args.bpf_pin_dir), Path(args.run_state_dir), ifaces, args.nft_family, args.nft_table)
+    except RuntimeError as exc:
+        # Audit and observe intentionally have no data plane. Keep host metrics
+        # and policy review available. An enforce-mode failure remains explicit
+        # in the mode badge and footer; never infer audit from a missing backend.
+        if config.POLICY_MODE not in {"audit", "observe"}:
+            protection_error = f"Protection inactive: {exc}"
+        backend = "inactive"
+        inactive_mode = config.POLICY_MODE
     map_id = read_xdp_map_id(args.bpf_pin_dir) if backend == "xdp" else "-"
     state_file = Path(args.run_state_dir) / "axdp_stats_tui.json"
-    rows, map_id = collect_stats_rows(backend, args.bpf_pin_dir, iface, args.nft_family, args.nft_table, state_file)
+    rows: list[tuple[str, int, int]] = []
+    if backend != "inactive":
+        rows, map_id = collect_stats_rows(backend, args.bpf_pin_dir, iface, args.nft_family, args.nft_table, state_file)
     now = time.monotonic()
     elapsed = max(now - prev_ts, 0.001)
     stats_rows = []
@@ -649,8 +726,12 @@ def _collect_snapshot(
         modes = {mode for _, mode in attach_targets}
         attach_mode = attach_targets[0][1] if len(modes) == 1 else "auto"
         attach_target = " ".join(name for name, _ in attach_targets)
-    else:
+    elif backend == "nftables":
         attach_mode = f"nftables fallback ({args.nft_family} {args.nft_table})"
+        attach_targets = [(name, attach_mode) for name in ifaces]
+        attach_target = " ".join(ifaces)
+    else:
+        attach_mode = f"inactive ({inactive_mode})"
         attach_targets = [(name, attach_mode) for name in ifaces]
         attach_target = " ".join(ifaces)
 
@@ -682,6 +763,8 @@ def _collect_snapshot(
             handler_inventory.status = "XDP backend inactive · " + handler_inventory.status
     snap = TuiSnapshot(
         backend=backend,
+        policy_mode=config.POLICY_MODE,
+        protection_error=protection_error,
         iface=iface,
         map_id=map_id,
         attach_mode=attach_mode,
@@ -706,7 +789,7 @@ def _collect_snapshot(
             args.nft_table,
             include_processes=not fast,
             interfaces=ifaces,
-        ),
+        ) if backend != "inactive" else _observed_port_rows(audit_rows),
         excluded=_excluded_counts(args.config),
         under_attack=_under_attack_enabled(args.config),
         packet_events_enabled=_read_packet_events_enabled(str(Path(args.bpf_pin_dir) / "xdp_runtime_cfg")) if backend == "xdp" else None,
@@ -794,7 +877,7 @@ class SnapshotWorker:
                 )
                 self._first_collect = False
                 snap.status = f"updated {_dt.datetime.now().strftime('%H:%M:%S')}"
-                self._set_result(snap, "")
+                self._set_result(snap, snap.protection_error)
             except Exception as exc:
                 with self._lock:
                     self._error = str(exc)
@@ -877,7 +960,8 @@ def _draw_summary(win: Any, snap: TuiSnapshot) -> None:
         _add(win, 5, 2, table_line(columns, dict(label="Drop ratio", value=text)), _color(_CP_RED) if ratio else _color(_CP_MUTED))
         tcp = sum(row[0] == "TCP" for row in snap.ports)
         udp = sum(row[0] == "UDP" for row in snap.ports)
-        _add(win, 6, 2, table_line(columns, dict(label="Ports", value=f"{tcp} TCP / {udp} UDP")), _color(_CP_MUTED))
+        _add(win, 6, 2, table_line(columns, dict(label="Discovered" if snap.backend == "inactive" else "Ports",
+                                              value=f"{tcp} TCP / {udp} UDP")), _color(_CP_MUTED))
     if h >= 10:
         cookie = "unknown" if snap.cookie_runtime is None else "on" if snap.cookie_runtime[0] else "off"
         _add(win, 7, 2, table_line(columns, dict(label="SYN cookie runtime", value=cookie)), _color(_CP_MUTED))
@@ -886,29 +970,33 @@ def _draw_summary(win: Any, snap: TuiSnapshot) -> None:
     _add(win, h - 1, 2, note, _color(_CP_YELLOW) if suppressed else _color(_CP_MUTED))
 
 
-def _draw_audit_page(stdscr: Any, snap: TuiSnapshot, scroll: int, last_error: str) -> None:
+def _draw_audit_page(stdscr: Any, snap: TuiSnapshot, cursor: int, last_error: str) -> None:
     win = _make_full_win(stdscr)
     if win is None:
         _add(stdscr, 0, 0, "terminal too small; need at least 80x20")
         stdscr.refresh()
         return
-    _box(win, f"authorization audit  {sum(row['action'] == 'allow' for row in snap.audit_rows)} allowed / {sum(row['action'] == 'drop' for row in snap.audit_rows)} denied")
+    label = "would allow / deny" if snap.policy_mode in {"audit", "observe"} else "allow / deny policy"
+    _box(win, f"authorization audit  {sum(row['action'] == 'allow' for row in snap.audit_rows)} / {sum(row['action'] == 'drop' for row in snap.audit_rows)} {label}")
     columns = table_columns(win.getmaxyx()[1] - 4, (
         Column("action", 5, 0), Column("protocol", 5, 0), Column("endpoint", 18, 4),
         Column("zone", 8), Column("subject", 10, 3), Column("attribution", 8), Column("reason", 14, 4)))
     _add(win, 1, 2, table_line(columns, dict(action="act", protocol="proto", endpoint="bind/address:port",
                                           zone="zone", subject="subject", attribution="source", reason="reason")), _color(_CP_MUTED))
     visible = max(0, win.getmaxyx()[0] - 3)
-    scroll = max(0, min(scroll, max(0, len(snap.audit_rows) - visible)))
+    cursor = max(0, min(cursor, len(snap.audit_rows) - 1)) if snap.audit_rows else -1
+    scroll = _port_window_start(cursor, len(snap.audit_rows), visible)
     for idx, row in enumerate(snap.audit_rows[scroll:scroll + visible], start=2):
         action = str(row["action"]).upper()
         attr = curses.color_pair(_CP_GREEN) if action == "ALLOW" else curses.color_pair(_CP_RED) | curses.A_BOLD
+        if scroll + idx - 2 == cursor:
+            attr = _color(_CP_SELECTED) | curses.A_BOLD
         endpoint = f"{row['bind_scope']}/{row['address']}:{row['port']}"
         line = table_line(columns, dict(action=action, protocol=str(row["protocol"]).upper(), endpoint=endpoint,
                                         zone=str(row["zone"]), subject=str(row["subject"]),
                                         attribution=str(row["attribution"]), reason=str(row["reason"])))
         _add(win, idx, 2, line, attr)
-    footer = "↑↓/PgUp/PgDn scroll  o:overview  p:approvals  v:traffic  q:quit"
+    footer = "↑↓ select  Enter:approve  p:requests  o:overview  q:quit" if os.geteuid() == 0 else "↑↓ select  root required to approve  p:requests  o:overview  q:quit"
     if len(snap.audit_rows) > visible:
         footer = f"{scroll + 1}-{min(scroll + visible, len(snap.audit_rows))}/{len(snap.audit_rows)}  " + footer
     _add(win, win.getmaxyx()[0] - 1, 2, footer, _color(_CP_MUTED))
@@ -1047,9 +1135,9 @@ def _filter_port_rows(
     return [row for row in rows if row[0] == proto_filter]
 
 
-def _port_filter_title(proto_filter: str) -> str:
+def _port_filter_title(proto_filter: str, observed: bool = False) -> str:
     label = proto_filter if proto_filter in ("TCP", "UDP") else "all"
-    return f"ports / services / limits [{label}]"
+    return f"discovered ports [{label}]" if observed else f"ports / services / limits [{label}]"
 
 
 def _draw_ports(
@@ -1061,9 +1149,11 @@ def _draw_ports(
     event_dport_filter: int | None = None,
     focused: bool = False,
     excluded: tuple[int, int] = (0, 0),
+    observed: bool = False,
+    discovery_error: str = "",
 ) -> None:
     h, w = win.getmaxyx()
-    title = _port_filter_title(proto_filter)
+    title = _port_filter_title(proto_filter, observed)
     _box(win, title, focused=focused)
     interior = max(0, w - 4)
     with_limit = interior >= 64
@@ -1071,7 +1161,8 @@ def _draw_ports(
     if with_limit:
         specs.append(Column("limit", 14, 2))
     columns = table_columns(interior, specs)
-    header = table_line(columns, dict(proto="P", port="PORT", service="SERVICE", process="PROCESS", limit="LIMIT"))
+    header = table_line(columns, dict(proto="P", port="PORT", service="SERVICE",
+                                     process="OWNER" if observed else "PROCESS", limit="LIMIT"))
     _add(win, 1, 2, header, _color(_CP_MUTED))
     now = time.monotonic()
     display_rows = list(rows)
@@ -1086,6 +1177,9 @@ def _draw_ports(
 
     visible = max(0, h - 3)
     start = _port_window_start(cursor, len(display_rows), visible)
+    if not display_rows and visible:
+        message = "Discovery unavailable; see Audit." if observed and discovery_error else "No matching ports."
+        _add(win, 2, 2, message, _color(_CP_MUTED))
     for idx, (proto, port, svc, proc, limit) in enumerate(display_rows[start:start + visible], start=2):
         mark = port_marks.get((proto, port))
         attr = curses.A_NORMAL
@@ -1108,6 +1202,8 @@ def _draw_ports(
         excl_parts.append(f"{excl_cidrs} src CIDR{'s' if excl_cidrs != 1 else ''}")
     excl_hint = f"  excluded: {', '.join(excl_parts)}  (axdp exclude list)" if excl_parts else ""
     footer = f" {start + bool(display_rows)}-{min(start + visible, len(display_rows))}/{len(display_rows)} · t TCP / u UDP "
+    if observed:
+        footer += "· not filtering · a audit "
     if focused:
         footer += "· enter events "
         if w >= 78:
@@ -1133,7 +1229,7 @@ def _draw(
     port_cursor: int = -1,
     event_dport_filter: int | None = None,
     event_filter_scroll: int = 0,
-    audit_scroll: int = 0,
+    audit_cursor: int = 0,
     approval_cursor: int = -1,
     geoip: GeoIPResolver | None = None,
     mouse_enabled: bool = False,
@@ -1149,8 +1245,10 @@ def _draw(
         return
     _draw_header(stdscr, snap, page, _dt.datetime.now().strftime("%H:%M:%S"))
     _draw_footer(stdscr, snap, last_error, focus, page, mouse_enabled=mouse_enabled)
+    maps_empty_reason = (f"{snap.policy_mode.upper()} mode: XDP inactive."
+                         if snap.backend == "inactive" and snap.policy_mode in {"audit", "observe"} else "")
     if page == "audit":
-        _draw_audit_page(stdscr, snap, audit_scroll, last_error)
+        _draw_audit_page(stdscr, snap, audit_cursor, last_error)
         return
     if page == "approvals":
         _draw_approvals_page(stdscr, snap, approval_cursor, 0, last_error)
@@ -1198,7 +1296,8 @@ def _draw(
     if page == "maps":
         full_win = _make_full_win(stdscr)
         if full_win is not None:
-            _draw_maps(full_win, snap.maps, map_scroll, True, expanded=True, exact_bytes=map_bytes)
+            _draw_maps(full_win, snap.maps, map_scroll, True, expanded=True, exact_bytes=map_bytes,
+                       empty_reason=maps_empty_reason)
         stdscr.refresh()
         return
     if page == "handlers":
@@ -1213,7 +1312,7 @@ def _draw(
         return
     _draw_network(wins.network, snap.network, snap)
     _draw_system(wins.system, snap.host)
-    _draw_maps(wins.maps, snap.maps, map_scroll, focus == "maps")
+    _draw_maps(wins.maps, snap.maps, map_scroll, focus == "maps", empty_reason=maps_empty_reason)
     _draw_events(wins.events, relay, snap, event_top, focus == "events",
                  dport_filter=event_dport_filter, filter_scroll=event_filter_scroll, compact=True)
     _draw_summary(wins.summary, snap)
@@ -1221,7 +1320,8 @@ def _draw(
                 cursor=port_cursor,
                 event_dport_filter=event_dport_filter,
                 focused=focus == "ports",
-                excluded=snap.excluded)
+                excluded=snap.excluded,
+                observed=snap.backend == "inactive", discovery_error=snap.audit_status)
     stdscr.refresh()
 
 
@@ -1263,7 +1363,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     port_cursor = 0
     event_dport_filter: int | None = None
     event_filter_scroll = 0
-    audit_scroll = 0
+    audit_cursor = 0
     approval_cursor = 0
     ui_error = geoip_error
     wins: _WinSet | None = None
@@ -1328,7 +1428,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                         if page in {"maps", "events"}:
                             focus = page
                         if page == "audit":
-                            audit_scroll = 0
+                            audit_cursor = 0
                         worker.show_approvals(page == "approvals")
                     elif mouse.kind == "focus":
                         focus = mouse.target
@@ -1352,7 +1452,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 ui_dirty = True
             elif ch in (ord("a"), ord("A")):
                 page = "audit"
-                audit_scroll = 0
+                audit_cursor = 0
                 worker.show_approvals(False)
                 ui_dirty = True
             elif ch in (ord("p"), ord("P")):
@@ -1451,6 +1551,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             display_port_rows = _filter_port_rows(snap.ports, port_filter)
             port_cursor = max(0, min(port_cursor, len(display_port_rows) - 1))
             approval_cursor = max(0, min(approval_cursor, len(snap.approval_rows) - 1)) if snap.approval_rows else -1
+            audit_cursor = max(0, min(audit_cursor, len(snap.audit_rows) - 1)) if snap.audit_rows else -1
             if mouse is not None and mouse.kind in {"port", "port_events"} and wins is not None:
                 visible = max(1, wins.ports.getmaxyx()[0] - 3)
                 clicked = _port_window_start(port_cursor, len(display_port_rows), visible) + mouse.index
@@ -1462,11 +1563,30 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                         event_filter_scroll = 0
                         page, focus = "events", "events"
                         worker.show_approvals(False)
+            elif mouse is not None and mouse.kind == "audit":
+                visible = max(1, stdscr.getmaxyx()[0] - 6)
+                clicked = _port_window_start(audit_cursor, len(snap.audit_rows), visible) + mouse.index
+                if 0 <= clicked < len(snap.audit_rows):
+                    audit_cursor = clicked
             elif mouse is not None and mouse.kind == "approval":
                 visible = max(1, stdscr.getmaxyx()[0] - 6)
                 clicked = _port_window_start(approval_cursor, len(snap.approval_rows), visible) + mouse.index
                 if 0 <= clicked < len(snap.approval_rows):
                     approval_cursor = clicked
+            if page == "audit" and ch in (10, 13, curses.KEY_ENTER):
+                try:
+                    if os.geteuid() != 0:
+                        raise PermissionError("approval changes require root")
+                    if audit_cursor < 0:
+                        raise ValueError("no audit endpoint selected")
+                    selected = snap.audit_rows[audit_cursor]
+                    request = _audit_request(selected)
+                    answer = _tui_prompt(stdscr, f"Approve {selected['subject']} {request['protocol']}/{selected['port']} zone={selected['zone']} (all addresses)? [y/N] ")
+                    ui_error = _approve_audit_row(args, selected) if answer.lower() in {"y", "yes"} else "approval cancelled"
+                except (ValueError, RuntimeError, OSError) as exc:
+                    ui_error = str(exc)
+                worker.wakeup()
+                ui_dirty = True
             if page == "approvals" and ch in (10, 13, curses.KEY_ENTER, ord("d"), ord("D"), ord("x"), ord("X"), ord("n"), ord("N")):
                 if os.geteuid() != 0:
                     ui_error = "approval changes require root"
@@ -1556,16 +1676,16 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                     ui_dirty = True
             elif page == "audit":
                 if ch == curses.KEY_UP:
-                    audit_scroll = max(0, audit_scroll - scroll_step)
+                    audit_cursor = max(0, audit_cursor - scroll_step)
                     ui_dirty = True
                 elif ch == curses.KEY_DOWN:
-                    audit_scroll += scroll_step
+                    audit_cursor = min(len(snap.audit_rows) - 1, audit_cursor + scroll_step)
                     ui_dirty = True
                 elif ch == curses.KEY_PPAGE:
-                    audit_scroll = max(0, audit_scroll - max(1, event_visible))
+                    audit_cursor = max(0, audit_cursor - max(1, event_visible))
                     ui_dirty = True
                 elif ch == curses.KEY_NPAGE:
-                    audit_scroll += max(1, event_visible)
+                    audit_cursor = min(len(snap.audit_rows) - 1, audit_cursor + max(1, event_visible))
                     ui_dirty = True
             elif page == "approvals":
                 if ch == curses.KEY_UP:
@@ -1673,7 +1793,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
                 port_cursor,
                 event_dport_filter,
                 event_filter_scroll,
-                audit_scroll,
+                audit_cursor,
                 approval_cursor,
                 snap.audit_fingerprint,
                 len(snap.approval_rows),
@@ -1682,7 +1802,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
             )
             now = time.monotonic()
             if ui_dirty or draw_state != last_draw_state or now - last_draw_at >= TUI_IDLE_REDRAW_INTERVAL:
-                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll, audit_scroll, approval_cursor, geoip, mouse_enabled,
+                _draw(stdscr, snap, relay, last_error, map_scroll, event_top, focus, port_marks, wins, port_filter, page, reasons_scroll, port_cursor, event_dport_filter, event_filter_scroll, audit_cursor, approval_cursor, geoip, mouse_enabled,
                       handler_scroll=handler_scroll, map_bytes=map_bytes, handler_cursor=handler_cursor)
                 if copy_mode:
                     _draw_footer(stdscr, snap, "", focus, page, copy_mode=True)
