@@ -20,7 +20,7 @@ from auto_xdp.admin.ports import collect_ports, lookup_port_procs, read_xdp_port
 from auto_xdp.admin.stats import collect_stats_rows, read_xdp_map_id
 from auto_xdp.admin import approvals
 from auto_xdp.bpf.maps import (
-    BpfGlobalRlMap, BpfPortPolicyMap, BpfSyncookieRuntimeMap, BpfRuntimeConfigMap,
+    BpfGlobalRlMap, BpfPortPolicyMap, BpfSyncookieRuntimeMap, BpfRuntimeConfigMap, BpfUdpPortPolicyMap,
     XDP_CFG_FLAG_DROP_EVENTS_DISABLED,
 )
 from auto_xdp.config import parse_toml_config, load_toml_config, module_configs
@@ -374,11 +374,13 @@ def _safe_service(port: int, proto: str) -> str:
     return name
 
 
-def _read_policy(path: str) -> dict[int, tuple[int, ...]]:
+def _read_policy(
+    path: str, map_cls: type[BpfPortPolicyMap] = BpfPortPolicyMap,
+) -> dict[int, tuple[int, ...]]:
     if not Path(path).exists():
         return {}
     try:
-        m = BpfPortPolicyMap(path)
+        m = map_cls(path)
     except OSError:
         return {}
     try:
@@ -512,7 +514,7 @@ def _collect_port_rows(
     tcp_procs = lookup_port_procs("tcp", tcp_ports) if include_processes else {}
     udp_procs = lookup_port_procs("udp", udp_ports) if include_processes else {}
     tcp_policy = _read_policy(str(Path(bpf_pin_dir) / "tcp_port_policies"))
-    udp_policy = _read_policy(str(Path(bpf_pin_dir) / "udp_port_policies"))
+    udp_policy = _read_policy(str(Path(bpf_pin_dir) / "udp_port_policies"), BpfUdpPortPolicyMap)
     global_udp = _read_global_udp_rate(str(Path(bpf_pin_dir) / "udp_global_rl"))
 
     rows: list[tuple[str, int, str, str, str]] = []

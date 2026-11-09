@@ -642,6 +642,7 @@ test_loaded_map_abi() {
     _assert_map_abi syn6 array_of_maps 4 4 65536 || return 1
 
     _assert_map_abi tcp_port_policies hash 4 32 1024 || return 1
+    _assert_map_abi udp_port_policies hash 4 24 1024 || return 1
     _assert_map_abi tcp_whitelist array 4 24 65536 || return 1
     _assert_map_abi tcp_zone_whitelist hash 8 24 4096 || return 1
     _assert_map_abi tcp_profile_handlers prog_array 4 4 256 || return 1
