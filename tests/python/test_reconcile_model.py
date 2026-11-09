@@ -25,6 +25,12 @@ from test_xdp_port_sync import (
 KEY = ("tcp", "198.51.100.10", 8080, "public")
 
 
+@pytest.fixture(autouse=True)
+def isolated_bpf_pins(tmp_path, monkeypatch):
+    # Fake maps must not inspect the host's root-only BPF filesystem.
+    monkeypatch.setattr(cfg, "BPF_PIN_DIR", str(tmp_path / "bpf"))
+
+
 def target(policies=None, **settings):
     snapshot = cfg.ConfigSnapshot({**cfg.snapshot_config().values, **settings})
     return DesiredState(config=snapshot,

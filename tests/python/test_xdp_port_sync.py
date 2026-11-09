@@ -34,6 +34,12 @@ import auto_xdp.discovery.services as services_mod
 import auto_xdp.state as state_mod
 
 
+@pytest.fixture(autouse=True)
+def isolated_bpf_pins(tmp_path, monkeypatch):
+    # Fake maps must not inspect the host's root-only BPF filesystem.
+    monkeypatch.setattr(cfg, "BPF_PIN_DIR", str(tmp_path / "bpf"))
+
+
 def make_addr(ip: str, port: int):
     return types.SimpleNamespace(ip=ip, port=port)
 
