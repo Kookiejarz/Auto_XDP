@@ -18,6 +18,7 @@ from typing import Mapping
 
 from auto_xdp import config as cfg
 from auto_xdp.admin import handlers as handler_admin
+from auto_xdp.admin import module_runtime
 from auto_xdp.install_state import atomic_write_json
 from auto_xdp.backends.base import BackendStatus, PortBackend
 from auto_xdp.abuseipdb import AbuseIPDBSyncer, BpfRiskMaps
@@ -100,6 +101,9 @@ def _legacy_syncookie_policy(policy: EndpointPolicy) -> EndpointPolicy:
 
 class XdpBackend(PortBackend):
     name = cfg.BACKEND_XDP
+    # Set by the transactional reload pre-seed when the runtime has verified
+    # that it will load the optional SYN-cookie program into this generation.
+    syncookie_program_expected = False
     # Last conntrack activation check error, to log each distinct failure once.
     _conntrack_check_error: str | None = None
     # SYN-cookie SYN-ACKs must decline ECN where the listener would.
@@ -799,7 +803,6 @@ class XdpBackend(PortBackend):
             pass
         return flags
 
-
     def ensure_conntrack_activation(self) -> bool | None:
         """Repair the conntrack activation table that the XDP data path needs.
 
@@ -829,6 +832,18 @@ class XdpBackend(PortBackend):
                         linux_conntrack.TABLE)
         return repaired
 
+    def _syncookie_program_available(self, config: cfg.ConfigSnapshot) -> bool:
+        """Cookie endpoints may only be exposed while the cookie program exists.
+
+        A transactional reload pre-seeds the candidate generation before the
+        runtime loads the optional cookie program into it. Checking only the
+        pin would close every cookie endpoint across the switch, including its
+        established connections, until a later daemon sync. The runtime passes
+        its capability decision instead; the daemon re-checks the real pin.
+        """
+        if module_runtime.program_available(Path(config.BPF_PIN_DIR)):
+            return True
+        return bool(self.syncookie_program_expected)
 
     def is_stale(self) -> bool:
         """Return True if the pinned tcp_whitelist map has been replaced since init."""
@@ -1165,9 +1180,8 @@ class XdpBackend(PortBackend):
 
         cookie_runtime_map = getattr(self, "syncookie_runtime_map", None)
         if cookie_runtime_map is not None:
-            active = desired_state.config.SYNCOOKIE_ENABLED and (
-                Path(desired_state.config.BPF_PIN_DIR) / "syncookie_prog"
-            ).exists()
+            active = desired_state.config.SYNCOOKIE_ENABLED and \
+                self._syncookie_program_available(desired_state.config)
             self._map_operation(cookie_runtime_map, 'set', active, desired_state.config.SYNCOOKIE_ACTIVATION_PERCENT, desired_state.config.SYNCOOKIE_AUTO_MAX_PERCENT, desired_state.config.SYNCOOKIE_INVALID_ACK_RATE_PPS, int(desired_state.config.SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS * 1_000_000_000), dry_run)
 
         if self.udp_rate_map is not None:
@@ -1324,7 +1338,7 @@ class XdpBackend(PortBackend):
                 required.append("global_rl_map")
             if policy.syncookie_mode != "off":
                 required.extend(("tcp_syncookie_mode_map", "tcp_syncookie_rate_map", "syncookie_runtime_map"))
-                if not (Path(projection.config.BPF_PIN_DIR) / "syncookie_prog").exists():
+                if not self._syncookie_program_available(projection.config):
                     scope_blocked[endpoint_key] = "SYN-cookie program is unavailable"
             missing = [name for name in required if getattr(self, name, None) is None]
             if missing:

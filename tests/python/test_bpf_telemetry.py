@@ -33,17 +33,31 @@ def test_counter_abi_manifest_is_generated_from_current_headers(tmp_path: Path) 
     ).read_text()
 
 
-def test_cookie_telemetry_uses_the_main_pinned_maps() -> None:
-    runtime = (ROOT / "runtime/auto_xdp_runtime_common.sh").read_text()
-    xdp = runtime.split('bpftool prog load "$xdp_obj"', 1)[1].split(
-        ">/dev/null 2>&1", 1
-    )[0]
-    tc = runtime.split('bpftool prog load "$tc_obj"', 1)[1].split(
-        ">/dev/null 2>&1", 1
-    )[0]
-    for name in ("pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg"):
-        assert f'map name {name} pinned "${{BPF_PIN_DIR}}/{name}"' in xdp
-    assert 'map name pkt_counters pinned "${BPF_PIN_DIR}/pkt_counters"' in tc
+@pytest.mark.component
+def test_cookie_telemetry_uses_the_main_pinned_maps(tmp_path: Path) -> None:
+    from auto_xdp.admin import handlers
+    xdp, tc = tmp_path / "xdp.o", tmp_path / "tc.o"
+    xdp.touch()
+    tc.touch()
+    names = ("pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg")
+    abi = handlers.HandlerMapAbi(2, 4, 4, 1, 0)
+    for name in names:
+        (tmp_path / name).touch()
+    def maps(obj):
+        return {name: abi for name in (names if obj == xdp else ("pkt_counters",))}
+    with mock.patch.object(handlers, "handler_object_programs", return_value=("entry", None)), \
+         mock.patch.object(handlers, "handler_object_maps", side_effect=maps), \
+         mock.patch.object(handlers, "pinned_handler_map_abi", return_value=abi), \
+         mock.patch.object(handlers, "run_checked") as run, \
+         mock.patch.object(handlers, "_transactional_handler_bindings"):
+        handlers._load_handler_bundle(tmp_path / "syncookie_prog_array", 0,
+                                      [("prog", xdp, "xdp"), ("ingress", tc, "classifier")],
+                                      tmp_path / "modules/syncookie", [])
+    for call, expected in zip(run.call_args_list, (names, ("pkt_counters",))):
+        command = call.args[0]
+        bindings = {command[i + 2]: command[i + 4] for i, value in enumerate(command) if value == "map"}
+        assert bindings == {name: str(tmp_path / name) for name in expected}
+    assert run.call_count == 2
 
 
 def test_runtime_builtin_slot_telemetry_map_binding(tmp_path: Path) -> None:

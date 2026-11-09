@@ -155,7 +155,8 @@ _auto_xdp_resolve_preferred_backend() {
         printf '%s\n' "$default"
         return 0
     }
-    "${PYTHON3_BIN:-python3}" - "$config_path" "$default" <<'PY'
+    local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+    PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON3_BIN:-python3}" - "$config_path" "$default" <<'PY'
 import sys
 try:
     import tomllib
@@ -168,7 +169,13 @@ except ImportError:
 
 try:
     with open(sys.argv[1], "rb") as handle:
-        value = str(tomllib.load(handle).get("daemon", {}).get("preferred_backend", sys.argv[2])).lower()
+        config = tomllib.load(handle)
+        from auto_xdp.config import module_configs
+        try:
+            modules = module_configs(config)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        value = str(config.get("daemon", {}).get("preferred_backend", sys.argv[2])).lower()
 except Exception:
     value = sys.argv[2]
 print(value if value in {"auto", "xdp", "nftables"} else sys.argv[2])
@@ -874,12 +881,15 @@ _auto_xdp_rollback_iface() {
 
 preseed_xdp_candidate_policy() {
     local candidate_dir="$1"
+    local syncookie_expected="${2:-0}"
     local py_bin="${PYTHON3_BIN:-python3}"
     local config_path="${TOML_CONFIG:-/etc/auto_xdp/config.toml}"
     local python_path="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
 
+    AUTO_XDP_SYNCOOKIE_EXPECTED="$syncookie_expected" \
     PYTHONPATH="$python_path${PYTHONPATH:+:$PYTHONPATH}" \
         "$py_bin" - "$candidate_dir" "$config_path" <<'PYEOF'
+import os
 import sys
 
 from auto_xdp import config as cfg
@@ -891,6 +901,10 @@ pin_dir, config_path = sys.argv[1:]
 apply_toml_config(load_toml_config(config_path))
 cfg._set_bpf_pin_dir(pin_dir)
 with XdpBackend() as backend:
+    # The optional cookie program is loaded into this generation only after
+    # the switch. Without the runtime's decision, every cookie endpoint would
+    # be closed across it, established connections included.
+    backend.syncookie_program_expected = os.environ.get("AUTO_XDP_SYNCOOKIE_EXPECTED") == "1"
     sync_once(backend, dry_run=False)
     if backend.last_apply_failures:
         print(
@@ -1117,34 +1131,38 @@ raise SystemExit(0 if release_sysctl(sys.argv[1]) else 1)
 PY
 }
 
-cleanup_syncookie_handoff() {
-    local iface_var="" iface=""
+# The installer and runtime use the same module transaction as the handler catalog.
+_auto_xdp_syncookie_module() {
+    local action="$1" iface_var="" iface=""
+    shift
+    local -a arguments=("$action" syncookie --root "$BPF_PIN_DIR")
     if iface_var=$(_auto_xdp_iface_var_name); then
-        local -n cookie_ifaces="$iface_var"
-        for iface in "${cookie_ifaces[@]}"; do
-            tc filter del dev "$iface" ingress protocol all pref 49151 handle 2 bpf 2>/dev/null || true
-        done
+        local -n module_ifaces="$iface_var"
+        for iface in "${module_ifaces[@]}"; do arguments+=(--iface "$iface"); done
     fi
-    rm -f "${BPF_PIN_DIR}/syncookie_prog" \
-          "${BPF_PIN_DIR}/tc_syncookie_handoff_prog" 2>/dev/null || true
+    local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+    PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
+        "${PYTHON3_BIN:-python3}" -m auto_xdp.admin.module_runtime "${arguments[@]}" "$@"
+}
+
+cleanup_syncookie_handoff() {
+    _auto_xdp_syncookie_module remove || return 1
     [[ ${1:-0} -eq 0 ]] || syncookie_sysctl_release || true
 }
 
-load_syncookie_program() {
-    local xdp_obj="" tc_obj="" capability="" enabled="0" strict="0"
-    local acquired_sysctl=0 sysctl_state="" capability_reason="" handoff_environment_ready=0
-    local -a capability_details=()
-    xdp_obj=$(_auto_xdp_first_value SYNCOOKIE_OBJ_PATH SYNCOOKIE_OBJ_INSTALLED) || true
-    tc_obj=$(_auto_xdp_first_value TC_SYNCOOKIE_OBJ_PATH TC_SYNCOOKIE_OBJ_INSTALLED) || true
-    readarray -t cookie_config < <("${PYTHON3_BIN:-python3}" - "$TOML_CONFIG" <<'PY'
+# Prints two lines: 1 when [modules.syncookie] enabled, and 1 when any mode is "always".
+_auto_xdp_syncookie_config_flags() {
+    local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+    PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON3_BIN:-python3}" - "$TOML_CONFIG" <<'PY'
 import sys
+from auto_xdp.config import module_configs
 try:
     import tomllib
 except ImportError:
     import tomli as tomllib
 try:
     with open(sys.argv[1], "rb") as handle:
-        cfg = tomllib.load(handle).get("syncookie", {})
+        cfg = module_configs(tomllib.load(handle)).get("syncookie", {})
     modes = [cfg.get("default_mode", "auto")]
     for scope in ("by_proc", "by_service", "by_port"):
         values = cfg.get(scope, {})
@@ -1152,110 +1170,69 @@ try:
             modes.extend(values.values())
     print("1" if cfg.get("enabled", False) else "0")
     print("1" if any(str(mode).lower() == "always" for mode in modes) else "0")
-except (OSError, ValueError):
+except OSError:
     print("0")
     print("0")
 PY
-    )
-    enabled=${cookie_config[0]:-0}
-    strict=${cookie_config[1]:-0}
-    if [[ "$enabled" != 1 ]]; then
-        cleanup_syncookie_handoff
-        syncookie_sysctl_release || true
-        return 0
-    fi
+}
 
-    capability=$("${PYTHON3_BIN:-python3}" - <<'PY'
+# Prints three lines: capability level, reason, handoff environment readiness.
+_auto_xdp_syncookie_capability() {
+    "${PYTHON3_BIN:-python3}" - <<'PY'
 from auto_xdp.bpf.syncookie import probe_syncookie_capability
 cap = probe_syncookie_capability()
 print(cap.level)
 print(cap.reason)
 print(int(cap.handoff_environment_ready))
 PY
-    ) || capability=$'0\nSYN-cookie capability probe failed'
-    readarray -t capability_details <<< "$capability"
-    capability=${capability_details[0]:-0}
-    capability_reason=${capability_details[1]:-}
-    handoff_environment_ready=${capability_details[2]:-0}
-    if [[ "$handoff_environment_ready" != 1 || "$capability" != 2 \
-            || ! -f "$xdp_obj" || ! -f "$tc_obj" ]]; then
-        # A reload may have retained the old program-array entry. Withdraw it
-        # as well as the TC filter before reporting an incompatible optional
-        # path; never leave a previously enabled challenge path active.
-        bpftool map delete pinned "${BPF_PIN_DIR}/syncookie_prog_array" \
-            key hex 00 00 00 00 >/dev/null 2>&1 || true
-        cleanup_syncookie_handoff
-        syncookie_sysctl_release || true
-        if [[ "$handoff_environment_ready" != 1 ]]; then
-            printf '[auto_xdp] error: refusing SYN-cookie enablement: %s\n' \
-                "${capability_reason:-cannot verify the handoff environment}" >&2
-            return 1
-        fi
-        _auto_xdp_warn "SYN-cookie listener handoff unavailable: ${capability_reason:-requires Linux 6.11+ and both optional objects}."
-        [[ "$strict" != 1 ]]
-        return
-    fi
-    sysctl_state=$(syncookie_sysctl_state_path)
-    [[ -f "$sysctl_state" ]] || acquired_sysctl=1
-    syncookie_sysctl_acquire || {
-        _auto_xdp_warn "Cannot enable net.ipv4.tcp_syncookies."
-        [[ "$strict" != 1 ]]
-        return
-    }
+}
 
-    local xdp_pin="${BPF_PIN_DIR}/syncookie_prog"
-    local tc_pin="${BPF_PIN_DIR}/tc_syncookie_handoff_prog"
-    rm -f "$xdp_pin" "$tc_pin"
-    bpftool prog load "$xdp_obj" "$xdp_pin" type xdp \
-        map name slot_ctx_map pinned "${BPF_PIN_DIR}/slot_ctx_map" \
-        map name pkt_counters pinned "${BPF_PIN_DIR}/pkt_counters" \
-        map name byte_counters pinned "${BPF_PIN_DIR}/byte_counters" \
-        map name pkt_ringbuf pinned "${BPF_PIN_DIR}/pkt_ringbuf" \
-        map name xdp_runtime_cfg pinned "${BPF_PIN_DIR}/xdp_runtime_cfg" \
-        map name tcp_synck_policy pinned "${BPF_PIN_DIR}/tcp_synck_policy" \
-        map name sync_run_cfg pinned "${BPF_PIN_DIR}/sync_run_cfg" \
-        map name sync_handoff4 pinned "${BPF_PIN_DIR}/sync_handoff4" \
-        map name sync_handoff6 pinned "${BPF_PIN_DIR}/sync_handoff6" \
-        >/dev/null 2>&1 || {
-        _auto_xdp_warn "Kernel rejected the optional SYN-cookie XDP program."
-        cleanup_syncookie_handoff "$acquired_sysctl"
-        [[ "$strict" != 1 ]]
-        return
-    }
-    bpftool prog load "$tc_obj" "$tc_pin" type classifier \
-        map name pkt_counters pinned "${BPF_PIN_DIR}/pkt_counters" \
-        map name sync_handoff4 pinned "${BPF_PIN_DIR}/sync_handoff4" \
-        map name sync_handoff6 pinned "${BPF_PIN_DIR}/sync_handoff6" \
-        >/dev/null 2>&1 || {
-        _auto_xdp_warn "Kernel rejected the SYN-cookie reqsk handoff program."
-        cleanup_syncookie_handoff "$acquired_sysctl"
-        [[ "$strict" != 1 ]]
-        return
-    }
+# Succeeds when load_syncookie_program is expected to install the optional
+# program: enabled in config, both objects present, Level 2 handoff verified.
+# A transactional reload uses this to pre-seed cookie endpoints as available.
+# The probe result is kept for the following load, so both decisions agree
+# and the (slow) probe runs once per reload.
+syncookie_program_expected() {
+    local xdp_obj="" tc_obj="" capability=""
+    local -a flags=() details=()
+    xdp_obj=$(_auto_xdp_first_value SYNCOOKIE_OBJ_PATH SYNCOOKIE_OBJ_INSTALLED) || return 1
+    tc_obj=$(_auto_xdp_first_value TC_SYNCOOKIE_OBJ_PATH TC_SYNCOOKIE_OBJ_INSTALLED) || return 1
+    [[ -f "$xdp_obj" && -f "$tc_obj" ]] || return 1
+    readarray -t flags < <(_auto_xdp_syncookie_config_flags)
+    [[ "${flags[0]:-0}" == 1 ]] || return 1
+    capability=$(_auto_xdp_syncookie_capability) || return 1
+    AUTO_XDP_SYNCOOKIE_CAPABILITY=$capability
+    readarray -t details <<< "$capability"
+    [[ "${details[0]:-0}" == 2 && "${details[2]:-0}" == 1 ]]
+}
 
-    local iface_var="" iface=""
-    iface_var=$(_auto_xdp_iface_var_name) || {
-        cleanup_syncookie_handoff "$acquired_sysctl"
-        return 1
-    }
-    local -n cookie_ifaces="$iface_var"
-    for iface in "${cookie_ifaces[@]}"; do
-        tc qdisc add dev "$iface" clsact 2>/dev/null || true
-        tc filter replace dev "$iface" ingress pref 49151 handle 2 \
-            bpf direct-action object-pinned "$tc_pin" >/dev/null 2>&1 || {
-            _auto_xdp_warn "Cannot attach SYN-cookie handoff on $iface."
-            cleanup_syncookie_handoff "$acquired_sysctl"
-            [[ "$strict" != 1 ]]
-            return
-        }
-    done
-    bpftool map update pinned "${BPF_PIN_DIR}/syncookie_prog_array" \
-        key 0 0 0 0 value pinned "$xdp_pin" >/dev/null 2>&1 || {
-        cleanup_syncookie_handoff "$acquired_sysctl"
-        [[ "$strict" != 1 ]]
-        return
-    }
-    _auto_xdp_info "SYN-cookie Level 2 enabled on ${cookie_ifaces[*]}."
+# Restores "cookie endpoints only while the cookie program exists" after a
+# reload pre-seeded them on an expectation that the load did not meet, for any
+# reason (strict failure, non-strict fallback, changed environment).
+_auto_xdp_settle_syncookie_preseed() {
+    [[ "${AUTO_XDP_SYNCOOKIE_PRESEEDED:-0}" == 1 ]] || return 0
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=0
+    _auto_xdp_syncookie_module verify >/dev/null 2>&1 && return 0
+    _auto_xdp_warn "SYN-cookie program was not installed; closing the cookie endpoints pre-seeded for it."
+    preseed_xdp_candidate_policy "$BPF_PIN_DIR" 0 || \
+        _auto_xdp_warn "Could not close pre-seeded cookie endpoints; the daemon closes them on its first sync."
+}
+
+load_syncookie_program() {
+    local status=0
+    _auto_xdp_load_syncookie_program || status=$?
+    _auto_xdp_settle_syncookie_preseed
+    return "$status"
+}
+
+_auto_xdp_load_syncookie_program() {
+    local xdp_obj="" tc_obj="" capability="${AUTO_XDP_SYNCOOKIE_CAPABILITY:-}"
+    xdp_obj=$(_auto_xdp_first_value SYNCOOKIE_OBJ_PATH SYNCOOKIE_OBJ_INSTALLED) || true
+    tc_obj=$(_auto_xdp_first_value TC_SYNCOOKIE_OBJ_PATH TC_SYNCOOKIE_OBJ_INSTALLED) || true
+    AUTO_XDP_SYNCOOKIE_CAPABILITY=""
+    _auto_xdp_syncookie_module apply --config "$TOML_CONFIG" \
+        --xdp "$xdp_obj" --tc "$tc_obj" --sysctl-state "$(syncookie_sysctl_state_path)" \
+        --capability "$capability"
 }
 
 ensure_linux_conntrack() {
@@ -1302,6 +1279,8 @@ transactional_reload_xdp() {
     AUTO_XDP_SWITCH_MODE=""
     AUTO_XDP_SWITCH_ROLLED_BACK=0
     AUTO_XDP_HANDLERS_PRELOADED=0
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=0
+    AUTO_XDP_SYNCOOKIE_CAPABILITY=""
 
     if [[ -e "$rollback_dir" || -e "$candidate_dir" ]]; then
         if ! _auto_xdp_finish_interrupted_reload; then
@@ -1355,7 +1334,9 @@ transactional_reload_xdp() {
         rm -rf "$candidate_dir"
         return 1
     fi
-    if ! preseed_xdp_candidate_policy "$candidate_dir"; then
+    local syncookie_expected=0
+    syncookie_program_expected && syncookie_expected=1
+    if ! preseed_xdp_candidate_policy "$candidate_dir" "$syncookie_expected"; then
         BPF_PIN_DIR="$saved_pin_dir"
         _auto_xdp_warn "Candidate XDP policy pre-seeding failed; current protection was not changed."
         rm -rf "$candidate_dir"
@@ -1383,6 +1364,16 @@ transactional_reload_xdp() {
         fi
         break
     done
+
+    # TC ingress still refers to the old module while the main root changes.
+    # Retain its ownership pins so the common module transaction can roll back.
+    if [[ -d "$live_dir/modules/syncookie" ]]; then
+        if ! _auto_xdp_syncookie_module retain --candidate "$candidate_dir"; then
+            rm -rf "$candidate_dir"
+            _auto_xdp_warn "Cannot retain the previous SYN Cookie module for rollback."
+            return 1
+        fi
+    fi
 
     [[ -d "$live_dir" ]] && had_old=1
 
@@ -1413,6 +1404,10 @@ transactional_reload_xdp() {
 
     local saved_pin_dir="$BPF_PIN_DIR"
     BPF_PIN_DIR="$saved_pin_dir"
+    # Every interface now runs the candidate, whose cookie endpoints may have
+    # been admitted ahead of the cookie program; load_syncookie_program closes
+    # them again if that program is not installed.
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=$syncookie_expected
 
     if [[ $had_old -eq 1 ]]; then
         mv "$live_dir" "$rollback_dir" || return 1

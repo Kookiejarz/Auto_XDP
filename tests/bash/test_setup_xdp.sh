@@ -8,6 +8,59 @@ BASE_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 # shellcheck source=tests/bash/testlib.sh
 source "$REPO_ROOT/tests/bash/testlib.sh"
 
+test_optional_syncookie_handoff_requires_complete_kernel_btf_type() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir case_name output vmlinux_dir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BUILD_STAGING_DIR="$tmpdir/staging with spaces"
+    vmlinux_dir="$tmpdir/kernel btf"
+    mkdir -p "$BUILD_STAGING_DIR" "$vmlinux_dir"
+    stage_build_source() {
+        printf 'stage\n' >> "$tmpdir/calls"
+        [[ "$case_name" != source_failure ]]
+    }
+    compile_bpf_object() {
+        printf 'compile\n' >> "$tmpdir/calls"
+        assert_eq "$1" "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_SRC" || return 1
+        assert_eq "$3" "$BUILD_STAGING_DIR" || return 1
+        assert_eq "$4" "$vmlinux_dir" || return 1
+        printf 'object\n' > "$2"
+        [[ "$case_name" != compile_failure ]]
+    }
+    warn() { printf '%s\n' "$*"; }
+    for case_name in no_btf missing_type forward_only supported source_failure compile_failure; do
+        : > "$tmpdir/calls"
+        printf 'stale object\n' > "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ"
+        case "$case_name" in
+            no_btf) rm -f "$vmlinux_dir/vmlinux.h" ;;
+            missing_type) printf 'struct other { int field; };\n' > "$vmlinux_dir/vmlinux.h" ;;
+            forward_only) printf 'struct bpf_tcp_req_attrs;\n' > "$vmlinux_dir/vmlinux.h" ;;
+            *) printf 'struct bpf_tcp_req_attrs;\nstruct bpf_tcp_req_attrs { int field; };\n' > "$vmlinux_dir/vmlinux.h" ;;
+        esac
+        output=$(compile_syncookie_handoff "$BUILD_STAGING_DIR" "$vmlinux_dir") || return 1
+        if [[ "$case_name" == supported ]]; then
+            assert_eq "$(cat "$tmpdir/calls")" $'stage\ncompile' || return 1
+            assert_eq "$(cat "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ")" object || return 1
+            assert_eq "$output" '' || return 1
+        else
+            [[ ! -e "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ" ]] || return 1
+            case "$case_name" in
+                no_btf|missing_type|forward_only)
+                    [[ ! -s "$tmpdir/calls" ]] || return 1
+                    assert_contains "$output" 'handoff skipped:' || return 1 ;;
+                source_failure)
+                    assert_eq "$(cat "$tmpdir/calls")" stage || return 1
+                    assert_contains "$output" 'source could not be staged' || return 1 ;;
+                compile_failure)
+                    assert_eq "$(cat "$tmpdir/calls")" $'stage\ncompile' || return 1
+                    assert_contains "$output" 'compilation failed' || return 1 ;;
+            esac
+        fi
+    done
+)
+
 test_log_colors_disable_for_non_tty_and_no_color() (
     local output
 
@@ -50,10 +103,8 @@ test_tc_cleanup_uses_filter_kind_including_dispatcher_rollback() (
         done
     done
     cleanup_tc_egress_dispatch || return 1
-    cleanup_syncookie_handoff 1 || return 1
-    [[ -e "$tmpdir/sysctl-released" ]] || return 1
     for iface in "${IFACES[@]}"; do
-        for direction in ingress egress; do
+        for direction in egress; do
             [[ ! -e "$tmpdir/tc-$iface-$direction" ]] \
                 || { printf 'runtime TC cleanup left %s %s\n' "$iface" "$direction"; return 1; }
         done
@@ -1069,6 +1120,24 @@ test_conntrack_activation_rejects_reserved_fallback_table() (
     fi
 )
 
+test_runtime_module_switches_use_current_values_and_ignore_drafts() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    local tmpdir output
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    TOML_CONFIG="$tmpdir/config.toml"
+    printf '[modules.syncookie]\nenabled=true\ndefault_mode="always"\n[modules.icmp]\nenabled=false\n[modules.icmp.draft]\nenabled=true\n' >"$TOML_CONFIG"
+    output=$(_auto_xdp_syncookie_config_flags) || return 1
+    assert_eq "$output" $'1\n1' || return 1
+    output=$(_auto_xdp_resolve_preferred_backend "$TOML_CONFIG" auto) || return 1
+    assert_eq "$output" auto || return 1
+    printf '[syncookie]\nenabled=true\n' >"$TOML_CONFIG"
+    if _auto_xdp_syncookie_config_flags >"$tmpdir/error" 2>&1; then return 1; fi
+    assert_file_contains "$tmpdir/error" 'Unsupported module configuration' || return 1
+    if _auto_xdp_resolve_preferred_backend "$TOML_CONFIG" auto >"$tmpdir/error" 2>&1; then return 1; fi
+    assert_file_contains "$tmpdir/error" 'Unsupported module configuration'
+)
+
 test_transactional_xdp_validation_failure_keeps_current_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
     ensure_linux_conntrack() { return 0; }
@@ -1261,6 +1330,187 @@ test_transactional_handler_failure_keeps_current_generation() (
     assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
     [[ ! -e "${BPF_PIN_DIR}_next" ]] || return 1
     [[ ! -e "$tmpdir/ops.log" ]]
+)
+
+test_transactional_preseed_receives_syncookie_expectation() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
+    set +e
+
+    local tmpdir expectation
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=("eth0")
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' > "$BPF_PIN_DIR/prog"
+    touch "$XDP_OBJ_INSTALLED"
+
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
+    xdp_maps_ready() { return 0; }
+    # Stop after the pre-seed so each round leaves the live generation intact.
+    preseed_xdp_candidate_policy() { printf '%s\n' "${2:-unset}" > "$tmpdir/preseed.arg"; return 1; }
+    for expectation in 0 1; do
+        if [[ $expectation == 1 ]]; then
+            syncookie_program_expected() { return 0; }
+        else
+            syncookie_program_expected() { return 1; }
+        fi
+        transactional_reload_xdp >/dev/null 2>&1
+        assert_eq "$(cat "$tmpdir/preseed.arg")" "$expectation" || return 1
+        assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
+    done
+)
+
+test_syncookie_program_expected_mirrors_load_gate() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir enabled=1 level=2 ready=1
+    tmpdir=$(mktemp -d)
+    SYNCOOKIE_OBJ_PATH="$tmpdir/xdp_syncookie.o"
+    TC_SYNCOOKIE_OBJ_PATH="$tmpdir/tc_syncookie.o"
+    _auto_xdp_syncookie_config_flags() { printf '%s\n0\n' "$enabled"; }
+    _auto_xdp_syncookie_capability() { printf '%s\nprobe reason\n%s\n' "$level" "$ready"; }
+
+    if syncookie_program_expected; then
+        printf 'missing optional objects were accepted\n'
+        return 1
+    fi
+    touch "$SYNCOOKIE_OBJ_PATH" "$TC_SYNCOOKIE_OBJ_PATH"
+    syncookie_program_expected || { printf 'ready Level 2 handoff was rejected\n'; return 1; }
+    enabled=0
+    if syncookie_program_expected; then printf 'disabled config was accepted\n'; return 1; fi
+    enabled=1 level=1
+    if syncookie_program_expected; then printf 'Level 1 capability was accepted\n'; return 1; fi
+    level=2 ready=0
+    if syncookie_program_expected; then printf 'unready handoff environment was accepted\n'; return 1; fi
+    return 0
+)
+
+test_candidate_preseed_passes_syncookie_expectation_to_backend() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir argument expected
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/python/auto_xdp/backends" "$tmpdir/candidate"
+    touch "$tmpdir/config.toml" \
+        "$tmpdir/python/auto_xdp/__init__.py" \
+        "$tmpdir/python/auto_xdp/backends/__init__.py"
+    cat > "$tmpdir/python/auto_xdp/config.py" <<'PY'
+def apply_toml_config(_config):
+    return None
+
+def load_toml_config(_path):
+    return {}
+
+def _set_bpf_pin_dir(_path):
+    return None
+PY
+    cat > "$tmpdir/python/auto_xdp/backends/xdp.py" <<'PY'
+class XdpBackend:
+    syncookie_program_expected = False
+
+    def __init__(self):
+        self.last_apply_failures = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+PY
+    cat > "$tmpdir/python/auto_xdp/syncer.py" <<PY
+def sync_once(backend, dry_run):
+    with open("$tmpdir/expected", "w") as handle:
+        handle.write(repr(backend.syncookie_program_expected))
+PY
+
+    PYTHON_LIB_DIR="$tmpdir/python"
+    PYTHON3_BIN="/usr/bin/python3"
+    TOML_CONFIG="$tmpdir/config.toml"
+    cd "$tmpdir" || return 1
+    for argument in 1 0 omitted; do
+        rm -f "$tmpdir/expected"
+        if [[ $argument == omitted ]]; then
+            preseed_xdp_candidate_policy "$tmpdir/candidate" || return 1
+        else
+            preseed_xdp_candidate_policy "$tmpdir/candidate" "$argument" || return 1
+        fi
+        expected=False
+        [[ $argument == 1 ]] && expected=True
+        assert_eq "$(cat "$tmpdir/expected")" "$expected" || return 1
+    done
+)
+
+test_syncookie_load_failure_closes_preseeded_endpoints() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    mkdir -p "$BPF_PIN_DIR"
+    preseed_xdp_candidate_policy() { printf '%s %s\n' "$1" "${2:-unset}" >> "$tmpdir/preseed.log"; }
+
+    _auto_xdp_syncookie_module() { [[ "$1" == verify && -e "$BPF_PIN_DIR/active-cookie" ]]; }
+
+    # The reload admitted cookie endpoints, then the load fails (strict).
+    _auto_xdp_load_syncookie_program() { return 1; }
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=1
+    load_syncookie_program >/dev/null 2>&1
+    assert_eq "$?" "1" || return 1
+    assert_eq "$(cat "$tmpdir/preseed.log")" "$BPF_PIN_DIR 0" || return 1
+    assert_eq "$AUTO_XDP_SYNCOOKIE_PRESEEDED" "0" || return 1
+
+    # A non-strict fallback returns 0 without installing the program.
+    : > "$tmpdir/preseed.log"
+    _auto_xdp_load_syncookie_program() { return 0; }
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=1
+    load_syncookie_program >/dev/null 2>&1 || return 1
+    assert_eq "$(cat "$tmpdir/preseed.log")" "$BPF_PIN_DIR 0" || return 1
+
+    # Installed program, or no pre-seeded expectation: nothing to close.
+    : > "$tmpdir/preseed.log"
+    _auto_xdp_load_syncookie_program() { touch "$BPF_PIN_DIR/active-cookie"; return 0; }
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=1
+    load_syncookie_program >/dev/null 2>&1 || return 1
+    rm -f "$BPF_PIN_DIR/active-cookie"
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=0
+    load_syncookie_program >/dev/null 2>&1 || return 1
+    [[ ! -s "$tmpdir/preseed.log" ]]
+)
+
+test_syncookie_load_reuses_the_preseed_capability_probe() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    SYNCOOKIE_OBJ_PATH="$tmpdir/xdp_syncookie.o"
+    TC_SYNCOOKIE_OBJ_PATH="$tmpdir/tc_syncookie.o"
+    mkdir -p "$BPF_PIN_DIR"
+    touch "$SYNCOOKIE_OBJ_PATH" "$TC_SYNCOOKIE_OBJ_PATH"
+    _auto_xdp_syncookie_config_flags() { printf '1\n0\n'; }
+    _auto_xdp_syncookie_capability() {
+        printf 'probe\n' >> "$tmpdir/probes.log"
+        printf '2\nready\n1\n'
+    }
+    _auto_xdp_syncookie_module() {
+        printf '%s\n' "$@" > "$tmpdir/module-arguments"
+        printf 'module\n' >> "$tmpdir/probes.log"
+    }
+
+    syncookie_program_expected || { printf 'ready Level 2 handoff was rejected\n'; return 1; }
+    _auto_xdp_load_syncookie_program >/dev/null 2>&1
+    # One probe for the expectation; the module receives the same decision.
+    assert_contains "$(cat "$tmpdir/module-arguments")" "--capability" || return 1
+    assert_contains "$(cat "$tmpdir/module-arguments")" "ready" || return 1
+    assert_eq "$(tr '\n' ' ' < "$tmpdir/probes.log")" "probe module " || return 1
+    assert_eq "${AUTO_XDP_SYNCOOKIE_CAPABILITY:-}" ""
 )
 
 test_candidate_preseed_rejects_map_update_failures() (
@@ -2901,6 +3151,7 @@ SCRIPT
         fi
     done
 )
+
 
 run_discovered_tests "${BASH_SOURCE[0]}" "setup_xdp"
 finish_tests

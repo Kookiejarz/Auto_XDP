@@ -628,7 +628,7 @@ def test_handler_configuration_pages_fit_terminal_and_show_module_options(width,
     assert "SYN Cookie" in output and "Activation threshold" in output
     assert "TC ingress" in output
     draw_form(screen, row, fields, catalog.settings(module, {}), len(fields) - 1)
-    assert "Rate limits by service" in "\n".join(item[2] for item in screen.calls)
+    assert "Port SYN/s by service" in "\n".join(item[2] for item in screen.calls)
 
 
 @pytest.mark.parametrize("keys,expected", [([ord(" "), 27], []), ([ord("s"), ord("a"), 27], [False, True])])
@@ -656,7 +656,7 @@ def test_runtime_row_edits_its_binding_instead_of_last_saved_target():
     from auto_xdp.tui.handler_editor import form_values
     module = catalog.Module("custom", "Custom", "/custom.o")
     row = HandlerRow("TC_UDP", 5353, 10, "egress", "loaded", module=module)
-    values = form_values(row, {"handler_settings": {"custom": {"target": 80, "kind": "tcp"}}})
+    values = form_values(row, {"modules": {"custom": {"draft": {"target": 80, "kind": "tcp"}}}})
     assert values["target"] == 5353 and values["kind"] == "udp"
 
 

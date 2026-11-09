@@ -262,7 +262,7 @@ def test_save_is_a_draft_and_apply_uses_validated_values_and_common_loader(conte
             mock.patch.object(handlers, "load_handler_object") as load:
         catalog.configure(context, module, {"limit": "25"})
         draft = config_file.load_toml(context.config)
-        assert draft["handler_settings"]["custom"]["limit"] == 25
+        assert draft["modules"]["custom"]["draft"]["limit"] == 25
         assert "port_handlers" not in draft
         load.assert_not_called()
         catalog.configure(context, module, {}, apply=True)
@@ -273,6 +273,29 @@ def test_save_is_a_draft_and_apply_uses_validated_values_and_common_loader(conte
         assert load.call_args.args[:3] == (context.bpf_pin_dir / "udp_port_handlers", 30120, obj)
         assert maps.call_args.args == (obj, context.bpf_pin_dir)
         assert active["handler_bindings"]["udp"]["30120"]["module"] == "custom"
+        assert active["modules"]["custom"]["limit"] == 25
+        assert "draft" not in active["modules"]["custom"]
+        assert "handler_settings" not in active
+
+
+@pytest.mark.parametrize("name", ["syncookie"])
+def test_managed_module_save_keeps_current_settings_until_apply(context, monkeypatch, name):
+    config_file.write_toml(context.config, {"modules": {name: {"enabled": False}}})
+    module = catalog.select(context, name)
+    refresh = mock.Mock(return_value={})
+    monkeypatch.setattr(catalog, "_refresh_managed_runtime", refresh)
+    monkeypatch.setattr(catalog, "_managed_result", lambda *args: "applied")
+    catalog.configure(context, module, {"enabled": True})
+    data = config_file.load_toml(context.config)
+    assert data["modules"][name]["enabled"] is False
+    assert data["modules"][name]["draft"]["enabled"] is True
+    refresh.assert_not_called()
+    catalog.configure(context, module, {}, apply=True)
+    data = config_file.load_toml(context.config)
+    assert data["modules"][name]["enabled"] is True
+    assert "draft" not in data["modules"][name]
+    assert name not in data and "handler_settings" not in data
+    refresh.assert_called_once_with(context)
 
 
 @pytest.mark.parametrize("updates,match", [
@@ -281,7 +304,7 @@ def test_save_is_a_draft_and_apply_uses_validated_values_and_common_loader(conte
     ({"by_port": '{"0": "always"}'}, "syncookie.by_port"),
 ])
 def test_invalid_settings_leave_config_and_runtime_untouched(context, compiler, updates, match):
-    config_file.write_toml(context.config, {"syncookie": {"enabled": False}})
+    config_file.write_toml(context.config, {"modules": {"syncookie": {"enabled": False}}})
     original = context.config.read_bytes()
     module = catalog.select(context, "syncookie")
     with mock.patch.object(catalog, "_refresh_managed_runtime") as refresh:
@@ -470,12 +493,14 @@ def test_managed_apply_has_one_writer_and_always_restores_controller(context, fa
 @pytest.mark.parametrize("tc_program,valid", [(200, True), (201, False)])
 @pytest.mark.parametrize("nested", [False, True])
 def test_syncookie_apply_verifies_xdp_entry_and_tc_ingress_on_each_interface(context, tc_program, valid, nested):
-    (context.bpf_pin_dir / "syncookie_prog").touch()
+    (context.bpf_pin_dir / "modules/syncookie").mkdir(parents=True)
+    (context.bpf_pin_dir / "modules/syncookie/prog").touch()
+    (context.bpf_pin_dir / "syncookie_prog_array").touch()
     module = catalog.select(context, "syncookie")
     with mock.patch.object(handlers, "pinned_program_id", side_effect=[100, 200]), \
             mock.patch.object(handlers, "_pinned_u32_lookup", return_value=100), \
             mock.patch.object(catalog.subprocess, "run", return_value=subprocess.CompletedProcess(
-                [], 0, json.dumps([{"kind": "bpf", "options": {"prog": {"id": tc_program}} if nested else {"id": tc_program}}]), "")) as query:
+                [], 0, json.dumps([{"kind": "bpf", "pref": 49151, "options": {"handle": "0x2", **({"prog": {"id": tc_program}} if nested else {"id": tc_program})}}]), "")) as query:
         if valid:
             result = catalog._managed_result(context, module, {"enabled": True}, {"IFACES": "veth0 veth1"})
             assert "program 100" in result

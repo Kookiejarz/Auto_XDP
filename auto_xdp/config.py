@@ -441,7 +441,30 @@ def _coerce_prefix_len(value: object, path: str, default: int, maximum: int) -> 
     return parsed
 
 
+def module_configs(cfg: dict) -> dict[str, Any]:
+    """Read the current module namespace without interpreting retired formats."""
+    retired = sorted(set(cfg) & {"icmp", "syncookie", "handler_settings"})
+    if retired:
+        names = ", ".join(f"[{name}]" for name in retired)
+        raise ValueError(f"Unsupported module configuration: {names}; use [modules.<name>]")
+    modules = cfg.get("modules", {})
+    if not isinstance(modules, dict):
+        raise ValueError("modules must be a table")
+    for name, values in modules.items():
+        if not isinstance(values, dict):
+            raise ValueError(f"modules.{name} must be a table")
+        if type(values.get("enabled", False)) is not bool:
+            raise ValueError(f"modules.{name}.enabled must be true or false")
+        draft = values.get("draft", {})
+        if not isinstance(draft, dict):
+            raise ValueError(f"modules.{name}.draft must be a table")
+        if "enabled" in draft and type(draft["enabled"]) is not bool:
+            raise ValueError(f"modules.{name}.draft.enabled must be true or false")
+    return modules
+
+
 def _normalize_config(cfg: dict) -> dict[str, Any]:
+    modules = module_configs(cfg)
     settings = copy.deepcopy(_DEFAULT_SETTINGS)
 
     settings["TRUSTED_SRC_IPS"].clear()
@@ -540,34 +563,34 @@ def _normalize_config(cfg: dict) -> dict[str, Any]:
             "rate-limit inner map capacities are fixed by the compiled XDP map ABI"
         )
 
-    syncookie = cfg.get("syncookie", {})
+    syncookie = modules.get("syncookie", {})
     if not isinstance(syncookie, dict):
-        raise ValueError("syncookie must be a table")
+        raise ValueError("modules.syncookie must be a table")
     settings["SYNCOOKIE_ENABLED"] = bool(syncookie.get("enabled", False))
     settings["SYNCOOKIE_DEFAULT_MODE"] = str(syncookie.get("default_mode", "auto")).lower()
     if settings["SYNCOOKIE_DEFAULT_MODE"] not in settings["SYNCOOKIE_MODES"]:
-        raise ValueError("syncookie.default_mode must be off, auto, or always")
+        raise ValueError("modules.syncookie.default_mode must be off, auto, or always")
     settings["SYNCOOKIE_ACTIVATION_PERCENT"] = _coerce_percent(
         syncookie.get("activation_percent", 90),
-        "syncookie.activation_percent", 90, 1, 99,
+        "modules.syncookie.activation_percent", 90, 1, 99,
     )
     settings["SYNCOOKIE_AUTO_MAX_PERCENT"] = _coerce_percent(
         syncookie.get("auto_max_percent", 200),
-        "syncookie.auto_max_percent", 200, 100, 10000,
+        "modules.syncookie.auto_max_percent", 200, 100, 10000,
     )
     if settings["SYNCOOKIE_AUTO_MAX_PERCENT"] <= settings["SYNCOOKIE_ACTIVATION_PERCENT"]:
-        raise ValueError("syncookie.auto_max_percent must exceed activation_percent")
+        raise ValueError("modules.syncookie.auto_max_percent must exceed activation_percent")
     settings["SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS"] = _coerce_nonnegative_float(
         syncookie.get("challenge_cooldown_seconds", 5),
-        "syncookie.challenge_cooldown_seconds", 5.0,
+        "modules.syncookie.challenge_cooldown_seconds", 5.0,
     )
     settings["SYNCOOKIE_INVALID_ACK_RATE_PPS"] = _coerce_positive_int(
         syncookie.get("invalid_ack_rate_pps", 1000),
-        "syncookie.invalid_ack_rate_pps", 1000,
+        "modules.syncookie.invalid_ack_rate_pps", 1000,
     )
     settings["SYNCOOKIE_PORT_RATE_DEFAULT"] = _coerce_nonnegative_int(
         syncookie.get("port_rate_default", 0),
-        "syncookie.port_rate_default", 0,
+        "modules.syncookie.port_rate_default", 0,
     )
     for scope, target in (
         ("port_rate_by_proc", settings["_SYNCOOKIE_PORT_RATE_BY_PROC"]),
@@ -575,25 +598,25 @@ def _normalize_config(cfg: dict) -> dict[str, Any]:
     ):
         values = syncookie.get(scope, {})
         if not isinstance(values, dict):
-            raise ValueError(f"syncookie.{scope} must be a table")
+            raise ValueError(f"modules.syncookie.{scope} must be a table")
         for name, value in values.items():
             target[str(name)] = _coerce_nonnegative_int(
-                value, f"syncookie.{scope}.{name}", 0
+                value, f"modules.syncookie.{scope}.{name}", 0
             )
     port_rates = syncookie.get("port_rate_by_port", {})
     if not isinstance(port_rates, dict):
-        raise ValueError("syncookie.port_rate_by_port must be a table")
+        raise ValueError("modules.syncookie.port_rate_by_port must be a table")
     for raw_port, value in port_rates.items():
         try:
             port = int(raw_port)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "syncookie.port_rate_by_port keys must be ports"
+                "modules.syncookie.port_rate_by_port keys must be ports"
             ) from exc
         if not 1 <= port <= 65535:
-            raise ValueError("syncookie.port_rate_by_port keys must be ports")
+            raise ValueError("modules.syncookie.port_rate_by_port keys must be ports")
         settings["_SYNCOOKIE_PORT_RATE_BY_PORT"][port] = _coerce_nonnegative_int(
-            value, f"syncookie.port_rate_by_port.{port}", 0
+            value, f"modules.syncookie.port_rate_by_port.{port}", 0
         )
     for scope, mode_target in (
         ("by_proc", settings["_SYNCOOKIE_BY_PROC"]),
@@ -601,25 +624,25 @@ def _normalize_config(cfg: dict) -> dict[str, Any]:
     ):
         values = syncookie.get(scope, {})
         if not isinstance(values, dict):
-            raise ValueError(f"syncookie.{scope} must be a table")
+            raise ValueError(f"modules.syncookie.{scope} must be a table")
         for name, raw_mode in values.items():
             mode = str(raw_mode).lower()
             if mode not in settings["SYNCOOKIE_MODES"]:
-                raise ValueError(f"syncookie.{scope}.{name} has invalid mode")
+                raise ValueError(f"modules.syncookie.{scope}.{name} has invalid mode")
             mode_target[str(name)] = mode
     by_port = syncookie.get("by_port", {})
     if not isinstance(by_port, dict):
-        raise ValueError("syncookie.by_port must be a table")
+        raise ValueError("modules.syncookie.by_port must be a table")
     for raw_port, raw_mode in by_port.items():
         try:
             port = int(raw_port)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "syncookie.by_port entries require port and valid mode"
+                "modules.syncookie.by_port entries require port and valid mode"
             ) from exc
         mode = str(raw_mode).lower()
         if not 1 <= port <= 65535 or mode not in settings["SYNCOOKIE_MODES"]:
-            raise ValueError("syncookie.by_port entries require port and valid mode")
+            raise ValueError("modules.syncookie.by_port entries require port and valid mode")
         settings["_SYNCOOKIE_BY_PORT"][port] = mode
 
     settings["BOGON_FILTER_ENABLED"] = bool(cfg.get("firewall", {}).get("bogon_filter", True))

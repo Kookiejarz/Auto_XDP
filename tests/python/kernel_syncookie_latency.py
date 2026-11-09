@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 
+from auto_xdp.admin.module_runtime import program_pin
+
 
 PAYLOADS = [b"cookie-first-payload"] * 5 + [bytes(range(256)) * 512]
 HOSTS = [(socket.AF_INET, "10.99.0.1"), (socket.AF_INET6, "2001:db8:99::1")]
@@ -60,7 +62,7 @@ def established_ack_probe(pin, iface, host, peer, port):
     with tempfile.TemporaryDirectory(prefix='axdp-established-ack-') as temp:
         root = Path(temp); (root/'packet').write_bytes(packet)
         (root/'context').write_bytes(struct.pack('<6I', 0, len(packet), 0, socket.if_nametoindex(iface), 0, 0))
-        result = json.loads(subprocess.check_output(['bpftool', '-j', 'prog', 'run', 'pinned', str(pin/'syncookie_prog'),
+        result = json.loads(subprocess.check_output(['bpftool', '-j', 'prog', 'run', 'pinned', str(program_pin(pin)),
             'data_in', str(root/'packet'), 'ctx_in', str(root/'context'), 'repeat', '1'], text=True))
         assert result['retval'] == 2, f'{host}: established socket ACK was treated as a handshake cookie: {result}'
 

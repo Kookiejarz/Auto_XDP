@@ -17,8 +17,9 @@ import sys
 import tempfile
 from pathlib import Path
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 from auto_xdp.admin import config_file, handler_state
 from auto_xdp.bpf.syscall import (
@@ -72,10 +73,11 @@ _HANDLER_SHARED_MAPS = (
     "slot_ctx_map", "hblk4", "hblk6", "udp_hv4", "udp_hv6",
     "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg",
     "profile_ctx_map", "tc_handler_ctx", "sctp_whitelist",
+    "tcp_synck_policy", "sync_run_cfg", "sync_handoff4", "sync_handoff6",
 )
 
 
-def handler_object_programs(obj_path: Path) -> tuple[str, str | None]:
+def handler_object_programs(obj_path: Path, *, classifier_only: bool = False) -> tuple[str, str | None]:
     """Require one XDP entry and at most one optional TC classifier entry."""
     try:
         lib = ctypes.CDLL(ctypes.util.find_library("bpf") or "libbpf.so.1")
@@ -108,6 +110,10 @@ def handler_object_programs(obj_path: Path) -> tuple[str, str | None]:
                 raise RuntimeError("Handlers support only XDP and TC classifier entries")
             entries[kind].append(os.fsdecode(name))
             program = lib.bpf_object__next_program(obj, program)
+        if classifier_only:
+            if entries[6] or len(entries[3]) != 1:
+                raise RuntimeError("Module companion must contain exactly one TC classifier entry")
+            return entries[3][0], None
         if len(entries[6]) != 1 or len(entries[3]) > 1:
             raise RuntimeError("Handler must contain exactly one XDP entry and at most one TC entry")
         return entries[6][0], entries[3][0] if entries[3] else None
@@ -259,7 +265,7 @@ def _preserved_state_maps(
     if not (live_dir / "prog").exists():
         return digest, []
     if digest is None and not marker.exists():
-        return None, []  # Unversioned legacy objects keep their original behavior.
+        return None, []  # Objects without a state contract get fresh private maps.
     if digest is None or not marker.exists() or _state_marker(marker) != digest:
         raise RuntimeError(
             "Handler state is not compatible with the active generation; "
@@ -554,84 +560,7 @@ def protocol_handler_dir(root: Path, proto: int) -> Path:
 
 
 def protocol_handler_pin(root: Path, proto: int) -> Path:
-    pin = protocol_handler_dir(root, proto) / "prog"
-    return pin if pin.exists() else root / "handlers" / f"proto_{proto}"
-
-
-def _adopt_protocol_pin(root: Path, proto: int) -> Path | None:
-    """Retain the legacy pin until the new generation has been verified."""
-    legacy = root / "handlers" / f"proto_{proto}"
-    live = protocol_handler_dir(root, proto)
-    if not legacy.exists():
-        return None
-    legacy_id = pinned_program_id(legacy)
-    active = _pinned_u32_lookup(root / "proto_handlers", struct.pack("=I", proto))
-    if (live / "prog").exists():
-        canonical_id = pinned_program_id(live / "prog")
-        if canonical_id != legacy_id and active != canonical_id:
-            raise RuntimeError(f"Conflicting legacy protocol pin: {legacy}")
-    elif active not in {None, legacy_id}:
-        raise RuntimeError(f"Protocol {proto} has no matching legacy ownership pin")
-    else:
-        live.mkdir(parents=True, exist_ok=True)
-        run_checked(["bpftool", "prog", "pin", "pinned", str(legacy), str(live / "prog")],
-                    "Failed to adopt legacy protocol handler")
-        if pinned_program_id(live / "prog") != legacy_id:
-            raise RuntimeError("Legacy protocol ownership verification failed")
-    return legacy
-
-
-def _retire_protocol_pins(root: Path, proto: int) -> None:
-    """After verified publication/removal, retire only known old pin names."""
-    directory = root / "handlers"
-    if not directory.is_dir():
-        return
-    pattern = re.compile(rf"proto_{proto}(?:_(?:next|rollback)_[0-9a-f]{{8}})?")
-    for pin in directory.iterdir():
-        if pin.is_symlink() or not pin.is_file() or not pattern.fullmatch(pin.name):
-            continue
-        try:
-            pin.unlink()
-        except OSError as exc:
-            print(f"Warning: obsolete protocol pin retained at {pin}: {exc}", file=sys.stderr)
-    try:
-        directory.rmdir()  # Other protocols and unrelated files are left intact.
-    except OSError as exc:
-        if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
-            print(f"Warning: obsolete protocol directory retained at {directory}: {exc}", file=sys.stderr)
-
-
-def _adopt_stateless_contract(root: Path, live: Path, obj: Path) -> None:
-    """Only a proven public-map-only legacy program can adopt an empty schema."""
-    if not (live / "prog").exists() or (live / "state_contract").exists():
-        return
-    contract = handler_state.object_contract(obj)
-    if contract is None or contract.maps or (live / "egress").exists():
-        return
-    active = _pinned_u32_lookup(root / "proto_handlers", struct.pack("=I", int(live.name)))
-    if active is not None and pinned_program_id(live / "prog") != active:
-        raise RuntimeError("Active protocol handler does not match its ownership pin")
-    result = run_checked(["bpftool", "-j", "prog", "show", "pinned", str(live / "prog")],
-                         "Failed to inspect legacy state ownership")
-    try:
-        info = json.loads(result.stdout)
-        if isinstance(info, list):
-            info = info[0]
-        old_maps = set(info["map_ids"])
-    except (ValueError, KeyError, TypeError, IndexError) as exc:
-        raise RuntimeError("Cannot establish legacy state ownership") from exc
-    public = {_pinned_map_id(root / name) for name in _HANDLER_SHARED_MAPS if (root / name).exists()}
-    if old_maps - public:
-        raise RuntimeError("Legacy protocol handler has private state; explicitly unload before replacing it")
-    digest = handler_state_fingerprint(obj)
-    assert digest is not None
-    try:
-        _pin_state_marker(live, digest)
-    except (OSError, RuntimeError):
-        # This marker did not exist before adoption. A partially initialized
-        # marker must not make a retry look like an incompatible schema.
-        (live / "state_contract").unlink(missing_ok=True)
-        raise
+    return protocol_handler_dir(root, proto) / "prog"
 
 
 def load_protocol_handler(root: Path, proto: int, obj: Path) -> bool:
@@ -639,11 +568,7 @@ def load_protocol_handler(root: Path, proto: int, obj: Path) -> bool:
     shared = handler_shared_maps(obj, root)
     try:
         with _handler_lock(root):
-            _adopt_protocol_pin(root, proto)
-            _adopt_stateless_contract(root, live, obj)
-            preserved = _load_handler_object(root / "proto_handlers", proto, obj, live, shared)
-            _retire_protocol_pins(root, proto)
-            return preserved
+            return _load_handler_object(root / "proto_handlers", proto, obj, live, shared)
     except OSError as exc:
         raise RuntimeError(f"Protocol handler replacement failed: {exc}") from exc
 
@@ -653,9 +578,7 @@ def unload_protocol_handler(root: Path, proto: int) -> None:
     table = root / "proto_handlers"
     try:
         with _handler_lock(root):
-            _adopt_protocol_pin(root, proto)
             _transactional_handler_pair(table, proto, None, live)
-            _retire_protocol_pins(root, proto)
     except OSError as exc:
         raise RuntimeError(f"Protocol handler removal failed: {exc}") from exc
 
@@ -710,7 +633,7 @@ def transactional_handler_pair(
         _transactional_handler_pair(handler_map, key, candidate_dir, live_dir)
 
 
-def _retire_handler_generations(live_dir: Path, key: int) -> None:
+def _retire_handler_generations(live_dir: Path, key: int | str) -> None:
     """A verified canonical generation supersedes prior interrupted staging."""
     patterns = (
         re.compile(rf"{key}_next_[a-z0-9_]{{8}}"),
@@ -729,52 +652,81 @@ def _retire_handler_generations(live_dir: Path, key: int) -> None:
             print(f"Warning: obsolete handler generation retained at {path}: {exc}", file=sys.stderr)
 
 
-def _transactional_handler_pair(
-    handler_map: Path, key: int, candidate_dir: Path | None, live_dir: Path,
-) -> None:
-    """Publish or remove a complete generation; retain pins if rollback fails.
+@dataclass(frozen=True)
+class ProgramBinding:
+    """One observable hook owned by a program in a module generation."""
+    name: str
+    read: Callable[[], int | None]
+    write: Callable[[Path | None, int | None], None]
+    candidate: bool = True
 
-    Cross-hook switching is not atomic. Compatible generations share explicitly
-    versioned state; unversioned generations retain their independent maps.
-    """
-    tc_map, kind = handler_egress_table(handler_map)
-    root = handler_map.parent
-    single_entry_only = not (tc_map.exists() and (root / "handler_egress").exists())
-    tables = [(handler_map, "prog")] if single_entry_only else [(handler_map, "prog"), (tc_map, "egress")]
-    def entry(table: Path) -> int | None:
+
+def program_array_binding(table: Path, key: int, name: str = "prog") -> ProgramBinding:
+    def read() -> int | None:
         return _pinned_u32_lookup(table, struct.pack("=I", key))
 
-    def restore(table: Path, pin: Path | None, program_id: int | None) -> None:
+    def write(pin: Path | None, program_id: int | None) -> None:
         if program_id is None:
             prog_array_delete(table, key)
         else:
             assert pin is not None
             prog_array_update(table, key, pin)
-        if entry(table) != program_id:
-            raise RuntimeError(f"Handler table verification failed: {table.name}[{key}]")
 
-    old_ids: dict[str, int | None] = {"egress": None}
-    new_ids: dict[str, int | None] = {"egress": None}
+    return ProgramBinding(name, read, write)
+
+
+def _transactional_handler_pair(
+    handler_map: Path, key: int, candidate_dir: Path | None, live_dir: Path,
+) -> None:
+    tc_map, kind = handler_egress_table(handler_map)
+    root = handler_map.parent
+    single_entry_only = not (tc_map.exists() and (root / "handler_egress").exists())
+    if single_entry_only and (
+        tc_map.exists() or (live_dir / "egress").exists() or
+        (candidate_dir is not None and (candidate_dir / "egress").exists()) or
+        ((root / "handler_egress").exists() and handler_egress_id(root, kind, key) is not None)
+    ):
+        if candidate_dir is not None:
+            shutil.rmtree(candidate_dir, ignore_errors=True)
+        raise RuntimeError("Handler egress maps are incomplete; active pins retained")
+    bindings = [program_array_binding(handler_map, key)]
+    if not single_entry_only:
+        bindings += [
+            ProgramBinding("egress", lambda: handler_egress_id(root, kind, key),
+                           lambda pin, value: set_handler_egress(root, kind, key, value)),
+            program_array_binding(tc_map, key, "egress"),
+        ]
+    _transactional_handler_bindings(bindings, key, candidate_dir, live_dir)
+
+
+def _transactional_handler_bindings(
+    bindings: list[ProgramBinding], key: int | str, candidate_dir: Path | None, live_dir: Path,
+) -> None:
+    """Publish a module through the same ownership, readback and rollback path.
+
+    Bindings are ordered ingress first: removal stops ingress before companions;
+    replacement prepares companions before exposing the new ingress program.
+    The caller holds the root's handler lock throughout preparation/publication.
+    """
+    def restore(binding: ProgramBinding, pin: Path | None, program_id: int | None) -> None:
+        binding.write(pin, program_id)
+        if binding.read() != program_id:
+            raise RuntimeError(f"Handler binding verification failed: {binding.name}")
+
+    old_ids: list[int | None] = []
+    new_ids: list[int | None] = []
     try:
-        if single_entry_only and (
-            tc_map.exists() or (live_dir / "egress").exists() or
-            (candidate_dir is not None and (candidate_dir / "egress").exists()) or
-            ((root / "handler_egress").exists() and handler_egress_id(root, kind, key) is not None)
-        ):
-            raise RuntimeError("Handler egress maps are incomplete; active pins retained")
-        for table, name in tables:
-            pin = live_dir / name
-            old_ids[name] = entry(table)
-            if old_ids[name] is not None and (
-                not pin.exists() or pinned_program_id(pin) != old_ids[name]
-            ):
-                raise RuntimeError(f"Active entry in {table.name} has no matching ownership pin {pin}")
-            new_pin = candidate_dir / name if candidate_dir is not None else None
-            new_ids[name] = pinned_program_id(new_pin) if new_pin and new_pin.exists() else None
-        if candidate_dir is not None and new_ids["prog"] is None:
+        if candidate_dir is not None and not (candidate_dir / "prog").exists():
             raise RuntimeError("Candidate generation is missing its XDP entry")
-        old_capability = None if single_entry_only else handler_egress_id(root, kind, key)
-    except (OSError, RuntimeError):
+        for binding in bindings:
+            old = binding.read()
+            pin = live_dir / binding.name
+            if old is not None and (not pin.exists() or pinned_program_id(pin) != old):
+                raise RuntimeError(f"Active entry has no matching ownership pin {pin}")
+            old_ids.append(old)
+            new_pin = candidate_dir / binding.name if candidate_dir is not None and binding.candidate else None
+            new_ids.append(pinned_program_id(new_pin) if new_pin is not None and new_pin.exists() else None)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         if candidate_dir is not None:
             shutil.rmtree(candidate_dir, ignore_errors=True)
         raise
@@ -782,42 +734,31 @@ def _transactional_handler_pair(
     backup = live_dir.with_name(f"{live_dir.name}_rollback_{secrets.token_hex(4)}")
     moved_old = moved_candidate = False
     try:
-        # On removal stop ingress first; on replacement prepare egress first.
-        order = tables if candidate_dir is None else list(reversed(tables))
-        for table, name in order:
-            new_id = new_ids[name]
-            if new_id is None:
-                restore(table, None, None)
-            else:
-                assert candidate_dir is not None
-                restore(table, candidate_dir / name, new_id)
-            if not single_entry_only and ((candidate_dir is None and name == "prog") or name == "egress"):
-                set_handler_egress(root, kind, key, new_ids["egress"])
+        order = list(range(len(bindings)))
+        if candidate_dir is not None:
+            order.reverse()
+        for index in order:
+            binding, new_id = bindings[index], new_ids[index]
+            candidate_pin = candidate_dir / binding.name if candidate_dir is not None and new_id is not None else None
+            restore(binding, candidate_pin, new_id)
         if live_dir.exists():
             live_dir.rename(backup)
             moved_old = True
         if candidate_dir is not None:
             candidate_dir.rename(live_dir)
             moved_candidate = True
-        for table, name in tables:
-            if entry(table) != new_ids[name]:
-                raise RuntimeError(f"Committed {table.name} entry changed during publication")
-            if new_ids[name] is not None and pinned_program_id(live_dir / name) != new_ids[name]:
-                raise RuntimeError(f"Committed {name} pin does not match the active entry")
-    except (OSError, RuntimeError) as exc:
+        for binding, new_id in zip(bindings, new_ids):
+            if binding.read() != new_id:
+                raise RuntimeError(f"Committed {binding.name} binding changed during publication")
+            if new_id is not None and pinned_program_id(live_dir / binding.name) != new_id:
+                raise RuntimeError(f"Committed {binding.name} pin does not match the active entry")
+    except BaseException as exc:
         errors: list[str] = []
         previous = backup if moved_old else live_dir
-        for table, name in reversed(tables):
+        for binding, old_id in reversed(list(zip(bindings, old_ids))):
             try:
-                restore(
-                    table, previous / name if old_ids[name] is not None else None, old_ids[name],
-                )
-            except (OSError, RuntimeError) as error:
-                errors.append(str(error))
-        if not single_entry_only:
-            try:
-                set_handler_egress(root, kind, key, old_capability)
-            except (OSError, RuntimeError) as error:
+                restore(binding, previous / binding.name if old_id is not None else None, old_id)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                 errors.append(str(error))
         if errors:
             raise RuntimeError(
@@ -831,10 +772,48 @@ def _transactional_handler_pair(
             backup.rename(live_dir)
         if candidate_dir is not None:
             shutil.rmtree(candidate_dir, ignore_errors=True)
+        if not isinstance(exc, Exception):
+            raise
         raise RuntimeError(f"Handler switch failed; previous generation restored: {exc}") from exc
-    # This is reached only after both dispatch entries/pins are verified. A
-    # failed switch or rollback keeps every recovery generation untouched.
     _retire_handler_generations(live_dir, key)
+
+
+def stage_handler_program(obj: Path, pin: Path, program_type: str,
+                          shared: list[tuple[str, Path]], maps: Path) -> None:
+    """Load a single entry without making any live hook reach it."""
+    command = ["bpftool", "prog", "load", str(obj), str(pin), "type", program_type,
+               "pinmaps", str(maps)]
+    for name, path in shared:
+        command.extend(["map", "name", name, "pinned", str(path)])
+    run_checked(command, f"Failed to load {obj}", include_detail=True)
+
+
+def _load_handler_bundle(
+    handler_map: Path, key: int, objects: list[tuple[str, Path, str]], live_dir: Path,
+    companions: list[ProgramBinding],
+) -> None:
+    """Stage separate module objects, then publish all hooks as one generation.
+
+    The caller holds the handler root lock. Each object reuses declared public
+    maps with the same ABI validation as protocol, port and profile handlers.
+    """
+    shared = []
+    for name, obj, kind in objects:
+        _, second = handler_object_programs(obj, classifier_only=kind == "classifier")
+        if second is not None:
+            raise RuntimeError("Bundled module entries must each contain a single program")
+        shared.append(handler_shared_maps(obj, handler_map.parent))
+    live_dir.parent.mkdir(parents=True, exist_ok=True)
+    candidate = Path(tempfile.mkdtemp(prefix=f"{live_dir.name}_next_", dir=live_dir.parent))
+    try:
+        for (name, obj, kind), maps in zip(objects, shared):
+            stage_handler_program(obj, candidate / name, kind, maps, candidate / f"{name}_maps")
+    except BaseException:
+        shutil.rmtree(candidate, ignore_errors=True)
+        raise
+    _transactional_handler_bindings(
+        [program_array_binding(handler_map, key), *companions], live_dir.name, candidate, live_dir,
+    )
 
 
 def load_handler_object(
@@ -872,19 +851,16 @@ def _load_handler_object(
     candidate_dir = Path(
         tempfile.mkdtemp(prefix=f"{key}_next_", dir=str(pin_dir.parent))
     )
-    load_cmd = [
-        "bpftool", "prog", "load", str(obj_path), str(candidate_dir / "prog"),
-        "type", "xdp", "pinmaps", str(candidate_dir),
-    ]
-    if egress is not None:
-        # Let libbpf infer each program's type from its section. A global type
-        # override would incorrectly turn the TC entry into an XDP program.
-        load_cmd = ["bpftool", "prog", "loadall", str(obj_path), str(candidate_dir / "programs"),
-                    "pinmaps", str(candidate_dir / "maps")]
-    for name, map_path in shared_maps + preserved:
-        load_cmd.extend(["map", "name", name, "pinned", str(map_path)])
     try:
-        run_checked(load_cmd, f"Failed to load {obj_path}")
+        if egress is None:
+            stage_handler_program(obj_path, candidate_dir / "prog", "xdp", shared_maps + preserved, candidate_dir)
+        else:
+            # A global type override would turn the TC entry into XDP.
+            load_cmd = ["bpftool", "prog", "loadall", str(obj_path), str(candidate_dir / "programs"),
+                        "pinmaps", str(candidate_dir / "maps")]
+            for name, map_path in shared_maps + preserved:
+                load_cmd.extend(["map", "name", name, "pinned", str(map_path)])
+            run_checked(load_cmd, f"Failed to load {obj_path}", include_detail=True)
         if egress is not None:
             (candidate_dir / "programs" / ingress).rename(candidate_dir / "prog")
             (candidate_dir / "programs" / egress).rename(candidate_dir / "egress")

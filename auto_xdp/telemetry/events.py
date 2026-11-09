@@ -57,7 +57,7 @@ COUNTERS = (
     ("SYN_COOKIE_INVALID", "cookie", "ACK failed SYN-cookie validation"),
     ("SYN_COOKIE_BUDGET_DROP", "summary", "Combined SYN-port and cookie-ACK budget drops"),
     ("SYN_COOKIE_HELPER_ERROR", "cookie", "Kernel SYN-cookie generation helper failed"),
-    ("SYN_COOKIE_TAILCALL_MISS", "cookie", "Required SYN-cookie program could not be dispatched"),
+    ("SYN_COOKIE_TAILCALL_MISS", "cookie", "SYN-cookie program absent; packet continued on the normal path"),
     ("SYN_GUARD_SHED_ENTER", "cookie", "Port entered SYN load-shedding state"),
     ("PORT_NOT_AUTHORIZED", "policy", "Destination port is not authorized on this ingress interface"),
     ("SYN_COOKIE_PORT_BUDGET_DROP", "rate", "SYN port guard refused: budget exhausted, shedding cooldown, or budget state unavailable"),

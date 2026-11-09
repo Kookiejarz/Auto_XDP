@@ -65,6 +65,20 @@ XDP_OBJ_INSTALLED="$BUILD_STAGING_DIR/$XDP_OBJ"
     exit 1
 }
 
+if [[ -s "$BUILD_STAGING_DIR/btf/vmlinux.h" ]] && \
+        grep -Eq '^[[:space:]]*struct[[:space:]]+bpf_tcp_req_attrs[[:space:]]*\{' \
+            "$BUILD_STAGING_DIR/btf/vmlinux.h"; then
+    [[ -s "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ" ]] || {
+        echo "[ERROR] supported SYN-cookie listener handoff failed to build" >&2
+        exit 1
+    }
+else
+    [[ ! -e "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ" ]] || {
+        echo "[ERROR] unsupported SYN-cookie listener handoff retained an object" >&2
+        exit 1
+    }
+fi
+
 resolve_bpf_build_env || {
     echo "[ERROR] failed to resolve native BPF build environment" >&2
     exit 1

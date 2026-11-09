@@ -23,7 +23,7 @@ from auto_xdp.bpf.maps import (
     BpfGlobalRlMap, BpfPortPolicyMap, BpfSyncookieRuntimeMap, BpfRuntimeConfigMap,
     XDP_CFG_FLAG_DROP_EVENTS_DISABLED,
 )
-from auto_xdp.config import parse_toml_config, load_toml_config
+from auto_xdp.config import parse_toml_config, load_toml_config, module_configs
 from auto_xdp.discovery.listeners import get_listening_ports
 from auto_xdp.policy import resolve_desired_state
 from auto_xdp.telemetry.geoip import GeoIPResolver
@@ -669,7 +669,7 @@ def _collect_snapshot(
         except Exception as exc:
             audit_error = audit_error or f"approvals: {exc}"
 
-    cookie_cfg = _load_toml(args.config).get("syncookie", {})
+    cookie_cfg = module_configs(_load_toml(args.config)).get("syncookie", {})
     cookie_enabled = cookie_cfg.get("enabled") if isinstance(cookie_cfg, dict) else None
     host, network = (resource_sampler.sample(iface, now) if resource_sampler is not None
                      else (HostMetrics(), NetworkMetrics(iface=iface)))

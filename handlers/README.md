@@ -97,7 +97,9 @@ offer compiler parameters. Private map state still follows the declared
 state contract: a parameter change that alters its ABI must not reuse an
 incompatible schema.
 
-Draft values are stored in `[handler_settings.<id>]`. Applying a slot or
+Module switches and parameters are stored in `[modules.<id>]`.
+Save writes pending values to `[modules.<id>.draft]`; Apply publishes those
+values to the module table and removes the draft. Applying a slot or
 port module writes the normal `[slots]` / `[port_handlers]` startup config
 and `[handler_bindings]` ownership metadata, then uses the common transaction
 to activate it. If activation fails, the command reports **configuration
@@ -110,7 +112,7 @@ remove the old target automatically.
 Minecraft config selects an existing policy subject and changes its
 `protection.profile`; it never creates exposure grants. SYN Cookie exposes its
 existing policy modes, thresholds and per-port/process/service overrides.
-These two managed modules apply through the installed runtime's normal
+These managed modules apply through the installed runtime's normal
 reconciliation; observe/audit mode is reported as non-active. When the matching
 installed controller is running, Apply stops that watcher, performs one sync,
 and restarts it with the saved configuration. Existing BPF attachments remain
@@ -122,8 +124,21 @@ both failures if recovery fails. Unrelated controllers are left alone.
 Activation errors, including both subprocess output streams, can be inspected
 with **e** in the configuration page; **PgUp/PgDn** scrolls the full error.
 Saving a draft retains the last activation error; a successful Apply clears it.
-SYN Cookie still
-uses its dedicated XDP/TC-ingress lifecycle, not the TC-egress handler ABI.
+SYN Cookie uses the common module generation transaction for loading, replacing
+and disabling its XDP program and TC ingress companion. Both objects must pass
+entry-type and shared-map ABI checks before activation. TC ingress is prepared
+before XDP dispatch; Disable withdraws XDP dispatch first. Every changed hook is
+read back, and a failed switch restores the previous generation on all affected
+interfaces. Failed rollback keeps recovery pins and the required sysctl ownership.
+The module remains one row in Handlers, with both hooks reflected in its status;
+the handoff program is a companion, not a separate configurable module.
+
+SYN Cookie settings live in `[modules.syncookie]`;
+`axdp handler apply syncookie` uses only the current module ownership pins.
+Old root-level program pins are not adopted. Pins are retired only
+after a verified switch/removal. New generations live under
+`BPF_PIN_DIR/modules/syncookie/` (`prog` and `ingress`). Capability checks and
+namespace-scoped sysctl ownership remain requirements of this module.
 
 A handler object contains exactly one XDP program and optionally one TC egress
 classifier. Use `SEC("xdp")` and `SEC("tc")` so libbpf can infer their different
@@ -184,7 +199,7 @@ Existing `axdp port-handler load tcp|udp PORT file.c|file.o` and
 `axdp profile-handler load ID file.o` commands load both entries when present.
 Protocol modules use `axdp slot load gre|esp|sctp` or
 `axdp slot load PROTO file.c|file.o` through the same loader.
-Single-XDP service objects remain supported, including legacy `xdp/...` sections.
+Single-XDP service objects remain supported, using `xdp/...` sections.
 The parallel dispatch tables are:
 
 | Service key | XDP table | TC table |
@@ -231,7 +246,7 @@ staging and rollback generations for that target. Failed switches retain
 recovery pins; foreign names are not swept. Protocol migration removes the
 old flat pin, its recognized temporary pins, and the old directory once empty.
 A private map lives under the generation's `maps/` directory
-for dual-entry objects; legacy single-entry objects retain their existing layout.
+for dual-entry objects; single-entry objects retain their existing layout.
 
 `handler_eg_stats` exposes parse,
 binding, policy, conntrack and tail-call misses plus dispatch attempts; the TUI
@@ -282,13 +297,14 @@ state deliberately, run the existing `port-handler unload` or
 object loaded before this contract existed has no compatibility marker, so its
 first upgrade to a versioned object also requires that explicit reset.
 A stateless protocol module may declare `AXDP_STATE_SCHEMA("name-v1", "[]")`.
-The old flat `handlers/proto_N` pin can be adopted without reset only when
-its program ID matches the dispatch entry and every referenced map is a
-known shared public map. Unknown/private legacy state rejects adoption. The
-old pin stays available until the new generation is verified. Two
-unversioned legacy objects keep their existing fresh-map replacement behavior.
-Compatible UDP port updates retain the public validation cache; legacy updates
-and explicit unload still flush that port's cache.
+Only current generation pins and state markers authorize replacement or
+removal. Flat `handlers/proto_N`, `syncookie_prog` and
+`tc_syncookie_handoff_prog` pins are not adopted or converted. An old live
+attachment must be stopped with its matching release before a fresh start;
+unknown ownership fails without replacing or deleting that attachment.
+Objects without a state contract receive fresh private maps on replacement.
+Compatible UDP port updates retain the public validation cache; updates
+without a state contract and explicit unload flush that port's cache.
 
 This contract covers handler replacement inside the same running XDP
 map set. Restarting the host, recreating the main firewall maps, changing the

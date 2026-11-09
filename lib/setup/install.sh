@@ -74,7 +74,8 @@ prepare_candidate_config() {
     candidate=$(mktemp)
     _SETUP_TMPFILES+=("$candidate")
     cp "$source_config" "$candidate" || return 1
-    "${PYTHON3_BIN:-python3}" - "$candidate" <<'PY'
+    PYTHONPATH="${SOURCE_ROOT:-.}${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON3_BIN:-python3}" - \
+        "$candidate" <<'PY' || return 1
 import sys
 try:
     import tomllib

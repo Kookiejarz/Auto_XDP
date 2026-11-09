@@ -66,6 +66,34 @@ target_vmlinux_header() {
     [[ -s "${out_dir}/vmlinux.h" ]]
 }
 
+compile_syncookie_handoff() {
+    local source_root="$1" vmlinux_dir="${2:-}"
+    local object="${BUILD_STAGING_DIR}/${TC_SYNCOOKIE_OBJ}"
+    # A reused staging directory must not retain an unsupported/partial object.
+    rm -f "$object"
+    if [[ -z "$vmlinux_dir" || ! -s "${vmlinux_dir}/vmlinux.h" ]]; then
+        warn "Level 2 SYN-cookie listener handoff skipped: kernel BTF is unavailable."
+        return 0
+    fi
+    # Older kernels still have BTF, but lack the request-socket kfunc's types.
+    # Check the generated definition, not just a possible forward declaration.
+    if ! grep -Eq '^[[:space:]]*struct[[:space:]]+bpf_tcp_req_attrs[[:space:]]*\{' \
+            "${vmlinux_dir}/vmlinux.h"; then
+        warn "Level 2 SYN-cookie listener handoff skipped: kernel BTF has no complete bpf_tcp_req_attrs definition; bpf_sk_assign_tcp_reqsk support is required."
+        return 0
+    fi
+    if ! stage_build_source "$TC_SYNCOOKIE_SRC" "$TC_SYNCOOKIE_SRC" "$TC_SYNCOOKIE_SRC"; then
+        warn "Level 2 SYN-cookie listener handoff unavailable: source could not be staged."
+        return 0
+    fi
+    if ! compile_bpf_object "${source_root}/${TC_SYNCOOKIE_SRC}" "$object" \
+            "$source_root" "$vmlinux_dir"; then
+        rm -f "$object"
+        warn "Level 2 SYN-cookie listener handoff unavailable: compilation failed."
+    fi
+    return 0
+}
+
 generate_xdp_map_abi() {
     local source_root="$1"
     local header="${source_root}/bpf/include/map_sizes.h"
@@ -330,13 +358,7 @@ compile_xdp_program() {
     if target_vmlinux_header "${BUILD_STAGING_DIR}/btf"; then
         _vmlinux_dir="${BUILD_STAGING_DIR}/btf"
     fi
-    if [[ -n "$_vmlinux_dir" ]] && \
-            stage_build_source "$TC_SYNCOOKIE_SRC" "$TC_SYNCOOKIE_SRC" "$TC_SYNCOOKIE_SRC"; then
-        compile_bpf_object "${_source_root}/${TC_SYNCOOKIE_SRC}" \
-            "${BUILD_STAGING_DIR}/${TC_SYNCOOKIE_OBJ}" "$_source_root" \
-            "$_vmlinux_dir" || \
-            warn "Level 2 SYN-cookie listener handoff unavailable."
-    fi
+    compile_syncookie_handoff "$_source_root" "$_vmlinux_dir"
     if ! stage_build_source "$TC_EGRESS_SRC" "$TC_EGRESS_SRC" "$TC_EGRESS_SRC" \
             || ! compile_bpf_object \
                 "${_source_root}/${TC_EGRESS_SRC}" \
