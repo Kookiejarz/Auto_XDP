@@ -137,13 +137,20 @@ def client(port):
         timings = []
         for payload in PAYLOADS:
             start = time.monotonic()
-            with socket.socket(family, socket.SOCK_STREAM) as sock:
-                sock.settimeout(3)
-                sock.connect((host, port))
-                sock.sendall(struct.pack("!I", len(payload)) + payload)
-                size = struct.unpack("!I", read_exact(sock, 4))[0]
-                assert size == len(payload)
-                assert read_exact(sock, size) == payload, "transfer content changed"
+            stage = "connect"
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(3)
+                    sock.connect((host, port))
+                    stage = "send request"
+                    sock.sendall(struct.pack("!I", len(payload)) + payload)
+                    stage = "read response size"
+                    size = struct.unpack("!I", read_exact(sock, 4))[0]
+                    assert size == len(payload)
+                    stage = "read response body"
+                    assert read_exact(sock, size) == payload, "transfer content changed"
+            except OSError as exc:
+                raise AssertionError(f"{host}: {len(payload)}-byte transfer failed at {stage}: {exc}") from exc
             timings.append((time.monotonic() - start) * 1000)
         median = statistics.median(timings[:5])
         assert median < 100, f"{host}: first-payload median {median:.2f}ms suggests a persist-probe stall"
