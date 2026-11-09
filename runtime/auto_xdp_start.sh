@@ -169,6 +169,7 @@ ensure_xdp_loaded() {
     ensure_bpffs
 
     ensure_linux_conntrack || {
+        [[ ${AUTO_XDP_ATTACH_FATAL:-0} -eq 0 ]] || return 2
         _auto_xdp_any_target_has_xdp && return 2
         return 1
     }
@@ -216,6 +217,7 @@ ensure_xdp_loaded() {
         # Strict cookie requirements and incompatible NAT both abort activation.
         # Keep XDP attached and forbid a silent nftables downgrade.
         load_syncookie_program || return 2
+        load_icmp_module || return 2
         load_tc_egress_dispatch || return 1
         load_port_handlers || true
         auto_tune_interface_parallelism || true
@@ -355,7 +357,7 @@ select_backend() {
             fi
             return 0
         fi
-        if [[ $xdp_status -eq 2 ]]; then
+        if [[ $xdp_status -eq 2 || "$preferred_backend" == "xdp" ]]; then
             echo "[auto_xdp] XDP activation blocked; automatic backend fallback disabled" >&2
             return 1
         fi

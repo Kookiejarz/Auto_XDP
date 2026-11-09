@@ -228,7 +228,8 @@ jobs:
       - name: Install kernel test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends conntrack
+          sudo apt-get install -y --no-install-recommends \
+            conntrack "linux-headers-$(uname -r)" libelf-dev kmod pahole llvm
 
       - name: Run real kernel and packet-policy integration
         run: |
@@ -237,6 +238,7 @@ jobs:
           mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           sudo env \
             REQUIRE_KERNEL_TESTS=1 \
+            KERNEL_TEST_ICMP=1 \
             VERIFIER_METRICS_FILE="$GITHUB_WORKSPACE/verifier-metrics.tsv" \
             bash tests/run.sh kernel 2>&1 | tee kernel-integration.log
 

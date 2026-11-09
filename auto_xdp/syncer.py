@@ -134,6 +134,11 @@ def _probe_backend(backend_cls: type[PortBackend]):
 
 
 def open_backend(name: str) -> PortBackend:
+    if cfg.ICMP_REPLY_ENABLED:
+        if name == BACKEND_NFTABLES:
+            raise RuntimeError("ICMP Echo Reply protection requires the XDP backend")
+        if name == BACKEND_AUTO:
+            name = BACKEND_XDP
     if name == BACKEND_XDP:
         status = XdpBackend.probe()
         if not status.available:
@@ -255,6 +260,7 @@ def watch(
                 _old_nft_family = cfg.NFT_FAMILY
                 _old_nft_table = cfg.NFT_TABLE
                 _old_preferred = cfg.PREFERRED_BACKEND
+                _old_icmp = cfg.ICMP_REPLY_ENABLED
                 _old_resources = {name: value for name, value in cfg.snapshot_config().values.items()
                                   if name.startswith(("ABUSEIPDB_", "NFT_"))}
                 if not _reload_config(config_path):
@@ -268,6 +274,7 @@ def watch(
                 _new_resources = cfg.snapshot_config()
                 _backend_stale = (
                     cfg.BPF_PIN_DIR != _old_pin_dir
+                    or cfg.ICMP_REPLY_ENABLED != _old_icmp
                     or cfg.NFT_FAMILY != _old_nft_family
                     or cfg.NFT_TABLE != _old_nft_table
                     or any(_new_resources.values[name] != value

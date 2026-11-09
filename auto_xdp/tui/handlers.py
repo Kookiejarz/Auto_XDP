@@ -92,6 +92,8 @@ def _configured(config: dict[str, Any]) -> dict[tuple[str, int], str]:
     modules = configuration.module_configs(config)
     if modules.get("syncookie", {}).get("enabled", False):
         result[("SYNCOOKIE", 0)] = "builtin:syncookie"
+    if modules.get("icmp", {}).get("enabled", False):
+        result.update({("SLOT", key): "builtin:icmp" for key in (1, 58)})
     slots = config.get("slots", {})
     enabled = slots.get("enabled", []) if isinstance(slots, dict) else []
     for entry in enabled if isinstance(enabled, list) else []:
@@ -123,6 +125,8 @@ def _expected_pin(kind: str, key: int) -> str:
     if kind.startswith("TC_"):
         return _expected_pin(kind.removeprefix("TC_"), key).removesuffix("prog") + "egress"
     if kind == "SLOT":
+        if key in (1, 58):
+            return "modules/icmp/prog"
         return f"protocol_handlers/{key}/prog"
     if kind in {"TCP", "UDP"}:
         return f"port_handlers/{kind.lower()}/{key}/prog"
@@ -144,6 +148,8 @@ def _pin_key(pin: str) -> tuple[str, int] | None:
                 return prefix + "PROFILE", int(parts[2])
         if pin == "modules/syncookie/prog":
             return "SYNCOOKIE", 0
+        if pin == "modules/icmp/prog":
+            return "SLOT", 1
     except ValueError:
         pass
     return None
@@ -270,9 +276,23 @@ def _include_catalog(inventory: HandlerInventory, context: handler_catalog.Conte
             module = by_id.get("minecraft")
         if module is None and kind == "SYNCOOKIE":
             module = by_id.get("syncookie")
+        if module is None and row.pin == "modules/icmp/prog":
+            module = by_id.get("icmp")
         if module is not None:
             inventory.rows[index] = replace(row, module=module)
             represented.add(module.id)
+    icmp_rows = [row for row in inventory.rows if row.module is not None and row.module.id == "icmp"]
+    if icmp_rows:
+        first = next((row for row in icmp_rows if row.program_id is not None), icmp_rows[0])
+        state, detail = first.state, first.detail
+        if any(row.program_id is not None for row in icmp_rows):
+            try:
+                module_runtime.verify_icmp(context.bpf_pin_dir)
+                state, detail = "loaded", "IPv4 + IPv6 Echo Reply protection · kernel dependency axdp_icmp"
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                state, detail = "incomplete", str(exc)
+        inventory.rows = [row for row in inventory.rows if row not in icmp_rows]
+        inventory.rows.append(replace(first, kind="ICMP", state=state, detail=detail, name="ICMP"))
     for module in modules:
         if module.id in represented:
             continue
@@ -302,6 +322,8 @@ def handler_labels(row: HandlerRow) -> tuple[str, str]:
         return "SYN handoff", "TC in / SYN"
     if row.kind == "SYNCOOKIE":
         return "SYN cookie", "XDP + TC in / SYN"
+    if row.kind == "ICMP":
+        return "ICMP", "XDP / IPv4 + IPv6"
     kind = row.kind.removeprefix("TC_")
     hook = "TC out" if row.kind.startswith("TC_") else "XDP"
     if row.kind == "AVAILABLE":
@@ -311,6 +333,8 @@ def handler_labels(row: HandlerRow) -> tuple[str, str]:
     prefix = f"{hook} / " if hook else ""
     if kind == "SYNCOOKIE":
         return "SYN cookie", "SYN"
+    if kind == "ICMP":
+        return "ICMP", "IPv4 + IPv6 Echo Reply"
     if kind == "SLOT":
         protocol = f"/{_PROTOCOLS[row.key]}" if row.key in _PROTOCOLS else ""
         return "Protocol", f"{prefix}IP {row.key}{protocol}"

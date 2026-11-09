@@ -117,6 +117,11 @@ exclude_bind_cidrs = []
 source_cidr_v4 = 32
 source_cidr_v6 = 128
 
+[modules.icmp]
+# Managed Echo Reply protection; axdp handler apply icmp --set enabled=true
+# The loader resolves its axdp_icmp kernel module before publishing handlers.
+enabled = false
+
 [modules.syncookie]
 # Optional per-service XDP SYN-cookie challenge. Full listener handoff requires
 # Linux 6.11+; unsupported kernels keep this path disabled.

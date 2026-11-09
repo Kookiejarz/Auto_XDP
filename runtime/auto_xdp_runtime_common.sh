@@ -176,6 +176,10 @@ try:
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
         value = str(config.get("daemon", {}).get("preferred_backend", sys.argv[2])).lower()
+    if modules.get("icmp", {}).get("enabled", False):
+        if value == "nftables":
+            raise SystemExit("ICMP reply protection requires the XDP backend")
+        value = "xdp"  # A requested kernel module must not silently disappear in fallback.
 except Exception:
     value = sys.argv[2]
 print(value if value in {"auto", "xdp", "nftables"} else sys.argv[2])
@@ -1540,6 +1544,20 @@ load_sock_state_tracker() {
     return 0
 }
 
+load_icmp_module() {
+    local install_dir="${INSTALL_DIR:-/usr/local/lib/auto_xdp/current}"
+    local handlers_dir="${AUTO_XDP_BUILTIN_HANDLERS_DIR:-${install_dir}/handlers}"
+    local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+    [[ -f "${TOML_CONFIG:-}" ]] || return 0
+    if ! PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON3_BIN:-python3}" \
+            -m auto_xdp.admin.module_runtime apply icmp --root "$BPF_PIN_DIR" \
+            --config "$TOML_CONFIG" --xdp "$handlers_dir/icmp_handler.o"; then
+        AUTO_XDP_ATTACH_FATAL=1
+        AUTO_XDP_LAST_ATTACH_ERRORS="ICMP module or its kernel dependency could not be activated"
+        return 1
+    fi
+}
+
 load_slot_handlers() {
     local handlers_dir="${AUTO_XDP_BUILTIN_HANDLERS_DIR:-${INSTALL_DIR}/handlers}"
     local py_bin="${PYTHON3_BIN:-python3}"
@@ -1615,6 +1633,7 @@ PYEOF
 
 preseed_xdp_candidate_handlers() {
     AUTO_XDP_STRICT_HANDLERS=1 load_slot_handlers \
+        && load_icmp_module \
         && AUTO_XDP_STRICT_HANDLERS=1 load_port_handlers
 }
 

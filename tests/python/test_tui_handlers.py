@@ -13,6 +13,23 @@ def prepare(root):
         (root / name).touch()
 
 
+@pytest.mark.parametrize("broken", [False, True])
+def test_icmp_has_one_row_and_checks_both_families(tmp_path, broken):
+    prepare(tmp_path)
+    context = handlers.handler_catalog.Context(tmp_path / "config.toml", tmp_path, tmp_path / "custom", tmp_path, tmp_path / "run")
+    programs = [dict(id=11, name="xdp_icmp_handler", pinned=[str(tmp_path / "modules/icmp/prog")])]
+    def query(*args):
+        return programs if args[0] == "-f" else ([{"key": key, "value": 11} for key in (1, 58)]
+                                                 if args[-1].endswith("proto_handlers") else [])
+    with mock.patch.object(handlers, "_query", side_effect=query), \
+            mock.patch.object(handlers.module_runtime, "verify_icmp", side_effect=RuntimeError("IPv6 missing") if broken else None, return_value=11):
+        inventory = handlers.collect_handlers(str(tmp_path), {"modules": {"icmp": {"enabled": True}}}, handlers.HandlerCache(), context=context)
+    rows = [row for row in inventory.rows if row.module and row.module.id == "icmp"]
+    assert len(rows) == 1 and rows[0].kind == "ICMP"
+    assert rows[0].state == ("incomplete" if broken else "loaded")
+    assert handlers.handler_labels(rows[0]) == ("ICMP", "XDP / IPv4 + IPv6")
+
+
 def test_inventory_uses_dispatch_entries_instead_of_configuration_or_pin_presence(tmp_path):
     prepare(tmp_path)
     config = dict(slots=dict(enabled=["gre"]), port_handlers=dict(tcp={"8080": "/tcp.c"}, udp={"30120": "/udp.c"}))

@@ -14,6 +14,12 @@
 
 /* --- Protocol dispatch functions --- */
 
+static __always_inline bool icmp_reply_required(void)
+{
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+    return cfg && (cfg->cfg_flags & XDP_CFG_FLAG_ICMP_REPLY);
+}
+
 static __always_inline int check_tcp_policy(
     struct xdp_md *ctx, struct flow_key *key, __u8 tcp_flags,
     bool pure_ack, __u32 dest_port, __u16 l3_off, __u16 inner_off)
@@ -572,6 +578,11 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
                 return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
             }
             __u8 icmp_type = icmp->type;
+            if (icmp_type == ICMP_ECHOREPLY && icmp_reply_required()) {
+                __u32 src[4] = { ip->saddr }, dst[4] = { ip->daddr };
+                return dispatch_to_slot(ctx, CT_FAMILY_IPV4, IPPROTO_ICMP,
+                                        l3_off, inner_off, src, dst);
+            }
             // Control-plane messages required for PMTU discovery, traceroute,
             // and error feedback — never rate-limit these.
             if (icmp_type == ICMP_DEST_UNREACH  ||
@@ -697,6 +708,13 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             if (l4_len < sizeof(*icmp6) || (void *)(icmp6 + 1) > data_end) {
                 count(CNT_IPV6_OTHER);
                 return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
+            }
+            if (icmp6->icmp6_type == ICMPV6_ECHO_REPLY && icmp_reply_required()) {
+                __u32 src[4], dst[4];
+                __builtin_memcpy(src, &ipv6->saddr, sizeof(src));
+                __builtin_memcpy(dst, &ipv6->daddr, sizeof(dst));
+                return dispatch_to_slot(ctx, CT_FAMILY_IPV6, IPPROTO_ICMPV6,
+                                        l3_off, inner_off, src, dst);
             }
             if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST &&
                 !is_trusted_v6(&ipv6->saddr) &&

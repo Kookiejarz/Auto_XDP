@@ -83,6 +83,8 @@ except ImportError:
     import tomli as tomllib
 with open(sys.argv[1], "rb") as handle:
     value = tomllib.load(handle)
+from auto_xdp.config import parse_toml_config
+parse_toml_config(value)
 backend = str(value.get("daemon", {}).get("preferred_backend", "auto")).lower()
 if backend not in {"auto", "xdp", "nftables"}:
     raise SystemExit(f"invalid daemon.preferred_backend: {backend}")
@@ -352,7 +354,7 @@ install_slot_handler_sdk() {
         local _staged=()
         mapfile -t -d '' _staged < <(
             find "${sdk_root}/handlers" -maxdepth 1 \
-                -type f \( -name 'Makefile' -o -name '*.c' -o -name '*.h' -o -name '*.handler.json' \) -print0
+                -type f \( -name 'Makefile*' -o -name 'Kbuild' -o -name '*.c' -o -name '*.h' -o -name '*.handler.json' \) -print0
             find "${sdk_root}/bpf/include" -maxdepth 1 -type f -name '*.h' -print0
         )
         if [[ ${#_staged[@]} -gt 0 ]]; then
@@ -382,7 +384,7 @@ for e in json.load(sys.stdin).get('tree', []):
     if not p.startswith('handlers/'):
         continue
     tail = p.split('/')[-1]
-    if tail == 'Makefile' or p.endswith(('.c', '.h', '.handler.json')):
+    if tail.startswith('Makefile') or tail == 'Kbuild' or p.endswith(('.c', '.h', '.handler.json')):
         print(p)
 " | sort
         )

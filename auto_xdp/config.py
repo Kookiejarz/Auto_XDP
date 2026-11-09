@@ -115,6 +115,7 @@ DISCOVERY_EXCLUDE_PORTS: set[int] = set()
 PREFERRED_BACKEND = BACKEND_AUTO
 XDP_ICMP_BURST_PACKETS = 100
 XDP_ICMP_RATE_PPS = 100.0
+ICMP_REPLY_ENABLED = False
 XDP_UDP_GLOBAL_WINDOW_SECONDS = 1.0
 XDP_RATE_WINDOW_SECONDS = 1.0
 XDP_UDP_GLOBAL_BYTE_RATE = 0
@@ -839,6 +840,13 @@ def _normalize_config(cfg: dict) -> dict[str, Any]:
         0.0,
     )
     settings["XDP_UDP_GLOBAL_BYTE_RATE"] = int(_udp_global_byte_rate_mbps * 1_000_000 / 8)
+
+    icmp = modules.get("icmp", {})
+    if not isinstance(icmp, dict) or type(icmp.get("enabled", False)) is not bool:
+        raise ValueError("modules.icmp.enabled must be true or false")
+    settings["ICMP_REPLY_ENABLED"] = icmp.get("enabled", False)
+    if settings["ICMP_REPLY_ENABLED"] and settings["PREFERRED_BACKEND"] == BACKEND_NFTABLES:
+        raise ValueError("ICMP reply protection requires the XDP backend")
 
     _slots = cfg.get("slots", {})
     _slot_default = str(_slots.get("default_action", "drop")).lower()

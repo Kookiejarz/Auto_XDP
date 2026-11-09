@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from auto_xdp import config as configuration
-from auto_xdp.admin import config_file, handlers, module_runtime
+from auto_xdp.admin import config_file, handlers, module_runtime, kernel_modules
 
 
 _IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
@@ -90,6 +90,7 @@ class Module:
     hooks: str = "XDP; optional TC egress (checked on install/apply)"
     build_error: str = ""
     companions: tuple[str, ...] = ()
+    kernel_dependencies: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -261,6 +262,9 @@ def discover(context: Context, data: dict[str, Any] | None = None) -> list[Modul
                       "Protocol admission checks. Existing exposure policy still applies.")
                for name, (proto, _) in handlers.BUILTIN_SLOT_INFO.items()]
     modules.extend((
+        Module("icmp", "ICMP", str(_artifact(sdk, "icmp_handler")), "icmp", 1,
+               "Admit IPv4/IPv6 Echo Replies only for matching Linux conntrack requests. Echo Request limits remain active.",
+               hooks="XDP / ICMP + ICMPv6", kernel_dependencies=("axdp_icmp",)),
         Module("minecraft", "Minecraft Java", str(_artifact(sdk, "minecraft_handler")), "minecraft", 1,
                "Protect an existing policy subject. This does not grant network exposure.",
                hooks="XDP + TC egress"),
@@ -276,6 +280,8 @@ def discover(context: Context, data: dict[str, Any] | None = None) -> list[Modul
         if not directory.is_dir():
             continue
         for path in sorted(directory.iterdir()):
+            if path.stem.removesuffix(".mod") in {Path(name).stem for name in kernel_modules.BUNDLED_SOURCES.values()}:
+                continue  # Native kernel dependency, represented by its owning module.
             if path.suffix not in {".c", ".o"} or not path.is_file():
                 continue
             key = str(path.with_suffix("").resolve())
@@ -349,7 +355,7 @@ def fields_for(module: Module) -> tuple[Field, ...]:
     fields = [Field("enabled", "Enabled", "bool", True)]
     if module.kind == "minecraft":
         fields.append(Field("subject", "Existing policy subject", help="Use a subject already defined in the policy config."))
-    elif module.kind not in {"syncookie"}:
+    elif module.kind not in {"syncookie", "icmp"}:
         if module.kind == "custom":
             fields.append(Field("kind", "Attach to", default="tcp", choices=_KINDS))
         fields.append(Field("target", "IP protocol" if module.kind == "slot" else "Target port / IP protocol", "int", module.target, 0, 65535,
@@ -360,7 +366,7 @@ def fields_for(module: Module) -> tuple[Field, ...]:
 def settings(module: Module, data: dict[str, Any]) -> dict[str, Any]:
     values = {item.name: copy.deepcopy(item.default) for item in fields_for(module)}
     saved = configuration.module_configs(data).get(module.id, {})
-    if module.kind in {"syncookie"}:
+    if module.kind in {"syncookie", "icmp"}:
         values["enabled"] = False
     if module.kind == "minecraft":
         subjects = [name for name, spec in data.get("subjects", {}).items()
@@ -476,7 +482,7 @@ def _effective_config(module: Module, values: dict[str, Any], data: dict[str, An
         if current not in {"", "minecraft"}:
             raise ValueError(f"Subject already uses protection profile {current}")
         subject["protection"]["profile"] = "minecraft" if enabled else ""
-    elif kind not in {"syncookie"}:
+    elif kind not in {"syncookie", "icmp"}:
         target = values["target"]
         bindings = result.setdefault("handler_bindings", {}).setdefault(kind, {})
         current = bindings.get(str(target), {})
@@ -622,6 +628,10 @@ def _refresh_managed_runtime(context: Context) -> dict[str, str]:
 
 
 def _managed_result(context: Context, module: Module, values: dict[str, Any], env: dict[str, str]) -> str:
+    if module.kind == "icmp":
+        ident = module_runtime.verify_icmp(context.bpf_pin_dir, enabled=values["enabled"])
+        return (f"ICMP applied; program {ident} protects IPv4 and IPv6 Echo Replies." if values["enabled"]
+                else "ICMP reply protection disabled; both module bindings were removed.")
     if module.kind == "syncookie":
         interfaces = env.get("IFACES", env.get("IFACE", "")).split()
         program_id = module_runtime.verify_syncookie(context.bpf_pin_dir, interfaces, enabled=values["enabled"])
@@ -650,14 +660,14 @@ def configure(context: Context, module: Module, updates: dict[str, Any], *, appl
         data = config_file.load_toml(context.config)
         values = validate(module, {**settings(module, data), **updates})
         obj = None
-        if apply and values["enabled"] and module.kind not in {"minecraft", "syncookie"}:
+        if apply and values["enabled"] and module.kind not in {"minecraft", "syncookie", "icmp"}:
             obj = _checked_object(context, module, values)
         try:
             candidate = _effective_config(module, values, data, obj) if apply else copy.deepcopy(data)
             if not apply:
                 candidate.setdefault("modules", {}).setdefault(module.id, {})["draft"] = values
                 # Validate built-in configuration fields even when saving a draft.
-                if module.kind in {"minecraft", "syncookie"}:
+                if module.kind in {"minecraft", "syncookie", "icmp"}:
                     _effective_config(module, values, data, Path(module.path))
             config_file.write_toml(context.config, candidate)
         except Exception:
@@ -675,7 +685,7 @@ def configure(context: Context, module: Module, updates: dict[str, Any], *, appl
             return "Configuration saved; select Apply to activate it."
         try:
             kind = values.get("kind", module.kind)
-            if kind in {"minecraft", "syncookie"}:
+            if kind in {"minecraft", "syncookie", "icmp"}:
                 env = _refresh_managed_runtime(context)
                 mode = candidate.get("policy", {}).get("mode", "audit")
                 if mode != "enforce":
@@ -721,7 +731,7 @@ def install(context: Context, source: Path, *, name: str = "", kind: str = "cust
     if not source.is_file() or source.suffix not in {".c", ".o"}:
         raise ValueError("Install a .c source, .o BPF object, or directory containing handler.json")
     identifier = name or str(metadata.get("id", source.stem))
-    if not _NAME.fullmatch(identifier) or identifier in {*handlers.BUILTIN_SLOT_INFO, "minecraft", "syncookie"}:
+    if not _NAME.fullmatch(identifier) or identifier in {*handlers.BUILTIN_SLOT_INFO, "minecraft", "syncookie", "icmp"}:
         raise ValueError("Choose a valid, non-reserved handler name")
     parent = context.handlers_dir / "catalog"
     parent.mkdir(parents=True, exist_ok=True)

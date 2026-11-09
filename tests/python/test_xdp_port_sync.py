@@ -1600,6 +1600,17 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         self.assertEqual(backend, "nft-backend")
         nft_backend.assert_called_once_with()
 
+    def test_icmp_requirement_blocks_python_backend_fallback(self):
+        with mock.patch.object(cfg, "ICMP_REPLY_ENABLED", True), \
+             mock.patch.object(syncer_mod, "XdpBackend") as xdp_backend, \
+             mock.patch.object(syncer_mod, "NftablesBackend") as nft_backend:
+            xdp_backend.probe.return_value = backends_mod.BackendStatus("xdp", False, "missing maps")
+            with self.assertRaisesRegex(RuntimeError, "missing maps"):
+                syncer_mod.open_backend(syncer_mod.BACKEND_AUTO)
+            with self.assertRaisesRegex(RuntimeError, "requires the XDP"):
+                syncer_mod.open_backend(syncer_mod.BACKEND_NFTABLES)
+            nft_backend.assert_not_called()
+
     def test_xdp_probe_checks_runtime_prerequisites(self):
         with mock.patch.object(xdp_backend_mod.shutil, "which", return_value=None):
             status = xdp_backend_mod.XdpBackend.probe()

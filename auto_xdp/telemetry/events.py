@@ -79,6 +79,7 @@ COUNTERS = (
     ("GRE_VERSION_INVALID", "protocol", "GRE version is unsupported"),
     ("ESP_SPI_RESERVED", "protocol", "ESP security parameter index is reserved"),
     ("SCTP_PORT_NOT_AUTHORIZED", "policy", "SCTP destination port is not authorized"),
+    ("ICMP_REPLY_UNTRACKED", "policy", "Echo reply has no matching confirmed Linux conntrack request"),
 )
 
 _LEGACY_LABELS = {
@@ -97,7 +98,7 @@ PROTO_NAMES = {1: "ICMP", 6: "TCP", 17: "UDP", 41: "6in4", 47: "GRE", 50: "ESP",
 # never as a replacement for dedicated packet/drop totals.
 DROP_INDEXES = frozenset({2, 4, 7, 10, 11, 12, 13, *range(14, 22), 24, 25, 26,
                           27, 29, 30, 31, 34, 35, 37, 41, 42, 43, 44, 46, 47,
-                          48, 49, 50, 51, 52, 53, 55, 63, 64, 65})
+                          48, 49, 50, 51, 52, 53, 55, 63, 64, 65, 66})
 
 
 def reason_info(reason: int | str) -> dict[str, str]:

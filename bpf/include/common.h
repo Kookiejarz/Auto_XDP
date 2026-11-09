@@ -68,6 +68,7 @@ static __always_inline bool tcp_pure_ack(__u8 tcp_flags, __u32 l4_len, __u32 dof
 #define XDP_CFG_FLAG_SLOT_DROP            (1U << 3)  // unknown proto → drop (default: pass)
 #define XDP_CFG_FLAG_ENDPOINT_POLICY      (1U << 4)  // exact address/family/interface admission
 #define XDP_CFG_FLAG_ECN_REFUSED          (1U << 5)  // listener netns has net.ipv4.tcp_ecn=0
+#define XDP_CFG_FLAG_ICMP_REPLY           (1U << 6)  // require the managed ICMP reply handler
 
 // Runtime tunables. Userspace writes this map from config.toml; zero fields
 // fall back to defaults so old loaders remain compatible.

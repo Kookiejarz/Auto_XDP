@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, NamedTuple
 
-from auto_xdp.admin import config_file, handler_state
+from auto_xdp.admin import config_file, handler_state, kernel_modules
 from auto_xdp.bpf.syscall import (
     BPF_MAP_DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_MAP_LOOKUP_ELEM, BPF_OBJ_GET_INFO_BY_FD,
     bpf, map_id, obj_get,
@@ -781,6 +781,7 @@ def _transactional_handler_bindings(
 def stage_handler_program(obj: Path, pin: Path, program_type: str,
                           shared: list[tuple[str, Path]], maps: Path) -> None:
     """Load a single entry without making any live hook reach it."""
+    kernel_modules.ensure(obj)
     command = ["bpftool", "prog", "load", str(obj), str(pin), "type", program_type,
                "pinmaps", str(maps)]
     for name, path in shared:
@@ -856,6 +857,7 @@ def _load_handler_object(
             stage_handler_program(obj_path, candidate_dir / "prog", "xdp", shared_maps + preserved, candidate_dir)
         else:
             # A global type override would turn the TC entry into XDP.
+            kernel_modules.ensure(obj_path)
             load_cmd = ["bpftool", "prog", "loadall", str(obj_path), str(candidate_dir / "programs"),
                         "pinmaps", str(candidate_dir / "maps")]
             for name, map_path in shared_maps + preserved:
