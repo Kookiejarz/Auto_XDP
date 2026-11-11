@@ -24,8 +24,6 @@ static __always_inline int check_tcp_policy(
     struct xdp_md *ctx, struct flow_key *key, __u8 tcp_flags,
     bool pure_ack, __u32 dest_port, __u16 l3_off, __u16 inner_off)
 {
-    __u64 now = bpf_ktime_get_ns();
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
     struct tcp_endpoint_policy endpoint_policy = {};
     __u8 reason = CNT_PORT_NOT_AUTHORIZED;
     enum linux_ct_class ct_class = linux_ct_classify(ctx, key, IPPROTO_TCP);
@@ -35,6 +33,8 @@ static __always_inline int check_tcp_policy(
         return XDP_PASS;
     }
 
+    __u64 now = bpf_ktime_get_ns();
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
     if (!endpoint_scope_allowed(ctx, key->family, IPPROTO_TCP, key->daddr, dest_port) ||
         !tcp_endpoint_policy_lookup(ctx, dest_port, &endpoint_policy))
         goto drop;
@@ -184,8 +184,6 @@ static __always_inline int check_udp_ipv4(
     struct udphdr *udp = trans_data;
     struct flow_key key;
     struct udp_validation_key_v4 validation_key;
-    __u64 now = bpf_ktime_get_ns();
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
 
     if (l4_len < sizeof(*udp) || (void *)(udp + 1) > data_end)
         return drop_unclassified(ctx, CNT_PACKET_TRUNCATED);
@@ -197,7 +195,7 @@ static __always_inline int check_udp_ipv4(
         __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
         __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
         emit_drop(ctx, IPPROTO_UDP, CT_FAMILY_IPV4, s, d,
-                  udp->source, udp->dest, malform, now);
+                  udp->source, udp->dest, malform, bpf_ktime_get_ns());
         return XDP_DROP;
     }
 
@@ -210,6 +208,8 @@ static __always_inline int check_udp_ipv4(
         count(CNT_UDP_PASS);
         return XDP_PASS;
     }
+    __u64 now = bpf_ktime_get_ns();
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
     fill_udp_validation_key_v4(&validation_key, &key);
 
     if (!endpoint_scope_allowed(ctx, key.family, IPPROTO_UDP, key.daddr, dest_port) ||
@@ -320,8 +320,6 @@ static __always_inline int check_udp_ipv6(
     struct udphdr *udp = trans_data;
     struct flow_key key;
     struct udp_validation_key_v6 validation_key;
-    __u64 now = bpf_ktime_get_ns();
-    struct xdp_runtime_cfg *cfg = runtime_cfg();
     struct udp_port_policy_cfg *policy;
 
     if (l4_len < sizeof(*udp) || (void *)(udp + 1) > data_end)
@@ -335,7 +333,7 @@ static __always_inline int check_udp_ipv6(
         __builtin_memcpy(s, &ipv6->saddr, 16);
         __builtin_memcpy(d, &ipv6->daddr, 16);
         emit_drop(ctx, IPPROTO_UDP, CT_FAMILY_IPV6, s, d,
-                  udp->source, udp->dest, malform, now);
+                  udp->source, udp->dest, malform, bpf_ktime_get_ns());
         return XDP_DROP;
     }
 
@@ -347,6 +345,8 @@ static __always_inline int check_udp_ipv6(
         count(CNT_UDP_PASS);
         return XDP_PASS;
     }
+    __u64 now = bpf_ktime_get_ns();
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
     fill_udp_validation_key_v6(&validation_key, &key);
 
 
@@ -494,7 +494,8 @@ static __always_inline int icmp_rate_limit(void)
 static __always_inline int _xdp_fw(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     void *data     = (void *)(long)ctx->data;
-    __u64 now      = bpf_ktime_get_ns();
+    /* Successful ICMP/slot packets need no timestamp. TCP and UDP obtain
+     * their own only after the conntrack reply fast path. */
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
@@ -515,7 +516,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         eth_proto == bpf_htons(ETH_P_8021AD)) {
         count(CNT_VLAN_DROP);
         { __u32 z[4]; __builtin_memset(z, 0, 16);
-          emit_drop(ctx, 0, 0, z, z, 0, 0, (__u8)CNT_VLAN_DROP, now); }
+          emit_drop(ctx, 0, 0, z, z, 0, 0, (__u8)CNT_VLAN_DROP, bpf_ktime_get_ns()); }
         return XDP_DROP;
     }
 
@@ -549,7 +550,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             count(CNT_FRAG_DROP);
             { __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
               __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
-              emit_drop(ctx, ip->protocol, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_FRAG_DROP, now); }
+              emit_drop(ctx, ip->protocol, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_FRAG_DROP, bpf_ktime_get_ns()); }
             return XDP_DROP;
         }
 
@@ -559,7 +560,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             count(CNT_BOGON_DROP);
             { __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
               __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
-              emit_drop(ctx, ip->protocol, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_BOGON_DROP, now); }
+              emit_drop(ctx, ip->protocol, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_BOGON_DROP, bpf_ktime_get_ns()); }
             return XDP_DROP;
         }
 
@@ -598,7 +599,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
                 count(CNT_ICMP_DROP);
                 { __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
                   __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
-                  emit_drop(ctx, IPPROTO_ICMP, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_ICMP_DROP, now); }
+                  emit_drop(ctx, IPPROTO_ICMP, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_ICMP_DROP, bpf_ktime_get_ns()); }
                 return XDP_DROP;
             }
             count(CNT_IPV4_OTHER);
@@ -619,7 +620,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             count(CNT_TUNNEL_ENDPOINT_NOT_AUTHORIZED);
             { __u32 s[4] = { (__u32)ip->saddr, 0, 0, 0 };
               __u32 d[4] = { (__u32)ip->daddr, 0, 0, 0 };
-              emit_drop(ctx, IPPROTO_IPV6, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_TUNNEL_ENDPOINT_NOT_AUTHORIZED, now); }
+              emit_drop(ctx, IPPROTO_IPV6, CT_FAMILY_IPV4, s, d, 0, 0, (__u8)CNT_TUNNEL_ENDPOINT_NOT_AUTHORIZED, bpf_ktime_get_ns()); }
             return XDP_DROP;
         }
         case IPPROTO_SCTP: {
@@ -663,7 +664,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             { __u32 s[4], d[4];
               __builtin_memcpy(s, &ipv6->saddr, 16);
               __builtin_memcpy(d, &ipv6->daddr, 16);
-              emit_drop(ctx, 0, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_FRAG_DROP, now); }
+              emit_drop(ctx, 0, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_FRAG_DROP, bpf_ktime_get_ns()); }
             return XDP_DROP;
         }
         if (nexthdr == IPV6_EXTHDR_MALFORMED_SENTINEL)
@@ -688,7 +689,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             { __u32 s[4], d[4];
               __builtin_memcpy(s, &ipv6->saddr, 16);
               __builtin_memcpy(d, &ipv6->daddr, 16);
-              emit_drop(ctx, nexthdr, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_BOGON_DROP, now); }
+              emit_drop(ctx, nexthdr, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_BOGON_DROP, bpf_ktime_get_ns()); }
             return XDP_DROP;
         }
 
@@ -723,7 +724,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
                 { __u32 s[4], d[4];
                   __builtin_memcpy(s, &ipv6->saddr, 16);
                   __builtin_memcpy(d, &ipv6->daddr, 16);
-                  emit_drop(ctx, IPPROTO_ICMPV6, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_ICMP_DROP, now); }
+                  emit_drop(ctx, IPPROTO_ICMPV6, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_ICMP_DROP, bpf_ktime_get_ns()); }
                 return XDP_DROP;
             }
             count(CNT_IPV6_OTHER);
