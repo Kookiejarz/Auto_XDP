@@ -646,6 +646,8 @@ _auto_xdp_attach_error_class() {
         *"cannot allocate memory"*|*"no space left on device"*|*"no buffer space available"*|*"too many open files"*)
             printf 'resource' ;;
         *"no such device"*|*"cannot find device"*|*"invalid devname"*) printf 'device' ;;
+        *"ena: failed to set xdp program, the current mtu is larger than the maximum allowed mtu"*)
+            printf 'native-mtu-limit' ;;
         *"interface xdpdrv attach failed: operation not supported"*|*"interface xdpgeneric attach failed: operation not supported"*)
             printf 'unsupported' ;;
         *"native and generic xdp can't be active at the same time"*|*"interface xdpdrv attach failed: file exists"*|*"interface xdpgeneric attach failed: file exists"*)
@@ -723,10 +725,14 @@ _auto_xdp_attach_candidate() {
         AUTO_XDP_LAST_ATTACH_ERRORS+="${AUTO_XDP_LAST_ATTACH_ERRORS:+$'\n'}${mode} [${error_class}, exit ${status}]: ${attach_error}"
         _auto_xdp_warn "XDP attach failed on $iface: $mode [$error_class, exit $status]: $attach_error"
 
-        # Only a known unsupported mode permits an automatic downgrade. On
+        # Only known mode/driver limitations permit an automatic fallback. On
         # reload, an opposite-mode EEXIST may instead retry the already active
         # mode, without detaching protection to change hooks.
         if [[ "$requested" == "auto" && "$error_class" == "unsupported" ]]; then
+            continue
+        fi
+        if [[ "$requested" == "auto" && "$mode" == "native" && "$error_class" == "native-mtu-limit" ]]; then
+            _auto_xdp_warn "Native XDP on $iface cannot use the current MTU; trying generic XDP without changing the MTU."
             continue
         fi
         if [[ "$requested" == "auto" && "$error_class" == "mode-conflict" \

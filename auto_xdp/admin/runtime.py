@@ -5,11 +5,12 @@ import os
 import shlex
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from auto_xdp.admin.detect import detect_backend as _detect_backend_impl
 from auto_xdp.admin.detect import iface_xdp_state as _iface_xdp_state
+from auto_xdp.install_state import interface_details, read_system_links, select_interfaces
 
 
 @dataclass
@@ -36,6 +37,9 @@ class BackendReport:
     policy: str
     release: str
     install_transition: str | None
+    interface_details: dict[str, dict[str, object]] = field(default_factory=dict)
+    unprotected_interfaces: list[str] = field(default_factory=list)
+    interface_discovery_error: str | None = None
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -339,6 +343,27 @@ def _policy_mode(env: dict[str, str]) -> str:
     return value if value in {"observe", "audit", "enforce"} else "audit"
 
 
+def _interface_exclusions(env: dict[str, str], saved: dict[str, object]) -> list[str]:
+    fallback = [str(name) for name, reason in saved.items() if reason == "configured exclusion"]
+    path = Path(env.get("TOML_CONFIG", "/etc/auto_xdp/config.toml"))
+    try:
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+        with path.open("rb") as handle:
+            table = tomllib.load(handle).get("interfaces")
+    except (ImportError, OSError, ValueError):
+        return fallback
+    if not isinstance(table, dict):
+        return fallback
+    names = table.get("exclude", [])
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        return fallback
+    # Older machine state omitted exclusions for interfaces absent at install.
+    return names
+
+
 def detect_backend(ctx: RuntimeContext, interfaces: list[str]) -> str:
     return _detect_backend_impl(
         ctx.bpf_pin_dir, ctx.run_state_dir, interfaces, ctx.nft_family, ctx.nft_table
@@ -386,6 +411,23 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
     excluded = machine.get("excluded", {})
     if not isinstance(excluded, dict):
         excluded = {}
+    details: dict[str, dict[str, object]] = {}
+    unprotected: list[str] = []
+    discovery_error = None
+    try:
+        links = read_system_links()
+        details = {str(link["ifname"]): interface_details(link) for link in links}
+        eligible, current_excluded = select_interfaces(
+            links, excluded_names=_interface_exclusions(env, excluded),
+        )
+        # XDP coverage follows the attachment list. The nftables INPUT hook
+        # already sees traffic from all interfaces, including newly added ones.
+        if backend == "xdp":
+            unprotected = sorted(set(eligible) - set(interfaces))
+        if machine.get("selection") == "auto":
+            excluded = current_excluded
+    except ValueError as exc:
+        discovery_error = str(exc)
     clean_generation = not any(
         path.exists()
         for path in (
@@ -423,6 +465,8 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
         healthy = False
     if transition_state:
         healthy = False
+    if backend == "xdp" and machine.get("selection") == "auto" and (unprotected or discovery_error):
+        healthy = False
 
     return BackendReport(
         backend=backend,
@@ -441,6 +485,9 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
         policy=policy,
         release=release,
         install_transition=transition_state,
+        interface_details=details,
+        unprotected_interfaces=unprotected,
+        interface_discovery_error=discovery_error,
     )
 
 
@@ -462,6 +509,15 @@ def render_backend_text(report: BackendReport) -> str:
         lines.append(f"Fallback  : {report.fallback_reason}")
     if report.install_transition:
         lines.append(f"Install   : transaction/{report.install_transition}")
+    if report.interface_details:
+        lines.append("Link types: " + " ".join(
+            f"{name}={details['kind']}" + (f"/{details['driver']}" if details.get("driver") else "")
+            for name, details in sorted(report.interface_details.items())
+        ))
+    if report.unprotected_interfaces:
+        lines.append("Unselected: " + " ".join(report.unprotected_interfaces) + " (not covered by this installation)")
+    if report.interface_discovery_error:
+        lines.append(f"Discovery : {report.interface_discovery_error}")
     if report.excluded_interfaces:
         excluded = " ".join(
             f"{name}={reason.replace(' ', '-')}"
@@ -486,6 +542,9 @@ def render_backend_json(report: BackendReport) -> str:
             "policy": report.policy,
             "release": report.release,
             "install_transition": report.install_transition,
+            "interface_details": report.interface_details,
+            "unprotected_interfaces": report.unprotected_interfaces,
+            "interface_discovery_error": report.interface_discovery_error,
         },
         sort_keys=True,
     )

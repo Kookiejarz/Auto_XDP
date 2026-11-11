@@ -1109,6 +1109,50 @@ test_xdp_attach_candidate_prefers_saved_per_interface_mode() (
     assert_eq "$(head -n 1 "$tmpdir/modes")" "generic"
 )
 
+test_xdp_attach_candidate_ena_mtu_limit_only_allows_auto_native_fallback() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir test_requested diagnostic status
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    _auto_xdp_saved_iface_mode() { printf '%s:auto\n' "$test_requested"; }
+    _auto_xdp_iface_is_veth() { return 1; }
+    _auto_xdp_attach_mode() {
+        printf '%s\n' "$3" >> "$tmpdir/modes"
+        if [[ "$3" == native || "$test_requested" == generic ]]; then
+            printf '%s\n' "$diagnostic" >&2
+            return 234
+        fi
+    }
+    local ena_error='libbpf: Kernel error message: ena: Failed to set xdp program, the current MTU is larger than the maximum allowed MTU. Check the dmesg for more info; Error: interface xdpdrv attach failed: Invalid argument'
+    for test_requested in auto native generic; do
+        : > "$tmpdir/modes"
+        diagnostic="$ena_error"
+        _auto_xdp_attach_candidate ens5 /pins/prog > "$tmpdir/warnings" 2>&1
+        status=$?
+        if [[ "$test_requested" == auto ]]; then
+            assert_eq "$status" 0 || return 1
+            assert_eq "$(cat "$tmpdir/modes")" $'native\ngeneric' || return 1
+            assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" generic || return 1
+            assert_eq "$AUTO_XDP_ATTACH_FATAL" 0 || return 1
+            assert_file_contains "$tmpdir/warnings" 'without changing the MTU' || return 1
+        else
+            assert_eq "$status" 1 || return 1
+            assert_eq "$(cat "$tmpdir/modes")" "$test_requested" || return 1
+            assert_eq "$AUTO_XDP_ATTACH_FATAL" 1 || return 1
+        fi
+    done
+    test_requested=auto
+    for diagnostic in 'Error: interface xdpdrv attach failed: Invalid argument' 'Error: Operation not permitted'; do
+        : > "$tmpdir/modes"
+        _auto_xdp_attach_candidate ens5 /pins/prog >/dev/null 2>&1
+        assert_eq "$?" 1 || return 1
+        assert_eq "$(cat "$tmpdir/modes")" native || return 1
+        assert_eq "$AUTO_XDP_ATTACH_FATAL" 1 || return 1
+    done
+)
+
 test_xdp_attach_candidate_auto_prefers_generic_for_renamed_veth() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -2052,7 +2096,7 @@ test_ambiguous_interrupted_reload_retains_all_generations() (
         && -e "${BPF_PIN_DIR}_rollback/prog" ]]
 )
 
-test_resolve_target_interfaces_uses_default_route_interface() (
+test_resolve_target_interfaces_uses_kernel_inventory() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
@@ -2064,8 +2108,8 @@ test_resolve_target_interfaces_uses_default_route_interface() (
 
     ip() {
         case "$*" in
-            "route show default")
-                echo "default via 192.0.2.1 dev eth9"
+            "-j -d link show")
+                echo '[{"ifname":"eth9","link_type":"ether","flags":["UP"]}]'
                 ;;
             "link show eth9")
                 return 0
@@ -2096,6 +2140,7 @@ test_resolve_target_interfaces_reuses_installed_env_ifaces() (
 
     ip() {
         case "$*" in
+            "-j -d link show") echo '[{"ifname":"eth7","link_type":"ether","flags":["UP"]},{"ifname":"eth8","link_type":"ether","flags":["UP"]}]' ;;
             "link show eth7"|"link show eth8") return 0 ;;
             *) return 1 ;;
         esac
@@ -2121,6 +2166,7 @@ test_resolve_target_interfaces_drops_missing_saved_ifaces() (
 
     ip() {
         case "$*" in
+            "-j -d link show") echo '[{"ifname":"eth7","link_type":"ether","flags":["UP"]}]' ;;
             "link show eth7") return 0 ;;
             *) return 1 ;;
         esac
@@ -2146,7 +2192,7 @@ test_resolve_target_interfaces_detects_when_saved_ifaces_all_gone() (
 
     ip() {
         case "$*" in
-            "route show default") echo "default via 192.0.2.1 dev eth9" ;;
+            "-j -d link show") echo '[{"ifname":"eth9","link_type":"ether","flags":["UP"]}]' ;;
             "link show eth9") return 0 ;;
             *) return 1 ;;
         esac
@@ -2154,7 +2200,47 @@ test_resolve_target_interfaces_detects_when_saved_ifaces_all_gone() (
 
     resolve_target_interfaces || return 1
     assert_eq "${IFACES[*]}" "eth9" || return 1
-    assert_eq "$IFACE_SOURCE" "default route auto-detect"
+    assert_eq "$IFACE_SOURCE" "host auto-discovery"
+)
+
+test_interface_discovery_failure_cannot_fall_back_to_a_partial_route_list() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    ALL_IFACES=0
+    IFACES=()
+    CONFIG_FILE="/nonexistent/auto_xdp.env"
+    ip() {
+        case "$*" in
+            "route show default") echo "default via 192.0.2.1 dev eth9" ;;
+            *) return 1 ;;
+        esac
+    }
+    local output status
+    output=$(resolve_target_interfaces 2>&1)
+    status=$?
+    [[ $status -ne 0 ]] || return 1
+    assert_contains "$output" "Interface discovery failed"
+)
+
+test_auto_selection_does_not_override_explicit_exclusions() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    ALL_IFACES=0
+    IFACES=()
+    CONFIG_FILE="/nonexistent/auto_xdp.env"
+    INTERFACE_CONFIG_EXCLUDE=(eth9)
+    ip() {
+        case "$*" in
+            "-j -d link show") echo '[{"ifname":"eth9","link_type":"ether","flags":["UP"]}]' ;;
+            "route show default") echo "default via 192.0.2.1 dev eth9" ;;
+            *) return 1 ;;
+        esac
+    }
+    local output status
+    output=$(resolve_target_interfaces 2>&1)
+    status=$?
+    [[ $status -ne 0 ]] || return 1
+    assert_contains "$output" "No eligible active Ethernet interfaces"
 )
 
 test_install_toml_config_preserves_existing_local_config() (

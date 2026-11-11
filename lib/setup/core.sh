@@ -362,43 +362,37 @@ print_basic_info() {
 
 get_active_interfaces() {
     local source_root="${SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-    local state_json=""
+    local state_json="" link_json=""
     local -a exclude_args=()
     local excluded_iface
     for excluded_iface in "${INTERFACE_CONFIG_EXCLUDE[@]:-}"; do
         [[ -n "$excluded_iface" ]] && exclude_args+=(--exclude "$excluded_iface")
     done
-    state_json=$(ip -j -d link show up 2>/dev/null \
-        | PYTHONPATH="$source_root" "${PYTHON3_BIN:-python3}" \
-            -m auto_xdp.install_state select --input - "${exclude_args[@]}" 2>/dev/null) || state_json=""
-    if [[ -n "$state_json" ]]; then
-        "${PYTHON3_BIN:-python3}" -c '
+    link_json=$(ip -j -d link show) || {
+        echo "Cannot discover interface types; iproute2 JSON support is required." >&2
+        return 1
+    }
+    state_json=$(PYTHONPATH="$source_root" "${PYTHON3_BIN:-python3}" \
+        -m auto_xdp.install_state select --input - "${exclude_args[@]}" <<< "$link_json") || return 1
+    "${PYTHON3_BIN:-python3}" -c '
 import json, sys
 for name in json.load(sys.stdin).get("interfaces", {}):
     print(name)
 ' <<< "$state_json"
-        return 0
-    fi
-
-    # Compatibility fallback for older iproute2 without JSON output.
-    ip -o link show up 2>/dev/null \
-        | awk -F': ' '{print $2}' \
-        | awk '{print $1}' \
-        | grep -v '^lo$' \
-        | grep -v '@' \
-        | grep -Ev '^(dummy|virbr|docker|veth|cni|flannel|cali|kube-ipvs)' \
-        || true
 }
 
 _stage_machine_interface_state() {
     local source_root="${SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
     local link_json="" state_file=""
-    link_json=$(ip -j -d link show 2>/dev/null) || return 0
+    link_json=$(ip -j -d link show) || {
+        echo "Cannot verify interface types; interface selection was not saved." >&2
+        return 1
+    }
     state_file=$(mktemp)
     _SETUP_TMPFILES+=("$state_file")
 
     local -a explicit_args=()
-    if [[ "$IFACE_SOURCE" == "arguments" || "$IFACE_SOURCE" == "config.toml interfaces.include" ]]; then
+    if [[ "$IFACE_SOURCE" != "host auto-discovery" && "$IFACE_SOURCE" != "all active interfaces" ]]; then
         local iface
         for iface in "${IFACES[@]}"; do
             explicit_args+=(--interface "$iface")
@@ -423,7 +417,7 @@ _stage_machine_interface_state() {
             "${exclude_args[@]}" --default-xdp-mode "${INTERFACE_XDP_MODE:-auto}" \
             --write "$state_file" >/dev/null; then
         MACHINE_STATE_CANDIDATE="$state_file"
-    elif [[ ${#explicit_args[@]} -gt 0 ]]; then
+    else
         return 1
     fi
 }
@@ -465,34 +459,32 @@ _reuse_installed_ifaces() {
     return 0
 }
 
-_detect_default_route_iface() {
-    local _default_iface
-    _default_iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-    [[ -n "$_default_iface" ]] || die "Cannot detect default interface. Specify manually: sudo bash $0 eth0"
-    IFACES=("$_default_iface")
-    IFACE_SOURCE="default route auto-detect"
-}
-
 # Silent: resolves IFACES/IFACE only; the result is reported in the basic-info
 # block printed at the top of the run.
 resolve_target_interfaces() {
+    local discovered=""
     if [[ ${#IFACES[@]} -eq 0 && ${#INTERFACE_CONFIG_INCLUDE[@]} -gt 0 ]]; then
         IFACES=("${INTERFACE_CONFIG_INCLUDE[@]}")
         IFACE_SOURCE="config.toml interfaces.include"
     fi
     if [[ $ALL_IFACES -eq 1 ]]; then
-        mapfile -t IFACES < <(get_active_interfaces)
+        discovered=$(get_active_interfaces) || { die "Interface discovery failed; no interfaces changed."; return 1; }
+        IFACES=()
+        [[ -z "$discovered" ]] || mapfile -t IFACES <<< "$discovered"
         [[ ${#IFACES[@]} -gt 0 ]] || die "No active non-loopback interfaces found."
         IFACE_SOURCE="all active interfaces"
     elif [[ ${#IFACES[@]} -eq 0 ]]; then
         if [[ ${INTERFACE_POLICY_PRESENT:-0} -eq 0 ]] && _reuse_installed_ifaces; then
             :
         else
-            mapfile -t IFACES < <(get_active_interfaces)
+            discovered=$(get_active_interfaces) || { die "Interface discovery failed; no interfaces changed."; return 1; }
+            IFACES=()
+            [[ -z "$discovered" ]] || mapfile -t IFACES <<< "$discovered"
             if [[ ${#IFACES[@]} -gt 0 ]]; then
                 IFACE_SOURCE="host auto-discovery"
             else
-                _detect_default_route_iface
+                die "No eligible active Ethernet interfaces found; check interfaces.exclude or specify an interface."
+                return 1
             fi
         fi
     fi

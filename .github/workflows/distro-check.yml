@@ -114,6 +114,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Select the container ingress interface
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Container veth devices require explicit opt-in; automatic discovery
+          # must not silently bypass its exclusions via the default route.
+          axdp_ci_iface=$(ip -j route show default | python3 -c 'import json, sys; print(next(row["dev"] for row in json.load(sys.stdin) if row.get("dev")))')
+          test -n "$axdp_ci_iface"
+          printf 'AXDP_CI_INTERFACE=%s\n' "$axdp_ci_iface" >> "$GITHUB_ENV"
+
       - name: Run installer end to end
         shell: bash
         run: |
@@ -125,7 +135,8 @@ jobs:
             fi
           done
           cd /tmp
-          bash "$GITHUB_WORKSPACE/setup_xdp.sh" 2>&1 | tee "$GITHUB_WORKSPACE/install.log"
+          bash "$GITHUB_WORKSPACE/setup_xdp.sh" --allow-container-interfaces "$AXDP_CI_INTERFACE" \
+            2>&1 | tee "$GITHUB_WORKSPACE/install.log"
 
       - name: Verify installed artifacts and compiled objects
         shell: bash
@@ -136,7 +147,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           cd /tmp
-          bash "$GITHUB_WORKSPACE/setup_xdp.sh" 2>&1 | tee "$GITHUB_WORKSPACE/reinstall.log"
+          bash "$GITHUB_WORKSPACE/setup_xdp.sh" --allow-container-interfaces "$AXDP_CI_INTERFACE" \
+            2>&1 | tee "$GITHUB_WORKSPACE/reinstall.log"
 
       - name: Verify overwrite reinstall
         shell: bash

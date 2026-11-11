@@ -54,8 +54,10 @@ debounce_seconds = 0.4
 preferred_backend = "auto"
 
 [interfaces]
-# Auto discovery excludes loopback and common Docker/CNI plumbing. Use include
-# for a stable explicit list, and exclude for host interfaces managed elsewhere.
+# Auto discovery reads kernel interface types, not name prefixes. Loopback,
+# veth/dummy/ifb/netkit and non-Ethernet links (e.g. TUN/WireGuard) are excluded.
+# Bridges, bonds, VLANs, TAP and unknown types remain candidates. Use exclude
+# for container bridges you do not want covered, or include for a stable list.
 mode = "auto"
 include = []
 exclude = []
