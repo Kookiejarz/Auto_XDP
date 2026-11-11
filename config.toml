@@ -55,8 +55,10 @@ debounce_seconds = 0.5
 preferred_backend = "auto"
 
 [interfaces]
-# auto discovers active host ingress interfaces. Loopback, veth and common
-# Docker/CNI plumbing are excluded. Set include for an explicit stable list.
+# auto reads kernel interface types, not name prefixes. Loopback, veth,
+# dummy/ifb/netkit and non-Ethernet (e.g. TUN/WireGuard) links are excluded.
+# Bridges, bonds, VLANs, TAP and unknown types remain candidates. Use exclude
+# for container bridges you do not want covered, or include for a stable list.
 mode = "auto"
 include = []
 exclude = []

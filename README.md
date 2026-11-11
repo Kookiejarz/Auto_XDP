@@ -104,13 +104,24 @@ interfaces. Native veth XDP can disable the peer's TCP segmentation offloads and
 introduce a receive-queue bottleneck, reducing permitted TCP throughput even
 with a small BPF program. Other interfaces restore their last verified mode,
 or try native first. The alternate mode is tried when the first mode is
-unsupported, or when a verified native/generic conflict requires retaining the
-already active mode. An explicit `native` or `generic` setting stays strict.
+unsupported, when the ENA driver reports a native-XDP MTU limit, or when a
+verified native/generic conflict requires retaining the already active mode.
+ENA fallback leaves the interface MTU unchanged. An explicit `native` or
+`generic` setting stays strict.
 Permission, resource, configuration, and unclassified attachment errors stop
 activation and block automatic nftables fallback; diagnostics retain each
 attempt's mode and error. Native attachment alone does not
-guarantee faster permitted traffic. Virtual/container interfaces remain excluded
-from automatic discovery unless explicitly opted in.
+guarantee faster permitted traffic.
+
+Automatic discovery uses kernel interface types rather than name prefixes.
+Loopback, veth, dummy, ifb, netkit, and non-Ethernet interfaces are excluded;
+bridges, bonds, VLANs, TAP, and unknown types remain candidates. Use
+`interfaces.exclude` for container bridges or other devices managed elsewhere.
+Discovery failures stop installation instead of selecting only the default
+route. `axdp backend` reports newly eligible interfaces without XDP coverage;
+automatic selection is marked degraded until coverage or configuration is
+updated. Explicitly excluded interfaces remain excluded when they appear later.
+This XDP coverage check does not apply to the nftables INPUT hook.
 
 Reload replaces programs within their active mode without detaching protection.
 An already attached native veth program can therefore remain native during an

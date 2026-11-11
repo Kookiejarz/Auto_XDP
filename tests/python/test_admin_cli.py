@@ -322,6 +322,75 @@ with tempfile.TemporaryDirectory() as directory:
             self.assertTrue(report.healthy)
             self.assertEqual(report.policy, "audit (data plane inactive)")
 
+    def test_backend_report_audits_new_interfaces_and_discovery_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            machine = root / "machine.json"
+            runtime = root / "runtime.json"
+            env = root / "env"
+            config = root / "config.toml"
+            config.write_text('[policy]\nmode="enforce"\n')
+            env.write_text(f'IFACES="eth0"\nMACHINE_STATE="{machine}"\nRUNTIME_STATE="{runtime}"\nTOML_CONFIG="{config}"\nINSTALL_DIR="{root}"\n')
+            runtime.write_text(json.dumps({"healthy": True, "interfaces": {"eth0": {"program_id": 10}}}))
+            context = admin_runtime.RuntimeContext(env, root / "bpf", root / "run", "inet", "auto_xdp")
+            links = [{"ifname": name, "flags": ["UP"], "link_type": "ether"}
+                     for name in ("eth0", "new-uplink")]
+            for backend, selection, inventory, expected_healthy in (
+                ("xdp", "auto", links, False), ("xdp", "auto", links[:1], True),
+                ("xdp", "explicit", links, True),
+                ("xdp", "auto", ValueError("query failed"), False),
+                ("nftables", "auto", links, True), ("inactive", "auto", links, True),
+            ):
+                machine.write_text(json.dumps({"selection": selection}))
+                with self.subTest(backend=backend, selection=selection, inventory=inventory), \
+                     mock.patch.object(admin_runtime, "read_system_links", side_effect=
+                                       inventory if isinstance(inventory, ValueError) else lambda: inventory), \
+                     mock.patch.object(admin_runtime, "detect_backend", return_value=backend), \
+                     mock.patch.object(admin_runtime, "_iface_xdp_state", return_value=
+                                       "native" if backend == "xdp" else "off"), \
+                     mock.patch.object(admin_runtime, "_nft_policy_schema", return_value="policy_schema_v2"), \
+                     mock.patch.object(admin_runtime, "_iface_xdp_program_id", return_value=10):
+                    report = admin_runtime.collect_backend_report(context)
+                self.assertEqual(report.healthy, expected_healthy)
+                if isinstance(inventory, list) and len(inventory) == 2:
+                    self.assertEqual(report.unprotected_interfaces, ["new-uplink"] if backend == "xdp" else [])
+                    self.assertIn("new-uplink=ether", admin_runtime.render_backend_text(report))
+                    if backend != "xdp":
+                        self.assertNotIn("not covered", admin_runtime.render_backend_text(report))
+                        self.assertEqual(json.loads(admin_runtime.render_backend_json(report))["unprotected_interfaces"], [])
+                elif isinstance(inventory, ValueError):
+                    self.assertEqual(report.interface_discovery_error, "query failed")
+
+    def test_backend_report_preserves_exclusions_when_interfaces_appear_later(self):
+        from auto_xdp import install_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            machine, runtime, env, config = (root / name for name in ("machine.json", "runtime.json", "env", "config.toml"))
+            env.write_text(f'IFACES="eth0"\nMACHINE_STATE="{machine}"\nRUNTIME_STATE="{runtime}"\nTOML_CONFIG="{config}"\nINSTALL_DIR="{root}"\n')
+            runtime.write_text(json.dumps({"healthy": True, "interfaces": {"eth0": {"program_id": 10}}}))
+            context = admin_runtime.RuntimeContext(env, root / "bpf", root / "run", "inet", "auto_xdp")
+            links = [{"ifname": name, "flags": ["UP"], "link_type": "ether"}
+                     for name in ("eth0", "later-uplink")]
+            selected, excluded = install_state.select_interfaces(links[:1], excluded_names=["later-uplink"])
+            saved = install_state.merge_machine_state({}, selected, excluded, selection="auto", links=links[:1])
+            for label, state, interface_config in (
+                ("saved exclusion", saved, ""),
+                ("legacy state", {"selection": "auto", "excluded": {}},
+                 '\n[interfaces]\nexclude=["later-uplink"]\n'),
+            ):
+                machine.write_text(json.dumps(state))
+                config.write_text('[policy]\nmode="enforce"\n' + interface_config)
+                with self.subTest(case=label), \
+                     mock.patch.object(admin_runtime, "read_system_links", return_value=links), \
+                     mock.patch.object(admin_runtime, "detect_backend", return_value="xdp"), \
+                     mock.patch.object(admin_runtime, "_iface_xdp_state", return_value="native"), \
+                     mock.patch.object(admin_runtime, "_iface_xdp_program_id", return_value=10):
+                    report = admin_runtime.collect_backend_report(context)
+                    self.assertTrue(report.healthy)
+                    self.assertEqual(report.unprotected_interfaces, [])
+                    self.assertEqual(report.excluded_interfaces["later-uplink"], "configured exclusion")
+
     def test_approval_workflow_updates_and_reverts_service_exposure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
