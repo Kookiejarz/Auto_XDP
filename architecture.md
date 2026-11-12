@@ -279,7 +279,6 @@ metrics remain unknown, including when reading older producers.
 Source summaries use the same retained client window as DROP distributions.
 Only displayed addresses are enriched, using local databases and a bounded
 cache; neither the dataplane nor the ring consumer performs GeoIP lookup.
-See the [observation guide](./plans/information-plane.md) for operational limits.
 
 ## V1 boundary
 

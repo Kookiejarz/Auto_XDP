@@ -1,6 +1,6 @@
 """Measure application delivery during real XDP endpoint takeover.
 
-Run through reproducible-tests/port-takeover-reproduce.sh in an isolated Linux
+Run through tests/run.sh kernel in an isolated Linux
 container. This is an experiment, not a deterministic pytest regression.
 """
 from __future__ import annotations

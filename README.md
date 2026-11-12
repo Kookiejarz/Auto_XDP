@@ -355,10 +355,7 @@ automatically and reports connected once the packet ring becomes available.
 Cookie ACK validation and successful TC handoff do **not** prove application
 acceptance. These changes do not enable SYN cookies or alter exposure grants.
 
-GeoIP is disabled by default and uses local MMDB files only. Configuration,
-upgrade/ABI notes, metric definitions, and module boundaries are in the
-[information-plane guide](./plans/information-plane.md). The phased scope and
-remaining work are tracked in the [implementation plan](./plans/2026-09-05-information-plane.md).
+GeoIP is disabled by default and uses local MMDB files only.
 
 ## Real-World Performance Benchmark
 
