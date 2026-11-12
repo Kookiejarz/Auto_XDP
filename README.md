@@ -144,7 +144,7 @@ Install the latest published release:
 (
   set -e
   # quick-install-version:start
-  AUTO_XDP_VERSION=v26.8.13a
+  AUTO_XDP_VERSION=v26.11.12a
   # quick-install-version:end
   auto_xdp_tmp=$(mktemp -d)
   trap 'rm -rf "$auto_xdp_tmp"' EXIT
