@@ -45,14 +45,8 @@ if [[ $sock_status -ne 0 ]]; then
 fi
 
 XDP_OBJ_INSTALLED="$BUILD_STAGING_DIR/$XDP_OBJ"
-TC_OBJ_INSTALLED="$BUILD_STAGING_DIR/$TC_OBJ"
 [[ -s "$XDP_OBJ_INSTALLED" ]] || {
     echo "[ERROR] missing staged XDP object: $XDP_OBJ_INSTALLED" >&2
-    exit 1
-}
-
-[[ -s "$BUILD_STAGING_DIR/$TC_OBJ" ]] || {
-    echo "[ERROR] missing staged tc object: $BUILD_STAGING_DIR/$TC_OBJ" >&2
     exit 1
 }
 
@@ -65,6 +59,25 @@ TC_OBJ_INSTALLED="$BUILD_STAGING_DIR/$TC_OBJ"
     echo "[ERROR] missing staged sock_state object: $BUILD_STAGING_DIR/$SOCK_STATE_OBJ" >&2
     exit 1
 }
+
+[[ -s "$BUILD_STAGING_DIR/$TC_EGRESS_OBJ" ]] || {
+    echo "[ERROR] missing staged handler egress dispatcher object: $BUILD_STAGING_DIR/$TC_EGRESS_OBJ" >&2
+    exit 1
+}
+
+if [[ -s "$BUILD_STAGING_DIR/btf/vmlinux.h" ]] && \
+        grep -Eq '^[[:space:]]*struct[[:space:]]+bpf_tcp_req_attrs[[:space:]]*\{' \
+            "$BUILD_STAGING_DIR/btf/vmlinux.h"; then
+    [[ -s "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ" ]] || {
+        echo "[ERROR] supported SYN-cookie listener handoff failed to build" >&2
+        exit 1
+    }
+else
+    [[ ! -e "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ" ]] || {
+        echo "[ERROR] unsupported SYN-cookie listener handoff retained an object" >&2
+        exit 1
+    }
+fi
 
 resolve_bpf_build_env || {
     echo "[ERROR] failed to resolve native BPF build environment" >&2
@@ -84,5 +97,17 @@ for src in "$REPO_ROOT"/handlers/*_handler.c; do
         exit 1
     }
 done
+
+PYTHONPATH="$REPO_ROOT" python3 - "$BUILD_STAGING_DIR" <<'PY'
+from pathlib import Path
+import sys
+from auto_xdp.admin.kernel_modules import dependencies
+root = Path(sys.argv[1])
+assert dependencies(root / 'handlers/icmp_handler.o') == ('axdp_icmp',)
+assert dependencies(root / 'xdp_firewall.o') == ()
+for name in ('axdp_icmp.c', 'Kbuild', 'Makefile.kmod'):
+    assert (root / 'handlers' / name).is_file(), f'missing kernel dependency source: {name}'
+assert (root / 'bpf/include/icmp_ct_tuple.h').is_file()
+PY
 
 echo "[INFO] native distro build succeeded"

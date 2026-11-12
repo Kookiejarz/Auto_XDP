@@ -1,7 +1,6 @@
 """Tests for auto_xdp.abuseipdb: fetch, map management, syncer lifecycle."""
 from __future__ import annotations
 
-import threading
 import unittest
 from unittest import mock
 from urllib.error import URLError
@@ -325,15 +324,13 @@ class TestAbuseIPDBConfig(unittest.TestCase):
         trusted_alias = cfg_mod.TRUSTED_SRC_IPS
         cfg_mod.apply_toml_config({
             "trusted_ips": {"198.51.100.8/32": "old"},
-            "permanent_ports": {"tcp": [443]},
         })
         try:
             with self.assertRaises(ValueError):
                 cfg_mod.apply_toml_config({
                     "trusted_ips": {"203.0.113.8/32": "new"},
-                    "permanent_ports": {"tcp": ["invalid"]},
+                    "policy": {"mode": "invalid"},
                 })
-            self.assertEqual(cfg_mod.TCP_PERMANENT, {443: "config"})
             self.assertIs(cfg_mod.TRUSTED_SRC_IPS, trusted_alias)
             self.assertEqual(trusted_alias, {"198.51.100.8/32": "old"})
         finally:

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""BPF ring buffer relay daemon for auto_xdp DROP events.
+"""BPF event transport, bounded history, and relay health reporting.
 
 Consumes pkt_ringbuf, maintains a configurable retention window,
-and fans out to Textual TUI clients via a Unix domain socket.
+and fans out to TUI clients via a Unix domain socket.
 
 Protocol: line-delimited JSON.
   On connect: {"type":"history","events":[...]}  (up to max_history_on_connect)
   Live:       {"type":"event",...}
+  Health:     {"type":"telemetry_status","packet_state":..., ...} (once per second)
+              packet_state is ready, waiting, inactive, or error.
 """
 from __future__ import annotations
 
@@ -14,8 +16,10 @@ import argparse
 import collections
 import ctypes
 import ctypes.util
+import errno
 import fcntl
 import json
+import itertools
 import logging
 import mmap
 import os
@@ -29,10 +33,18 @@ import struct
 import sys
 import threading
 import time
+import uuid
 
 from auto_xdp.bpf.syscall import obj_get
 from auto_xdp.config import load_toml_config
-from auto_xdp.sock_state import SOCK_STATE_EVENT_SIZE, SockStateReader
+from auto_xdp.discovery.sock_state import SOCK_STATE_EVENT_SIZE, SockStateReader
+from auto_xdp.telemetry.events import (
+    PACKET_EVENT_SIZES,
+    PACKET_EVENT_V1_SIZE,
+    PROTO_NAMES as _PROTO_NAMES,
+    REASON_NAMES as _REASON_NAMES,
+    decode_event,
+)
 
 # paths & defaults
 
@@ -53,6 +65,10 @@ RETENTION_SECONDS  = 300
 MAX_EVENTS         = 100_000
 MAX_HISTORY_SEND   = 5_000      # cap history batch sent on client connect
 EVENT_QUEUE_MAX    = 20_000     # reader→broadcaster queue depth before dropping
+EVENT_BROADCAST_BATCH = 256
+# ponytail: replay is a bounded sample; use incremental replay only if a full
+# retained history becomes a requirement. Fits the client's bounded poll loop.
+MAX_HISTORY_BYTES = 512 * 1024
 
 PAGE_SIZE = mmap.PAGESIZE
 
@@ -62,49 +78,7 @@ _BUSY_BIT    = 1 << 31
 _DISCARD_BIT = 1 << 30
 _HDR_SZ      = 8               # u32 hdr + u32 pad
 
-# event decoding tables
-
-_PROTO_NAMES: dict[int, str] = {
-    1:   "ICMP",
-    6:   "TCP",
-    17:  "UDP",
-    58:  "ICMPv6",
-    132: "SCTP",
-}
-
-# xdp_counter_idx values that appear as the reason field
-_REASON_NAMES: dict[int, str] = {
-    0:  "TCP_NEW_ALLOW",
-    2:  "TCP_DROP",
-    4:  "UDP_DROP",
-    7:  "FRAG_DROP",
-    9:  "TCP_CT_MISS",
-    10: "ICMP_DROP",
-    11: "SYN_RATE_DROP",
-    12: "UDP_RATE_DROP",
-    13: "UDP_GLOBAL_RATE_DROP",
-    14: "TCP_MALFORM_NULL",
-    15: "TCP_MALFORM_XMAS",
-    16: "TCP_MALFORM_SYN_FIN",
-    17: "TCP_MALFORM_SYN_RST",
-    18: "TCP_MALFORM_RST_FIN",
-    19: "TCP_MALFORM_DOFF",
-    20: "TCP_MALFORM_PORT0",
-    21: "VLAN_DROP",
-    24: "SLOT_DROP",
-    25: "UDP_MALFORM_PORT0",
-    26: "UDP_MALFORM_LEN",
-    27: "BOGON_DROP",
-    28: "TCP_CONN_LIMIT_DROP",
-    29: "SYN_AGG_RATE_DROP",
-    30: "UDP_AGG_RATE_DROP",
-    31: "HANDLER_BLOCK_DROP",
-    32: "TCP_CONN_PREFIX_LIMIT_DROP",
-    33: "TCP_CONN_PORT_LIMIT_DROP",
-    34: "ABUSEIPDB_DROP",
-}
-
-_PKT_EVENT_SIZE = 48   # sizeof(struct pkt_event)
+_PKT_EVENT_SIZE = PACKET_EVENT_V1_SIZE  # retained import compatibility
 _AF_INET        = 2
 _AF_INET6       = 10
 
@@ -252,46 +226,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# event decoder
-
-_DECODE_STRUCT = struct.Struct("<Q16s16sHHBBBB")
-
-def decode_event(raw: bytes) -> dict | None:
-    if len(raw) < _PKT_EVENT_SIZE:
-        return None
-    ts_ns, src_raw, dst_raw, src_port, dst_port, proto, family, verdict, reason = \
-        _DECODE_STRUCT.unpack_from(raw, 0)
-    src_port = socket.ntohs(src_port)
-    dst_port = socket.ntohs(dst_port)
-
-    if family == _AF_INET:
-        src_ip = socket.inet_ntoa(src_raw[0:4])
-        dst_ip = socket.inet_ntoa(dst_raw[0:4])
-        ip_ver = 4
-    else:
-        try:
-            src_ip = socket.inet_ntop(socket.AF_INET6, bytes(src_raw))
-            dst_ip = socket.inet_ntop(socket.AF_INET6, bytes(dst_raw))
-        except Exception:
-            src_ip = src_raw.hex()
-            dst_ip = dst_raw.hex()
-        ip_ver = 6
-
-    return {
-        "ts_ns":     ts_ns,
-        "src":       src_ip,
-        "dst":       dst_ip,
-        "sport":     src_port,
-        "dport":     dst_port,
-        "proto":     _PROTO_NAMES.get(proto, str(proto)),
-        "family":    ip_ver,
-        "verdict":   "ALLOW" if verdict == 2 else "DROP",
-        "verdict_id": verdict,
-        "reason":    _REASON_NAMES.get(reason, str(reason)),
-        "reason_id": reason,
-    }
-
-
 # ring buffer reader
 
 class RingBufReader:
@@ -301,11 +235,12 @@ class RingBufReader:
         self,
         pin_path: str,
         max_entries: int = RINGBUF_MAX_ENTRIES,
-        event_size: int = _PKT_EVENT_SIZE,
+        event_size: int | tuple[int, ...] = PACKET_EVENT_SIZES,
     ) -> None:
         self._max = max_entries
         self._mask = max_entries - 1
         self._event_size = event_size
+        self.invalid_records = 0
         self._fd = obj_get(pin_path)
 
         # Consumer page: read+write — we store the consumer position here.
@@ -342,8 +277,12 @@ class RingBufReader:
                 break
 
             data_len = hdr & ~(_BUSY_BIT | _DISCARD_BIT)
-            if not (hdr & _DISCARD_BIT) and data_len == self._event_size:
-                yield bytes(self._data[off + _HDR_SZ: off + _HDR_SZ + data_len])
+            if not (hdr & _DISCARD_BIT):
+                sizes = self._event_size if isinstance(self._event_size, tuple) else (self._event_size,)
+                if data_len in sizes:
+                    yield bytes(self._data[off + _HDR_SZ: off + _HDR_SZ + data_len])
+                else:
+                    self.invalid_records = getattr(self, "invalid_records", 0) + 1
 
             cpos += _HDR_SZ + ((data_len + 7) & ~7)
             self._set_cpos(cpos)
@@ -365,24 +304,52 @@ class RelayServer:
 
     def __init__(
         self,
-        ringbuf: RingBufReader,
+        ringbuf: RingBufReader | None,
         *,
         sock_path: str = SOCKET_PATH,
         retention_seconds: float = RETENTION_SECONDS,
         max_events: int = MAX_EVENTS,
         max_history_send: int = MAX_HISTORY_SEND,
         sock_state_reader: SockStateReader | None = None,
+        sock_state_pin_path: str | None = None,
+        packet_pin_path: str | None = None,
+        config_path: str = TOML_CONFIG_PATH,
+        retry_interval: float = 2.0,
     ) -> None:
+        if type(max_events) is not int or max_events < 1:
+            raise ValueError("max_events must be a positive integer")
+        if type(max_history_send) is not int or max_history_send < 0:
+            raise ValueError("max_history_send must be a non-negative integer")
+        if ringbuf is None and not packet_pin_path:
+            raise ValueError("a packet ring or its pin path is required")
         self._rb = ringbuf
+        self._rb_pin = packet_pin_path
+        self._config_path = config_path
+        self._retry_interval = max(retry_interval, 0.1)
+        self._packet_status = {
+            "packet_state": "ready" if ringbuf is not None else "waiting",
+            "policy_mode": "", "packet_error": "",
+        }
         self._ss = sock_state_reader
+        self._ss_pin = sock_state_pin_path
+        self._ss_perf_fds: list[int] = []
         self._sock_path = sock_path
         self._retention_ns = int(retention_seconds * 1e9)
         self._history: collections.deque[dict] = collections.deque(maxlen=max_events)
         self._max_history_send = max_history_send
         self._clients: dict[int, socket.socket] = {}   # fd → socket
         self._server: socket.socket | None = None
+        self._wakeup_reader: socket.socket | None = None
+        self._wakeup_writer: socket.socket | None = None
         self._running = False
         self._queue: queue.Queue[dict] = queue.Queue(maxsize=EVENT_QUEUE_MAX)
+        self._session_id = uuid.uuid4().hex
+        self._seq = 0
+        self._decoded_events = 0
+        self._queue_dropped = 0
+        self._port_events_dropped = 0
+        self._invalid_records = 0
+        self._client_disconnects = 0
 
     # internal helpers
 
@@ -432,19 +399,46 @@ class RelayServer:
             log.warning("Rejected unauthorized relay client")
             conn.close()
             return
-        conn.setblocking(False)
+        # The initial history can exceed the Unix socket send buffer.  Give
+        # sendall() a bounded blocking window, then switch live fan-out back
+        # to non-blocking mode.
+        conn.settimeout(1.0)
         self._trim_history()
-        history_slice = list(self._history)[-self._max_history_send:]
-        if not self._send_line(conn, {"type": "history", "events": history_slice}):
+        if not self._send_line(conn, self._history_message()):
+            self._client_disconnects += 1
             conn.close()
             return
+        if not self._send_line(conn, self._health_status()):
+            self._client_disconnects += 1
+            conn.close()
+            return
+        conn.setblocking(False)
         fd = conn.fileno()
         self._clients[fd] = conn
         log.debug("client connected fd=%d total=%d", fd, len(self._clients))
 
+    def _history_message(self) -> dict:
+        """Newest events, bounded by both count and serialized wire bytes."""
+        message = {"type": "history", "session_id": self._session_id,
+                   "events": [], "available_events": len(self._history),
+                   "truncated": False}
+        # 'false' is longer than 'true'; initial overhead includes the newline.
+        size = len(json.dumps(message, separators=(",", ":")).encode()) + 1
+        events: list[dict] = []
+        for event in itertools.islice(reversed(self._history), self._max_history_send):
+            event_size = len(json.dumps(event, separators=(",", ":")).encode()) + bool(events)
+            if size + event_size > MAX_HISTORY_BYTES:
+                break
+            events.append(event)
+            size += event_size
+        message["events"] = list(reversed(events))
+        message["truncated"] = len(events) < len(self._history)
+        return message
+
     def _drop_client(self, fd: int) -> None:
         conn = self._clients.pop(fd, None)
         if conn:
+            self._client_disconnects += 1
             try:
                 conn.close()
             except OSError:
@@ -467,52 +461,162 @@ class RelayServer:
 
     # main loop
 
-    def _reader_loop(self) -> None:
-        watch_fds = [self._rb.fileno()]
-        if self._ss is not None:
-            watch_fds.append(self._ss.fileno())
-        while self._running:
+    def _enqueue(self, event: dict) -> None:
+        """Reader-thread only: assign identity even when the queue is full."""
+        self._seq += 1
+        event.update(session_id=self._session_id, seq=self._seq)
+        event.setdefault("seen_at", time.time())
+        self._decoded_events += 1
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            if event.get("type") == "port_change":
+                self._port_events_dropped += 1
+            else:
+                self._queue_dropped += 1
+        else:
+            self._wake_broadcaster()
+
+    def _wake_broadcaster(self) -> None:
+        wakeup = self._wakeup_writer
+        if wakeup is not None:
             try:
-                select.select(watch_fds, [], [], 0.5)
+                wakeup.send(b"\0")
+            except OSError:
+                # Full or closing socket: events stay queued for the polling fallback.
+                pass
+
+    def _health_status(self) -> dict:
+        """Cumulative relay counters, independent of retained packet samples."""
+        rejected = getattr(self._rb, "invalid_records", 0)
+        # In-process test adapters need not expose a ring-reader counter.
+        rejected = rejected if isinstance(rejected, int) else 0
+        return {
+            "type": "telemetry_status", "session_id": self._session_id,
+            **self._packet_status,
+            "decoded_events": self._decoded_events,
+            "queue_dropped": self._queue_dropped,
+            "port_events_dropped": self._port_events_dropped,
+            "invalid_records": self._invalid_records + rejected,
+            "client_disconnects": self._client_disconnects,
+            "retained_events": len(self._history), "queue_depth": self._queue.qsize(),
+        }
+
+    def _flush_batch(self) -> int:
+        """Bound work so continuous input cannot starve health and new clients."""
+        sent = 0
+        for _ in range(EVENT_BROADCAST_BATCH):
+            try:
+                event = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._history.append(event)
+            self._broadcast(event)
+            sent += 1
+        return sent
+
+    def _connect_sock_state(self) -> None:
+        if self._ss is not None or self._ss_pin is None:
+            return
+        try:
+            rb = RingBufReader(self._ss_pin, SOCK_STATE_RB_MAX_ENTRIES, SOCK_STATE_EVENT_SIZE)
+        except OSError:
+            return
+        if not os.path.exists(SOCK_STATE_LINK_PIN_PATH):
+            self._ss_perf_fds = attach_tracepoint(SOCK_STATE_PROG_PIN_PATH, SOCK_STATE_TRACEPOINT)
+            if not self._ss_perf_fds:
+                rb.close()
+                return
+        self._ss = SockStateReader(rb)
+        log.info("sock_state_rb opened; port_change events enabled.")
+
+    def _connect_packet_ring(self) -> None:
+        if self._rb is not None or self._rb_pin is None:
+            return
+        try:
+            rb = RingBufReader(self._rb_pin)
+        except OSError as exc:
+            # Re-read policy while waiting so enforcement failures cannot be
+            # hidden by an earlier audit/observe decision.
+            mode = _inactive_policy_mode(self._config_path) if exc.errno == errno.ENOENT else None
+            status = {
+                "packet_state": "inactive" if mode else "error",
+                "policy_mode": mode or "", "packet_error": str(exc),
+            }
+            if mode:
+                if status != self._packet_status:
+                    log.info("Waiting for ring buffer %s: policy.mode=%s; packet events are inactive",
+                             self._rb_pin, mode)
+            else:
+                log.warning("Cannot open ring buffer %s: %s; retrying in %.1fs",
+                            self._rb_pin, exc, self._retry_interval)
+            self._packet_status = status
+        else:
+            self._rb = rb
+            self._packet_status = {"packet_state": "ready", "policy_mode": "", "packet_error": ""}
+            log.info("Packet ring buffer opened: %s", self._rb_pin)
+
+    def close_packet_ring(self) -> None:
+        if self._rb is not None:
+            self._rb.close()
+            self._rb = None
+
+    def _reader_loop(self) -> None:
+        next_socket_retry = next_packet_retry = 0.0
+        while self._running:
+            now = time.monotonic()
+            if self._rb is None and now >= next_packet_retry:
+                self._connect_packet_ring()
+                next_packet_retry = now + self._retry_interval
+            if self._ss is None and now >= next_socket_retry:
+                self._connect_sock_state()
+                next_socket_retry = now + 1.0
+            rb = self._rb
+            watch_fds = [rb.fileno()] if rb is not None else []
+            if self._ss is not None:
+                watch_fds.append(self._ss.fileno())
+            timeout = 0.5 if rb is not None else min(0.5, max(0.0, next_packet_retry - time.monotonic()))
+            try:
+                select.select(watch_fds, [], [], timeout)
             except (ValueError, OSError):
                 break
-            for raw in self._rb.drain():
-                ev = decode_event(raw)
-                if ev:
-                    ev["seen_at"] = time.time()
-                    try:
-                        self._queue.put_nowait(ev)
-                    except queue.Full:
-                        pass
+            if rb is not None:
+                for raw in rb.drain():
+                    ev = decode_event(raw)
+                    if ev:
+                        self._enqueue(ev)
+                    else:
+                        self._invalid_records += 1
             if self._ss is not None:
                 for ev in self._ss.drain():
-                    try:
-                        self._queue.put_nowait(ev)
-                    except queue.Full:
-                        pass
+                    self._enqueue(ev)
 
     def run(self) -> None:
         self._open_server()
         assert self._server is not None
-        self._running = True
-        log.info("pkt_relay running  retention=%.0fs", self._retention_ns / 1e9)
-
         reader = threading.Thread(target=self._reader_loop, name="rb-reader", daemon=True)
-        reader.start()
-
-        srv_fd = self._server.fileno()
-        last_trim = time.monotonic()
-
         try:
+            self._wakeup_reader, self._wakeup_writer = socket.socketpair()
+            self._wakeup_reader.setblocking(False)
+            self._wakeup_writer.setblocking(False)
+            self._running = True
+            log.info("pkt_relay running  retention=%.0fs", self._retention_ns / 1e9)
+            reader.start()
+            srv_fd = self._server.fileno()
+            wakeup_fd = self._wakeup_reader.fileno()
+            last_trim = time.monotonic()
+
             while self._running:
-                rfds: list[int] = [srv_fd, *self._clients.keys()]
+                rfds: list[int] = [srv_fd, wakeup_fd, *self._clients.keys()]
                 try:
-                    readable, _, _ = select.select(rfds, [], [], 0.05)
+                    readable, _, _ = select.select(rfds, [], [], 0 if not self._queue.empty() else 0.05)
                 except (InterruptedError, ValueError):
                     readable = []
 
                 for rfd in readable:
-                    if rfd == srv_fd:
+                    if rfd == wakeup_fd:
+                        self._wakeup_reader.recv(65536)
+                    elif rfd == srv_fd:
                         self._accept_client()
                     else:
                         conn = self._clients.get(rfd)
@@ -524,26 +628,35 @@ class RelayServer:
                             if not data:
                                 self._drop_client(rfd)
 
-                while True:
-                    try:
-                        ev = self._queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    self._history.append(ev)
-                    self._broadcast(ev)
+                self._flush_batch()
 
                 now = time.monotonic()
                 if now - last_trim >= 1.0:
                     self._trim_history()
+                    self._broadcast(self._health_status())
                     last_trim = now
         finally:
-            reader.join(timeout=2.0)
+            self._running = False
+            if reader.ident is not None:
+                reader.join(timeout=2.0)
             self._cleanup()
 
     def stop(self) -> None:
         self._running = False
+        self._wake_broadcaster()
 
     def _cleanup(self) -> None:
+        self.close_packet_ring()
+        if self._ss is not None:
+            self._ss.close()
+            self._ss = None
+        for fd in self._ss_perf_fds:
+            os.close(fd)
+        self._ss_perf_fds.clear()
+        for wakeup in (self._wakeup_reader, self._wakeup_writer):
+            if wakeup is not None:
+                wakeup.close()
+        self._wakeup_reader = self._wakeup_writer = None
         for conn in list(self._clients.values()):
             try:
                 conn.close()
@@ -610,6 +723,19 @@ def _remove_pid(path: str, fd: int) -> None:
 
 # entry point
 
+def _inactive_policy_mode(config_path: str) -> str | None:
+    """Only treat a missing packet ring as expected for a readable inactive policy."""
+    try:
+        config = load_toml_config(config_path, strict=True)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    policy = config.get("policy", {})
+    if not isinstance(policy, dict):
+        return None
+    mode = str(policy.get("mode", "audit")).lower()
+    return mode if mode in {"audit", "observe"} else None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="BPF ring buffer relay — streams DROP events to TUI clients",
@@ -648,47 +774,13 @@ def main() -> None:
     retention  = args.retention or cfg.get("retention_seconds", RETENTION_SECONDS)
     max_events = args.max_events or cfg.get("max_events",       MAX_EVENTS)
 
-    while True:
+    rb = None
+    if not args.wait_for_ringbuf:
         try:
             rb = RingBufReader(args.pin_path)
-            break
         except OSError as exc:
-            if not args.wait_for_ringbuf:
-                log.error("Cannot open ring buffer %s: %s", args.pin_path, exc)
-                sys.exit(1)
-            log.warning(
-                "Cannot open ring buffer %s: %s; retrying in %.1fs",
-                args.pin_path,
-                exc,
-                args.retry_interval,
-            )
-            time.sleep(max(args.retry_interval, 0.1))
-
-    # If sock_state_rb is pinned but no bpftool link was created, attach the
-    # tracepoint ourselves so the ring buffer actually receives events.
-    _perf_fds: list[int] = []
-    if (
-        not os.path.exists(SOCK_STATE_LINK_PIN_PATH)
-        and os.path.exists(args.sock_state_rb)
-        and os.path.exists(SOCK_STATE_PROG_PIN_PATH)
-    ):
-        _perf_fds = attach_tracepoint(SOCK_STATE_PROG_PIN_PATH, SOCK_STATE_TRACEPOINT)
-        if _perf_fds:
-            log.info("sock_state tracepoint attached via perf_event_open (%d CPUs).", len(_perf_fds))
-        else:
-            log.info("perf_event_open attachment failed; port_change events disabled.")
-
-    ss_reader: SockStateReader | None = None
-    try:
-        ss_rb = RingBufReader(
-            args.sock_state_rb,
-            SOCK_STATE_RB_MAX_ENTRIES,
-            SOCK_STATE_EVENT_SIZE,
-        )
-        ss_reader = SockStateReader(ss_rb)
-        log.info("sock_state_rb opened; port_change events enabled.")
-    except (OSError, FileNotFoundError):
-        log.info("sock_state_rb not found; port_change events disabled.")
+            log.error("Cannot open ring buffer %s: %s", args.pin_path, exc)
+            sys.exit(1)
 
     max_history_send = cfg.get("max_history_send", MAX_HISTORY_SEND)
 
@@ -698,7 +790,10 @@ def main() -> None:
         retention_seconds=float(retention),
         max_events=int(max_events),
         max_history_send=int(max_history_send),
-        sock_state_reader=ss_reader,
+        sock_state_pin_path=args.sock_state_rb,
+        packet_pin_path=args.pin_path if args.wait_for_ringbuf else None,
+        config_path=args.config,
+        retry_interval=args.retry_interval,
     )
 
     def _on_signal(signum: int, _frame: object) -> None:
@@ -714,12 +809,8 @@ def main() -> None:
         relay.run()
     finally:
         _remove_pid(args.pid_file, pid_fd)
-        rb.close()
-        for _pfd in _perf_fds:
-            try:
-                os.close(_pfd)
-            except OSError:
-                pass
+        relay.close_packet_ring()
+
 
 
 if __name__ == "__main__":

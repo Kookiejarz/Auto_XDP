@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # auto-xdp-test-suite: kernel
 # Real-environment XDP integration tests: kernel BPF, network namespaces, veth.
-# Requires root, clang, bpftool, iproute2 (with netns support), python3.
+# Requires root, clang, bpftool, iproute2/tc (with netns support), python3.
 
 set -uo pipefail
 
@@ -20,7 +20,11 @@ readonly _PIN_DIR="/sys/fs/bpf/axdp_integ"
 readonly _DEBUG_PIN_DIR="/sys/fs/bpf/axdp_integ_debug"
 readonly _RUN_DIR="/run/axdp_integ"
 readonly _XDP_OBJ="/tmp/axdp_integ_fw.o"
-readonly _TC_OBJ="/tmp/axdp_integ_tc.o"
+readonly _ICMP_OBJ="/tmp/axdp_integ_icmp.o"
+readonly _SYNCOOKIE_OBJ="/tmp/axdp_integ_syncookie.o"
+readonly _TC_SYNCOOKIE_OBJ="/tmp/axdp_integ_tc_syncookie.o"
+readonly _VMLINUX_DIR="/tmp/axdp_integ_btf"
+_SYNCOOKIE_LEVEL2=0
 
 # ---------------------------------------------------------------------------
 # Prerequisites
@@ -38,9 +42,23 @@ if [[ $EUID -ne 0 ]]; then
     _kernel_unavailable "must run as root"
 fi
 
-for _cmd in clang bpftool ip python3; do
+for _cmd in clang bpftool ip python3 tc nft ethtool unshare mount nsenter conntrack; do
     command -v "$_cmd" &>/dev/null || _kernel_unavailable "$_cmd not found"
 done
+
+# Keep the server, XDP/TC hooks and listener in a fresh, NAT-free network
+# namespace. The client gets its own namespace below. Private mounts keep
+# sysfs, BPF pins and named client namespaces scoped to this test process.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    exec unshare --mount --net --propagation private bash -euc '
+        mount -t sysfs sysfs /sys
+        mount -t bpf bpf /sys/fs/bpf
+        mkdir -p /run/netns
+        mount -t tmpfs tmpfs /run/netns
+        set +e
+        source "$1"
+    ' bash "$REPO_ROOT/tests/bash/test_integration.sh"
+fi
 
 ip netns add "${_NS}_chk" 2>/dev/null || true
 if ! ip netns exec "${_NS}_chk" true 2>/dev/null; then
@@ -49,16 +67,31 @@ if ! ip netns exec "${_NS}_chk" true 2>/dev/null; then
 fi
 ip netns del "${_NS}_chk" 2>/dev/null || true
 
+# A fresh audit-only host may not have loaded nf_conntrack yet. Use the
+# production activation path in this isolated namespace to load its kfuncs,
+# then release the hooks so individual tests can control conntrack themselves.
+PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.bpf.conntrack \
+    || _kernel_unavailable "Linux conntrack activation/ABI check failed"
+PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.bpf.conntrack --remove \
+    || _kernel_unavailable "cannot remove the conntrack prerequisite table"
+
 # ---------------------------------------------------------------------------
 # Compile XDP object from current sources. Never reuse a leftover /tmp object
 # after the repository has changed.
 # ---------------------------------------------------------------------------
+# Match the installer's host macros when BPF sources include glibc headers.
+# Without these, clang's BPF target can select 32-bit stubs on x86_64 RHEL.
+# shellcheck source=lib/setup/build.sh
+source "$REPO_ROOT/lib/setup/build.sh"
+resolve_bpf_target_arch
+_arch_args=("-D__TARGET_ARCH_${TARGET_ARCH}")
+[[ -z "$HOST_ARCH_FLAG" ]] || _arch_args+=("$HOST_ARCH_FLAG")
 _src="$REPO_ROOT/bpf/xdp_firewall.c"
 [[ -f "$_src" ]] || _kernel_unavailable "$_src not found"
 _asm_inc=$(clang -print-file-name=include 2>/dev/null) || {
     _kernel_unavailable "clang include path not found"
 }
-_include_args=(-I "$REPO_ROOT/bpf/include" -I "$_asm_inc")
+_include_args=("${_arch_args[@]}" -I "$REPO_ROOT/bpf/include" -I "$_asm_inc")
 _multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
 [[ ! -d "$_multiarch_inc" ]] || _include_args+=(-I "$_multiarch_inc")
 rm -f "$_XDP_OBJ"
@@ -68,16 +101,23 @@ if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
     test_log_error "XDP compile failed"
     exit 1
 fi
-_tc_src="$REPO_ROOT/tc_flow_track.c"
-[[ -f "$_tc_src" ]] || _kernel_unavailable "$_tc_src not found"
-rm -f "$_TC_OBJ"
-if ! clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
-    "${_include_args[@]}" \
-    -c "$_tc_src" -o "$_TC_OBJ"; then
-    test_log_error "tc egress compile failed"
-    exit 1
+clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector "${_include_args[@]}" \
+    -c "$REPO_ROOT/handlers/icmp_handler.c" -o "$_ICMP_OBJ" || exit 1
+if bpftool btf dump file /sys/kernel/btf/vmlinux format raw 2>/dev/null \
+        | grep -F bpf_sk_assign_tcp_reqsk >/dev/null; then
+    rm -rf "$_VMLINUX_DIR"
+    mkdir -p "$_VMLINUX_DIR"
+    bpftool btf dump file /sys/kernel/btf/vmlinux format c \
+        >"$_VMLINUX_DIR/vmlinux.h" || _kernel_unavailable "cannot generate vmlinux.h"
+    clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+        "${_include_args[@]}" -c "$REPO_ROOT/bpf/xdp_syncookie.c" \
+        -o "$_SYNCOOKIE_OBJ" || _kernel_unavailable "SYN-cookie XDP compile failed"
+    clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+        -DAUTO_XDP_VMLINUX_H -I "$_VMLINUX_DIR" \
+        "${_include_args[@]}" -c "$REPO_ROOT/bpf/tc_syncookie_handoff.c" \
+        -o "$_TC_SYNCOOKIE_OBJ" || _kernel_unavailable "SYN-cookie TC compile failed"
+    _SYNCOOKIE_LEVEL2=1
 fi
-
 # ---------------------------------------------------------------------------
 # Runtime common (xdp_required_map_names, xdp_maps_ready, etc.)
 # ---------------------------------------------------------------------------
@@ -92,18 +132,16 @@ source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
 _load_xdp_program() {
     local phase="${1:-load}"
     local load_log status debug_status metrics_tmp metrics_status
-    local -a pipe_status
     load_log=$(mktemp)
 
     if [[ -n "${VERIFIER_METRICS_FILE:-}" && ! -s "$VERIFIER_METRICS_FILE" ]]; then
         metrics_tmp=$(mktemp)
         bpftool -d prog load "$_XDP_OBJ" "$_PIN_DIR/prog" type xdp \
-            pinmaps "$_PIN_DIR" 2>&1 \
-            | bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "$phase" \
-                >"$metrics_tmp"
-        pipe_status=("${PIPESTATUS[@]}")
-        status=${pipe_status[0]}
-        metrics_status=${pipe_status[1]}
+            pinmaps "$_PIN_DIR" >"$load_log" 2>&1
+        status=$?
+        bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "$phase" \
+            <"$load_log" >"$metrics_tmp"
+        metrics_status=$?
         if [[ $status -eq 0 && $metrics_status -eq 0 ]]; then
             {
                 printf '# kernel\t%s\n' "$(uname -r)"
@@ -116,6 +154,10 @@ _load_xdp_program() {
         rm -f "$metrics_tmp"
         if [[ $status -eq 0 && $metrics_status -ne 0 ]]; then
             printf 'error: unable to parse bpftool verifier metrics during %s\n' "$phase" >&2
+            printf '%s\n' '--- program sizes and verifier summary ---' >&2
+            grep -E 'found program .*code size|verification time|stack depth|processed [0-9]+ insns' \
+                "$load_log" >&2 || true
+            tail -n 40 "$load_log" >&2
             rm -f "$load_log"
             return 1
         fi
@@ -174,8 +216,6 @@ _setup() {
 
 _teardown() {
     ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
-    tc filter del dev "$_VETH" egress pref 49152 handle 1 2>/dev/null || true
-    tc qdisc del dev "$_VETH" clsact 2>/dev/null || true
     nft delete table inet axdp_integ 2>/dev/null || true
     ip netns del "$_NS" 2>/dev/null || true
     ip link del "$_VETH" 2>/dev/null || true
@@ -199,6 +239,43 @@ _ip6be() { python3 -c "import socket; print(' '.join(f'{b:02x}' for b in socket.
 _u16be() { python3 -c "import struct; print(' '.join(f'{b:02x}' for b in struct.pack('>H', $1)))"; }
 # Current kernel monotonic time in ns (same epoch as bpf_ktime_get_ns)
 _ktime_ns() { python3 -c "import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))"; }
+
+_set_tcp_policy() {
+    local port="$1" allow="$2" profile_id="${3:-0}"
+    local policy_generation="${4:-0}" profile_generation="${5:-0}" value_hex
+    value_hex=$(python3 -c "
+import struct
+print(' '.join(f'{b:02x}' for b in struct.pack('<IIQQ', $allow, $profile_id, $policy_generation, $profile_generation)))
+") || return 1
+    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
+        key hex $(_u32le "$port") value hex $value_hex >/dev/null 2>&1
+}
+
+_get_tcp_policy() {
+    local port="$1"
+    bpftool -j map lookup pinned "$_PIN_DIR/tcp_whitelist" \
+        key hex $(_u32le "$port") | python3 -c '
+import json, struct, sys
+value = json.load(sys.stdin)["value"]
+raw = bytes(int(byte, 0) if isinstance(byte, str) else byte for byte in value)
+print(*struct.unpack("<IIQQ", raw))
+'
+}
+
+_set_tcp_zone_policy() {
+    local ifindex="$1" port="$2" allow="$3" profile_id="${4:-0}"
+    local policy_generation="${5:-0}" profile_generation="${6:-0}" key_hex value_hex
+    key_hex=$(python3 -c "
+import struct
+print(' '.join(f'{b:02x}' for b in struct.pack('<II', $ifindex, $port)))
+") || return 1
+    value_hex=$(python3 -c "
+import struct
+print(' '.join(f'{b:02x}' for b in struct.pack('<IIQQ', $allow, $profile_id, $policy_generation, $profile_generation)))
+") || return 1
+    bpftool map update pinned "$_PIN_DIR/tcp_zone_whitelist" \
+        key hex $key_hex value hex $value_hex >/dev/null 2>&1
+}
 
 _pinned_prog_id() {
     bpftool -j prog show pinned "$1" | python3 -c '
@@ -261,7 +338,7 @@ if actual != expected:
 
 # Integration traffic uses an RFC1918 veth subnet. Production defaults treat
 # private source addresses as bogons, so disable that independent policy here;
-# otherwise whitelist, ACL, conntrack, and rate-limit assertions never reach
+# otherwise whitelist, ACL, and rate-limit assertions never reach
 # the code paths they claim to exercise.
 _configure_test_runtime() {
     local value_hex value_bytes=72
@@ -282,6 +359,24 @@ print(" ".join(f"{byte:02x}" for byte in payload[:size]))
 ' "$value_bytes")
     bpftool map update pinned "$_PIN_DIR/xdp_runtime_cfg" \
         key hex 00 00 00 00 value hex $value_hex >/dev/null
+}
+
+# Set or clear one XDP_CFG_FLAG_* bit, as the control plane would.
+_set_runtime_cfg_flag() {
+    local bit="$1" state="$2"
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR/xdp_runtime_cfg" "$bit" "$state" <<'PYEOF'
+import sys
+from auto_xdp.bpf.maps import BpfRuntimeConfigMap
+path, bit, state = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+runtime = BpfRuntimeConfigMap(path)
+try:
+    flags = runtime.get_cfg_flags() or 0
+    flags = flags | bit if state == "on" else flags & ~bit
+    if not runtime.set(runtime.get(), flags):
+        raise SystemExit(f"cannot update runtime flags: {runtime.last_error}")
+finally:
+    runtime.close()
+PYEOF
 }
 
 # Send TCP SYN from inside the namespace to _HOST_IP:PORT.
@@ -377,33 +472,200 @@ test_attach() {
     }
 }
 
+test_linux_conntrack_replies() {
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_conntrack.py" \
+        "$_PIN_DIR" "$_NS"
+}
+
+test_linux_conntrack_native_replies() {
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+    test_linux_conntrack_replies
+}
+
+test_icmp_dispatch_gate() {
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" "$REPO_ROOT/tests/python" <<'PY'
+from pathlib import Path
+import socket, sys
+sys.path.insert(0, sys.argv[2])
+from kernel_icmp_conntrack import frame
+from kernel_packet_telemetry import run_packet
+from auto_xdp.admin.module_runtime import remove_icmp, verify_icmp
+from auto_xdp.bpf.maps import BpfRuntimeConfigMap, XDP_CFG_FLAG_ICMP_REPLY
+root = Path(sys.argv[1])
+index = socket.if_nametoindex('axdp_v0')
+packets = [frame(socket.AF_INET, '10.99.0.2', '10.99.0.1', 59999),
+           frame(socket.AF_INET6, '2001:db8:99::2', '2001:db8:99::1', 59999)]
+controls = [frame(socket.AF_INET, '10.99.0.2', '10.99.0.1', 0, kind=3),
+            frame(socket.AF_INET6, '2001:db8:99::2', '2001:db8:99::1', 0, kind=2)]
+runtime = BpfRuntimeConfigMap(str(root / 'xdp_runtime_cfg'))
+try:
+    flags = (runtime.get_cfg_flags() or 0) & ~XDP_CFG_FLAG_ICMP_REPLY
+    assert runtime.set(runtime.get(), flags)
+    assert all(run_packet(root, index, packet)[0] == 2 for packet in packets)
+    assert runtime.set(runtime.get(), flags | XDP_CFG_FLAG_ICMP_REPLY)
+    assert all(run_packet(root, index, packet)[0] == 1 for packet in packets)
+    assert all(run_packet(root, index, packet)[0] == 2 for packet in controls)
+finally:
+    runtime.close()
+remove_icmp(root)
+verify_icmp(root, enabled=False)
+assert all(run_packet(root, index, packet)[0] == 2 for packet in packets)
+print('IPv4/IPv6 missing handler drops only enabled Echo Replies; Disable clears the gate')
+PY
+}
+
+test_icmp_native_dispatch_gate() {
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+    test_icmp_dispatch_gate
+}
+
+test_icmp_conntrack_replies() {
+    if [[ "${KERNEL_TEST_ICMP:-0}" != 1 ]]; then
+        test_log_warning "SKIP optional ICMP kernel dependency: set KERNEL_TEST_ICMP=1 to test automatic loading"
+        return 0
+    fi
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" "$_ICMP_OBJ" <<'PY' || return 1
+from pathlib import Path
+import sys
+from auto_xdp.admin.module_runtime import load_icmp, verify_icmp
+from auto_xdp.bpf.maps import BpfRuntimeConfigMap, XDP_CFG_FLAG_ICMP_REPLY
+root = Path(sys.argv[1])
+load_icmp(root, Path(sys.argv[2]))
+runtime = BpfRuntimeConfigMap(str(root / 'xdp_runtime_cfg'))
+try:
+    assert runtime.set(runtime.get(), (runtime.get_cfg_flags() or 0) | XDP_CFG_FLAG_ICMP_REPLY)
+finally:
+    runtime.close()
+verify_icmp(root)
+PY
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_icmp_conntrack.py" \
+        "$_PIN_DIR" "$_NS" || return 1
+    # The extension must not disturb existing TCP/UDP reply admission.
+    test_linux_conntrack_replies || return 1
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" "$REPO_ROOT/tests/python" <<'PY'
+from pathlib import Path
+import socket, sys
+sys.path.insert(0, sys.argv[2])
+from kernel_icmp_conntrack import frame, expect
+from auto_xdp.admin.module_runtime import remove_icmp, verify_icmp
+from auto_xdp.admin.handlers import prog_array_delete
+root = Path(sys.argv[1])
+index = socket.if_nametoindex('axdp_v0')
+packet = frame(socket.AF_INET6, '2001:db8:99::2', '2001:db8:99::1', 59999)
+# An enabled module whose dispatch entry disappears must fail closed.
+prog_array_delete(root / 'proto_handlers', 58)
+from kernel_packet_telemetry import run_packet
+assert run_packet(root, index, packet)[0] == 1
+remove_icmp(root)
+verify_icmp(root, enabled=False)
+expect(root, index, packet, 2)
+print('Missing handler fails closed; Disable removes both bindings and restores normal Echo Reply handling')
+PY
+}
+
+test_icmp_conntrack_native_replies() {
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+    test_icmp_conntrack_replies
+}
+
+test_named_interfaces_use_json_and_real_unsupported_mode_fallback() (
+    local name
+    trap 'ip link del xdpgeneric0 2>/dev/null || true; ip link del xdp0 2>/dev/null || true' EXIT
+    for name in xdpgeneric0 xdp0; do
+        ip link add "$name" type dummy || return 1
+        ip link set "$name" up || return 1
+        assert_eq "$(_auto_xdp_iface_xdp_mode "$name")" none || return 1
+        _auto_xdp_attach_candidate "$name" "$_PIN_DIR/prog" || return 1
+        assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" generic || return 1
+        assert_eq "$AUTO_XDP_LAST_ATTACH_ERROR_CLASS" unsupported || return 1
+        assert_eq "$AUTO_XDP_ATTACH_FATAL" 0 || return 1
+        assert_eq "$(_auto_xdp_iface_xdp_mode "$name")" generic || return 1
+        _auto_xdp_verify_iface_program "$name" "$_PIN_DIR/prog" || return 1
+        ip link del "$name" || return 1
+    done
+)
+
+test_veth_auto_mode_preserves_peer_offloads() (
+    local MACHINE_STATE="$_RUN_DIR/machine-state.json"
+    local mode tso_before tso_after
+    # Simulate reboot/link recovery with a previously verified native mode.
+    # This also covers arbitrary link names: _VETH does not start with veth.
+    printf '{"interfaces":{"%s":{"requested_mode":"auto","xdp_mode":"native"}}}\n' \
+        "$_VETH" > "$MACHINE_STATE"
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    tso_before=$(ip netns exec "$_NS" ethtool -k "$_VETH_IN" \
+        | awk '$1 == "tcp-segmentation-offload:" { print $2 }') || return 1
+    [[ -n "$tso_before" ]] || return 1
+
+    _auto_xdp_attach_candidate "$_VETH" "$_PIN_DIR/prog" || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "generic" || return 1
+    mode=$(_auto_xdp_iface_xdp_mode "$_VETH")
+    assert_eq "$mode" "generic" || return 1
+    _auto_xdp_verify_iface_program "$_VETH" "$_PIN_DIR/prog" || return 1
+    tso_after=$(ip netns exec "$_NS" ethtool -k "$_VETH_IN" \
+        | awk '$1 == "tcp-segmentation-offload:" { print $2 }') || return 1
+    assert_eq "$tso_after" "$tso_before" "auto mode preserves peer TSO" || return 1
+
+    # Verify packet policy and outbound reply admission on the selected hook.
+    test_linux_conntrack_replies
+)
+
+test_veth_auto_reload_preserves_active_native_protection() (
+    local MACHINE_STATE="$_RUN_DIR/machine-state.json"
+    printf '{"interfaces":{"%s":{"requested_mode":"auto","xdp_mode":"native"}}}\n' \
+        "$_VETH" > "$MACHINE_STATE"
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+
+    # The kernel cannot atomically change native <-> generic. A live reload
+    # must keep filtering rather than detach it to obtain the preferred mode.
+    _auto_xdp_attach_candidate "$_VETH" "$_PIN_DIR/prog" || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "native" || return 1
+    assert_eq "$(_auto_xdp_iface_xdp_mode "$_VETH")" "native" || return 1
+    _auto_xdp_verify_iface_program "$_VETH" "$_PIN_DIR/prog" || return 1
+    test_linux_conntrack_replies
+)
+
 _header_define() {
     awk -v name="$2" '$1 == "#define" && $2 == name { print $3; exit }' "$1"
 }
 
 test_loaded_map_abi() {
-    local ct4 ct6 rate4 rate6
-    ct4=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" CT_MAP_MAX_ENTRIES_V4)
-    ct6=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" CT_MAP_MAX_ENTRIES_V6)
+    local rate4 rate6
     rate4=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" RATE_MAP_MAX_ENTRIES_V4)
     rate6=$(_header_define "$REPO_ROOT/bpf/include/map_sizes.h" RATE_MAP_MAX_ENTRIES_V6)
 
-    _assert_map_abi tcp_ct4 lru_hash 12 8 "$ct4" || return 1
-    _assert_map_abi tcp_ct6 lru_hash 36 8 "$ct6" || return 1
-    _assert_map_abi udp_ct4 lru_hash 12 8 "$ct4" || return 1
-    _assert_map_abi udp_ct6 lru_hash 36 8 "$ct6" || return 1
     _assert_map_abi syn4 array_of_maps 4 4 65536 || return 1
     _assert_map_abi syn6 array_of_maps 4 4 65536 || return 1
 
-    _assert_map_abi tsc4 lru_hash 8 8 "$rate4" || return 1
-    _assert_map_abi tsc6 lru_hash 20 8 "$rate6" || return 1
-    _assert_map_abi tsc_pfx4 lru_hash 8 8 "$rate4" || return 1
-    _assert_map_abi tsc_pfx6 lru_hash 20 8 "$rate6" || return 1
-    _assert_map_abi tsc_port array 4 8 65536 || return 1
-
     _assert_map_abi tcp_port_policies hash 4 32 1024 || return 1
+    _assert_map_abi udp_port_policies hash 4 24 1024 || return 1
+    _assert_map_abi tcp_whitelist array 4 24 65536 || return 1
+    _assert_map_abi tcp_zone_whitelist hash 8 24 4096 || return 1
+    _assert_map_abi tcp_profile_handlers prog_array 4 4 256 || return 1
+    _assert_map_abi profile_ctx_map percpu_array 4 24 1 || return 1
+    _assert_map_abi handler_flows lru_hash 48 32 65536 || return 1
+    _assert_map_abi tc_handler_ctx percpu_array 4 96 1 || return 1
     _assert_map_abi udp_global_rl array 4 40 1 || return 1
     _assert_map_abi udp_percpu_acc percpu_array 4 16 1 || return 1
+    _assert_map_abi byte_counters percpu_array 4 32 1 || return 1
+}
+
+test_packet_event_v2_kernel() {
+    # Exercise the actual loaded program with controlled kernel test-run input;
+    # detach only this fixture's veth to make byte/counter deltas exact.
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_telemetry.py" \
+        events "$_PIN_DIR" "$_VETH"
+}
+
+test_ip_packet_lengths() {
+    ip link set dev "$_VETH" xdpgeneric off || return 1
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_lengths.py" \
+        "$_PIN_DIR" "$_VETH"
 }
 
 test_interrupted_candidate_restore() {
@@ -440,13 +702,22 @@ test_interrupted_candidate_restore() {
     }
 }
 
+test_handler_catalog() {
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_handler_catalog.py" \
+        "$_PIN_DIR" "$_VETH" "$REPO_ROOT"
+}
+
 test_handler_transactional_hot_swap() {
     local handler_obj="/tmp/axdp_integ_gre_handler.o"
     local config_path="/tmp/axdp_integ_handler.toml"
     local asm_inc multiarch_inc old_id new_id map_id
     asm_inc=$(clang -print-file-name=include) || return 1
     multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
-    local -a include_args=(-I "$REPO_ROOT/handlers" -I /usr/include -I /usr/include/bpf -I "$asm_inc")
+    local -a include_args=(
+        "${_arch_args[@]}"
+        -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include"
+        -I /usr/include -I /usr/include/bpf -I "$asm_inc"
+    )
     [[ ! -d "$multiarch_inc" ]] || include_args+=(-I "$multiarch_inc")
 
     clang -O2 -g -target bpf -mcpu=v3 \
@@ -454,19 +725,19 @@ test_handler_transactional_hot_swap() {
         -c "$REPO_ROOT/handlers/gre_handler.c" -o "$handler_obj" || return 1
     printf '[slots]\nenabled = []\n' > "$config_path"
 
-    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin_cli \
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin.cli \
         --config "$config_path" \
         --bpf-pin-dir "$_PIN_DIR" \
         --handlers-dir /tmp \
         slot load 47 "$handler_obj" >/dev/null || return 1
-    old_id=$(_pinned_prog_id "$_PIN_DIR/handlers/proto_47") || return 1
+    old_id=$(_pinned_prog_id "$_PIN_DIR/protocol_handlers/47/prog") || return 1
 
-    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin_cli \
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin.cli \
         --config "$config_path" \
         --bpf-pin-dir "$_PIN_DIR" \
         --handlers-dir /tmp \
         slot load 47 "$handler_obj" >/dev/null || return 1
-    new_id=$(_pinned_prog_id "$_PIN_DIR/handlers/proto_47") || return 1
+    new_id=$(_pinned_prog_id "$_PIN_DIR/protocol_handlers/47/prog") || return 1
     map_id=$(_map_lookup_u32 "$_PIN_DIR/proto_handlers" "$(_u32le 47)") || return 1
 
     [[ "$new_id" != "$old_id" ]] || {
@@ -477,32 +748,643 @@ test_handler_transactional_hot_swap() {
         echo "proto_handlers entry points to $map_id, expected candidate $new_id"
         return 1
     }
-    if find "$_PIN_DIR/handlers" -maxdepth 1 \
-            \( -name 'proto_47_next_*' -o -name 'proto_47_rollback_*' \) | grep -q .; then
+    if find "$_PIN_DIR/protocol_handlers" -maxdepth 1 \
+            \( -name '47_next_*' -o -name '47_rollback_*' \) | grep -q .; then
         echo "handler transaction left candidate or rollback pins after success"
         return 1
     fi
     rm -f "$handler_obj" "$config_path"
 }
 
+test_dual_handler_dispatch() {
+    local fixture=/tmp/axdp_dual_handler.o
+    local replacement=/tmp/axdp_dual_handler_next.o
+    local dispatcher=/tmp/axdp_handler_dispatcher.o
+    local chain=/tmp/axdp_handler_chain.o
+    local -a args=("${_arch_args[@]}" -O2 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
+    [[ ! -d "/usr/include/$(uname -m)-linux-gnu" ]] || args+=(-I "/usr/include/$(uname -m)-linux-gnu")
+    clang "${args[@]}" -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$fixture" || return 1
+    clang "${args[@]}" -DMETRIC_STEP=2 -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$replacement" || return 1
+    clang "${args[@]}" -DCHAIN_ONLY -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$chain" || return 1
+    clang "${args[@]}" -c "$REPO_ROOT/bpf/tc_egress_dispatch.c" -o "$dispatcher" || return 1
+    PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 \
+        "$REPO_ROOT/tests/python/kernel_handler_dispatch.py" "$_PIN_DIR" "$_NS" "$_VETH" \
+        "$_HOST_IP" "$_NS_IP" "$_HOST_IP6" "$_NS_IP6" "$fixture" "$replacement" "$dispatcher" "$chain"
+}
+
+test_protocol_handler_migration() {
+    local objects=/tmp/axdp_protocol_objects name
+    mkdir -p "$objects"
+    local -a args=("${_arch_args[@]}" -O2 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
+    [[ ! -d "/usr/include/$(uname -m)-linux-gnu" ]] || args+=(-I "/usr/include/$(uname -m)-linux-gnu")
+    for name in gre esp sctp; do
+        clang "${args[@]}" -c "$REPO_ROOT/handlers/${name}_handler.c" -o "$objects/$name.o" || return 1
+    done
+    clang "${args[@]}" -c "$REPO_ROOT/tests/c/protocol_handler_fixture.c" -o "$objects/fixture.o" || return 1
+    clang "${args[@]}" -DCHAIN_ONLY -c "$REPO_ROOT/tests/c/dual_handler_fixture.c" -o "$objects/chain.o" || return 1
+    clang "${args[@]}" -c "$REPO_ROOT/bpf/tc_egress_dispatch.c" -o "$objects/dispatcher.o" || return 1
+    PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 \
+        "$REPO_ROOT/tests/python/kernel_protocol_handlers.py" "$_PIN_DIR" "$_VETH" "$objects"
+}
+
+test_minecraft_session_migration() {
+    local obj=/tmp/axdp_mc_reload.o dispatcher=/tmp/axdp_mc_reload_dispatcher.o
+    local -a args=("${_arch_args[@]}" -O3 -g -target bpf -mcpu=v3 -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include")
+    [[ ! -d "/usr/include/$(uname -m)-linux-gnu" ]] || args+=(-I "/usr/include/$(uname -m)-linux-gnu")
+    clang "${args[@]}" -c "$REPO_ROOT/handlers/minecraft_handler.c" -o "$obj" || return 1
+    clang "${args[@]}" -c "$REPO_ROOT/bpf/tc_egress_dispatch.c" -o "$dispatcher" || return 1
+    PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 \
+        "$REPO_ROOT/tests/python/kernel_minecraft_reload.py" "$_PIN_DIR" "$_NS" "$_VETH" \
+        "$_HOST_IP" "$_HOST_IP6" "$obj" "$dispatcher"
+}
+
+test_minecraft_profile_dataplane() {
+    local port=25565
+    local handler_obj="/tmp/axdp_integ_minecraft_handler.o"
+    local egress_obj="/tmp/axdp_integ_tc_egress_dispatch.o"
+    local result_file="/tmp/axdp_integ_minecraft_result"
+    local ready_file="/tmp/axdp_integ_minecraft_ready"
+    local continue_file="/tmp/axdp_integ_minecraft_continue"
+    local ready_file2="/tmp/axdp_integ_minecraft_ready2"
+    local continue_file2="/tmp/axdp_integ_minecraft_continue2"
+    local ready_file3="/tmp/axdp_integ_minecraft_ready3"
+    local continue_file3="/tmp/axdp_integ_minecraft_continue3"
+    local asm_inc multiarch_inc server_pid
+    asm_inc=$(clang -print-file-name=include) || return 1
+    multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
+    local -a include_args=(
+        "${_arch_args[@]}"
+        -I "$REPO_ROOT/handlers"
+        -I "$REPO_ROOT/bpf/include"
+        -I /usr/include
+        -I /usr/include/bpf
+        -I "$asm_inc"
+    )
+    [[ ! -d "$multiarch_inc" ]] || include_args+=(-I "$multiarch_inc")
+
+    clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+        "${include_args[@]}" \
+        -c "$REPO_ROOT/handlers/minecraft_handler.c" -o "$handler_obj" || return 1
+    clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+        "${include_args[@]}" -I "$REPO_ROOT" \
+        -c "$REPO_ROOT/bpf/tc_egress_dispatch.c" -o "$egress_obj" || return 1
+    PYTHONPATH="$REPO_ROOT" python3 -m auto_xdp.admin.cli \
+        --config /tmp/axdp_integ_missing.toml \
+        --bpf-pin-dir "$_PIN_DIR" \
+        --install-dir "$REPO_ROOT" \
+        profile-handler load 1 "$handler_obj" \
+        >/dev/null || return 1
+    local name
+    local -a dispatcher_load=(bpftool prog load "$egress_obj" "$_PIN_DIR/tc_egress_dispatch_test" type classifier)
+    for name in slot_ctx_map profile_ctx_map xdp_runtime_cfg pkt_counters byte_counters pkt_ringbuf \
+                endpoint_scopes tcp_whitelist udp_whitelist tcp_zone_whitelist udp_zone_whitelist \
+                tc_handler_ctx handler_egress handler_flows tc_profile_handlers tc_tcp_handlers \
+                tc_udp_handlers tc_proto_handlers handler_eg_stats; do
+        dispatcher_load+=(map name "$name" pinned "$_PIN_DIR/$name")
+    done
+    "${dispatcher_load[@]}" >/dev/null || return 1
+    tc qdisc add dev "$_VETH" clsact 2>/dev/null || true
+    tc filter replace dev "$_VETH" egress pref 49153 handle 2 \
+        bpf direct-action object-pinned "$_PIN_DIR/tc_egress_dispatch_test" \
+        >/dev/null || return 1
+    _set_tcp_policy "$port" 1 1 11 22 || return 1
+
+    # Raw replay cannot manufacture Linux conntrack state: only a SYN passes.
+    python3 - "$port" <<'PYEOF' || return 1
+import ipaddress, struct, sys
+
+port = int(sys.argv[1])
+payload = b"\x0f\x00\x2f\x09localhost\x63\xdd\x02"
+
+def tcp(sport, seq, flags, body=b""):
+    return struct.pack("!HHIIHHHH", sport, port, seq, 0, (5 << 12) | flags,
+                       65535, 0, 0) + body
+
+def ipv4(name, seq, flags, body=b""):
+    segment = tcp(40100, seq, flags, body)
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(segment), 0, 0,
+                     64, 6, 0, ipaddress.ip_address("10.99.0.3").packed,
+                     ipaddress.ip_address("10.99.0.1").packed)
+    open(f"/tmp/axdp_mc4_{name}", "wb").write(b"\0" * 12 + b"\x08\x00" + ip + segment)
+
+def ipv6(name, seq, flags, body=b""):
+    segment = tcp(40101, seq, flags, body)
+    ip = struct.pack("!IHBB16s16s", 6 << 28, len(segment), 6, 64,
+                     ipaddress.ip_address("2001:db8:99::3").packed,
+                     ipaddress.ip_address("2001:db8:99::1").packed)
+    open(f"/tmp/axdp_mc6_{name}", "wb").write(b"\0" * 12 + b"\x86\xdd" + ip + segment)
+
+for writer in (ipv4, ipv6):
+    writer("syn", 100, 0x02)
+    writer("syn_payload", 100, 0x02, payload)
+    writer("ack", 101, 0x10)
+    writer("handshake", 101, 0x18, payload)
+PYEOF
+    local family packet retval expected
+    for family in 4 6; do
+        for packet in syn syn_payload ack handshake; do
+            expected=1
+            [[ "$packet" == syn ]] && expected=2
+            retval=$(bpftool -j prog run pinned "$_PIN_DIR/prog" \
+                data_in "/tmp/axdp_mc${family}_${packet}" \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["retval"])') || return 1
+            [[ "$retval" == "$expected" ]] || {
+                echo "Minecraft IPv${family} ${packet} returned XDP action ${retval}, expected ${expected}"
+                return 1
+            }
+        done
+    done
+    rm -f /tmp/axdp_mc4_{syn,syn_payload,ack,handshake} /tmp/axdp_mc6_{syn,syn_payload,ack,handshake}
+
+    # Register conntrack hooks in this fixture's host network namespace. The
+    # optional /proc/net/nf_conntrack interface is not a capability test: many
+    # kernels support the kfuncs without enabling that procfs listing. This
+    # accept-only table is fixture-owned and removed by _teardown.
+    nft add table inet axdp_integ || return 1
+    nft add chain inet axdp_integ mc_conntrack \
+        '{ type filter hook input priority filter; policy accept; }' || return 1
+    nft add rule inet axdp_integ mc_conntrack \
+        ct state established,related counter || return 1
+
+    rm -f "$result_file" "$ready_file" "$continue_file" "$ready_file2" \
+        "$continue_file2" "$ready_file3" "$continue_file3"
+    python3 - "$port" "$result_file" "$ready_file" "$ready_file2" "$ready_file3" <<'PYEOF' &
+import socket, sys
+
+port, result_path = int(sys.argv[1]), sys.argv[2]
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("0.0.0.0", port))
+server.listen(5)
+server.settimeout(3)
+
+def receive_verified(ready_path):
+    valid = b""
+    old_payload = b""
+    conn, _ = server.accept()
+    conn.settimeout(2)
+    while b"Test" not in valid:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        valid += chunk
+    conn.sendall(b"\x01\x02")
+    while b"PLAY" not in valid:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        valid += chunk
+    open(ready_path, "w", encoding="ascii").close()
+    try:
+        old_payload = conn.recv(4096)
+    except OSError:
+        pass
+    conn.close()
+    return valid, old_payload
+
+try:
+    expired_valid, expired_payload = receive_verified(sys.argv[3])
+    generation_valid, old_generation_payload = receive_verified(sys.argv[4])
+    profile_valid, old_profile_payload = receive_verified(sys.argv[5])
+except OSError:
+    expired_valid = expired_payload = generation_valid = old_generation_payload = b""
+    profile_valid = old_profile_payload = b""
+
+server.settimeout(2)
+status_payload = b""
+try:
+    conn, _ = server.accept()
+    conn.settimeout(1)
+    while len(status_payload) < 18:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        status_payload += chunk
+    conn.sendall(b"\x01\x00")
+    while len(status_payload) < 28:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        status_payload += chunk
+    conn.close()
+except OSError:
+    pass
+
+invalid_payload = b""
+try:
+    conn, _ = server.accept()
+    conn.settimeout(1)
+    try:
+        invalid_payload = conn.recv(4096)
+    except OSError:
+        pass
+    conn.close()
+except OSError:
+    pass
+server.close()
+with open(result_path, "w", encoding="ascii") as handle:
+    handle.write(
+        f"{expired_valid.hex()}\n{expired_payload.hex()}\n"
+        f"{generation_valid.hex()}\n{old_generation_payload.hex()}\n"
+        f"{profile_valid.hex()}\n{old_profile_payload.hex()}\n"
+        f"{status_payload.hex()}\n{invalid_payload.hex()}\n"
+    )
+PYEOF
+    server_pid=$!
+    sleep 0.15
+
+    if ! ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" "$continue_file" <<'PYEOF'
+import os, socket, sys, time
+
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+time.sleep(0.1)
+s.sendall(b"\x0f\x00\x2f\x09localhost\x63\xdd\x02")
+time.sleep(0.1)
+s.sendall(b"\x06\x00\x04Test")
+s.recv(2)
+s.sendall(b"PLAY")
+deadline = time.monotonic() + 3
+while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:
+    time.sleep(0.02)
+s.sendall(b"OLD")
+time.sleep(0.2)
+s.close()
+PYEOF
+    then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        return 1
+    fi &
+    local client_pid=$!
+
+    local waited=0
+    while [[ ! -f "$ready_file" && $waited -lt 60 ]]; do
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    [[ -f "$ready_file" ]] || {
+        kill "$client_pid" "$server_pid" 2>/dev/null || true
+        wait "$client_pid" "$server_pid" 2>/dev/null || true
+        echo "Minecraft flow did not reach verified state"
+        return 1
+    }
+    [[ "$(bpftool -j map dump pinned "$_PIN_DIR/profile_handlers/tcp/1/maps/mc_l7_pending" \
+        | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" == 0 ]] || {
+        echo "wire verification did not clear the bounded parser state"
+        bpftool -j map dump pinned "$_PIN_DIR/profile_handlers/tcp/1/maps/mc_l7_pending" || true
+        grep 'dport=25565' /proc/net/nf_conntrack || true
+        tc -s filter show dev "$_VETH" egress || true
+        kill "$client_pid" "$server_pid" 2>/dev/null || true
+        wait "$client_pid" "$server_pid" 2>/dev/null || true
+        return 1
+    }
+    # +256 collides in the old compact CT epoch, but not in the full proof.
+    _set_tcp_policy "$port" 1 1 11 278 || return 1
+    : > "$continue_file"
+    wait "$client_pid" || return 1
+
+    if ! ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" "$continue_file2" <<'PYEOF'
+import os, socket, sys, time
+
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+time.sleep(0.1)
+s.sendall(b"\x10\x00\xfe\x05\x09localhost\x63\xdd\x02")
+time.sleep(0.1)
+s.sendall(b"\x16\x00\x04Test" + b"\x00" * 16)
+s.recv(2)
+s.sendall(b"PLAY")
+deadline = time.monotonic() + 3
+while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:
+    time.sleep(0.02)
+s.sendall(b"OLD")
+time.sleep(0.2)
+s.close()
+PYEOF
+    then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        return 1
+    fi &
+    client_pid=$!
+
+    waited=0
+    while [[ ! -f "$ready_file2" && $waited -lt 60 ]]; do
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    [[ -f "$ready_file2" ]] || {
+        kill "$client_pid" "$server_pid" 2>/dev/null || true
+        wait "$client_pid" "$server_pid" 2>/dev/null || true
+        echo "second Minecraft flow did not reach verified state"
+        return 1
+    }
+    _set_tcp_policy "$port" 1 1 12 278 || return 1
+    : > "$continue_file2"
+    wait "$client_pid" || return 1
+
+    if ! ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" "$continue_file3" <<'PYEOF'
+import os, socket, sys, time
+
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+time.sleep(0.1)
+s.sendall(b"\x0f\x00\x2f\x09localhost\x63\xdd\x02")
+time.sleep(0.1)
+s.sendall(b"\x06\x00\x04Test")
+s.recv(2)
+s.sendall(b"PLAY")
+deadline = time.monotonic() + 3
+while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:
+    time.sleep(0.02)
+s.sendall(b"OLD")
+time.sleep(0.2)
+s.close()
+PYEOF
+    then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        return 1
+    fi &
+    client_pid=$!
+
+    waited=0
+    while [[ ! -f "$ready_file3" && $waited -lt 60 ]]; do
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    [[ -f "$ready_file3" ]] || {
+        kill "$client_pid" "$server_pid" 2>/dev/null || true
+        wait "$client_pid" "$server_pid" 2>/dev/null || true
+        echo "third Minecraft flow did not reach verified state"
+        return 1
+    }
+    # Losing the bounded cache must revoke a still-marked live connection.
+    python3 - "$_PIN_DIR/profile_handlers/tcp/1/maps/mc_verified" <<'PYEOF' || return 1
+import json, subprocess, sys
+
+path = sys.argv[1]
+rows = json.loads(subprocess.check_output(
+    ["bpftool", "-j", "map", "dump", "pinned", path], text=True))
+assert rows, "wire verification did not publish full session proof"
+for row in rows:
+    key = [f"{int(byte, 0) if isinstance(byte, str) else byte:02x}" for byte in row["key"]]
+    subprocess.run(["bpftool", "map", "delete", "pinned", path, "key", "hex", *key], check=True)
+PYEOF
+    : > "$continue_file3"
+    wait "$client_pid" || return 1
+
+    if ! ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" <<'PYEOF'
+import socket, sys, time
+
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+time.sleep(0.1)
+s.sendall(b"\x0f\x00\x2f\x09localhost\x63\xdd\x01")
+time.sleep(0.05)
+s.sendall(b"\x01\x00")
+s.recv(2)
+s.sendall(b"\x09\x01" + b"\x00" * 8)
+time.sleep(0.1)
+s.close()
+PYEOF
+    then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" <<'PYEOF'
+import socket, sys, time
+
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+time.sleep(0.1)
+s.sendall(b"\x00BAD")
+time.sleep(0.1)
+s.close()
+PYEOF
+    then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+        return 1
+    fi
+
+    wait "$server_pid" || return 1
+    python3 - "$result_file" <<'PYEOF' || return 1
+import sys
+
+lines = open(sys.argv[1], encoding="ascii").read().splitlines()
+legacy = b"\x0f\x00\x2f\x09localhost\x63\xdd\x02\x06\x00\x04TestPLAY"
+modern = (b"\x10\x00\xfe\x05\x09localhost\x63\xdd\x02" +
+          b"\x16\x00\x04Test" + b"\x00" * 16 + b"PLAY")
+status = (b"\x0f\x00\x2f\x09localhost\x63\xdd\x01" +
+          b"\x01\x00\x09\x01" + b"\x00" * 8)
+if bytes.fromhex(lines[0]) != legacy or bytes.fromhex(lines[4]) != legacy:
+    raise SystemExit("valid Minecraft flow mismatch")
+if bytes.fromhex(lines[2]) != modern:
+    raise SystemExit("modern Minecraft flow mismatch")
+if lines[1]:
+    raise SystemExit("old connmark survived profile generation change")
+if lines[3]:
+    raise SystemExit("old connmark survived policy generation change")
+if lines[5]:
+    raise SystemExit("old connmark survived loss of the full session proof")
+if bytes.fromhex(lines[6]) != status:
+    raise SystemExit("Minecraft status/ping flow mismatch")
+if lines[7]:
+    raise SystemExit("non-Minecraft payload reached the protected listener")
+PYEOF
+
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" <<'PYEOF' || return 1
+import json, subprocess, sys
+from auto_xdp.admin.stats import _read_byte_counters
+
+def scalar(value):
+    if isinstance(value, list):
+        raw = bytes(int(byte, 0) if isinstance(byte, str) else byte for byte in value)
+        return int.from_bytes(raw, "little")
+    return int(value, 0) if isinstance(value, str) else int(value)
+
+def counter(path, key):
+    rows = json.loads(subprocess.check_output(
+        ["bpftool", "-j", "map", "lookup", "pinned", path,
+         "key", "hex", *key.to_bytes(4, "little").hex(" ").split()], text=True
+    ))
+    values = rows.get("values", rows.get("value", []))
+    if values and isinstance(values[0], dict):
+        return sum(scalar(item["value"]) for item in values)
+    return scalar(values) if values else 0
+
+root = sys.argv[1]
+if counter(f"{root}/pkt_counters", 36) == 0:
+    raise SystemExit("profile allow counter stayed zero")
+if counter(f"{root}/pkt_counters", 37) == 0:
+    raise SystemExit("profile drop counter stayed zero")
+totals = _read_byte_counters(root)
+if totals[2] <= 0:
+    raise SystemExit("profile traffic missing from total packet counter")
+if totals[3] <= 0:
+    raise SystemExit("profile drops missing from total drop counter")
+PYEOF
+
+    bpftool map delete pinned "$_PIN_DIR/tcp_profile_handlers" \
+        key hex $(_u32le 1) >/dev/null || return 1
+    _tcp_probe "$port" && {
+        echo "required profile tail-call miss did not fail closed"
+        return 1
+    }
+    tc filter del dev "$_VETH" egress protocol all pref 49153 handle 2 bpf || return 1
+    rm -f "$handler_obj" "$egress_obj" "$result_file" "$ready_file" "$continue_file" \
+        "$ready_file2" "$continue_file2" "$ready_file3" "$continue_file3"
+}
+
+test_minecraft_profile_syncer_lifecycle() (
+    local port=25567 config_path=/tmp/axdp_lifecycle.toml
+    local install_dir=/tmp/axdp_lifecycle_install run_dir=/tmp/axdp_lifecycle_run
+    local ready_file=/tmp/axdp_lifecycle_ready listener_pid="" first_generation=""
+
+    cleanup() {
+        [[ -z "$listener_pid" ]] || kill "$listener_pid" 2>/dev/null || true
+        [[ -z "$listener_pid" ]] || wait "$listener_pid" 2>/dev/null || true
+        rm -rf "$install_dir" "$run_dir"
+        rm -f "$config_path" "$ready_file"
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$install_dir/handlers" "$install_dir/python" "$run_dir"
+    local asm_inc multiarch_inc
+    asm_inc=$(clang -print-file-name=include) || return 1
+    multiarch_inc="/usr/include/$(uname -m)-linux-gnu"
+    local -a include_args=(
+        "${_arch_args[@]}"
+        -I "$REPO_ROOT/handlers" -I "$REPO_ROOT/bpf/include"
+        -I /usr/include -I /usr/include/bpf -I "$asm_inc"
+    )
+    [[ ! -d "$multiarch_inc" ]] || include_args+=(-I "$multiarch_inc")
+    clang -O3 -g -target bpf -mcpu=v3 -fno-stack-protector \
+        "${include_args[@]}" -c "$REPO_ROOT/handlers/minecraft_handler.c" \
+        -o "$install_dir/handlers/minecraft_handler.o" || return 1
+
+    local subject_resolve
+    subject_resolve=$(PYTHONPATH="$REPO_ROOT" python3 - <<'PYEOF'
+import json, os
+from auto_xdp.discovery.listeners import _pid_comm, _pid_systemd_unit
+
+# A systemd-run test and its listener share the real cgroup service identity;
+# outside a service, use the actual Python executable's comm, not a guess.
+unit = _pid_systemd_unit(os.getpid())
+kind, value = ("systemd_unit", unit) if unit else ("process_name", _pid_comm(os.getpid()))
+if not value:
+    raise SystemExit("cannot determine lifecycle listener ownership")
+print(f"{kind} = {json.dumps(value)}")
+PYEOF
+    ) || return 1
+
+    {
+        printf '[firewall]\nbogon_filter = false\n'
+        printf '[policy]\nmode = "enforce"\n'
+        printf '[zones.public]\ninterfaces = []\n'
+        printf '[unknown_subjects]\npublic = "deny"\n'
+        printf '[subjects.minecraft.resolve]\n%s\n' "$subject_resolve"
+        printf '[subjects.minecraft.exposure.public.tcp]\nports = [%d]\n' "$port"
+        printf '[subjects.minecraft.protection]\nprofile = "minecraft"\n'
+        printf '[xdp]\nbpf_pin_dir = "%s"\n' "$_PIN_DIR"
+    } >"$config_path"
+
+    sync_policy() {
+        env PYTHONPATH="$REPO_ROOT" PYTHON_LIB_DIR="$install_dir/python" \
+            RUN_STATE_DIR="$run_dir" XDP_OBJ_PATH="$_XDP_OBJ" \
+            python3 "$REPO_ROOT/xdp_port_sync.py" --config "$config_path" \
+            --backend xdp --mode enforce
+    }
+    start_listener() {
+        rm -f "$ready_file"
+        python3 - "$port" "$ready_file" <<'PYEOF' &
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen()
+open(sys.argv[2], "w", encoding="ascii").close()
+try:
+    time.sleep(20)
+finally:
+    s.close()
+PYEOF
+        listener_pid=$!
+        local waited=0
+        while [[ ! -f "$ready_file" && $waited -lt 50 ]]; do
+            sleep 0.05
+            waited=$((waited + 1))
+        done
+        [[ -f "$ready_file" ]]
+    }
+
+    start_listener || return 1
+    sync_policy || return 1
+    read -r allow profile_id first_generation profile_generation \
+        <<<"$(_get_tcp_policy "$port")"
+    [[ "$allow" == 1 && "$profile_id" == 1 && "$first_generation" != 0 \
+        && "$profile_generation" != 0 ]] || return 1
+    local first_program
+    first_program=$(_map_lookup_u32 "$_PIN_DIR/tcp_profile_handlers" "$(_u32le 1)") || return 1
+    [[ -f "$run_dir/profile-handlers/tcp/minecraft" ]] || return 1
+
+    # A controller restart with an unchanged listener and policy preserves both
+    # generations and the live handler rather than churning protected traffic.
+    sync_policy || return 1
+    local second_generation second_program
+    read -r _ _ second_generation _ <<<"$(_get_tcp_policy "$port")"
+    second_program=$(_map_lookup_u32 "$_PIN_DIR/tcp_profile_handlers" "$(_u32le 1)") || return 1
+    [[ "$second_generation" == "$first_generation" ]] || return 1
+    [[ "$second_program" == "$first_program" ]] || return 1
+
+    kill "$listener_pid"
+    wait "$listener_pid" 2>/dev/null || true
+    listener_pid=""
+    sync_policy || return 1
+    read -r allow _ _ _ <<<"$(_get_tcp_policy "$port")"
+    [[ "$allow" == 0 ]] || return 1
+    if bpftool map lookup pinned "$_PIN_DIR/tcp_profile_handlers" \
+        key hex $(_u32le 1) >/dev/null 2>&1; then
+        echo "profile handler remained loaded after workload stopped"
+        return 1
+    fi
+    [[ ! -e "$run_dir/profile-handlers/tcp/minecraft" ]] || return 1
+
+    start_listener || return 1
+    sync_policy || return 1
+    local restarted_generation
+    read -r allow profile_id restarted_generation _ <<<"$(_get_tcp_policy "$port")"
+    [[ "$allow" == 1 && "$profile_id" == 1 ]] || return 1
+    [[ "$restarted_generation" != 0 && "$restarted_generation" != "$first_generation" ]] \
+        || return 1
+
+    kill "$listener_pid"
+    wait "$listener_pid" 2>/dev/null || true
+    listener_pid=""
+    sync_policy || return 1
+)
+
 test_reload() {
     local map_id
 
     xdp_maps_ready || { echo "xdp_maps_ready failed with full map set"; return 1; }
 
-    map_id=$(bpftool -j map show pinned "$_PIN_DIR/tcp_ct4" \
+    map_id=$(bpftool -j map show pinned "$_PIN_DIR/tcp_whitelist" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])') || {
-        echo "failed to resolve tcp_ct4 map id"; return 1;
+        echo "failed to resolve tcp_whitelist map id"; return 1;
     }
 
-    rm "$_PIN_DIR/tcp_ct4"
-    xdp_maps_ready && { echo "xdp_maps_ready should detect missing tcp_ct4"; return 1; }
+    rm "$_PIN_DIR/tcp_whitelist"
+    xdp_maps_ready && { echo "xdp_maps_ready should detect missing tcp_whitelist"; return 1; }
 
     # Removing a pin does not destroy a map still referenced by the attached
     # program. Re-pin that exact map; loading a second program with pinmaps
     # would collide with every map name that remains in this directory.
-    bpftool map pin id "$map_id" "$_PIN_DIR/tcp_ct4" >/dev/null || {
-        echo "failed to re-pin tcp_ct4 map id $map_id"; return 1;
+    bpftool map pin id "$map_id" "$_PIN_DIR/tcp_whitelist" >/dev/null || {
+        echo "failed to re-pin tcp_whitelist map id $map_id"; return 1;
     }
 
     xdp_maps_ready || { echo "xdp_maps_ready failed after re-pinning"; return 1; }
@@ -522,15 +1404,21 @@ test_port_sync() {
     key_hex=$(_u32le "$port")
 
     # Enable port; SYN should pass and receive RST (no listener on host).
-    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $key_hex value hex 01 00 00 00 >/dev/null 2>&1
+    _set_tcp_policy "$port" 1 || return 1
     lookup_val=$(_map_lookup_u32 "$_PIN_DIR/tcp_whitelist" "$key_hex")
     assert_eq "$lookup_val" "1" "whitelist enabled" || return 1
+    PYTHONPATH="$REPO_ROOT" python3 - "$_PIN_DIR" "$port" <<'PYEOF' || return 1
+import sys
+from auto_xdp.admin.ports import read_xdp_ports
+
+tcp_ports, _ = read_xdp_ports(sys.argv[1])
+if int(sys.argv[2]) not in tcp_ports:
+    raise SystemExit("admin reader missed enabled TCP endpoint policy")
+PYEOF
     _tcp_probe "$port" || { echo "SYN to whitelisted port was dropped"; return 1; }
 
     # Disable port; SYN should be dropped (timeout).
-    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $key_hex value hex 00 00 00 00 >/dev/null 2>&1
+    _set_tcp_policy "$port" 0 || return 1
     lookup_val=$(_map_lookup_u32 "$_PIN_DIR/tcp_whitelist" "$key_hex")
     assert_eq "$lookup_val" "0" "whitelist disabled" || return 1
     _tcp_probe "$port" && { echo "SYN to non-whitelisted port was not dropped"; return 1; }
@@ -538,61 +1426,43 @@ test_port_sync() {
     return 0
 }
 
-test_udp_reply() {
-    local sport=5100 dport=9901
-    local key_hex val_hex
+test_zone_policy_overrides_global_profile() {
+    local port=7704 ifindex
+    ifindex=$(cat "/sys/class/net/$_VETH/ifindex") || return 1
 
-    # ct_key_v4: sport(__be16) + dport(__be16) + saddr(__be32) + daddr(__be32)
-    key_hex="$(_u16be "$sport") $(_u16be "$dport") $(_ip4be "$_NS_IP") $(_ip4be "$_HOST_IP")"
-    val_hex=$(_u64le "$(_ktime_ns)")
-
-    bpftool map update pinned "$_PIN_DIR/udp_ct4" \
-        key hex $key_hex value hex $val_hex >/dev/null 2>&1
-
-    local recv_file
-    recv_file=$(mktemp)
-
-    _udp_listen_py "$dport" >"$recv_file" 2>/dev/null &
-    local listen_pid=$!
-    sleep 0.15
-
-    # Send UDP from inside ns, bound to the exact source port in the CT entry.
-    ip netns exec "$_NS" python3 - "$_NS_IP" "$sport" "$_HOST_IP" "$dport" <<'PYEOF' 2>/dev/null
-import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind((sys.argv[1], int(sys.argv[2])))
-s.sendto(b'axdp-test', (sys.argv[3], int(sys.argv[4])))
-PYEOF
-
-    sleep 0.4
-    kill "$listen_pid" 2>/dev/null || true
-    wait "$listen_pid" 2>/dev/null || true
-
-    local got
-    got=$(<"$recv_file")
-    rm -f "$recv_file"
-    [[ "$got" == *"axdp-test"* ]] || {
-        echo "UDP reply packet not received (XDP may have dropped it)"
+    # The global endpoint requires an unavailable profile.  The ingress-zone
+    # endpoint for the same port is generic and therefore wins on this NIC.
+    _set_tcp_policy "$port" 1 99 1 1 || return 1
+    _set_tcp_zone_policy "$ifindex" "$port" 1 0 2 0 || return 1
+    _tcp_probe "$port" || {
+        echo "zone endpoint policy did not override global profile identity"
         return 1
     }
+
+    bpftool map delete pinned "$_PIN_DIR/tcp_zone_whitelist" \
+        key hex $(_u32le "$ifindex") $(_u32le "$port") >/dev/null || return 1
+    _tcp_probe "$port" && {
+        echo "missing global profile did not fail closed after zone policy removal"
+        return 1
+    }
+    return 0
 }
 
-_attach_tc_egress() {
-    command -v tc >/dev/null 2>&1 || { echo "tc not found"; return 1; }
-    bpftool prog load "$_TC_OBJ" "$_PIN_DIR/tc_egress_prog" type classifier \
-        map name tcp_ct4 pinned "$_PIN_DIR/tcp_ct4" \
-        map name tcp_ct6 pinned "$_PIN_DIR/tcp_ct6" \
-        map name udp_ct4 pinned "$_PIN_DIR/udp_ct4" \
-        map name udp_ct6 pinned "$_PIN_DIR/udp_ct6" \
-        map name sctp_conntrack pinned "$_PIN_DIR/sctp_conntrack" \
-        map name xdp_runtime_cfg pinned "$_PIN_DIR/xdp_runtime_cfg" >/dev/null || {
-        echo "failed to load tc egress program against shared maps"
+test_known_zone_deny_blocks_global_admission() {
+    local port=7705 ifindex
+    ifindex=$(cat "/sys/class/net/$_VETH/ifindex") || return 1
+
+    _set_tcp_policy "$port" 1 || return 1
+    _set_tcp_zone_policy "$ifindex" "$port" 0 || return 1
+    _tcp_probe "$port" && {
+        echo "known-zone deny tombstone fell through to global admission"
         return 1
     }
-    tc qdisc add dev "$_VETH" clsact 2>/dev/null || true
-    tc filter replace dev "$_VETH" egress pref 49152 handle 1 \
-        bpf direct-action object-pinned "$_PIN_DIR/tc_egress_prog" >/dev/null || {
-        echo "failed to attach tc egress filter"
+
+    bpftool map delete pinned "$_PIN_DIR/tcp_zone_whitelist" \
+        key hex $(_u32le "$ifindex") $(_u32le "$port") >/dev/null || return 1
+    _tcp_probe "$port" || {
+        echo "global admission did not recover after zone tombstone removal"
         return 1
     }
 }
@@ -601,6 +1471,41 @@ _map_has_key() {
     local map_path="$1"
     shift
     bpftool map lookup pinned "$map_path" key hex "$@" >/dev/null 2>&1
+}
+
+_configure_exhausted_tcp_rate() {
+    local port="$1" rate_max="$2"
+    local policy_hex now_ns rate_val_hex outer_error
+    local inner_pin="$_PIN_DIR/it_syn4_$port"
+
+    policy_hex=$(python3 -c "
+import struct
+print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIIIII', $rate_max, 0, 0, 32, 128, 0, 0, 0)))
+")
+    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
+        key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1 || {
+        echo "tcp policy update failed"; return 1;
+    }
+
+    now_ns=$(_ktime_ns)
+    rate_val_hex=$(python3 -c "
+import struct
+tick = ($now_ns // 1_000_000) & 0xffffffff
+state = (tick << 32) | $rate_max
+print(' '.join(f'{b:02x}' for b in struct.pack('<Q', state)))
+")
+    bpftool map create "$inner_pin" type lru_hash key 4 value 8 \
+        entries 16384 name "s4_$port" flags 0 >/dev/null 2>&1 || {
+        echo "inner map create failed"; return 1;
+    }
+    outer_error=$(bpftool map update pinned "$_PIN_DIR/syn4" \
+        key hex $(_u32le "$port") value pinned "$inner_pin" 2>&1) || {
+        echo "rate outer map update failed: $outer_error"; return 1;
+    }
+    bpftool map update pinned "$inner_pin" \
+        key hex $(_ip4be "$_NS_IP") value hex $rate_val_hex >/dev/null 2>&1 || {
+        echo "rate inner map update failed"; return 1;
+    }
 }
 
 test_acl() {
@@ -619,286 +1524,30 @@ test_acl() {
     bpftool map update pinned "$_PIN_DIR/tcp_acl_v4" \
         key hex $key_hex value hex $val_hex >/dev/null 2>&1
 
-    # Explicitly clear the whitelist for this port — ACL must grant access on its own.
-    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $(_u32le "$port") value hex 00 00 00 00 >/dev/null 2>&1
+    # Source ACLs constrain/bypass mitigation but never create exposure.
+    _set_tcp_policy "$port" 0 || return 1
+    _tcp_probe "$port" && { echo "ACL widened a closed port"; return 1; }
 
-    _tcp_probe "$port" || { echo "SYN from ACL-permitted source was dropped"; return 1; }
+    _set_tcp_policy "$port" 1 || return 1
+    _configure_exhausted_tcp_rate "$port" 1 || return 1
+    _tcp_probe "$port" || { echo "ACL did not bypass mitigation on an exposed port"; return 1; }
 }
 
 test_rate_limit() {
     local port=7703 rate_max=2
 
     # Enable port in whitelist so the packet reaches the rate-limit check.
-    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1
+    _set_tcp_policy "$port" 1 || return 1
 
-    # tcp_port_policy_cfg: three rate/connection limits, two source prefixes,
-    # two additional connection limits, and padding (__u32 x 8).
-    local policy_hex
-    policy_hex=$(python3 -c "
-import struct
-print(' '.join(f'{b:02x}' for b in struct.pack('<IIIIIIII', $rate_max, 0, 0, 32, 128, 0, 0, 0)))
-")
-    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-        key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1
-
-    # syn_rate_val.state packs window tick (upper 32) and count (lower 32).
-    local now_ns rate_val_hex
-    now_ns=$(_ktime_ns)
-    rate_val_hex=$(python3 -c "
-import struct
-tick = ($now_ns // 1_000_000) & 0xffffffff
-state = (tick << 32) | $rate_max
-print(' '.join(f'{b:02x}' for b in struct.pack('<Q', state)))
-")
-    # Create a per-port inner LRU and install it into the syn4 outer slot for
-    # $port, then pre-fill the source's counter with count=rate_max inside the
-    # current window so the next SYN overflows. BPF_F_INNER_MAP is valid for
-    # array inner maps, not LRU hash maps; the latter are created with flags 0.
-    local inner_pin="$_PIN_DIR/it_syn4_$port" value_bytes=8
-    value_bytes=$(python3 -c '
-import json, subprocess, sys
-data = json.loads(subprocess.check_output(["bpftool", "-j", "map", "show", "pinned", sys.argv[1]]))
-if isinstance(data, list):
-    data = data[0]
-print(int(data.get("bytes_value", data.get("value_size", 8))))
-' "$_PIN_DIR/tsc4")
-    bpftool map create "$inner_pin" type lru_hash key 4 value "$value_bytes" \
-        entries 1024 name "s4_$port" flags 0 >/dev/null 2>&1 || {
-        echo "inner map create failed"; return 1; }
-    bpftool map update pinned "$_PIN_DIR/syn4" \
-        key hex $(_u32le "$port") value pinned "$inner_pin" >/dev/null 2>&1
-    bpftool map update pinned "$inner_pin" \
-        key hex $(_ip4be "$_NS_IP") value hex $rate_val_hex >/dev/null 2>&1
+    _configure_exhausted_tcp_rate "$port" "$rate_max" || return 1
 
     local probe_rc=0
     _tcp_probe "$port" && probe_rc=1
-    rm -f "$inner_pin"
     [ "$probe_rc" -eq 1 ] && { echo "rate-limited SYN was not dropped"; return 1; }
     return 0
 }
 
-test_connection_limits() {
-    local source_at=7710 prefix_below=7711 prefix_at=7712
-    local port_below=7713 port_at=7714 disabled=7715
-    local port policy_hex state_hex key_hex
-
-    for port in "$source_at" "$prefix_below" "$prefix_at" \
-            "$port_below" "$port_at" "$disabled"; do
-        bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-            key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1 || return 1
-    done
-
-    # Use a current 100-ms activity tick so the preloaded counter is live for
-    # the real BPF timeout check. The low word is the established count.
-    _connection_state_hex() {
-        local count="$1"
-        python3 -c "
-import struct, time
-tick = (time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 100_000_000) & 0xffffffff
-state = (tick << 32) | ($count & 0xffffffff)
-print(' '.join(f'{byte:02x}' for byte in struct.pack('<Q', state)))
-"
-    }
-
-    _connection_policy_hex() {
-        local source_max="$1" prefix_max="$2" port_max="$3"
-        python3 -c "
-import struct
-values = (0, 0, $source_max, 32, 128, $prefix_max, $port_max, 0)
-print(' '.join(f'{byte:02x}' for byte in struct.pack('<IIIIIIII', *values)))
-"
-    }
-
-    # Per-source cap at the limit drops.
-    policy_hex=$(_connection_policy_hex 2 0 0)
-    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-        key hex $(_u32le "$source_at") value hex $policy_hex >/dev/null 2>&1 || return 1
-    key_hex="$(_ip4be "$_NS_IP") $(_u32le "$source_at")"
-    state_hex=$(_connection_state_hex 2)
-    bpftool map update pinned "$_PIN_DIR/tsc4" \
-        key hex $key_hex value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$source_at" && { echo "SYN at per-source cap was not dropped"; return 1; }
-
-    # Per-prefix cap passes immediately below the limit and drops at it.
-    policy_hex=$(_connection_policy_hex 0 2 0)
-    for port in "$prefix_below" "$prefix_at"; do
-        bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-            key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1 || return 1
-    done
-    key_hex="$(_ip4be "$_NS_IP") $(_u32le "$prefix_below")"
-    state_hex=$(_connection_state_hex 1)
-    bpftool map update pinned "$_PIN_DIR/tsc_pfx4" \
-        key hex $key_hex value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$prefix_below" || { echo "SYN below per-prefix cap was dropped"; return 1; }
-
-    key_hex="$(_ip4be "$_NS_IP") $(_u32le "$prefix_at")"
-    state_hex=$(_connection_state_hex 2)
-    bpftool map update pinned "$_PIN_DIR/tsc_pfx4" \
-        key hex $key_hex value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$prefix_at" && { echo "SYN at per-prefix cap was not dropped"; return 1; }
-
-    # Per-port cap has the same boundary and does not depend on a source key.
-    policy_hex=$(_connection_policy_hex 0 0 2)
-    for port in "$port_below" "$port_at"; do
-        bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-            key hex $(_u32le "$port") value hex $policy_hex >/dev/null 2>&1 || return 1
-    done
-    state_hex=$(_connection_state_hex 1)
-    bpftool map update pinned "$_PIN_DIR/tsc_port" \
-        key hex $(_u32le "$port_below") value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$port_below" || { echo "SYN below per-port cap was dropped"; return 1; }
-
-    state_hex=$(_connection_state_hex 2)
-    bpftool map update pinned "$_PIN_DIR/tsc_port" \
-        key hex $(_u32le "$port_at") value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$port_at" && { echo "SYN at per-port cap was not dropped"; return 1; }
-
-    # A populated counter is inert when all connection-limit policy fields are
-    # zero, which is the public disabled-state contract.
-    policy_hex=$(_connection_policy_hex 0 0 0)
-    bpftool map update pinned "$_PIN_DIR/tcp_port_policies" \
-        key hex $(_u32le "$disabled") value hex $policy_hex >/dev/null 2>&1 || return 1
-    state_hex=$(_connection_state_hex 4294967295)
-    bpftool map update pinned "$_PIN_DIR/tsc_port" \
-        key hex $(_u32le "$disabled") value hex $state_hex >/dev/null 2>&1 || return 1
-    _tcp_probe "$disabled" || { echo "disabled connection cap dropped SYN"; return 1; }
-}
-
-test_connection_counter_cas_contention() {
-    local port=7716 per_worker=8 workers total
-    local ready_file server_pid client_pid state source_count prefix_count port_count
-    ready_file=$(mktemp)
-    workers=$(ip netns exec "$_NS" python3 -c 'import os; print(min(8, len(os.sched_getaffinity(0))))')
-    if [[ "$workers" -lt 2 ]]; then
-        test_log_warning "SKIP CAS contention needs at least two available CPUs"
-        rm -f "$ready_file"
-        return 0
-    fi
-    total=$((workers * per_worker))
-
-    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1 || return 1
-
-    python3 - "$port" "$total" <<'PYEOF' &
-import socket, sys, time
-
-port, total = map(int, sys.argv[1:])
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(("10.99.0.1", port))
-server.listen(total)
-connections = [server.accept()[0] for _ in range(total)]
-time.sleep(4)
-for connection in connections:
-    connection.close()
-server.close()
-PYEOF
-    server_pid=$!
-
-    ip netns exec "$_NS" python3 - "$port" "$workers" "$per_worker" "$ready_file" <<'PYEOF' &
-import multiprocessing as mp
-import os
-import socket
-import sys
-import time
-
-port, workers, per_worker = map(int, sys.argv[1:4])
-ready_file = sys.argv[4]
-cpus = sorted(os.sched_getaffinity(0))[:workers]
-mp.set_start_method("fork")
-start = mp.Event()
-close = mp.Event()
-ready = mp.Queue()
-
-def worker(cpu):
-    os.sched_setaffinity(0, {cpu})
-    start.wait()
-    connections = []
-    for _ in range(per_worker):
-        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        connection.connect(("10.99.0.1", port))
-        connections.append(connection)
-    ready.put(len(connections))
-    close.wait()
-    for connection in connections:
-        connection.close()
-
-processes = [mp.Process(target=worker, args=(cpu,)) for cpu in cpus]
-for process in processes:
-    process.start()
-start.set()
-connected = sum(ready.get(timeout=8) for _ in processes)
-with open(ready_file, "w", encoding="ascii") as output:
-    output.write(str(connected))
-time.sleep(2)
-close.set()
-for process in processes:
-    process.join(5)
-    if process.exitcode != 0:
-        raise SystemExit(f"worker exited with {process.exitcode}")
-PYEOF
-    client_pid=$!
-
-    for ((state = 0; state < 100; state++)); do
-        [[ ! -s "$ready_file" ]] || break
-        sleep 0.05
-    done
-    if [[ "$(cat "$ready_file")" != "$total" ]]; then
-        echo "concurrent clients did not establish all $total connections"
-        kill "$client_pid" "$server_pid" 2>/dev/null || true
-        wait "$client_pid" "$server_pid" 2>/dev/null || true
-        rm -f "$ready_file"
-        return 1
-    fi
-
-    state=$(_map_lookup_u64_offset \
-        "$_PIN_DIR/tsc4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0) || return 1
-    source_count=$((state & 0xFFFFFFFF))
-    state=$(_map_lookup_u64_offset \
-        "$_PIN_DIR/tsc_pfx4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0) || return 1
-    prefix_count=$((state & 0xFFFFFFFF))
-    state=$(_map_lookup_u64_offset "$_PIN_DIR/tsc_port" "$(_u32le "$port")" 0) || return 1
-    port_count=$((state & 0xFFFFFFFF))
-    if [[ "$source_count" -ne "$total" || "$prefix_count" -ne "$total" ||
-          "$port_count" -ne "$total" ]]; then
-        echo "CAS record mismatch expected=$total source=$source_count prefix=$prefix_count port=$port_count"
-        kill "$client_pid" "$server_pid" 2>/dev/null || true
-        wait "$client_pid" "$server_pid" 2>/dev/null || true
-        rm -f "$ready_file"
-        return 1
-    fi
-
-    wait "$client_pid" || return 1
-    wait "$server_pid" || return 1
-    rm -f "$ready_file"
-
-    for ((state = 0; state < 40; state++)); do
-        source_count=$(_map_lookup_u64_offset \
-            "$_PIN_DIR/tsc4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0)
-        prefix_count=$(_map_lookup_u64_offset \
-            "$_PIN_DIR/tsc_pfx4" "$(_ip4be "$_NS_IP") $(_u32le "$port")" 0)
-        port_count=$(_map_lookup_u64_offset \
-            "$_PIN_DIR/tsc_port" "$(_u32le "$port")" 0)
-        source_count=$((source_count & 0xFFFFFFFF))
-        prefix_count=$((prefix_count & 0xFFFFFFFF))
-        port_count=$((port_count & 0xFFFFFFFF))
-        [[ "$source_count" -ne 0 || "$prefix_count" -ne 0 || "$port_count" -ne 0 ]] || return 0
-        sleep 0.05
-    done
-    echo "CAS close mismatch source=$source_count prefix=$prefix_count port=$port_count"
-    return 1
-}
-
 test_service_restart() {
-    # Seed a conntrack entry before the reload to confirm prog re-pins cleanly.
-    local ct_key ct_val
-    ct_key="$(_u16be 6100) $(_u16be 7704) $(_ip4be "$_NS_IP") $(_ip4be "$_HOST_IP")"
-    ct_val=$(_u64le "$(_ktime_ns)")
-    bpftool map update pinned "$_PIN_DIR/tcp_ct4" \
-        key hex $ct_key value hex $ct_val >/dev/null 2>&1
-
     # Simulate service restart: detach, wipe pins, reload, re-attach.
     ip link set dev "$_VETH" xdpgeneric off 2>/dev/null || true
     rm -rf "$_PIN_DIR"
@@ -911,57 +1560,8 @@ test_service_restart() {
     xdp_maps_ready || { echo "maps not ready after reload"; return 1; }
 
     # Verify the newly loaded program passes traffic on a whitelisted port.
-    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $(_u32le 7705) value hex 01 00 00 00 >/dev/null 2>&1
+    _set_tcp_policy 7705 1 || return 1
     _tcp_probe 7705 || { echo "traffic not passing after service restart"; return 1; }
-}
-
-test_tc_egress_udp_reply() {
-    local sport=5200 dport=9902
-    local key_hex
-
-    _attach_tc_egress || return 1
-
-    python3 - "$_HOST_IP" "$dport" "$_NS_IP" "$sport" <<'PYEOF' &
-import socket, sys, time
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind((sys.argv[1], int(sys.argv[2])))
-time.sleep(0.2)
-s.sendto(b'axdp-tc', (sys.argv[3], int(sys.argv[4])))
-s.close()
-PYEOF
-    local send_pid=$!
-    sleep 0.4
-    wait "$send_pid" 2>/dev/null || true
-
-    # Reverse tuple recorded by tc: sport=remote, dport=local, saddr=remote, daddr=local.
-    key_hex="$(_u16be "$sport") $(_u16be "$dport") $(_ip4be "$_NS_IP") $(_ip4be "$_HOST_IP")"
-    _map_has_key "$_PIN_DIR/udp_ct4" $key_hex || {
-        echo "tc egress did not insert udp_ct4 reverse tuple"
-        return 1
-    }
-
-    local recv_file
-    recv_file=$(mktemp)
-    _udp_listen_py "$dport" >"$recv_file" 2>/dev/null &
-    local listen_pid=$!
-    sleep 0.15
-    ip netns exec "$_NS" python3 - "$_NS_IP" "$sport" "$_HOST_IP" "$dport" <<'PYEOF' 2>/dev/null
-import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind((sys.argv[1], int(sys.argv[2])))
-s.sendto(b'axdp-tc-reply', (sys.argv[3], int(sys.argv[4])))
-PYEOF
-    sleep 0.4
-    kill "$listen_pid" 2>/dev/null || true
-    wait "$listen_pid" 2>/dev/null || true
-    local got
-    got=$(<"$recv_file")
-    rm -f "$recv_file"
-    [[ "$got" == *"axdp-tc-reply"* ]] || {
-        echo "inbound UDP reply after tc-created conntrack was dropped"
-        return 1
-    }
 }
 
 test_ipv6_whitelist() {
@@ -970,14 +1570,12 @@ test_ipv6_whitelist() {
         dev "$_VETH" nud permanent 2>/dev/null || true
     ip netns exec "$_NS" ip -6 neigh replace "$_HOST_IP6" \
         lladdr "$(cat /sys/class/net/$_VETH/address)" dev "$_VETH_IN" nud permanent 2>/dev/null || true
-    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $(_u32le "$port") value hex 01 00 00 00 >/dev/null 2>&1
+    _set_tcp_policy "$port" 1 || return 1
     _tcp_probe "$port" "$_HOST_IP6" inet6 || {
         echo "IPv6 SYN to whitelisted port was dropped"
         return 1
     }
-    bpftool map update pinned "$_PIN_DIR/tcp_whitelist" \
-        key hex $(_u32le "$port") value hex 00 00 00 00 >/dev/null 2>&1
+    _set_tcp_policy "$port" 0 || return 1
     _tcp_probe "$port" "$_HOST_IP6" inet6 && {
         echo "IPv6 SYN to non-whitelisted port was not dropped"
         return 1
@@ -1088,25 +1686,392 @@ test_nftables_packet_path() {
     PYTHONPATH="$REPO_ROOT" python3 - <<'PYEOF' || return 1
 from auto_xdp import config as cfg
 from auto_xdp.backends.nftables import NftablesBackend
-from auto_xdp.state import DesiredState
+from auto_xdp.state import DesiredState, EndpointPolicy
 
 cfg.NFT_FAMILY = "inet"
 cfg.NFT_TABLE = "axdp_integ"
 cfg.BOGON_FILTER_ENABLED = False
 cfg.SLOT_DEFAULT_ACTION = "drop"
+endpoint = ("tcp", "*", 7707, "public")
 backend = NftablesBackend()
 try:
-    backend.reconcile(
-        DesiredState(tcp_ports={7707}, bogon_filter_enabled=False),
+    result = backend.reconcile(
+        DesiredState(
+            endpoint_policies={endpoint: EndpointPolicy(allow=True, reason="test grant")},
+            bogon_filter_enabled=False,
+        ),
         dry_run=False,
     )
+    assert result.successful, result
+    assert result.applied.endpoint_admission[endpoint] == "admitted", result
 finally:
     backend.close()
 PYEOF
 
     _tcp_probe 7707 || { echo "nftables did not accept SYN to allowed TCP port"; return 1; }
     _tcp_probe 7708 && { echo "nftables did not drop SYN to closed TCP port"; return 1; }
+    _tcp_probe 7707 "$_HOST_IP6" inet6 || { echo "nftables did not accept IPv6 SYN to allowed TCP port"; return 1; }
+    _tcp_probe 7708 "$_HOST_IP6" inet6 && { echo "nftables did not drop IPv6 SYN to closed TCP port"; return 1; }
     return 0
+}
+
+test_syncookie_listener_handoff() (
+    [[ $_SYNCOOKIE_LEVEL2 -eq 1 ]] || {
+        echo "SKIP: kernel lacks bpf_sk_assign_tcp_reqsk"
+        return 0
+    }
+    local port=7710 value_hex ready_file recv_file listener_pid="" sniff_pid="" live_counters gate_output mode
+    local attach_mode="${1:-generic}" detach_mode=xdpgeneric
+    local TOML_CONFIG="$_RUN_DIR/syncookie.toml"
+    local SYNCOOKIE_OBJ_PATH="$_SYNCOOKIE_OBJ" TC_SYNCOOKIE_OBJ_PATH="$_TC_SYNCOOKIE_OBJ"
+    local SYNCOOKIE_SYSCTL_STATE="$_RUN_DIR/syncookie-sysctl.json"
+    local -a AUTO_XDP_IFACES=("$_VETH")
+    export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+    ready_file=$(mktemp)
+    recv_file=$(mktemp)
+    cleanup_cookie() {
+        [[ -z "$listener_pid" ]] || kill "$listener_pid" 2>/dev/null || true
+        [[ -z "$listener_pid" ]] || wait "$listener_pid" 2>/dev/null || true
+        [[ -z "$sniff_pid" ]] || kill "$sniff_pid" 2>/dev/null || true
+        [[ -z "$sniff_pid" ]] || wait "$sniff_pid" 2>/dev/null || true
+        nft delete table ip axdp_cookie_nat 2>/dev/null || true
+        nft delete table inet axdp_cookie_ct 2>/dev/null || true
+        bpftool map delete pinned "$_PIN_DIR/syncookie_prog_array" \
+            key hex 00 00 00 00 >/dev/null 2>&1 || true
+        cleanup_syncookie_handoff 1
+        rm -f "$ready_file" "$recv_file" "$TOML_CONFIG"
+    }
+    trap cleanup_cookie EXIT
+    # Prove the real runtime refuses NAT before allowing a cookie challenge.
+    # Only this fixture-owned table in the isolated server namespace is changed.
+    nft add table ip axdp_cookie_nat || return 1
+    nft add chain ip axdp_cookie_nat output \
+        '{ type nat hook output priority dstnat; policy accept; }' || return 1
+    for mode in auto always; do
+        printf '[modules.syncookie]\nenabled = true\ndefault_mode = "%s"\n' "$mode" >"$TOML_CONFIG"
+        if gate_output=$(load_syncookie_program 2>&1); then
+            echo "SYN-cookie runtime bypassed the NAT compatibility check in mode=$mode"
+            return 1
+        fi
+        [[ "$gate_output" == *'error: refusing SYN-cookie enablement:'*NAT* \
+            && ! -d "$_PIN_DIR/modules/syncookie" ]] || {
+            printf 'SYN-cookie NAT rejection failed in mode=%s: %s\n' "$mode" "$gate_output"
+            return 1
+        }
+        printf 'SYN-cookie runtime rejected NAT in mode=%s: %s\n' "$mode" "$gate_output"
+    done
+    nft delete table ip axdp_cookie_nat || return 1
+    load_syncookie_program || return 1
+    python3 "$REPO_ROOT/tests/python/kernel_syncookie_module.py" \
+        "$_PIN_DIR" "$_SYNCOOKIE_OBJ" "$_TC_SYNCOOKIE_OBJ" "$TOML_CONFIG" "$_VETH" || return 1
+
+    if [[ "$attach_mode" == native ]]; then
+        # Native veth XDP_TX needs the peer's XDP/NAPI receive path as well.
+        clang -O2 -g -target bpf "${_include_args[@]}" -x c - \
+            -c -o "$_RUN_DIR/peer-pass.o" <<'CEOF' || return 1
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+SEC("xdp") int peer_pass(struct xdp_md *ctx) { return XDP_PASS; }
+char LICENSE[] SEC("license") = "GPL";
+CEOF
+        bpftool prog load "$_RUN_DIR/peer-pass.o" "$_PIN_DIR/peer_pass" \
+            type xdp || return 1
+        # ip netns exec remounts sysfs and hides this fixture's private pins.
+        nsenter --net="/run/netns/$_NS" ip link set dev "$_VETH_IN" \
+            xdpdrv pinned "$_PIN_DIR/peer_pass" || return 1
+        ip link set dev "$_VETH" xdpgeneric off || return 1
+        ip link set dev "$_VETH" xdpdrv pinned "$_PIN_DIR/prog" || return 1
+        detach_mode=xdpdrv
+    fi
+
+    ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_timestamps=1
+    ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_window_scaling=1
+    ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_sack=1
+    ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_ecn=1
+
+    _set_tcp_policy "$port" 1 || return 1
+    bpftool map update pinned "$_PIN_DIR/tcp_synck_policy" \
+        key hex $(_u32le "$port") value hex 02 00 00 00 || return 1
+    bpftool map update pinned "$_PIN_DIR/sync_port_limit" \
+        key hex $(_u32le "$port") value hex $(_u32le 1000) || return 1
+    value_hex=$(python3 -c '
+import struct
+print(" ".join(f"{b:02x}" for b in struct.pack("<IIIIQ", 1, 90, 200, 1000, 5_000_000_000)))
+') || return 1
+    bpftool map update pinned "$_PIN_DIR/sync_run_cfg" \
+        key hex 00 00 00 00 value hex $value_hex || return 1
+
+    live_counters=$(PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 - "$_PIN_DIR" <<'PYEOF'
+import json, sys
+from pathlib import Path
+from kernel_packet_telemetry import counter
+print(json.dumps({key: counter(Path(sys.argv[1]) / "pkt_counters", key)
+                  for key in (39, 40, 59, 60, 61, 62)}))
+PYEOF
+    ) || return 1
+
+    python3 - "$port" "$ready_file" "$recv_file" <<'PYEOF' &
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("10.99.0.1", int(sys.argv[1])))
+s.listen()
+open(sys.argv[2], "w").write("ready")
+s.settimeout(3)
+c, _ = s.accept()
+payload = c.recv(32)
+open(sys.argv[3], "wb").write(payload)
+c.sendall(b"ok")
+PYEOF
+    listener_pid=$!
+    for _ in {1..50}; do
+        [[ -s "$ready_file" ]] && break
+        sleep 0.02
+    done
+    ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" <<'PYEOF' || {
+import socket, sys
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.sendall(b"cookie")
+raise SystemExit(0 if s.recv(2) == b"ok" else 1)
+PYEOF
+        python3 - "$_PIN_DIR" <<'PYEOF' || true
+import json, subprocess, sys
+for key in (*range(38, 46), 59, 60, 61, 62):
+    row = json.loads(subprocess.check_output([
+        "bpftool", "-j", "map", "lookup", "pinned", sys.argv[1] + "/pkt_counters",
+        "key", "hex", *key.to_bytes(4, "little").hex(" ").split()], text=True))
+    values = row.get("values", [])
+    total = sum(int.from_bytes(bytes(int(x, 0) if isinstance(x, str) else x
+                                     for x in item["value"]), "little")
+                for item in values)
+    print(f"cookie_counter[{key}]={total}")
+PYEOF
+        bpftool map dump pinned "$_PIN_DIR/sync_handoff4" || true
+        kill "$listener_pid" 2>/dev/null || true
+        wait "$listener_pid" 2>/dev/null || true
+        return 1
+    }
+    wait "$listener_pid" || return 1
+    listener_pid=""
+    [[ $(<"$recv_file") == cookie ]] || return 1
+
+    # A successful handoff must also permit prompt client-first payloads.
+    # Exercise both families and a transfer larger than the bootstrap window.
+    rm -f "$ready_file" "$recv_file"
+    python3 "$REPO_ROOT/tests/python/kernel_syncookie_latency.py" server "$port" \
+        --ready "$ready_file" --output "$recv_file" --stale-conntrack \
+        --pin-dir "$_PIN_DIR" --interface "$_VETH" &
+    listener_pid=$!
+    for _ in {1..50}; do
+        [[ -s "$ready_file" ]] && break
+        sleep 0.02
+    done
+    if ! ip netns exec "$_NS" python3 \
+        "$REPO_ROOT/tests/python/kernel_syncookie_latency.py" client "$port"; then
+        test_log_error "SYN-cookie $attach_mode payload probe failed; server result and counters follow"
+        wait "$listener_pid" || true
+        listener_pid=""
+        [[ ! -s "$recv_file" ]] || cat "$recv_file"
+        PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 - "$_PIN_DIR" <<'PYEOF' || true
+import json, sys
+from pathlib import Path
+from kernel_packet_telemetry import counter
+print(json.dumps({key: counter(Path(sys.argv[1]) / "pkt_counters", key)
+                  for key in (*range(38, 46), 59, 60, 61, 62)}))
+PYEOF
+        ss -tin || true
+        return 1
+    fi
+    wait "$listener_pid" || return 1
+    listener_pid=""
+
+    # Known flows must not reach the cookie validator. After the client
+    # half-closes, the server socket is CLOSE_WAIT and conntrack has left
+    # ESTABLISHED; every client pure ACK of the server's bulk reply must pass.
+    # Round "socket": no ct reference in this netns, so conntrack misses and the
+    # validator must recognise the CLOSE_WAIT/LAST_ACK socket. Round
+    # "conntrack": a fixture table registers the hooks, so the main program
+    # skips the validator for the ORIGINAL-direction entry.
+    local round invalid_before invalid_after
+    for round in socket conntrack; do
+        if [[ $round == conntrack ]]; then
+            nft add table inet axdp_cookie_ct || return 1
+            nft add chain inet axdp_cookie_ct track \
+                '{ type filter hook input priority filter; policy accept; }' || return 1
+            nft add rule inet axdp_cookie_ct track ct state established counter || return 1
+        fi
+        invalid_before=$(PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 -c \
+            'import sys; from pathlib import Path; from kernel_packet_telemetry import counter; print(counter(Path(sys.argv[1]) / "pkt_counters", 41))' \
+            "$_PIN_DIR") || return 1
+        rm -f "$ready_file"
+        python3 - "$port" "$ready_file" <<'PYEOF' &
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("10.99.0.1", int(sys.argv[1])))
+s.listen()
+open(sys.argv[2], "w").write("ready")
+s.settimeout(5)
+c, _ = s.accept()
+c.settimeout(5)
+data = b""
+while chunk := c.recv(65536):
+    data += chunk
+if data != b"half-close":
+    raise SystemExit(f"unexpected request {data!r}")
+c.sendall(b"x" * (2 << 20))
+c.close()
+PYEOF
+        listener_pid=$!
+        for _ in {1..50}; do
+            [[ -s "$ready_file" ]] && break
+            sleep 0.02
+        done
+        ip netns exec "$_NS" python3 - "$_HOST_IP" "$port" "$round" <<'PYEOF' || return 1
+import socket, sys
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)
+s.sendall(b"half-close")
+s.shutdown(socket.SHUT_WR)
+total = 0
+try:
+    while chunk := s.recv(1 << 16):
+        total += len(chunk)
+except socket.timeout:
+    pass
+if total != 2 << 20:
+    raise SystemExit(f"{sys.argv[3]} round: half-closed transfer stalled at {total} bytes: "
+                     "client ACKs were dropped")
+print(f"{sys.argv[3]} round: half-closed bulk reply delivered with cookie validation active")
+PYEOF
+        wait "$listener_pid" || return 1
+        listener_pid=""
+        invalid_after=$(PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 -c \
+            'import sys; from pathlib import Path; from kernel_packet_telemetry import counter; print(counter(Path(sys.argv[1]) / "pkt_counters", 41))' \
+            "$_PIN_DIR") || return 1
+        [[ $round == conntrack ]] && { nft delete table inet axdp_cookie_ct || return 1; }
+        [[ "$invalid_after" == "$invalid_before" ]] || {
+            printf '%s round: SYN_COOKIE_INVALID advanced %s -> %s\n' \
+                "$round" "$invalid_before" "$invalid_after"
+            return 1
+        }
+    done
+
+    # Cookie handshakes negotiate ECN like a classic-ECN Linux listener: ECE
+    # alone in the SYN-ACK for classic and AccECN requests, plain ACKs
+    # afterwards, ECT data only when ECN was negotiated, and no ECN at all when
+    # the host refuses it (net.ipv4.tcp_ecn=0, mirrored into the runtime
+    # flags by the control plane). Echoing the SYN's CWR/AE used to pull
+    # classic clients into AccECN and make AccECN clients disable ECN while
+    # the handed-off socket kept sending ECT. Kernels before 7.0 have no
+    # AccECN (tcp_ecn=3); those rounds are skipped there.
+    local client_ecn host_ecn ecn_round ecn_mode host_refuses
+    local -a ecn_rounds=(0 1 1:host-refuses)
+    client_ecn=$(ip netns exec "$_NS" sysctl -n net.ipv4.tcp_ecn) || return 1
+    host_ecn=$(sysctl -n net.ipv4.tcp_ecn) || return 1
+    if ip netns exec "$_NS" sysctl -q -w net.ipv4.tcp_ecn=3 2>/dev/null; then
+        ecn_rounds+=(3)
+    else
+        printf 'SKIP: kernel lacks AccECN (tcp_ecn=3); AccECN round not run\n'
+    fi
+    for ecn_round in "${ecn_rounds[@]}"; do
+        ecn_mode=${ecn_round%%:*}
+        host_refuses=""
+        [[ $ecn_round == *:host-refuses ]] && host_refuses=host-refuses
+        ip netns exec "$_NS" sysctl -q -w "net.ipv4.tcp_ecn=$ecn_mode" || return 1
+        if [[ -n $host_refuses ]]; then
+            sysctl -q -w net.ipv4.tcp_ecn=0 || return 1
+            _set_runtime_cfg_flag 32 on || return 1
+        fi
+        rm -f "$ready_file" "$_RUN_DIR/cookie-ecn.json" "$_RUN_DIR/cookie-ecn.ready"
+        ip netns exec "$_NS" python3 "$REPO_ROOT/tests/python/kernel_syncookie_ecn.py" \
+            sniff "$_VETH_IN" "$port" "$_RUN_DIR/cookie-ecn.json" "$_RUN_DIR/cookie-ecn.ready" &
+        sniff_pid=$!
+        for _ in {1..100}; do
+            [[ -s "$_RUN_DIR/cookie-ecn.ready" ]] && break
+            sleep 0.02
+        done
+        python3 "$REPO_ROOT/tests/python/kernel_syncookie_ecn.py" \
+            server "$port" "$ready_file" $((4 << 20)) &
+        listener_pid=$!
+        for _ in {1..50}; do
+            [[ -s "$ready_file" ]] && break
+            sleep 0.02
+        done
+        ip netns exec "$_NS" python3 "$REPO_ROOT/tests/python/kernel_syncookie_ecn.py" \
+            client "$_HOST_IP" "$port" $((4 << 20)) || return 1
+        wait "$listener_pid" || return 1
+        listener_pid=""
+        wait "$sniff_pid" || return 1
+        sniff_pid=""
+        if [[ -n $host_refuses ]]; then
+            sysctl -q -w "net.ipv4.tcp_ecn=$host_ecn" || return 1
+            _set_runtime_cfg_flag 32 off || return 1
+        fi
+        python3 "$REPO_ROOT/tests/python/kernel_syncookie_ecn.py" \
+            check "$_RUN_DIR/cookie-ecn.json" "$ecn_mode" $host_refuses || return 1
+    done
+    ip netns exec "$_NS" sysctl -q -w "net.ipv4.tcp_ecn=$client_ecn" || return 1
+    python3 - "$_PIN_DIR" "$live_counters" <<'PYEOF' || return 1
+import json, subprocess, sys
+def counter(key):
+    raw = json.loads(subprocess.check_output([
+        "bpftool", "-j", "map", "lookup", "pinned", sys.argv[1] + "/pkt_counters",
+        "key", "hex", *key.to_bytes(4, "little").hex(" ").split()], text=True))
+    def scalar(value):
+        if isinstance(value, list):
+            data = bytes(int(x, 0) if isinstance(x, str) else x for x in value)
+            return int.from_bytes(data, "little")
+        return int(value, 0) if isinstance(value, str) else int(value)
+    values = raw.get("values", raw.get("value", []))
+    if values and isinstance(values[0], dict):
+        return sum(scalar(item["value"]) for item in values)
+    return scalar(values) if values else 0
+before = json.loads(sys.argv[2])
+counts = {key: counter(key) - before[str(key)] for key in (39, 40, 59, 60, 61, 62)}
+# Live handshake ACKs (plain after classic negotiation) reach the XDP
+# validator (VALID) and TC hands every one of them to the listener. Routing of
+# ECN/PSH-flagged ACKs is covered by the kernel_packet_telemetry cookie cases.
+for key in (39, 40, 59, 60):
+    if counts[key] <= 0:
+        raise SystemExit(f"SYN-cookie stage counter {key} did not advance: {counts}")
+if counts[61] or counts[62] or counts[59] != counts[60]:
+    raise SystemExit(f"SYN-cookie TC handoff was not entirely successful: {counts}")
+print(f"SYN-cookie accepted and echoed; shared stage counters={counts}")
+PYEOF
+    if [[ "$attach_mode" == native ]]; then
+        live_counters=$(PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 - "$_PIN_DIR" <<'PYEOF'
+import json, sys
+from pathlib import Path
+from kernel_packet_telemetry import counter
+print(json.dumps({key: counter(Path(sys.argv[1]) / "pkt_counters", key)
+                  for key in (38, 39, 53)}))
+PYEOF
+        ) || return 1
+        ip netns exec "$_NS" python3 "$REPO_ROOT/tests/python/kernel_syncookie_native.py" \
+            "$_VETH_IN" "$(cat "/sys/class/net/$_VETH/address")" "$port" || return 1
+        PYTHONPATH="$REPO_ROOT:$REPO_ROOT/tests/python" python3 - \
+            "$_PIN_DIR" "$live_counters" <<'PYEOF' || return 1
+import json, sys
+from pathlib import Path
+from kernel_packet_telemetry import counter
+before = json.loads(sys.argv[2])
+counts = {key: counter(Path(sys.argv[1]) / "pkt_counters", key) - before[str(key)]
+          for key in (38, 39, 53)}
+assert counts == {38: 200, 39: 200, 53: 0}, counts
+print(f"Native short-SYN counters: {counts}")
+PYEOF
+    fi
+    # Do not mix synthetic tuple state with the live listener proof above.
+    # Detach only this fixture before checking exact synthetic packet deltas.
+    ip link set dev "$_VETH" "$detach_mode" off || return 1
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_telemetry.py" \
+        cookie "$_PIN_DIR" "$_VETH" --port "$port" || return 1
+    PYTHONPATH="$REPO_ROOT" python3 "$REPO_ROOT/tests/python/kernel_packet_lengths.py" \
+        "$_PIN_DIR" "$_VETH" --port "$port" --cookie
+)
+
+test_syncookie_native_tailroom() {
+    test_syncookie_listener_handoff native
 }
 
 # ---------------------------------------------------------------------------
@@ -1124,12 +2089,29 @@ _run_kernel_test() {
 }
 
 trap - EXIT
+if [[ "${ONLY_SYNCOOKIE:-0}" == 1 ]]; then
+    _run_kernel_test syncookie_listener_handoff test_syncookie_listener_handoff
+    _run_kernel_test syncookie_native_tailroom test_syncookie_native_tailroom
+    _teardown
+    finish_tests
+    exit
+fi
+selected_tests=0
 while IFS= read -r function_name; do
     [[ -n "$function_name" ]] || continue
+    if [[ -n "${KERNEL_TEST_FILTER:-}" && \
+        "$function_name" != "test_${KERNEL_TEST_FILTER}" ]]; then
+        continue
+    fi
+    selected_tests=$((selected_tests + 1))
     _run_kernel_test "${function_name#test_}" "$function_name"
 done < <(
     discover_test_functions "${BASH_SOURCE[0]}"
 )
+if [[ "$selected_tests" -eq 0 ]]; then
+    test_log_error "no kernel test matched KERNEL_TEST_FILTER=${KERNEL_TEST_FILTER:-}"
+    exit 1
+fi
 _teardown
 
 finish_tests

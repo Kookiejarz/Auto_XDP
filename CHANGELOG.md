@@ -3,19 +3,58 @@
 All notable changes to this project are documented in this file.
 
 
+## 2026-08-31
+
+### Added
+- **Atomic nftables policy transactions** (`auto_xdp/backends/nftables.py`):
+  the fallback backend now applies ports, ACLs, rate limits, and bogon
+  filters as one versioned `nft` batch. Parse or kernel validation failure
+  keeps the previous table; v1 → v2 migration preserves active admission
+  sets so listeners never pass through an empty generation.
+- **Shipped default configuration** (`auto_xdp/default_config.toml`):
+  the installer now installs a documented default `config.toml` and the
+  package ships it as package data. Operator CLI (`axdp`) no longer carries
+  a second copy of the config schema.
+- **Hardened BPF dataplane state** (`bpf/include/rate_limit.h`, `tc_flow_track.c`):
+  long-lived TCP connections keep prefix and per-port aggregate counters
+  alive; map capacities are shared via `map_sizes.h` across XDP, tc, and
+  slot handlers.
+- **Secured packet-relay lifecycle** (`pkt_relay.py`):
+  the Unix event socket now checks peer credentials, locks a pidfile, and
+  creates its socket directory with restricted permissions before accepting
+  TUI/telemetry clients.
+
+### Fixed
+- **Discovery failures no longer wipe policy** (`auto_xdp/syncer.py`):
+  initial and periodic `DiscoveryError` keep the last applied policy instead
+  of reconciling to an empty port set.
+- **Installer bootstrap and release validation** (`lib/setup/`):
+  candidate runtime install now merges bootstrap and release checks so a
+  staged tree cannot be activated without the packages, BPF objects, and
+  service files it needs.
+
+### Changed
+- **Layered test suites** (`tests/run.sh`):
+  tests register with `# auto-xdp-test-suite:` metadata. Suites are
+  `static`, `unit`, `component`, `smoke`, `build`, `kernel`, `installed`,
+  and `uninstall`. CI runs a single Full Validation workflow instead of
+  separate typecheck / distro / e2e jobs.
+- **Installed-lifecycle coverage**:
+  new bash contracts cover nftables fallback, upgrade/rollback, installed
+  runtime behavior, and complete uninstall residue checks.
+
 ## 2026-07-06
 
 ### Changed
 - **Per-port rate-limit isolation via ARRAY_OF_MAPS** (`bpf/include/maps.h`):
   `syn4`, `syn6`, `udprt4`, `udprt6` are now `BPF_MAP_TYPE_ARRAY_OF_MAPS`
   outers indexed by destination port; the daemon creates one LRU inner map per
-  rate-limited port (`BPF_F_INNER_MAP`, capacity configurable via
-  `[rate_limits] map_entries_v4/map_entries_v6/map_entries_by_proc/map_entries_by_service`),
+  rate-limited port (with fixed capacity matching the compiled inner-map ABI),
   so a flood on one port can no longer evict another port's rate-limit state.
   Pin names are unchanged, but external scripts reading these maps must now
   dereference the inner map by dport.
-  **Kernel requirement**: the XDP backend now needs kernel 5.10+
-  (`BPF_F_INNER_MAP`); older kernels fall back to the nftables backend.
+  Unsupported dynamic inner-map capacity settings are rejected instead of
+  silently failing map installation.
 
 ### Added
 - **Map update failure reporting and kernel state verification** (Python):

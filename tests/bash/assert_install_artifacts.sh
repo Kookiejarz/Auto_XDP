@@ -63,13 +63,19 @@ test -x /usr/local/lib/auto_xdp/current/auto_xdp_start.sh
 test -f /usr/local/lib/auto_xdp/current/auto_xdp_bpf_helpers.py
 test -f /usr/local/lib/auto_xdp/current/release.json
 test -s /usr/local/lib/auto_xdp/current/xdp_firewall.o
-test -s /usr/local/lib/auto_xdp/current/tc_flow_track.o
+test -s /usr/local/lib/auto_xdp/current/tc_egress_dispatch.o
 test -s /usr/local/lib/auto_xdp/current/xdp_map_abi.txt
+for module in admin/cli.py admin/approvals.py admin/handler_catalog.py tui/app.py tui/widgets.py tui/handler_editor.py \
+              telemetry/events.py telemetry/relay_client.py discovery/listeners.py bpf/conntrack.py; do
+    test -s "/usr/local/lib/auto_xdp/current/python/auto_xdp/$module"
+done
 test ! -e /usr/local/bin/auto_xdp_start.sh
 test ! -e /usr/local/bin/xdp_port_sync.py
 test ! -e /usr/local/bin/pkt_relay.py
 test -f /etc/auto_xdp/config.toml
 test -d /etc/auto_xdp/handlers
+# Builtins belong to the immutable release; /etc holds operator handlers.
+test -s /usr/local/lib/auto_xdp/current/handlers/minecraft_handler.o
 command -v clang >/dev/null
 command -v bpftool >/dev/null
 

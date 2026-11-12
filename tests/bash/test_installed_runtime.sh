@@ -7,6 +7,8 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]:-}")/../.." && pwd)
 # shellcheck source=tests/bash/diagnostics.sh
 source "$REPO_ROOT/tests/bash/diagnostics.sh"
 enable_test_error_diagnostics
+# shellcheck source=tests/bash/testlib.sh
+source "$REPO_ROOT/tests/bash/testlib.sh"
 
 CONFIG_FILE="${CONFIG_FILE:-/etc/auto_xdp/auto_xdp.env}"
 AXDP_CMD="${AXDP_CMD:-/usr/local/bin/axdp}"
@@ -88,6 +90,7 @@ loader_pid=""
 relay_pid=""
 listener_pid=""
 event_monitor_pid=""
+approval_id=""
 e2e_ns="auto-xdp-runtime-e2e-$$"
 e2e_peer=""
 e2e_peer_moved=0
@@ -103,6 +106,9 @@ cleanup() {
     if [[ -n "$listener_pid" ]]; then
         kill -TERM "$listener_pid" 2>/dev/null || true
         wait "$listener_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$approval_id" ]]; then
+        "$AXDP_CMD" approval revoke "$approval_id" >/dev/null 2>&1 || true
     fi
     if [[ $e2e_peer_moved -eq 1 ]]; then
         ip netns exec "$e2e_ns" ip link set "$e2e_peer" netns 1 2>/dev/null || true
@@ -136,7 +142,8 @@ import json, sys
 try:
     value = json.load(sys.stdin).get("value", 0)
     if isinstance(value, list):
-        value = int.from_bytes(bytes(int(v, 0) if isinstance(v, str) else v for v in value), "little")
+        raw = bytes(int(v, 0) if isinstance(v, str) else v for v in value)
+        value = int.from_bytes(raw[:4], "little")
     elif isinstance(value, str):
         value = int(value, 0)
     print(int(value))
@@ -213,11 +220,11 @@ test_auto_port_sync_closed_loop() {
     ip netns exec "$e2e_ns" ip link set lo up
 
     e2e_listener_info=$(mktemp)
-    python3 - "$e2e_host_ip" <<'PY' >"$e2e_listener_info" 2>/tmp/auto-xdp-runtime-e2e-listener.log &
-import socket, sys, time
+    python3 - <<'PY' >"$e2e_listener_info" 2>/tmp/auto-xdp-runtime-e2e-listener.log &
+import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind((sys.argv[1], 0))
+s.bind(("0.0.0.0", 0))
 s.listen(8)
 print(s.getsockname()[1], flush=True)
 try:
@@ -238,6 +245,17 @@ PY
     [[ -s "$e2e_listener_info" ]] || fail "timed out waiting for E2E TCP listener"
     port=$(<"$e2e_listener_info")
     [[ "$port" =~ ^[0-9]+$ ]] || fail "invalid E2E listener port: $port"
+    local resolver_key resolver_value approval_output
+    read -r resolver_key resolver_value < <(listener_resolver "$listener_pid") \
+        || fail "E2E listener process identity is unavailable"
+    approval_output=$("$AXDP_CMD" approval request runtime-e2e public tcp "$port" \
+        "--${resolver_key//_/-}" "$resolver_value" --reason "installed XDP runtime E2E" 2>&1) \
+        || fail "could not create E2E exposure approval: $approval_output"
+    approval_id=${approval_output##*#}
+    [[ "$approval_id" =~ ^[0-9]+$ ]] || fail "could not parse E2E approval id"
+    "$AXDP_CMD" approval approve "$approval_id" >/dev/null \
+        || fail "could not approve E2E exposure"
+    [[ -z "$loader_pid" ]] || kill -HUP "$loader_pid"
     key_hex=$(python3 - "$port" <<'PY'
 import struct, sys
 print(" ".join(f"{byte:02x}" for byte in struct.pack("<I", int(sys.argv[1]))))
@@ -302,6 +320,7 @@ PY
     kill -TERM "$listener_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
     listener_pid=""
+    [[ -z "$loader_pid" ]] || kill -HUP "$loader_pid"
     wait_for_tcp_policy "$port" 0
     _tcp_probe_from_netns "$e2e_ns" "$e2e_host_ip" "$port" \
         && fail "SYN to automatically closed TCP listener was not dropped"
@@ -316,6 +335,9 @@ PY
         event_monitor_pid=""
         rm -f "$event_log"
     fi
+    "$AXDP_CMD" approval revoke "$approval_id" >/dev/null \
+        || fail "could not revoke E2E exposure approval"
+    approval_id=""
     printf '[INFO] runtime-e2e: automatic TCP port sync opened and closed port %s\n' "$port"
 }
 
@@ -356,9 +378,47 @@ wait_for_path "$BPF_PIN_DIR/sock_state_prog"
 wait_for_path "$BPF_PIN_DIR/sock_state_rb"
 wait_for_socket "$socket_path"
 
-tc filter show dev "$iface" egress 2>/dev/null \
-    | grep -q 'pref 49152' \
-    || fail "installed TC egress filter is not active on $iface"
+# Pinned maps and the relay socket can precede tracepoint attachment. Confirm
+# a fresh event before opening the listener whose complete lifecycle we assert.
+if [[ "${REQUIRE_SOCK_STATE_EVENT:-0}" == "1" ]]; then
+    python3 - "$socket_path" "$RUNTIME_E2E_WAIT_SECONDS" <<'PYREADY'
+import json, socket, sys, time
+
+started = time.monotonic_ns()
+deadline = time.monotonic() + float(sys.argv[2])
+ports = set()
+pending = b""
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.settimeout(0.2)
+    client.connect(sys.argv[1])
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            ports.add(probe.getsockname()[1])
+            probe.listen(1)
+        try:
+            chunk = client.recv(65536)
+        except socket.timeout:
+            continue
+        if not chunk:
+            raise SystemExit("relay disconnected while waiting for socket tracking")
+        pending += chunk
+        while b"\n" in pending:
+            raw, pending = pending.split(b"\n", 1)
+            if not raw:
+                continue
+            message = json.loads(raw)
+            events = message.get("events", []) if message.get("type") == "history" else [message]
+            if any(event.get("type") == "port_change"
+                   and event.get("proto") == "tcp"
+                   and event.get("action") == "open"
+                   and event.get("port") in ports
+                   and event.get("ts_ns", 0) >= started for event in events):
+                print("[INFO] runtime-e2e: socket tracking is ready")
+                raise SystemExit(0)
+raise SystemExit("timed out waiting for real socket tracking events")
+PYREADY
+fi
 
 test_auto_port_sync_closed_loop
 
@@ -367,4 +427,4 @@ if [[ $systemd_mode -eq 1 ]]; then
     systemctl is-active --quiet auto-xdp-relay
 fi
 
-printf '[INFO] installed runtime: XDP + TC + sock_state + relay passed\n'
+printf '[INFO] installed runtime: XDP + sock_state + relay passed\n'

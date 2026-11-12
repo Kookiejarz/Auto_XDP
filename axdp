@@ -4,6 +4,7 @@ set -euo pipefail
 CONFIG_FILE="/etc/auto_xdp/auto_xdp.env"
 TOML_CONFIG="/etc/auto_xdp/config.toml"
 CONFIG_DIR="/etc/auto_xdp"
+APPROVAL_STORE="${CONFIG_DIR}/approval_requests.json"
 RELAY_GROUP="auto-xdp"
 RELAY_GROUP_MARKER="${CONFIG_DIR}/.relay-group-created"
 RUN_STATE_DIR="/run/auto_xdp"
@@ -42,16 +43,24 @@ Commands:
   tui [args...]          Open htop-like live TUI
   watch [args...]        Shorthand for: stats --watch
   ports [args...]        Show currently allowed TCP/UDP ports
+  discover               Show discovered services and exposure decisions
+  exposure               Show live service-aware exposure decisions
+  explain PROTO/PORT     Explain one runtime endpoint authorization decision
   backend                Show active backend and runtime attachment state
-  conntrack [args...]    Show TCP/UDP conntrack visibility
   sync [args...]         Run one sync pass with automatic backend selection
   check-update [args...] Compare installed files against GitHub and update
   log-level [LVL]        Show or change daemon log level
   under-attack [on|off] Show or change under-attack mode
   start                  Start the installed service
-  stop                   Stop the installed service
+  stop                   Stop the controller (active data plane remains)
   restart                Restart the installed service
   status                 Show service status
+  allow TARGET PROTO/PORT [options]   Grant a systemd unit or docker:<id>
+  deny TARGET PROTO/PORT [options]    Remove a service/container grant
+  grants                 List service exposure grants
+  mode [observe|audit|enforce]        Show or change activation mode
+  enable [--force]       Validate and activate the configured policy
+  disable [audit|observe] Detach the data plane and continue discovery
   uninstall [IFACE...]   Completely remove Auto XDP from this host
   config show            Show current TOML config
   config init            Create default config.toml (if missing)
@@ -61,9 +70,14 @@ Commands:
   acl list               List per-CIDR port ACL rules
   acl add PROTO CIDR PORT...  Add an ACL rule (proto: tcp|udp)
   acl del PROTO CIDR     Remove an ACL rule
-  permanent list         List permanently whitelisted ports
-  permanent add PROTO PORT [LABEL]  Add a permanent port (tcp|udp|sctp)
-  permanent del PROTO PORT          Remove a permanent port
+  policy grants          List approved service exposure grants
+  approval list          List exposure approval requests
+  approval history       Show immutable approval audit history
+  approval request ...   Create an exposure approval request
+  approval approve ID    Approve a request and apply its grant
+  approval reject ID     Reject a request
+  approval revoke ID     Revoke a request's applied grant
+  approval-api           Run the root-only Unix-socket management API
   slot list              List loaded and available protocol slot handlers
   slot load NAME         Load built-in handler: gre, esp, sctp
   slot load PROTO PATH   Load custom handler .o or compile/load .c for IP proto number
@@ -71,6 +85,10 @@ Commands:
   port-handler list                          List loaded TCP/UDP port handlers
   port-handler load tcp|udp PORT PATH        Load custom handler .o or compile/load .c for a port
   port-handler unload tcp|udp PORT           Remove handler from a port
+  handler list [--json]                      Discover local modules and runtime programs
+  handler install PATH [--name NAME]         Install a local handler source/object/package
+  handler config NAME [--set KEY=VALUE]      Show or save module configuration
+  handler apply NAME [--set KEY=VALUE]       Apply module configuration
   exclude list                              List discovery exclusions
   exclude port add PORT [PORT...]           Exclude port(s) from discovery
   exclude port del PORT [PORT...]           Remove port exclusion(s)
@@ -93,10 +111,6 @@ Ports options:
   --watch              Refresh continuously and detect changes
   --interval SEC       Refresh interval in seconds (default: 2)
 
-Conntrack options:
-  tcp|udp|all         Select conntrack map view (default: all)
-  --limit N           Show top N destination ports per map (default: 10)
-
 Check-update options:
   --force              Apply all updates without prompting
 
@@ -106,22 +120,23 @@ EOF
 
 run_service_cmd() {
     local action="$1"
+    local service_status=0
 
     if command -v systemctl >/dev/null 2>&1 && [[ -d "$SYSTEMD_RUN_DIR" ]]; then
-        systemctl "$action" "$SERVICE_NAME"
+        systemctl "$action" "$SERVICE_NAME" || service_status=$?
         if systemctl list-unit-files "${RELAY_SERVICE_NAME}.service" >/dev/null 2>&1; then
             systemctl "$action" "$RELAY_SERVICE_NAME" || true
         else
             echo "Relay service not installed yet. Re-run setup_xdp.sh --force to install ${RELAY_SERVICE_NAME}." >&2
         fi
-        return 0
+        return "$service_status"
     fi
 
     if command -v rc-service >/dev/null 2>&1; then
-        rc-service "$SERVICE_NAME" "$action"
+        rc-service "$SERVICE_NAME" "$action" || service_status=$?
         rc-service "$RELAY_SERVICE_NAME" "$action" 2>/dev/null || \
             echo "Relay service not installed yet. Re-run setup_xdp.sh --force to install ${RELAY_SERVICE_NAME}." >&2
-        return 0
+        return "$service_status"
     fi
 
     echo "No supported init system detected for service control." >&2
@@ -269,8 +284,43 @@ run_uninstall() {
         return 1
     fi
 
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl disable --now "$SERVICE_NAME" "$RELAY_SERVICE_NAME" >/dev/null 2>&1 || true
+    local systemd_mode=0 unit load_state active_state enabled_state enabled_status
+    local -a uninstall_units=("$RELAY_SERVICE_NAME.service" "$SERVICE_NAME.service")
+    if [[ -d "$SYSTEMD_RUN_DIR" ]]; then
+        command -v systemctl >/dev/null 2>&1 || {
+            printf 'Cannot stop systemd services: systemctl is missing.\n' >&2
+            return 1
+        }
+        systemd_mode=1
+        # Refresh stale units when retrying after files were already removed.
+        systemctl daemon-reload || return 1
+        for unit in "${uninstall_units[@]}"; do
+            load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
+            [[ -n "$load_state" ]] || return 1
+            if [[ "$load_state" != not-found ]]; then
+                systemctl disable --now "$unit" || return 1
+                systemctl disable --runtime "$unit" || return 1
+            else
+                # A partially removed unit may still have a running process.
+                active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+                case "$active_state" in
+                    inactive|failed) ;;
+                    *) systemctl stop "$unit" || return 1 ;;
+                esac
+            fi
+            active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+            case "$active_state" in
+                inactive|failed) ;;
+                *) printf 'Refusing to uninstall while %s is %s.\n' "$unit" "$active_state" >&2; return 1 ;;
+            esac
+            enabled_status=0
+            enabled_state=$(systemctl is-enabled "$unit") || enabled_status=$?
+            # is-enabled returns nonzero for disabled and absent units.
+            case "$enabled_status:$enabled_state" in
+                0:static|1:disabled|1:masked|1:masked-runtime|4:not-found) ;;
+                *) printf 'Cannot verify %s is disabled (%s).\n' "$unit" "$enabled_state" >&2; return 1 ;;
+            esac
+        done
     fi
     if command -v rc-service >/dev/null 2>&1; then
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
@@ -282,7 +332,7 @@ run_uninstall() {
     fi
     _stop_runtime_processes
 
-    local iface failures=0
+    local iface direction pref tc_filters xdp_details xdp_mode failures=0
     if ! command -v ip >/dev/null 2>&1; then
         printf 'ip command is required to detach XDP programs.\n' >&2
         return 1
@@ -295,26 +345,43 @@ run_uninstall() {
         ip link set dev "$iface" xdp off >/dev/null 2>&1 || true
         ip link set dev "$iface" xdpgeneric off >/dev/null 2>&1 || true
         ip link set dev "$iface" xdpoffload off >/dev/null 2>&1 || true
-        if ip -d link show dev "$iface" 2>/dev/null \
-                | grep -Eq 'prog/xdp|xdpgeneric|xdpoffload|(^|[[:space:]])xdp([[:space:]]|$)'; then
-            printf 'Failed to detach XDP from %s.\n' "$iface" >&2
+        if command -v tc >/dev/null 2>&1; then
+            for direction in ingress egress; do
+                pref=49151
+                [[ "$direction" != egress ]] || pref=49153
+                # Missing filters are harmless; failed or unreadable cleanup is not.
+                tc filter del dev "$iface" "$direction" protocol all pref "$pref" \
+                    handle 2 bpf >/dev/null 2>&1 || true
+                if ! tc_filters=$(tc -j filter show dev "$iface" "$direction" pref "$pref") \
+                    || ! python3 -c '
+import json, sys
+sys.exit(any(row.get("kind") == "bpf" and
+             str(row.get("options", {}).get("handle", "")) in ("0x2", "2")
+             for row in json.load(sys.stdin)))
+' <<< "$tc_filters"; then
+                    printf 'Cannot verify Auto XDP TC filter removal on %s %s (pref %s).\n' \
+                        "$iface" "$direction" "$pref" >&2
+                    failures=1
+                fi
+            done
+        else
+            printf 'tc command is required to verify TC filter removal on %s.\n' "$iface" >&2
+            failures=1
+        fi
+        if ! xdp_details=$(ip -j -d link show dev "$iface" 2>/dev/null) \
+                || ! xdp_mode=$(run_py_module auto_xdp.xdp_link <<< "$xdp_details") \
+                || [[ "$xdp_mode" != "off" && "$xdp_mode" != "missing" ]]; then
+            printf 'Failed to verify XDP removal from %s.\n' "$iface" >&2
             failures=1
         fi
 
-        if command -v tc >/dev/null 2>&1; then
-            tc filter del dev "$iface" egress \
-                protocol all pref 49152 handle 1 bpf >/dev/null 2>&1 || true
-            if tc filter show dev "$iface" egress pref 49152 handle 1 2>/dev/null | grep -q .; then
-                printf 'Failed to remove Auto XDP tc filter from %s.\n' "$iface" >&2
-                failures=1
-            fi
-        else
-            printf 'tc command is required to remove the egress tracker from %s.\n' "$iface" >&2
-            failures=1
-        fi
     done
 
     if command -v nft >/dev/null 2>&1; then
+        # Keep tracking alive if any data-plane detach could not be verified.
+        if [[ $failures -eq 0 ]]; then
+            PYTHONPATH="${PYTHON_LIB_DIR}" python3 -m auto_xdp.bpf.conntrack --remove || failures=1
+        fi
         nft delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
         if nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
             printf 'Failed to remove nftables table %s %s.\n' "$NFT_FAMILY" "$NFT_TABLE" >&2
@@ -330,20 +397,39 @@ run_uninstall() {
         return 1
     fi
 
-    _remove_owned_tree "${BPF_PIN_DIR}_next" "xdp_fw_next" || failures=1
-    _remove_owned_tree "${BPF_PIN_DIR}_rollback" "xdp_fw_rollback" || failures=1
-    _remove_owned_tree "$BPF_PIN_DIR" "xdp_fw" || failures=1
-
     _remove_owned_file "$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service" "${SERVICE_NAME}.service" || failures=1
     _remove_owned_file "$SYSTEMD_UNIT_DIR/${RELAY_SERVICE_NAME}.service" "${RELAY_SERVICE_NAME}.service" || failures=1
+    # Also remove installer-owned boot links if no systemd manager is running,
+    # or the unit was already missing and its enablement link is dangling.
+    for unit in "${uninstall_units[@]}"; do
+        _remove_owned_file "$SYSTEMD_UNIT_DIR/multi-user.target.wants/$unit" "$unit" || failures=1
+        _remove_owned_file "$SYSTEMD_RUN_DIR/multi-user.target.wants/$unit" "$unit" || failures=1
+    done
     _remove_owned_file "$OPENRC_INIT_DIR/$SERVICE_NAME" "$SERVICE_NAME" || failures=1
     _remove_owned_file "$OPENRC_INIT_DIR/$RELAY_SERVICE_NAME" "$RELAY_SERVICE_NAME" || failures=1
     _remove_owned_file "$OPENRC_RUN_DIR/${SERVICE_NAME}.pid" "${SERVICE_NAME}.pid" || failures=1
     _remove_owned_file "$OPENRC_RUN_DIR/${RELAY_SERVICE_NAME}.pid" "${RELAY_SERVICE_NAME}.pid" || failures=1
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ $systemd_mode -eq 1 ]]; then
+        systemctl daemon-reload || return 1
+        for unit in "${uninstall_units[@]}"; do
+            active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+            if [[ "$active_state" == failed ]]; then
+                systemctl reset-failed "$unit" || return 1
+                active_state=$(systemctl show --property=ActiveState --value "$unit") || return 1
+            fi
+            load_state=$(systemctl show --property=LoadState --value "$unit") || return 1
+            if [[ "$active_state" != inactive || "$load_state" != not-found ]]; then
+                printf 'Systemd unit %s remains (%s/%s); keeping runtime files for retry.\n' \
+                    "$unit" "$load_state" "$active_state" >&2
+                return 1
+            fi
+        done
     fi
+    [[ $failures -eq 0 ]] || return 1
 
+    _remove_owned_tree "${BPF_PIN_DIR}_next" "xdp_fw_next" || failures=1
+    _remove_owned_tree "${BPF_PIN_DIR}_rollback" "xdp_fw_rollback" || failures=1
+    _remove_owned_tree "$BPF_PIN_DIR" "xdp_fw" || failures=1
     _remove_owned_tree "$INSTALL_ROOT" "auto_xdp" || failures=1
     _remove_owned_tree "$RUN_STATE_DIR" "auto_xdp" || failures=1
     _remove_owned_relay_group || failures=1
@@ -393,7 +479,8 @@ PY_BOOTSTRAP='import sys, runpy; sys.path[:] = [p for p in sys.path if p]; runpy
 run_py_module() {
     local module="$1"
     shift
-    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -c "$PY_BOOTSTRAP" "$module" "$@"
+    AUTO_XDP_APPROVAL_STORE="$APPROVAL_STORE" PYTHONPATH="${PYTHON_LIB_DIR}" \
+        python3 -c "$PY_BOOTSTRAP" "$module" "$@"
 }
 
 require_admin_cli_runtime() {
@@ -404,7 +491,7 @@ import sys
 sys.path[:] = [p for p in sys.path if p]
 
 try:
-    from auto_xdp import admin_cli
+    from auto_xdp.admin import cli as admin_cli
     parser = admin_cli.build_parser()
 except Exception:
     raise SystemExit(1)
@@ -431,11 +518,12 @@ if sys.argv[1] not in choices:
 }
 
 run_admin_config() {
-    run_py_module auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin.cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
         --handlers-dir "$HANDLERS_DIR" \
+        --run-state-dir "$RUN_STATE_DIR" \
         "$@"
 }
 
@@ -483,12 +571,6 @@ run_backend() {
     run_admin_runtime backend "$@"
 }
 
-run_conntrack() {
-    run_admin_config conntrack "$@"
-}
-
-
-
 run_ports() {
     require_admin_cli_runtime ports
 
@@ -497,20 +579,130 @@ run_ports() {
         [[ "$arg" == "watch" ]] && arg="--watch"
         args+=("$arg")
     done
-    run_py_module auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin.cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
         --run-state-dir "$RUN_STATE_DIR" \
         --nft-family "$NFT_FAMILY" \
         --nft-table "$NFT_TABLE" \
+        --iface "${IFACES:-${IFACE:-}}" \
         ports "${args[@]}"
+}
+
+run_exposure() {
+    require_admin_cli_runtime exposure
+    run_admin_config exposure "$@"
+}
+
+run_explain() {
+    require_admin_cli_runtime explain
+    run_admin_config explain "$@"
+}
+
+run_allow() {
+    require_admin_cli_runtime allow
+    require_root "allow"
+    [[ -f "$TOML_CONFIG" ]] || run_config init
+    run_admin_config allow "$@"
+}
+
+run_deny() {
+    require_admin_cli_runtime deny
+    require_root "deny"
+    run_admin_config deny "$@"
+}
+
+remote_access_is_granted() {
+    [[ -n "${SSH_CONNECTION:-}" ]] || return 0
+    local _client_ip _client_port _server_ip server_port explanation
+    read -r _client_ip _client_port _server_ip server_port <<< "$SSH_CONNECTION"
+    [[ "$server_port" =~ ^[0-9]+$ ]] || return 1
+    explanation=$(run_admin_config explain "tcp/$server_port") || return 1
+    grep -q '^ALLOW$' <<< "$explanation" && ! grep -q '^BLOCK$' <<< "$explanation"
+}
+
+run_enable() {
+    require_root "enable"
+    local force=0
+    if [[ "${1:-}" == "--force" ]]; then
+        force=1
+        shift
+    fi
+    [[ $# -eq 0 ]] || { echo "Usage: axdp enable [--force]" >&2; return 1; }
+    [[ -f "$TOML_CONFIG" ]] || run_config init
+    if [[ $force -eq 0 ]] && ! remote_access_is_granted; then
+        echo "Refusing to enable: the current SSH listener has no matching grant." >&2
+        echo "Allow it first, or use axdp enable --force from a recovery console." >&2
+        return 1
+    fi
+    run_admin_config policy mode enforce >/dev/null || return 1
+    if ! run_service_cmd restart; then
+        run_admin_config policy mode audit >/dev/null || true
+        run_service_cmd start || true
+        echo "Enable failed; policy returned to audit mode." >&2
+        return 1
+    fi
+    # Service managers return before the launcher finishes attaching the data plane.
+    local deadline=$((SECONDS + 40)) backend_report
+    until backend_report=$(run_backend 2>&1); do
+        if (( SECONDS >= deadline )); then
+            printf 'Enable failed: backend did not become healthy within 40 seconds.\n%s\n' \
+                "$backend_report" >&2
+            SYSTEMD_PAGER=cat PAGER=cat run_service_cmd status >&2 || true
+            if ! run_disable audit; then
+                echo "Automatic rollback failed; check axdp status before retrying." >&2
+            fi
+            return 1
+        fi
+        sleep 0.2
+    done
+    echo "Auto XDP enforcement enabled."
+    printf '%s\n' "$backend_report"
+}
+
+run_disable() {
+    local target_mode="${1:-audit}" previous_mode
+    [[ $# -le 1 ]] || { echo "Usage: axdp disable [audit|observe]" >&2; return 1; }
+    [[ "$target_mode" == "audit" || "$target_mode" == "observe" ]] \
+        || { echo "disable mode must be audit or observe" >&2; return 1; }
+    require_root "disable"
+    previous_mode=$(run_admin_config policy mode) || return 1
+    run_admin_config policy mode "$target_mode" >/dev/null || return 1
+    if ! run_service_cmd stop; then
+        run_admin_config policy mode "$previous_mode" >/dev/null || true
+        echo "Disable failed: could not stop the policy controller." >&2
+        return 1
+    fi
+    if ! run_admin_runtime deactivate; then
+        run_admin_config policy mode "$previous_mode" >/dev/null || true
+        run_service_cmd start || true
+        echo "Disable failed; restored policy mode $previous_mode." >&2
+        return 1
+    fi
+    run_service_cmd start
+    echo "Auto XDP data plane disabled; discovery continues in $target_mode mode."
+}
+
+run_mode() {
+    local mode="${1:-}"
+    if [[ -z "$mode" ]]; then
+        run_admin_config policy mode
+        return
+    fi
+    shift
+    [[ $# -eq 0 ]] || { echo "Usage: axdp mode [observe|audit|enforce]" >&2; return 1; }
+    case "$mode" in
+        enforce) run_enable ;;
+        audit|observe) run_disable "$mode" ;;
+        *) echo "Usage: axdp mode [observe|audit|enforce]" >&2; return 1 ;;
+    esac
 }
 
 run_stats() {
     require_admin_cli_runtime stats
 
-    run_py_module auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin.cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
@@ -524,10 +716,11 @@ run_stats() {
 run_tui() {
     require_admin_cli_runtime tui
 
-    run_py_module auto_xdp.admin_cli \
+    run_py_module auto_xdp.admin.cli \
         --config "$TOML_CONFIG" \
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
+        --handlers-dir "$HANDLERS_DIR" \
         --run-state-dir "$RUN_STATE_DIR" \
         --nft-family "$NFT_FAMILY" \
         --nft-table "$NFT_TABLE" \
@@ -666,29 +859,52 @@ run_acl() {
     esac
 }
 
-run_permanent() {
-    local sub="${1:-list}"
+run_policy() {
+    local sub="${1:-grants}"
     shift || true
-    case "$sub" in add|del) require_root "permanent $sub" ;; esac
     case "$sub" in
-        list)
-            run_admin_config permanent list
+        grants)
+            require_admin_cli_runtime policy
+            run_admin_config policy grants "$@"
             ;;
-        add)
-            [[ -f "$TOML_CONFIG" ]] || run_config init
-            run_admin_config permanent add "$@"
-            reload_daemon
-            ;;
-        del)
-            run_admin_config permanent del "$@"
-            reload_daemon
+        mode)
+            run_mode "$@"
             ;;
         -h|--help)
-            echo "Usage: axdp permanent list|add tcp|udp|sctp PORT [LABEL]|del tcp|udp|sctp PORT"
+            echo "Usage: axdp policy grants [--json]|mode [observe|audit|enforce]"
             ;;
         *)
-            echo "Unknown permanent subcommand: $sub" >&2; exit 1 ;;
+            echo "Unknown policy subcommand: $sub" >&2; exit 1 ;;
     esac
+}
+
+run_approval() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list|history)
+            require_admin_cli_runtime approval
+            require_root "approval $sub"
+            run_admin_config approval "$sub" "$@"
+            ;;
+        request|approve|reject|revoke)
+            require_admin_cli_runtime approval
+            require_root "approval $sub"
+            [[ -f "$TOML_CONFIG" ]] || run_config init
+            run_admin_config approval "$sub" "$@"
+            ;;
+        -h|--help)
+            echo "Usage: axdp approval list|history|request SUBJECT ZONE PROTO PORT...|approve ID|reject ID|revoke ID"
+            ;;
+        *)
+            echo "Unknown approval subcommand: $sub" >&2; exit 1 ;;
+    esac
+}
+
+run_approval_api() {
+    require_admin_cli_runtime approval-api
+    require_root "approval-api"
+    run_admin_config approval-api "$@"
 }
 
 run_slot() {
@@ -792,13 +1008,17 @@ main() {
             shift || true
             run_ports "$@"
             ;;
+        discover|exposure)
+            shift || true
+            run_exposure "$@"
+            ;;
+        explain)
+            shift || true
+            run_explain "$@"
+            ;;
         backend)
             shift || true
             run_backend "$@"
-            ;;
-        conntrack)
-            shift || true
-            run_conntrack "$@"
             ;;
         sync)
             shift || true
@@ -830,9 +1050,41 @@ main() {
             shift || true
             run_acl "$@"
             ;;
-        permanent)
+        policy)
             shift || true
-            run_permanent "$@"
+            run_policy "$@"
+            ;;
+        grants)
+            shift || true
+            run_policy grants "$@"
+            ;;
+        allow)
+            shift || true
+            run_allow "$@"
+            ;;
+        deny)
+            shift || true
+            run_deny "$@"
+            ;;
+        mode)
+            shift || true
+            run_mode "$@"
+            ;;
+        enable)
+            shift || true
+            run_enable "$@"
+            ;;
+        disable)
+            shift || true
+            run_disable "$@"
+            ;;
+        approval)
+            shift || true
+            run_approval "$@"
+            ;;
+        approval-api)
+            shift || true
+            run_approval_api "$@"
             ;;
         slot)
             shift || true
@@ -841,6 +1093,11 @@ main() {
         port-handler)
             shift || true
             run_port_handler "$@"
+            ;;
+        handler)
+            shift || true
+            require_admin_cli_runtime handler
+            run_admin_config handler "$@"
             ;;
         exclude)
             shift || true

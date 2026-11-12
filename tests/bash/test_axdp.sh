@@ -9,7 +9,7 @@ BASE_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 source "$REPO_ROOT/tests/bash/testlib.sh"
 
 # NOTE: stats/ports formatting, flag parsing, and csv helpers migrated to
-# Python (auto_xdp/admin_cli.py); covered by tests/python/test_admin_cli.py.
+# Python (auto_xdp/admin/cli.py); covered by tests/python/test_admin_cli.py.
 
 test_run_log_level_reads_and_updates_config() (
     source "$REPO_ROOT/axdp"
@@ -78,6 +78,161 @@ test_main_dispatches_under_attack_command() (
     assert_eq "$called" "yes:on"
 )
 
+test_handler_catalog_wrapper_forwards_arguments_and_tui_directory() (
+    source "$REPO_ROOT/axdp"
+    local called="" arguments=""
+    require_admin_cli_runtime() { called="$1"; }
+    run_admin_config() { arguments="$*"; }
+    main handler install '/tmp/my handler.c' --name example --kind udp --target 1234 || return 1
+    assert_eq "$called" handler || return 1
+    assert_eq "$arguments" 'handler install /tmp/my handler.c --name example --kind udp --target 1234' || return 1
+    HANDLERS_DIR='/tmp/custom handlers'
+    run_py_module() { printf '%s\n' "$@"; }
+    local output
+    output=$(run_tui) || return 1
+    assert_contains "$output" '--handlers-dir' || return 1
+    assert_contains "$output" '/tmp/custom handlers'
+)
+
+test_main_dispatches_integrated_policy_commands() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local calls=""
+    run_exposure() { calls+="discover:$*|"; }
+    run_allow() { calls+="allow:$*|"; }
+    run_deny() { calls+="deny:$*|"; }
+    run_mode() { calls+="mode:$*|"; }
+
+    main discover || return 1
+    main allow paper.service tcp/25565 --profile minecraft || return 1
+    main deny paper.service tcp/25565 || return 1
+    main mode enforce || return 1
+    assert_eq "$calls" "discover:|allow:paper.service tcp/25565 --profile minecraft|deny:paper.service tcp/25565|mode:enforce|"
+)
+
+test_enable_refuses_ungranted_remote_ssh() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    TOML_CONFIG="$tmpdir/config.toml"
+    : > "$TOML_CONFIG"
+    require_root() { :; }
+    run_admin_config() {
+        [[ "$*" == "explain tcp/22" ]] && printf 'BLOCK\n'
+    }
+    SSH_CONNECTION="198.51.100.4 40000 203.0.113.2 22"
+    local output status
+    output=$(run_enable 2>&1)
+    status=$?
+    [[ $status -ne 0 ]] || return 1
+    assert_contains "$output" "current SSH listener has no matching grant"
+)
+
+test_remote_ssh_guard_rejects_mixed_allow_and_block() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    run_admin_config() { printf 'ALLOW\n---\nBLOCK\n'; }
+    SSH_CONNECTION="198.51.100.4 40000 203.0.113.2 22"
+    ! remote_access_is_granted
+)
+
+test_service_command_propagates_primary_daemon_failure() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    SYSTEMD_RUN_DIR="$tmpdir"
+    systemctl() {
+        [[ "$1" == "list-unit-files" ]] && return 0
+        [[ "$2" == "$RELAY_SERVICE_NAME" ]]
+    }
+
+    run_service_cmd restart
+    [[ $? -ne 0 ]]
+)
+
+test_enable_failure_restores_audit_discovery() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir calls=""
+    tmpdir=$(mktemp -d)
+    TOML_CONFIG="$tmpdir/config.toml"
+    : > "$TOML_CONFIG"
+    require_root() { :; }
+    remote_access_is_granted() { return 0; }
+    run_admin_config() { calls+="config:$*|"; }
+    run_service_cmd() {
+        calls+="service:$*|"
+        [[ "$1" != "restart" ]]
+    }
+
+    run_enable >/dev/null 2>&1
+    [[ $? -ne 0 ]] || return 1
+    assert_eq "$calls" "config:policy mode enforce|service:restart|config:policy mode audit|service:start|"
+)
+
+test_enable_waits_for_health_and_rolls_back_on_timeout() (
+    local scenario
+    for scenario in xdp nftables timeout; do
+        (
+            source "$REPO_ROOT/axdp"
+            set +e
+            local tmpdir attempts=0 output status
+            tmpdir=$(mktemp -d)
+            trap 'rm -rf "$tmpdir"' EXIT
+            TOML_CONFIG="$tmpdir/config.toml"
+            touch "$TOML_CONFIG"
+            require_root() { :; }
+            remote_access_is_granted() { return 0; }
+            run_admin_config() {
+                printf 'config:%s\n' "$*" >> "$tmpdir/calls"
+                [[ "$*" != 'policy mode' ]] || printf 'enforce\n'
+            }
+            run_service_cmd() {
+                printf 'service:%s\n' "$*" >> "$tmpdir/calls"
+                [[ "$1" != status ]] || printf 'pager:%s:%s\n' "${SYSTEMD_PAGER:-}" "${PAGER:-}" >> "$tmpdir/calls"
+            }
+            run_admin_runtime() { printf 'runtime:%s\n' "$*" >> "$tmpdir/calls"; }
+            run_backend() {
+                if (( attempts == 0 )); then
+                    printf 'No active Auto XDP backend detected.\n' >&2
+                    return 1
+                fi
+                if (( attempts == 1 )) || [[ "$scenario" == timeout ]]; then
+                    printf 'Health    : degraded\n'
+                    return 1
+                fi
+                printf 'Backend   : %s\nHealth    : healthy\n' "$scenario"
+            }
+            sleep() {
+                attempts=$((attempts + 1))
+                [[ "$scenario" != timeout ]] || SECONDS=$((SECONDS + 40))
+            }
+            output=$(run_enable --force 2>&1)
+            status=$?
+            if [[ "$scenario" == timeout ]]; then
+                assert_eq "$status" 1 "$output" || exit 1
+                [[ "$output" != *'Auto XDP enforcement enabled.'* ]] || exit 1
+                assert_contains "$output" 'Health    : degraded' || exit 1
+                assert_file_contains "$tmpdir/calls" 'pager:cat:cat' || exit 1
+                assert_file_contains "$tmpdir/calls" $'config:policy mode audit\nservice:stop\nruntime:deactivate\nservice:start' || exit 1
+            else
+                assert_eq "$status" 0 "$output" || exit 1
+                assert_contains "$output" "Backend   : $scenario" || exit 1
+                assert_contains "$output" 'Auto XDP enforcement enabled.' || exit 1
+                [[ "$output" != *'No active'* && "$output" != *degraded* ]] || exit 1
+                assert_eq "$(cat "$tmpdir/calls")" $'config:policy mode enforce\nservice:restart' || exit 1
+            fi
+        ) || { printf 'enable scenario failed: %s\n' "$scenario"; return 1; }
+    done
+)
+
 test_status_combines_service_and_backend_health() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -137,17 +292,24 @@ test_main_loads_configured_ifaces_for_tui() (
     tmpdir=$(mktemp -d)
     CONFIG_FILE="$tmpdir/auto_xdp.env"
     cat >"$CONFIG_FILE" <<'EOF_CFG'
-IFACES="eth0 eth1"
-IFACE="eth0"
+IFACES="lan0 lan1"
+IFACE="lan0"
 EOF_CFG
 
-    local called=""
-    run_tui() {
-        called="$IFACES"
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    run_py_module() {
+        PYTHONPATH="$REPO_ROOT" python3 - "$@" <<'PY'
+import sys
+from auto_xdp.admin.cli import build_parser
+
+args = build_parser().parse_args(sys.argv[2:])
+print(args.iface)
+PY
     }
 
-    main tui || return 1
-    assert_eq "$called" "eth0 eth1"
+    local output
+    output=$(main tui) || return 1
+    assert_eq "$output" "lan0 lan1"
 )
 
 test_main_reports_stale_admin_cli_for_tui() (
@@ -160,14 +322,14 @@ test_main_reports_stale_admin_cli_for_tui() (
     # Keep a real installed /etc/auto_xdp/auto_xdp.env from overriding the fake
     # PYTHON_LIB_DIR when this suite runs on a host with Auto XDP installed.
     CONFIG_FILE="$tmpdir/absent.env"
-    mkdir -p "$PYTHON_LIB_DIR/auto_xdp"
+    mkdir -p "$PYTHON_LIB_DIR/auto_xdp/admin"
     touch "$PYTHON_LIB_DIR/auto_xdp/__init__.py"
-    cat >"$PYTHON_LIB_DIR/auto_xdp/admin_cli.py" <<'EOF_PY'
+    cat >"$PYTHON_LIB_DIR/auto_xdp/admin/cli.py" <<'EOF_PY'
 import argparse
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin_cli")
+    parser = argparse.ArgumentParser(prog="python -m auto_xdp.admin.cli")
     parser.add_argument("--config", required=True)
     parser.add_argument("--bpf-pin-dir", default="/sys/fs/bpf/xdp_fw")
     parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp/current")
@@ -202,11 +364,6 @@ test_config_updates_preserve_unrelated_sections() (
 [firewall]
 bogon_filter = false
 
-[permanent_ports]
-tcp = [22]
-udp = []
-sctp = [3868]
-
 [trusted_ips]
 "203.0.113.1/32" = "office"
 
@@ -222,38 +379,12 @@ EOF_CFG
     assert_file_contains "$TOML_CONFIG" "[slots]" || return 1
     assert_file_contains "$TOML_CONFIG" 'default_action = "drop"' || return 1
     assert_file_contains "$TOML_CONFIG" 'enabled = ["sctp", { proto = 47, path = "/tmp/gre_handler.o" }]' || return 1
-    assert_file_contains "$TOML_CONFIG" "sctp = [3868]" || return 1
     assert_file_contains "$TOML_CONFIG" '"198.51.100.8/32" = "office"'
-)
-
-test_run_permanent_supports_sctp_ports() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    TOML_CONFIG="$tmpdir/config.toml"
-    PYTHON_LIB_DIR="$REPO_ROOT"
-    require_root() { :; }
-    reload_daemon() { :; }
-
-    cat >"$TOML_CONFIG" <<'EOF_CFG'
-[permanent_ports]
-tcp = []
-udp = []
-sctp = []
-EOF_CFG
-
-    run_permanent add sctp 3868 >/dev/null || return 1
-
-    local output
-    output=$(run_permanent list) || return 1
-    assert_contains "$output" "SCTP 3868" || return 1
-    assert_file_contains "$TOML_CONFIG" "sctp = [3868]"
 )
 
 _setup_reattach_test_env() {
     local tmpdir="$1"
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
     BPF_PIN_DIR="$tmpdir/bpf"
     RUN_STATE_DIR="$tmpdir/run"
     XDP_OBJ_PATH="$tmpdir/xdp.o"
@@ -261,7 +392,7 @@ _setup_reattach_test_env() {
 
     # satisfy ensure_xdp_loaded preconditions
     touch "$BPF_PIN_DIR/prog" "$XDP_OBJ_PATH"
-    for _m in tcp_whitelist udp_whitelist pkt_counters syn_rate tcp_ct4 tcp_ct6 udp_ct4 udp_ct6; do
+    for _m in tcp_whitelist udp_whitelist pkt_counters syn_rate; do
         touch "$BPF_PIN_DIR/$_m"
     done
 
@@ -275,14 +406,19 @@ _setup_reattach_test_env() {
 
     # stubs for functions from auto_xdp_runtime_common.sh (not loaded in tests)
     ensure_bpffs() { return 0; }
-    cleanup_tc_egress_filter() { return 0; }
+    ensure_linux_conntrack() { return 0; }
+    load_sock_state_tracker() { return 0; }
+    load_syncookie_program() { return 0; }
+    load_tc_egress_dispatch() { return 0; }
     xdp_maps_ready() { return 0; }
     load_port_handlers() { return 0; }
     auto_tune_interface_parallelism() { return 0; }
     _TEST_XDP_ATTACHED=""
     _auto_xdp_verify_iface_program() {
         [[ " $_TEST_XDP_ATTACHED " == *" $1 "* ]] && return 0
-        ip -d link show dev "$1" 2>/dev/null | grep -Eq 'xdp|xdpgeneric'
+        local mode
+        mode=$(_auto_xdp_iface_xdp_mode "$1")
+        [[ "$mode" == native || "$mode" == generic ]]
     }
     _auto_xdp_attach_candidate() {
         if ip link set dev "$1" xdp pinned "$2" 2>/dev/null; then
@@ -296,12 +432,6 @@ _setup_reattach_test_env() {
             return 0
         fi
         return 1
-    }
-    TC_RESTORE_STATUS=0
-    TC_RESTORE_CALLED=0
-    _auto_xdp_restore_tc_egress() {
-        TC_RESTORE_CALLED=$((TC_RESTORE_CALLED + 1))
-        return "$TC_RESTORE_STATUS"
     }
     _auto_xdp_record_xdp_state() { return 0; }
 }
@@ -320,9 +450,9 @@ test_ensure_xdp_reattach_records_generic_mode_on_fallback() (
 #!/bin/sh
 args="$*"
 if echo "$args" | grep -q "show.*eth0\b\|show dev eth0"; then
-    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether\n"
+    printf '%s\n' '[{"ifname":"eth0"}]'
 elif echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
-    printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
+    printf '%s\n' '[{"ifname":"eth1","xdp":{"mode":1,"prog":{"id":77}}}]'
 elif echo "$args" | grep -q "set.*eth0.*xdpgeneric"; then
     exit 0
 elif echo "$args" | grep -q "set.*eth0.*xdp "; then
@@ -350,9 +480,9 @@ test_ensure_xdp_reattach_records_native_mode_when_all_native() (
 #!/bin/sh
 args="$*"
 if echo "$args" | grep -q "show.*eth0\b\|show dev eth0"; then
-    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether\n"
+    printf '%s\n' '[{"ifname":"eth0"}]'
 elif echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
-    printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
+    printf '%s\n' '[{"ifname":"eth1","xdp":{"mode":1,"prog":{"id":77}}}]'
 elif echo "$args" | grep -q "set.*eth0.*xdp "; then
     exit 0
 fi
@@ -378,9 +508,9 @@ test_ensure_xdp_reattach_records_generic_when_existing_iface_is_generic() (
 #!/bin/sh
 args="$*"
 if echo "$args" | grep -q "show.*eth1\b\|show dev eth1"; then
-    printf "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdpgeneric\n"
+    printf '%s\n' '[{"ifname":"eth1","xdp":{"mode":2,"prog":{"id":77}}}]'
 else
-    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\n    link/ether xdp\n"
+    printf '%s\n' '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":77}}}]'
 fi
 exit 0
 EOF_IP
@@ -389,34 +519,6 @@ EOF_IP
     _IFACES=(eth0 eth1)
     ensure_xdp_loaded || return 1
     assert_eq "$(cat "$RUN_STATE_DIR/xdp_mode")" "generic"
-)
-
-test_ensure_xdp_reattach_restores_tc_and_blocks_fallback_on_failure() (
-    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    _setup_reattach_test_env "$tmpdir"
-    TC_RESTORE_STATUS=1
-
-    cat >"$tmpdir/bin/ip" <<'EOF_IP'
-#!/bin/sh
-args="$*"
-if echo "$args" | grep -q "show.*eth0\\b\\|show dev eth0"; then
-    printf "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\\n    link/ether\\n"
-elif echo "$args" | grep -q "set.*eth0.*xdp "; then
-    exit 0
-fi
-exit 0
-EOF_IP
-    chmod +x "$tmpdir/bin/ip"
-
-    _IFACES=(eth0)
-    ensure_xdp_loaded >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "2" || return 1
-    assert_eq "$TC_RESTORE_CALLED" "1"
 )
 
 test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails() (
@@ -429,6 +531,11 @@ test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails() (
     mkdir -p "${BPF_PIN_DIR}_next"
     touch "${BPF_PIN_DIR}_next/prog"
     _IFACES=(eth0)
+    # The restored stable generation is still attached natively; nothing else may call ip.
+    ip() {
+        [[ "$*" == "-j -d link show dev eth0" ]] || return 1
+        printf '%s\n' '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":77}}}]'
+    }
 
     _auto_xdp_finish_interrupted_reload() {
         printf 'resume\n' >> "$tmpdir/recovery.log"
@@ -444,6 +551,37 @@ test_ensure_xdp_recovers_stable_generation_when_candidate_resume_fails() (
     ensure_xdp_loaded >/dev/null 2>&1 || return 1
     assert_eq "$(cat "$tmpdir/recovery.log")" $'resume\nrestore' || return 1
     [[ ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
+test_ensure_xdp_blocks_fallback_when_conntrack_is_unavailable() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+    ensure_linux_conntrack() { return 1; }
+    _auto_xdp_any_target_has_xdp() { return 0; }
+    ensure_xdp_loaded >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 2
+)
+
+test_ensure_xdp_blocks_fallback_when_required_syncookie_is_unavailable() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+    _IFACES=(eth0)
+    _auto_xdp_verify_iface_program() { return 0; }
+    # eth0 already runs the program natively, so only the SYN-cookie gate can fail.
+    ip() { printf '%s\n' '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":77}}}]'; }
+    load_syncookie_program() { return 1; }
+
+    ensure_xdp_loaded >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "2"
 )
 
 test_select_backend_refuses_nftables_while_xdp_remains_attached() (
@@ -463,176 +601,6 @@ test_select_backend_refuses_nftables_while_xdp_remains_attached() (
     [[ ! -e "$RUN_STATE_DIR/backend" ]]
 )
 
-test_run_backend_reports_runtime_state_and_conntrack_counts() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    RUN_STATE_DIR="$tmpdir/run"
-    BPF_PIN_DIR="$tmpdir/bpf"
-    CONFIG_FILE="$tmpdir/auto_xdp.env"
-    PYTHON_LIB_DIR="$REPO_ROOT"
-    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
-    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
-    printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
-    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" "$BPF_PIN_DIR/udp_ct6"
-    cat >"$CONFIG_FILE" <<'EOF_CFG'
-IFACES="eth9"
-PREFERRED_BACKEND="auto"
-EOF_CFG
-
-    cat >"$tmpdir/bin/ip" <<'EOF_IP'
-#!/bin/sh
-printf '%s\n' '2: eth9: <BROADCAST> mtu 1500 xdp'
-EOF_IP
-    cat >"$tmpdir/bin/tc" <<'EOF_TC'
-#!/bin/sh
-if [ "$1" = "filter" ]; then
-  printf '%s\n' 'filter protocol all pref 49152 bpf chain 0'
-fi
-EOF_TC
-    cat >"$tmpdir/bin/bpftool" <<EOF_BPF
-#!/bin/sh
-case "\$*" in
-  *"tcp_ct4"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[2,0,0,0,0,81,1,187]}]'
-    ;;
-  *"udp_ct6"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
-    ;;
-  *)
-    printf '%s\n' '[]'
-    ;;
-esac
-EOF_BPF
-    chmod +x "$tmpdir/bin/ip" "$tmpdir/bin/tc" "$tmpdir/bin/bpftool"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-    IFACE=""
-    BACKEND=""
-
-    local output
-    output=$(run_backend) || return 1
-    assert_contains "$output" "Backend   : xdp" || return 1
-    assert_contains "$output" "XDP mode  : native" || return 1
-    assert_contains "$output" "XDP attach: eth9=native" || return 1
-    assert_contains "$output" "tc egress : eth9=attached" || return 1
-    assert_contains "$output" "Conntrack : tcp=2 udp=1"
-)
-
-test_run_backend_json_reports_runtime_state_and_conntrack_counts() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    RUN_STATE_DIR="$tmpdir/run"
-    BPF_PIN_DIR="$tmpdir/bpf"
-    CONFIG_FILE="$tmpdir/auto_xdp.env"
-    PYTHON_LIB_DIR="$REPO_ROOT"
-    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
-    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
-    printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
-    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" "$BPF_PIN_DIR/udp_ct6"
-    cat >"$CONFIG_FILE" <<'EOF_CFG'
-IFACES="eth9"
-PREFERRED_BACKEND="auto"
-EOF_CFG
-
-    cat >"$tmpdir/bin/ip" <<'EOF_IP'
-#!/bin/sh
-printf '%s\n' '2: eth9: <BROADCAST> mtu 1500 xdp'
-EOF_IP
-    cat >"$tmpdir/bin/tc" <<'EOF_TC'
-#!/bin/sh
-if [ "$1" = "filter" ]; then
-  printf '%s\n' 'filter protocol all pref 49152 bpf chain 0'
-fi
-EOF_TC
-    cat >"$tmpdir/bin/bpftool" <<EOF_BPF
-#!/bin/sh
-case "\$*" in
-  *"tcp_ct4"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[2,0,0,0,0,81,1,187]}]'
-    ;;
-  *"udp_ct6"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
-    ;;
-  *)
-    printf '%s\n' '[]'
-    ;;
-esac
-EOF_BPF
-    chmod +x "$tmpdir/bin/ip" "$tmpdir/bin/tc" "$tmpdir/bin/bpftool"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-
-    local output
-    output=$(run_backend --json) || return 1
-    python3 - "$output" <<'PY'
-import json
-import sys
-
-data = json.loads(sys.argv[1])
-assert data["backend"] == "xdp"
-assert data["preferred_backend"] == "auto"
-assert data["interfaces"] == ["eth9"]
-assert data["xdp_mode"] == "native"
-assert data["xdp_attach"] == {"eth9": "native"}
-assert data["tc_egress"] == {"eth9": "attached"}
-assert data["conntrack"] == {"tcp": 2, "udp": 1}
-PY
-)
-
-test_run_conntrack_summarizes_destination_ports() (
-    source "$REPO_ROOT/axdp"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    INSTALL_DIR="$tmpdir/install"
-    PYTHON_LIB_DIR="$REPO_ROOT"
-    TOML_CONFIG="$tmpdir/config.toml"
-    mkdir -p "$BPF_PIN_DIR" "$INSTALL_DIR" "$tmpdir/bin"
-    touch "$TOML_CONFIG"
-    # New split maps: ct_key_v4 (12 bytes), ct_key_v6 (36 bytes)
-    # ct_key_v4 layout: sport[2] dport[2] saddr[4] daddr[4]
-    # ct_key_v6 layout: sport[2] dport[2] saddr[16] daddr[16]
-    touch "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" \
-          "$BPF_PIN_DIR/udp_ct4" "$BPF_PIN_DIR/udp_ct6"
-
-    cat >"$tmpdir/bin/bpftool" <<EOF_BPF
-#!/bin/sh
-case "\$*" in
-  *"tcp_ct4"*)
-    printf '%s\n' '[{"key":[0,80,0,22,1,2,3,4,5,6,7,8]},{"key":[0,82,1,187,1,2,3,4,5,6,7,8]}]'
-    ;;
-  *"tcp_ct6"*)
-    printf '%s\n' '[{"key":[0,80,0,22,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2]}]'
-    ;;
-  *"udp_ct4"*)
-    printf '%s\n' '[{"key":[0,53,0,53,1,2,3,4,5,6,7,8]}]'
-    ;;
-  *)
-    printf '%s\n' '[]'
-    ;;
-esac
-EOF_BPF
-    chmod +x "$tmpdir/bin/bpftool"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-
-    local output
-    output=$(run_conntrack tcp --limit 2) || return 1
-    assert_contains "$output" "TCP conntrack:" || return 1
-    assert_contains "$output" "dport 22" || return 1
-    assert_contains "$output" "ipv4=1" || return 1
-    assert_contains "$output" "ipv6=1" || return 1
-    assert_contains "$output" "total=3"
-)
-
 test_cli_help_runs_without_runtime_state() (
     local output
     output=$(bash "$REPO_ROOT/axdp" help)
@@ -643,7 +611,7 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
     source "$REPO_ROOT/axdp"
     set +e
 
-    local tmpdir
+    local tmpdir tc_scenario="${1:-success}" iface direction output status
     tmpdir=$(mktemp -d)
     local ops_log="$tmpdir/ops.log"
 
@@ -661,6 +629,7 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
     RUNNER_SCRIPT="$INSTALL_DIR/auto_xdp_start.sh"
     AXDP_CMD="$tmpdir/usr/local/bin/axdp"
     SYSTEMD_UNIT_DIR="$tmpdir/etc/systemd/system"
+    SYSTEMD_RUN_DIR="$tmpdir/run/systemd/system"
     OPENRC_INIT_DIR="$tmpdir/etc/init.d"
     OPENRC_RUN_DIR="$tmpdir/run"
     AUTO_XDP_PROC_ROOT="$tmpdir/proc"
@@ -681,6 +650,13 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         "$OPENRC_RUN_DIR/xdp-port-sync.pid" \
         "$OPENRC_RUN_DIR/auto-xdp-relay.pid" \
         "$CONFIG_FILE" "$TOML_CONFIG" "$RELAY_GROUP_MARKER"
+    if [[ "$tc_scenario" != absent ]]; then
+        for iface in eth0 eth1; do
+            for direction in ingress egress; do
+                touch "$tmpdir/tc-$iface-$direction"
+            done
+        done
+    fi
 
     require_root() { return 0; }
     getent() {
@@ -698,13 +674,35 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         printf 'ip %s\n' "$*" >>"$ops_log"
         case "$*" in
             "link show dev "*) return 0 ;;
-            "-d link show dev "*) printf '2: test: <UP>\n'; return 0 ;;
+            "-j -d link show dev "*) printf '[{"ifname":"%s"}]\n' "$6"; return 0 ;;
         esac
         return 0
     }
+    command() {
+        [[ "$tc_scenario:$*" != "missing_tc:-v tc" ]] || return 1
+        builtin command "$@"
+    }
     tc() {
         printf 'tc %s\n' "$*" >>"$ops_log"
-        return 0
+        if [[ "$1" == -j ]]; then
+            [[ "$tc_scenario" != query_failure ]] || return 1
+            [[ "$tc_scenario" != invalid_json ]] || { printf 'invalid JSON\n'; return 0; }
+            [[ "$*" == "-j filter show dev "* ]] || return 1
+            if [[ -e "$tmpdir/tc-$5-$6" ]]; then
+                printf '[{"kind":"bpf","options":{"handle":"0x2"}}]\n'
+            else
+                # Another handle at the same preference belongs to someone else.
+                printf '[{"kind":"bpf","options":{"handle":"0x3"}}]\n'
+            fi
+            return 0
+        fi
+        [[ "$*" == "filter del dev "* && "${6:-}:${7:-}:${8:-}:${10:-}:${11:-}:${12:-}" \
+            == "protocol:all:pref:handle:2:bpf" ]] || return 255
+        case "$5:$9" in ingress:49151|egress:49153) ;; *) return 1 ;; esac
+        [[ "$tc_scenario" != delete_failure ]] || return 2
+        [[ "$tc_scenario" != residual_filter ]] || return 0
+        [[ -e "$tmpdir/tc-$4-$5" ]] || return 2
+        rm "$tmpdir/tc-$4-$5"
     }
     nft() {
         printf 'nft %s\n' "$*" >>"$ops_log"
@@ -713,8 +711,37 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         esac
         return 0
     }
+    python3() {
+        if [[ "$*" == '-m auto_xdp.bpf.conntrack --remove' ]]; then
+            printf 'conntrack remove\n' >> "$ops_log"
+            [[ "$tc_scenario" != conntrack_failure ]]
+            return
+        fi
+        command python3 "$@"
+    }
 
-    run_uninstall >/dev/null 2>&1 || return 1
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    output=$(run_uninstall 2>&1)
+    status=$?
+    case "$tc_scenario" in
+        delete_failure|query_failure|invalid_json|residual_filter|missing_tc|conntrack_failure)
+            assert_eq "$status" 1 "$tc_scenario: $output" || return 1
+            [[ -f "$AXDP_CMD" && -d "$INSTALL_ROOT" && -d "$BPF_PIN_DIR" && -d "$CONFIG_DIR" ]] \
+                || { printf 'TC failure deleted retry assets\n'; return 1; }
+            assert_contains "$output" "Uninstall stopped before deleting runtime files" || return 1
+            if [[ "$tc_scenario" != conntrack_failure ]]; then
+                ! grep -q 'conntrack remove' "$ops_log" || return 1
+            fi
+            [[ "$output" != *"completely uninstalled"* ]]
+            return ;;
+        *) assert_eq "$status" 0 "$output" || return 1 ;;
+    esac
+    for iface in eth0 eth1; do
+        for direction in ingress egress; do
+            [[ ! -e "$tmpdir/tc-$iface-$direction" ]] \
+                || { printf 'TC filter remains on %s %s\n' "$iface" "$direction"; return 1; }
+        done
+    done
 
     local path
     for path in \
@@ -733,14 +760,164 @@ test_uninstall_removes_all_auto_xdp_artifacts() (
         }
     done
 
-    assert_file_contains "$ops_log" \
-        "tc filter del dev eth0 egress protocol all pref 49152 handle 1 bpf" || return 1
     assert_file_contains "$ops_log" "ip link set dev eth1 xdpgeneric off" || return 1
     assert_file_contains "$ops_log" "groupdel auto-xdp" || return 1
+    assert_file_contains "$ops_log" "conntrack remove" || return 1
     if grep -q "qdisc del" "$ops_log"; then
         printf 'uninstall deleted the shared clsact qdisc\n'
         return 1
     fi
+)
+
+test_uninstall_verifies_tc_cleanup_before_removing_files() (
+    local scenario
+    for scenario in absent delete_failure query_failure invalid_json residual_filter missing_tc conntrack_failure; do
+        test_uninstall_removes_all_auto_xdp_artifacts "$scenario" || return 1
+    done
+)
+
+test_uninstall_systemd_lifecycle() (
+    local scenario
+    for scenario in success failed_unit missing_unit no_manager query_failure stop_failure \
+        disable_failure still_running still_enabled reload_failure reload_retry reset_failure residual_unit; do
+        (
+            source "$REPO_ROOT/axdp"
+            set +e
+            local tmpdir unit output status
+            tmpdir=$(mktemp -d)
+            BPF_PIN_DIR="$tmpdir/bpf/xdp_fw"
+            INSTALL_ROOT="$tmpdir/lib/auto_xdp"
+            INSTALL_DIR="$INSTALL_ROOT/current"
+            CONFIG_DIR="$tmpdir/etc/auto_xdp"
+            RUN_STATE_DIR="$tmpdir/run/auto_xdp"
+            AXDP_CMD="$tmpdir/bin/axdp"
+            SYSTEMD_UNIT_DIR="$tmpdir/systemd/system"
+            SYSTEMD_RUN_DIR="$tmpdir/run/systemd/system"
+            OPENRC_INIT_DIR="$tmpdir/init.d"
+            OPENRC_RUN_DIR="$tmpdir/run"
+            AUTO_XDP_PROC_ROOT="$tmpdir/proc"
+            RELAY_GROUP_MARKER="$CONFIG_DIR/.relay-group-created"
+            mkdir -p "$BPF_PIN_DIR" "$INSTALL_ROOT" "$CONFIG_DIR" "$RUN_STATE_DIR" \
+                "${AXDP_CMD%/*}" "$SYSTEMD_UNIT_DIR/multi-user.target.wants"
+            [[ "$scenario" == no_manager ]] || mkdir -p "$SYSTEMD_RUN_DIR/multi-user.target.wants"
+            touch "$AXDP_CMD"
+            for unit in "$SERVICE_NAME.service" "$RELAY_SERVICE_NAME.service"; do
+                [[ "$scenario:$unit" == "missing_unit:$RELAY_SERVICE_NAME.service" ]] \
+                    || touch "$SYSTEMD_UNIT_DIR/$unit"
+                ln -s "../$unit" "$SYSTEMD_UNIT_DIR/multi-user.target.wants/$unit"
+                [[ "$scenario" == no_manager ]] || ln -s "$SYSTEMD_UNIT_DIR/$unit" \
+                    "$SYSTEMD_RUN_DIR/multi-user.target.wants/$unit"
+            done
+            require_root() { :; }
+            python3() {
+                [[ "$*" != '-m auto_xdp.bpf.conntrack --remove' ]] || return 0
+                command python3 "$@"
+            }
+            ip() { return 1; } # No real network interface is touched.
+            nft() { return 1; }
+            rc-service() { :; }
+            rc-update() { :; }
+            systemctl() {
+                printf '%s\n' "$*" >> "$tmpdir/systemctl.log"
+                [[ "$scenario" != no_manager ]] || return 1
+                local action="$1" name="${*: -1}" links
+                [[ "$name" == *.service ]] || name+=.service
+                case "$action" in
+                    show)
+                        [[ "$scenario" != query_failure ]] || return 1
+                        case "$*" in
+                            *LoadState*)
+                                if [[ -e "$SYSTEMD_UNIT_DIR/$name" || "$scenario" == residual_unit ]] \
+                                    || { [[ "$scenario" == reload_retry ]] && [[ ! -e "$tmpdir/removed-reloaded" ]]; }; then
+                                    printf 'loaded\n'
+                                else
+                                    printf 'not-found\n'
+                                fi ;;
+                            *ActiveState*)
+                                if [[ "$scenario" == still_running ]]; then
+                                    printf 'active\n'
+                                elif [[ "$scenario" == failed_unit || "$scenario" == reset_failure ]] \
+                                    && [[ ! -e "$tmpdir/reset-$name" ]]; then
+                                    # A deleted failed unit must be reset explicitly.
+                                    printf 'failed\n'
+                                else
+                                    printf 'inactive\n'
+                                fi ;;
+                            *) return 1 ;;
+                        esac ;;
+                    disable)
+                        [[ "$scenario" != disable_failure ]] || return 1
+                        [[ "$scenario:$*" != stop_failure:*--now* ]] || return 1
+                        links="$SYSTEMD_UNIT_DIR"
+                        [[ "$*" != *--runtime* ]] || links="$SYSTEMD_RUN_DIR"
+                        shift
+                        for name in "$@"; do
+                            [[ "$name" != -* ]] || continue
+                            [[ "$name" == *.service ]] || name+=.service
+                            [[ -e "$SYSTEMD_UNIT_DIR/$name" ]] || return 1
+                            [[ "$scenario" == still_enabled ]] \
+                                || rm -f "$links/multi-user.target.wants/$name"
+                        done ;;
+                    stop) [[ "$scenario" != stop_failure ]] ;;
+                    is-enabled)
+                        if [[ -e "$SYSTEMD_UNIT_DIR/$name" ]]; then
+                            if [[ -L "$SYSTEMD_UNIT_DIR/multi-user.target.wants/$name" ]]; then
+                                printf 'enabled\n'; return 0
+                            fi
+                            if [[ -L "$SYSTEMD_RUN_DIR/multi-user.target.wants/$name" ]]; then
+                                printf 'enabled-runtime\n'; return 0
+                            fi
+                            printf 'disabled\n'; return 1
+                        fi
+                        printf 'not-found\n'; return 4 ;;
+                    daemon-reload)
+                        if [[ ! -e "$SYSTEMD_UNIT_DIR/$SERVICE_NAME.service" ]]; then
+                            [[ "$scenario" != reload_failure ]] || return 1
+                            if [[ "$scenario" == reload_retry && ! -e "$tmpdir/reload-failed-once" ]]; then
+                                touch "$tmpdir/reload-failed-once"
+                                return 1
+                            fi
+                            touch "$tmpdir/removed-reloaded"
+                        fi ;;
+                    reset-failed)
+                        [[ "$scenario" != reset_failure ]] || return 1
+                        [[ ! -e "$SYSTEMD_UNIT_DIR/$name" ]] || return 1
+                        touch "$tmpdir/reset-$name" ;;
+                    *) return 1 ;;
+                esac
+            }
+            output=$(run_uninstall eth0 2>&1)
+            status=$?
+            if [[ "$scenario" == reload_retry ]]; then
+                [[ $status -ne 0 && -f "$AXDP_CMD" && -d "$BPF_PIN_DIR" ]] || exit 1
+                output=$(run_uninstall eth0 2>&1)
+                status=$?
+            fi
+            case "$scenario" in
+                success|failed_unit|missing_unit|no_manager|reload_retry)
+                    assert_eq "$status" 0 "$scenario: $output" || exit 1
+                    for unit in "$SERVICE_NAME.service" "$RELAY_SERVICE_NAME.service"; do
+                        [[ ! -e "$SYSTEMD_UNIT_DIR/$unit" && ! -L "$SYSTEMD_UNIT_DIR/$unit" ]] || exit 1
+                        [[ ! -L "$SYSTEMD_UNIT_DIR/multi-user.target.wants/$unit" ]] || exit 1
+                        [[ ! -L "$SYSTEMD_RUN_DIR/multi-user.target.wants/$unit" ]] || exit 1
+                    done
+                    [[ ! -e "$AXDP_CMD" ]] || exit 1
+                    if [[ "$scenario" == no_manager ]]; then
+                        [[ ! -e "$tmpdir/systemctl.log" ]] || exit 1
+                    else
+                        assert_file_contains "$tmpdir/systemctl.log" "daemon-reload" || exit 1
+                        if [[ "$scenario" == failed_unit ]]; then
+                            assert_file_contains "$tmpdir/systemctl.log" "reset-failed $SERVICE_NAME.service" || exit 1
+                            assert_file_contains "$tmpdir/systemctl.log" "reset-failed $RELAY_SERVICE_NAME.service" || exit 1
+                        fi
+                    fi ;;
+                *)
+                    [[ $status -ne 0 ]] || { printf '%s falsely reported success\n' "$scenario"; exit 1; }
+                    [[ -f "$AXDP_CMD" && -d "$INSTALL_ROOT" && -d "$BPF_PIN_DIR" && -d "$CONFIG_DIR" ]] \
+                        || { printf '%s deleted retry assets\n' "$scenario"; exit 1; } ;;
+            esac
+        ) || { printf 'systemd uninstall scenario failed: %s\n' "$scenario"; return 1; }
+    done
 )
 
 test_uninstall_preserves_used_relay_group() (
@@ -779,6 +956,7 @@ test_uninstall_keeps_runtime_when_xdp_detach_fails() (
     INSTALL_ROOT="$tmpdir/usr/local/lib/auto_xdp"
     INSTALL_DIR="$INSTALL_ROOT/current"
     AUTO_XDP_PROC_ROOT="$tmpdir/proc"
+    SYSTEMD_RUN_DIR="$tmpdir/run/systemd/system"
     IFACES="eth0"
     mkdir -p "$BPF_PIN_DIR" "$INSTALL_DIR"
 
@@ -787,12 +965,13 @@ test_uninstall_keeps_runtime_when_xdp_detach_fails() (
     ip() {
         case "$*" in
             "link show dev eth0") return 0 ;;
-            "-d link show dev eth0") printf '2: eth0: <UP> prog/xdp id 42\n'; return 0 ;;
+            "-j -d link show dev eth0") printf '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":42}}}]\n'; return 0 ;;
         esac
         return 0
     }
     tc() { return 0; }
     nft() { return 1; }
+    PYTHON_LIB_DIR="$REPO_ROOT"
 
     run_uninstall >/dev/null 2>&1
     local status=$?
@@ -835,6 +1014,26 @@ test_main_dispatches_uninstall_command() (
     assert_eq "$(main uninstall eth9)" "uninstall eth9"
 )
 
+# The shell contracts exercise the real loader and fake bpftool. Object and
+# pinned-map inspection are isolated here; actual ELF/ABI checks run on Linux.
+_mock_protocol_inspection() {
+    local root="$1"
+    cat >"$root/sitecustomize.py" <<'PY'
+from auto_xdp.admin import handlers
+abi = handlers.HandlerMapAbi(2, 4, 4, 1, 0)
+def declarations(obj):
+    names = ["slot_ctx_map"]
+    if obj.name == "sctp_handler.o":
+        names += ["sctp_whitelist", "pkt_counters", "byte_counters", "pkt_ringbuf", "xdp_runtime_cfg"]
+    return {name: abi for name in names}
+handlers.handler_object_maps = declarations
+handlers.pinned_handler_map_abi = lambda path: abi
+handlers.handler_object_programs = lambda obj: ("entry", None)
+handlers._pinned_u32_lookup = lambda path, key: handlers.prog_array_entry_id(path, int.from_bytes(key, "little"))
+PY
+    PYTHON_LIB_DIR="$root:$REPO_ROOT"
+}
+
 test_slot_load_sctp_reuses_shared_maps() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -851,8 +1050,11 @@ test_slot_load_sctp_reuses_shared_maps() (
     touch \
         "$BPF_PIN_DIR/slot_ctx_map" \
         "$BPF_PIN_DIR/sctp_whitelist" \
-        "$BPF_PIN_DIR/sctp_conntrack" \
         "$BPF_PIN_DIR/proto_handlers" \
+        "$BPF_PIN_DIR/pkt_counters" \
+        "$BPF_PIN_DIR/byte_counters" \
+        "$BPF_PIN_DIR/pkt_ringbuf" \
+        "$BPF_PIN_DIR/xdp_runtime_cfg" \
         "$INSTALL_DIR/handlers/sctp_handler.o"
     cat >"$TOML_CONFIG" <<'EOF_CFG'
 [slots]
@@ -876,12 +1078,16 @@ exit 0
 EOF_BPFSH
     chmod +x "$tmpdir/bin/bpftool"
 
+    _mock_protocol_inspection "$tmpdir"
     PATH="$tmpdir/bin:$BASE_PATH"
     run_slot load sctp >/dev/null || return 1
 
     assert_file_contains "$tmpdir/bpftool.log" "map name slot_ctx_map pinned $BPF_PIN_DIR/slot_ctx_map" || return 1
     assert_file_contains "$tmpdir/bpftool.log" "map name sctp_whitelist pinned $BPF_PIN_DIR/sctp_whitelist" || return 1
-    assert_file_contains "$tmpdir/bpftool.log" "map name sctp_conntrack pinned $BPF_PIN_DIR/sctp_conntrack"
+    local map_name
+    for map_name in pkt_counters byte_counters pkt_ringbuf xdp_runtime_cfg; do
+        assert_file_contains "$tmpdir/bpftool.log" "map name $map_name pinned $BPF_PIN_DIR/$map_name" || return 1
+    done
 )
 
 test_slot_load_custom_c_compiles_and_persists_object_path() (
@@ -941,6 +1147,7 @@ exit 0
 EOF_BPFSH
     chmod +x "$tmpdir/bin/clang" "$tmpdir/bin/bpftool"
 
+    _mock_protocol_inspection "$tmpdir"
     PATH="$tmpdir/bin:$BASE_PATH"
     run_slot load 99 "$tmpdir/custom_handler.c" >/dev/null || return 1
 

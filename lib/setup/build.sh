@@ -31,6 +31,11 @@ compile_bpf_object() {
     local src_path="$1"
     local obj_path="$2"
     local include_root="${3:-.}"
+    local vmlinux_dir="${4:-}"
+    local -a vmlinux_flags=()
+    if [[ -n "$vmlinux_dir" ]]; then
+        vmlinux_flags=(-DAUTO_XDP_VMLINUX_H "-I${vmlinux_dir}")
+    fi
 
     if ! clang -O3 -g \
         -target bpf \
@@ -44,8 +49,47 @@ compile_bpf_object() {
         -I/usr/include/bpf \
         -I"${include_root}/bpf/include" \
         -I"$include_root" \
+        "${vmlinux_flags[@]}" \
         -c "$src_path" -o "$obj_path"; then
         return 1
+    fi
+    return 0
+}
+
+target_vmlinux_header() {
+    local out_dir="$1"
+    [[ -r /sys/kernel/btf/vmlinux ]] || return 1
+    command -v bpftool &>/dev/null || return 1
+    mkdir -p "$out_dir"
+    bpftool btf dump file /sys/kernel/btf/vmlinux format c \
+        >"${out_dir}/vmlinux.h" || return 1
+    [[ -s "${out_dir}/vmlinux.h" ]]
+}
+
+compile_syncookie_handoff() {
+    local source_root="$1" vmlinux_dir="${2:-}"
+    local object="${BUILD_STAGING_DIR}/${TC_SYNCOOKIE_OBJ}"
+    # A reused staging directory must not retain an unsupported/partial object.
+    rm -f "$object"
+    if [[ -z "$vmlinux_dir" || ! -s "${vmlinux_dir}/vmlinux.h" ]]; then
+        warn "Level 2 SYN-cookie listener handoff skipped: kernel BTF is unavailable."
+        return 0
+    fi
+    # Older kernels still have BTF, but lack the request-socket kfunc's types.
+    # Check the generated definition, not just a possible forward declaration.
+    if ! grep -Eq '^[[:space:]]*struct[[:space:]]+bpf_tcp_req_attrs[[:space:]]*\{' \
+            "${vmlinux_dir}/vmlinux.h"; then
+        warn "Level 2 SYN-cookie listener handoff skipped: kernel BTF has no complete bpf_tcp_req_attrs definition; bpf_sk_assign_tcp_reqsk support is required."
+        return 0
+    fi
+    if ! stage_build_source "$TC_SYNCOOKIE_SRC" "$TC_SYNCOOKIE_SRC" "$TC_SYNCOOKIE_SRC"; then
+        warn "Level 2 SYN-cookie listener handoff unavailable: source could not be staged."
+        return 0
+    fi
+    if ! compile_bpf_object "${source_root}/${TC_SYNCOOKIE_SRC}" "$object" \
+            "$source_root" "$vmlinux_dir"; then
+        rm -f "$object"
+        warn "Level 2 SYN-cookie listener handoff unavailable: compilation failed."
     fi
     return 0
 }
@@ -53,24 +97,29 @@ compile_bpf_object() {
 generate_xdp_map_abi() {
     local source_root="$1"
     local header="${source_root}/bpf/include/map_sizes.h"
-    local ct4 ct6 rate4 rate6
+    local rate4 rate6 counters
 
     [[ -f "$header" ]] || return 1
-    ct4=$(awk '$2 == "CT_MAP_MAX_ENTRIES_V4" { print $3; exit }' "$header")
-    ct6=$(awk '$2 == "CT_MAP_MAX_ENTRIES_V6" { print $3; exit }' "$header")
     rate4=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V4" { print $3; exit }' "$header")
     rate6=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V6" { print $3; exit }' "$header")
-    [[ "$ct4" =~ ^[0-9]+$ && "$ct6" =~ ^[0-9]+$ \
-        && "$rate4" =~ ^[0-9]+$ && "$rate6" =~ ^[0-9]+$ ]] || return 1
+    counters=$(awk '$1 == "CNT_MAX" { gsub(/,/, "", $3); print $3; exit }' \
+        "${source_root}/bpf/include/counters.h")
+    [[ "$rate4" =~ ^[0-9]+$ && "$rate6" =~ ^[0-9]+$ ]] || return 1
+    [[ "$counters" =~ ^[0-9]+$ ]] || return 1
 
     cat >"${BUILD_STAGING_DIR}/xdp_map_abi.txt" <<EOF
-# Map capacities derived from bpf/include/map_sizes.h.
-tcp_ct4 ${ct4}
-tcp_ct6 ${ct6}
-udp_ct4 ${ct4}
-udp_ct6 ${ct6}
-tcp_pd4 ${rate4}
-tcp_pd6 ${rate6}
+# Map capacities derived from bpf/include/map_sizes.h and counters.h.
+pkt_counters percpu_array 4 8 ${counters}
+byte_counters percpu_array 4 32 1
+endpoint_scopes hash 24 4 16384
+tc_handler_ctx percpu_array 4 96 1
+handler_egress hash 8 4 4096
+handler_flows lru_hash 48 32 65536
+tc_profile_handlers prog_array 4 4 256
+tc_tcp_handlers prog_array 4 4 65536
+tc_udp_handlers prog_array 4 4 65536
+tc_proto_handlers prog_array 4 4 256
+handler_eg_stats percpu_array 4 8 6
 hblk4 ${rate4}
 hblk6 ${rate6}
 udp_hv4 ${rate4}
@@ -79,10 +128,14 @@ synag4 ${rate4}
 synag6 ${rate6}
 udpag4 ${rate4}
 udpag6 ${rate6}
-tsc4 ${rate4}
-tsc6 ${rate6}
-tsc_pfx4 ${rate4}
-tsc_pfx6 ${rate6}
+tcp_synck_policy array 4 4 65536
+sync_run_cfg array 4 24 1
+sync_port_rate array 4 24 65536
+sync_port_state array 4 16 65536
+sync_port_limit array 4 4 65536
+syncookie_prog_array prog_array 4 4 1
+sync_handoff4 lru_hash 12 20 65536
+sync_handoff6 lru_hash 36 20 65536
 EOF
 }
 
@@ -223,7 +276,7 @@ prepare_slot_handler_sources() {
             fi
         done < <(
             find "${_source_dir}/handlers" -maxdepth 1 -type f \
-                \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) \
+                \( -name 'Makefile*' -o -name 'Kbuild' -o -name '*.c' -o -name '*.h' -o -name '*.handler.json' \) \
                 | sed "s|^${_source_dir}/||" | sort
         )
     else
@@ -296,15 +349,25 @@ compile_xdp_program() {
         warn "Failed to compile ${XDP_SRC}; XDP backend will be skipped."
         return 1
     fi
+    if stage_build_source "$SYNCOOKIE_SRC" "$SYNCOOKIE_SRC" "$SYNCOOKIE_SRC"; then
+        compile_bpf_object "${_source_root}/${SYNCOOKIE_SRC}" \
+            "${BUILD_STAGING_DIR}/${SYNCOOKIE_OBJ}" "$_source_root" || \
+            warn "SYN-cookie XDP object unavailable on this build host."
+    fi
+    local _vmlinux_dir=""
+    if target_vmlinux_header "${BUILD_STAGING_DIR}/btf"; then
+        _vmlinux_dir="${BUILD_STAGING_DIR}/btf"
+    fi
+    compile_syncookie_handoff "$_source_root" "$_vmlinux_dir"
+    if ! stage_build_source "$TC_EGRESS_SRC" "$TC_EGRESS_SRC" "$TC_EGRESS_SRC" \
+            || ! compile_bpf_object \
+                "${_source_root}/${TC_EGRESS_SRC}" \
+                "${BUILD_STAGING_DIR}/${TC_EGRESS_OBJ}" \
+                "$_source_root"; then
+        warn "Required Handler egress observer failed to build."
+        return 1
+    fi
 
-    if ! stage_build_source "$TC_SRC" "$TC_SRC" "$TC_SRC"; then
-        warn "Unable to fetch ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
-        return 0
-    fi
-    if ! compile_bpf_object "${_source_root}/${TC_SRC}" "${BUILD_STAGING_DIR}/${TC_OBJ}" "$_source_root"; then
-        warn "Failed to compile ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
-        return 0
-    fi
     if [[ $_handlers_ready -eq 1 && -d "$_handlers_dir" ]] && command -v make &>/dev/null; then
         if ! bpf_header_exists "linux/bpf.h" "/usr/include" "$ASM_INC"; then
             warn "Slot handlers skipped: missing linux/bpf.h in /usr/include or ${ASM_INC}"
@@ -328,6 +391,14 @@ compile_xdp_program() {
             fi
             rm -f "$handler_log"
         fi
+    fi
+    if [[ ! -s "${_handlers_dir}/minecraft_handler.o" ]]; then
+        step_error "Required Minecraft protection profile failed to build."
+        return 1
+    fi
+    if [[ ! -s "${_handlers_dir}/icmp_handler.o" ]]; then
+        step_error "Required ICMP module failed to build."
+        return 1
     fi
     return 0
 }
@@ -359,13 +430,13 @@ compile_sock_state_program() {
 }
 
 compile_bpf_objects_step() {
-    step_begin "Compiling XDP, tc, and sock_state BPF objects" COMPILE
+    step_begin "Compiling XDP and sock_state BPF objects" COMPILE
     local ok=1
     compile_xdp_program || ok=0
     compile_sock_state_program || true
     if [[ $ok -eq 1 ]]; then
         if [[ ${HANDLER_BUILD_FAILED:-0} -eq 1 ]]; then
-            step_ok "XDP/tc compiled; slot handlers unavailable"
+            step_ok "XDP compiled; slot handlers unavailable"
         else
             step_ok
         fi
@@ -399,14 +470,15 @@ cleanup_build_artifacts_step() {
     local _cleaned=()
 
     step_begin "Cleaning up build artifacts"
-    for _f in "$XDP_OBJ" "$TC_OBJ" "$SOCK_STATE_OBJ"; do
+    for _f in "$XDP_OBJ" "$SYNCOOKIE_OBJ" "$TC_SYNCOOKIE_OBJ" \
+              "$TC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
         if [[ -f "$_f" ]]; then
             rm -f "$_f" && _cleaned+=("$_f")
         fi
     done
 
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
-        for _f in "$XDP_SRC" "$TC_SRC"; do
+        for _f in "$XDP_SRC"; do
             if [[ -f "$_f" ]]; then
                 rm -f "$_f" && _cleaned+=("$_f")
             fi

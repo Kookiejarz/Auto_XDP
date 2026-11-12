@@ -1,26 +1,14 @@
 #pragma once
 #include "common.h"
 
-// Generic parsed 5-tuple used on the packet path. Map-facing keys below are
-// split by address family so IPv4 traffic does not hash or compare zeroed IPv6
-// words on every lookup/update.
-struct flow_key {
-    __u8 family;
-    __u8 pad[3];
-    __be16 sport;
-    __be16 dport;
-    __u32 saddr[4];
-    __u32 daddr[4];
-} __attribute__((aligned(8)));
-
-struct ct_key_v4 {
+struct udp_validation_key_v4 {
     __be16 sport;
     __be16 dport;
     __be32 saddr;
     __be32 daddr;
 };
 
-struct ct_key_v6 {
+struct udp_validation_key_v6 {
     __be16 sport;
     __be16 dport;
     __u32 saddr[4];
@@ -35,6 +23,25 @@ struct trusted_v4_key {
 struct trusted_v6_key {
     __u32 prefixlen;
     __u8 addr[16];
+};
+
+struct zone_port_key {
+    __u32 ifindex;
+    __u32 port;
+};
+
+/*
+ * TCP admission result.  A non-zero allow with profile_id == 0 selects the
+ * legacy generic/per-port path.  A non-zero profile_id makes successful
+ * profile execution a prerequisite for exposure.
+ *
+ * Keep this layout in sync with userspace's "=IIQQ" packing.
+ */
+struct tcp_endpoint_policy {
+    __u32 allow;
+    __u32 profile_id;
+    __u64 policy_generation;
+    __u64 profile_generation;
 };
 
 // Global ICMP token-bucket state (single entry, protected by spin lock)
@@ -68,11 +75,11 @@ struct udp_percpu_local {
 struct tcp_port_policy_cfg {
     __u32 syn_rate_max;             /* view idx 0 */
     __u32 syn_agg_rate_max;         /* view idx 1 */
-    __u32 conn_limit_max;           /* view idx 2 — true ESTABLISHED count after Task 8 */
+    __u32 _reserved2;               /* view idx 2 — retained for ABI stability */
     __u32 source_prefix_v4;         /* view idx 3 */
     __u32 source_prefix_v6;         /* view idx 4 */
-    __u32 conn_prefix_limit_max;    /* view idx 5 (NEW) */
-    __u32 conn_port_limit_max;      /* view idx 6 (NEW) */
+    __u32 _reserved5;               /* view idx 5 — retained for ABI stability */
+    __u32 _reserved6;               /* view idx 6 — retained for ABI stability */
     __u32 _pad;                     /* view idx 7 */
 };
 
@@ -85,17 +92,35 @@ struct udp_port_policy_cfg {
     __u32 _pad1;
 };
 
-// Per-IP SYN rate limiter state
-struct syn_rate_key_v4 {
-    __be32 addr;
-};
-
-struct syn_rate_key_v6 {
-    __u32 addr[4];
-};
-
 struct syn_rate_val {
     __u64 state; /* upper 32 bits: window tick; lower 32 bits: count */
+};
+
+struct syncookie_runtime_cfg {
+    __u32 enabled;
+    __u32 activation_percent;
+    __u32 auto_max_percent;
+    __u32 invalid_ack_pps;
+    __u64 cooldown_ns;
+};
+
+struct syncookie_port_state {
+    __u32 state; /* 0=NORMAL, 1=CHALLENGE, 2=SHED */
+    __u32 _pad;
+    __u64 cooldown_until_ns;
+};
+
+struct syncookie_port_rate_val {
+    struct bpf_spin_lock lock;
+    __u32 _pad;
+    __u64 window_start_ns;
+    __u64 count;
+};
+
+enum syncookie_guard_verdict {
+    SYN_GUARD_ALLOW = 0,
+    SYN_GUARD_COOKIE = 1,
+    SYN_GUARD_DROP = 2,
 };
 
 struct prefix_rate_key_v4 {
@@ -112,28 +137,6 @@ struct prefix_rate_val {
     __u64 state;
 };
 
-struct tcp_src_conn_key_v4 {
-    __be32 addr;
-    __u32 dest_port;
-};
-
-struct tcp_src_conn_key_v6 {
-    __u32 addr[4];
-    __u32 dest_port;
-};
-
-struct tcp_src_conn_val {
-    __u64 state; /* upper 32 bits: activity tick; lower 32 bits: count */
-};
-
-struct tcp_pfx_conn_val {
-    __u64 state;
-};
-
-struct tcp_port_conn_val {
-    __u64 state;
-};
-
 // Per-CIDR port ACL: source CIDR → list of allowed destination ports.
 // ACL entries bypass rate limiting and take priority over the port whitelist.
 // TCP and UDP are configured independently via separate maps.
@@ -144,7 +147,7 @@ struct acl_val {
     __u16 ports[ACL_MAX_PORTS];
 };
 
-static __always_inline void fill_ct_key_v4_map(struct ct_key_v4 *out, const struct flow_key *key)
+static __always_inline void fill_udp_validation_key_v4(struct udp_validation_key_v4 *out, const struct flow_key *key)
 {
     out->sport = key->sport;
     out->dport = key->dport;
@@ -152,7 +155,7 @@ static __always_inline void fill_ct_key_v4_map(struct ct_key_v4 *out, const stru
     out->daddr = (__be32)key->daddr[0];
 }
 
-static __always_inline void fill_ct_key_v6_map(struct ct_key_v6 *out, const struct flow_key *key)
+static __always_inline void fill_udp_validation_key_v6(struct udp_validation_key_v6 *out, const struct flow_key *key)
 {
     out->sport = key->sport;
     out->dport = key->dport;

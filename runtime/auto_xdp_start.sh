@@ -118,6 +118,14 @@ resolve_preferred_backend() {
     _auto_xdp_resolve_preferred_backend "${TOML_CONFIG:-}" "${PREFERRED_BACKEND:-auto}"
 }
 
+resolve_policy_mode() {
+    "$PYTHON3_BIN" -c '
+from auto_xdp.config import load_toml_config
+import sys
+print(str(load_toml_config(sys.argv[1]).get("policy", {}).get("mode", "audit")).lower())
+' "${TOML_CONFIG:-/etc/auto_xdp/config.toml}"
+}
+
 resolve_committed_backend() {
     local state_path="${RUNTIME_STATE:-/etc/auto_xdp/runtime-state.json}"
     [[ -f "$state_path" ]] || return 1
@@ -139,15 +147,16 @@ run_sync_script() {
     local mode="$1"
     shift || true
     local backend
-    backend=$(cat "${RUN_STATE_DIR}/backend")
+    backend=$(cat "${RUN_STATE_DIR}/backend" 2>/dev/null || resolve_preferred_backend)
 
     if [[ "$mode" == "watch" ]]; then
-        exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --watch --backend "$backend" "$@"
+        exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --config "${TOML_CONFIG:-/etc/auto_xdp/config.toml}" --watch --backend "$backend" "$@"
     fi
-    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --backend "$backend" "$@"
+    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --config "${TOML_CONFIG:-/etc/auto_xdp/config.toml}" --backend "$backend" "$@"
 }
 
 ensure_xdp_loaded() {
+    AUTO_XDP_ATTACH_FATAL=0
     if declare -F _auto_xdp_resolve_bpftool >/dev/null 2>&1; then
         _auto_xdp_resolve_bpftool || return 1
     else
@@ -158,6 +167,12 @@ ensure_xdp_loaded() {
     [[ -f "$XDP_OBJ_PATH" ]] || return 1
 
     ensure_bpffs
+
+    ensure_linux_conntrack || {
+        [[ ${AUTO_XDP_ATTACH_FATAL:-0} -eq 0 ]] || return 2
+        _auto_xdp_any_target_has_xdp && return 2
+        return 1
+    }
 
     # A killed loader can leave a staged or rollback generation behind. Resume
     # it when possible. If the staged generation is no longer usable, verify
@@ -173,8 +188,16 @@ ensure_xdp_loaded() {
     # If the prog is already pinned and maps are intact, just re-attach any
     # interface that has lost its XDP program (e.g. after a link bounce).
     if [[ -f "$BPF_PIN_DIR/prog" ]] && xdp_maps_ready; then
-        local _iface _any_missing=0 _xdp_mode="native"
+        local _iface _current_mode _any_missing=0 _xdp_mode="native"
         for _iface in "${_IFACES[@]}"; do
+            _current_mode=$(_auto_xdp_iface_xdp_mode "$_iface")
+            case "$_current_mode" in
+                none|native|generic) ;;
+                *)
+                    echo "[auto_xdp] cannot confirm a single XDP mode on $_iface ($_current_mode); current protection retained" >&2
+                    return 2
+                    ;;
+            esac
             if ! _auto_xdp_verify_iface_program "$_iface" "$BPF_PIN_DIR/prog"; then
                 _any_missing=1
                 if _auto_xdp_attach_candidate "$_iface" "$BPF_PIN_DIR/prog" \
@@ -183,19 +206,19 @@ ensure_xdp_loaded() {
                     [[ "$AUTO_XDP_LAST_ATTACH_MODE" == "generic" ]] && _xdp_mode="generic"
                 else
                     echo "[auto_xdp] warning: could not re-attach XDP to $_iface" >&2
+                    [[ ${AUTO_XDP_ATTACH_FATAL:-0} -eq 0 ]] || return 2
                     return 1
                 fi
-            elif ip -d link show dev "$_iface" 2>/dev/null | grep -q "xdpgeneric"; then
+            elif [[ "$_current_mode" == "generic" ]]; then
                 _xdp_mode="generic"
             fi
         done
         [[ -f "$BPF_PIN_DIR/sock_state_link" ]] || load_sock_state_tracker || true
-        if ! _auto_xdp_restore_tc_egress; then
-            echo "[auto_xdp] warning: could not restore tc egress tracker after XDP re-attach" >&2
-            # XDP is still attached; do not let select_backend tear it down
-            # and replace it with nftables without a verified tc rollback.
-            return 2
-        fi
+        # Strict cookie requirements and incompatible NAT both abort activation.
+        # Keep XDP attached and forbid a silent nftables downgrade.
+        load_syncookie_program || return 2
+        load_icmp_module || return 2
+        load_tc_egress_dispatch || return 1
         load_port_handlers || true
         auto_tune_interface_parallelism || true
         [[ $_any_missing -eq 1 ]] && echo "[auto_xdp] re-attached XDP to missing interfaces" >&2
@@ -209,11 +232,15 @@ ensure_xdp_loaded() {
 
     [[ -f "$BPF_PIN_DIR/prog" ]] && echo "[auto_xdp] existing XDP maps incomplete; reloading runtime objects" >&2
 
-    # Build and seed a candidate map generation while the current XDP/tc
-    # programs remain attached. The shared switch helper restores every
-    # interface and filter if any replace operation fails.
+    # Build a candidate map generation while the current XDP program remains
+    # attached. The shared switch helper restores every interface if any
+    # replace operation fails.
     if ! transactional_reload_xdp; then
-        echo "[auto_xdp] transactional XDP/tc reload failed; previous protection preserved or restored" >&2
+        echo "[auto_xdp] transactional XDP reload failed; previous protection preserved or restored" >&2
+        if [[ ${AUTO_XDP_ATTACH_FATAL:-0} -eq 1 ]]; then
+            echo "[auto_xdp] fatal XDP attachment error; automatic backend fallback disabled" >&2
+            return 2
+        fi
         if _auto_xdp_any_target_has_xdp; then
             echo "[auto_xdp] refusing nftables fallback while XDP remains attached" >&2
             return 2
@@ -222,6 +249,8 @@ ensure_xdp_loaded() {
     fi
 
     load_sock_state_tracker || true
+    load_syncookie_program || return 2
+    load_tc_egress_dispatch || return 1
     auto_tune_interface_parallelism || true
     echo "$AUTO_XDP_SWITCH_MODE" > "${RUN_STATE_DIR}/xdp_mode"
     return 0
@@ -233,15 +262,13 @@ activate_nftables_backend() {
         return 1
     }
 
-    local needs_cutover=0 iface mode index detached=0 rollback_ok=1
+    local needs_cutover=0 iface mode index detached=0 rollback_ok=1 table_dump=""
     local nft_family="${NFT_FAMILY:-inet}" nft_table="${NFT_TABLE:-auto_xdp}"
     local -a old_modes=()
     _auto_xdp_any_target_has_xdp && needs_cutover=1
-    if [[ $needs_cutover -eq 0 ]] \
-            && nft list table "$nft_family" "$nft_table" 2>/dev/null \
-                | grep -Fq 'set tcp_ports' \
-            && nft list table "$nft_family" "$nft_table" 2>/dev/null \
-                | grep -Fq 'chain input'; then
+    table_dump=$(nft list table "$nft_family" "$nft_table" 2>/dev/null || true)
+    if [[ $needs_cutover -eq 0 && "$table_dump" == *"set tcp_ports"* \
+            && "$table_dump" == *"chain input"* ]]; then
         echo "nftables" > "${RUN_STATE_DIR}/backend"
         _auto_xdp_record_nft_state
         return
@@ -255,13 +282,12 @@ activate_nftables_backend() {
         echo "[auto_xdp] nftables candidate sync failed; retaining current XDP backend" >&2
         return 1
     fi
-    nft list table "$nft_family" "$nft_table" 2>/dev/null \
-        | grep -Fq 'set tcp_ports' \
-        && nft list table "$nft_family" "$nft_table" 2>/dev/null \
-            | grep -Fq 'chain input' || {
+    table_dump=$(nft list table "$nft_family" "$nft_table" 2>/dev/null || true)
+    if [[ "$table_dump" != *"set tcp_ports"* \
+            || "$table_dump" != *"chain input"* ]]; then
         echo "[auto_xdp] nftables candidate schema verification failed; retaining current XDP backend" >&2
         return 1
-    }
+    fi
 
     if [[ $needs_cutover -eq 1 ]]; then
         for iface in "${_IFACES[@]}"; do
@@ -284,8 +310,9 @@ activate_nftables_backend() {
             fi
             detached=$((detached + 1))
         done
-        cleanup_tc_egress_filter
     fi
+
+    cleanup_tc_egress_dispatch
 
     echo "nftables" > "${RUN_STATE_DIR}/backend"
     _auto_xdp_record_nft_state
@@ -330,8 +357,8 @@ select_backend() {
             fi
             return 0
         fi
-        if [[ $xdp_status -eq 2 ]]; then
-            echo "[auto_xdp] XDP reload failed with an attachment still active; backend selection aborted" >&2
+        if [[ $xdp_status -eq 2 || "$preferred_backend" == "xdp" ]]; then
+            echo "[auto_xdp] XDP activation blocked; automatic backend fallback disabled" >&2
             return 1
         fi
     fi
@@ -342,8 +369,16 @@ select_backend() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     if [[ "${1:-}" == "--sync-once" ]]; then
         shift
+        if [[ "$(resolve_policy_mode)" != "enforce" ]]; then
+            run_sync_script once "$@"
+        fi
         select_backend
         run_sync_script once "$@"
+    fi
+
+    if [[ "$(resolve_policy_mode)" != "enforce" ]]; then
+        rm -f "${RUN_STATE_DIR}/backend" "${RUN_STATE_DIR}/xdp_mode"
+        run_sync_script watch
     fi
 
     select_backend

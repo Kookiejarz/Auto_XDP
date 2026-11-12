@@ -54,27 +54,33 @@ def obj_get(path: str) -> int:
     return bpf(BPF_OBJ_GET, attr)
 
 
-def map_max_entries(fd: int) -> int:
-    """Return the max_entries of an open BPF map fd via BPF_OBJ_GET_INFO_BY_FD."""
+def _map_info_u32(fd: int, offset: int) -> int:
     info = ctypes.create_string_buffer(128)
     attr = ctypes.create_string_buffer(16)
     info_ptr = ctypes.cast(info, ctypes.c_void_p).value or 0
-    # bpf_attr.info: bpf_fd(u32), info_len(u32), info(u64 ptr)
     struct.pack_into("=IIQ", attr, 0, fd, len(info), info_ptr)
     bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
-    # bpf_map_info.max_entries is at offset 16 (after type, id, key_size, value_size)
-    return struct.unpack_from("=I", info, 16)[0]
+    return struct.unpack_from("=I", info, offset)[0]
+
+
+def map_max_entries(fd: int) -> int:
+    """Return the max_entries of an open BPF map fd."""
+    return _map_info_u32(fd, 16)
+
+
+def map_value_size(fd: int) -> int:
+    """Return the value_size of an open BPF map fd."""
+    return _map_info_u32(fd, 12)
 
 
 def map_id(fd: int) -> int:
     """Return the kernel-assigned map ID for an open BPF map fd."""
-    info = ctypes.create_string_buffer(128)
-    attr = ctypes.create_string_buffer(16)
-    info_ptr = ctypes.cast(info, ctypes.c_void_p).value or 0
-    struct.pack_into("=IIQ", attr, 0, fd, len(info), info_ptr)
-    bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
-    # bpf_map_info: type(u32) at 0, id(u32) at 4
-    return struct.unpack_from("=I", info, 4)[0]
+    return _map_info_u32(fd, 4)
+
+
+def program_id(fd: int) -> int:
+    """Return a program's ID; bpf_prog_info shares the type/ID prefix."""
+    return _map_info_u32(fd, 4)
 
 
 def map_create(map_type: int, key_size: int, value_size: int,
@@ -98,9 +104,7 @@ def map_get_fd_by_id(map_id_: int) -> int:
 
 def probe_inner_map_support() -> bool:
     """True if the kernel accepts an LRU_HASH inner in an ARRAY_OF_MAPS
-    outer. No BPF_F_INNER_MAP: that flag is ARRAY-only and htab creation
-    rejects it with EINVAL; hash-type inners may differ in max_entries
-    without it (kernel 5.10+)."""
+    outer. LRU inner maps must match the outer's compiled template metadata."""
     inner_fd = -1
     outer_fd = -1
     try:

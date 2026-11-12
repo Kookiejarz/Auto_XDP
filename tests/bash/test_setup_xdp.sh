@@ -8,6 +8,59 @@ BASE_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 # shellcheck source=tests/bash/testlib.sh
 source "$REPO_ROOT/tests/bash/testlib.sh"
 
+test_optional_syncookie_handoff_requires_complete_kernel_btf_type() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir case_name output vmlinux_dir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BUILD_STAGING_DIR="$tmpdir/staging with spaces"
+    vmlinux_dir="$tmpdir/kernel btf"
+    mkdir -p "$BUILD_STAGING_DIR" "$vmlinux_dir"
+    stage_build_source() {
+        printf 'stage\n' >> "$tmpdir/calls"
+        [[ "$case_name" != source_failure ]]
+    }
+    compile_bpf_object() {
+        printf 'compile\n' >> "$tmpdir/calls"
+        assert_eq "$1" "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_SRC" || return 1
+        assert_eq "$3" "$BUILD_STAGING_DIR" || return 1
+        assert_eq "$4" "$vmlinux_dir" || return 1
+        printf 'object\n' > "$2"
+        [[ "$case_name" != compile_failure ]]
+    }
+    warn() { printf '%s\n' "$*"; }
+    for case_name in no_btf missing_type forward_only supported source_failure compile_failure; do
+        : > "$tmpdir/calls"
+        printf 'stale object\n' > "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ"
+        case "$case_name" in
+            no_btf) rm -f "$vmlinux_dir/vmlinux.h" ;;
+            missing_type) printf 'struct other { int field; };\n' > "$vmlinux_dir/vmlinux.h" ;;
+            forward_only) printf 'struct bpf_tcp_req_attrs;\n' > "$vmlinux_dir/vmlinux.h" ;;
+            *) printf 'struct bpf_tcp_req_attrs;\nstruct bpf_tcp_req_attrs { int field; };\n' > "$vmlinux_dir/vmlinux.h" ;;
+        esac
+        output=$(compile_syncookie_handoff "$BUILD_STAGING_DIR" "$vmlinux_dir") || return 1
+        if [[ "$case_name" == supported ]]; then
+            assert_eq "$(cat "$tmpdir/calls")" $'stage\ncompile' || return 1
+            assert_eq "$(cat "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ")" object || return 1
+            assert_eq "$output" '' || return 1
+        else
+            [[ ! -e "$BUILD_STAGING_DIR/$TC_SYNCOOKIE_OBJ" ]] || return 1
+            case "$case_name" in
+                no_btf|missing_type|forward_only)
+                    [[ ! -s "$tmpdir/calls" ]] || return 1
+                    assert_contains "$output" 'handoff skipped:' || return 1 ;;
+                source_failure)
+                    assert_eq "$(cat "$tmpdir/calls")" stage || return 1
+                    assert_contains "$output" 'source could not be staged' || return 1 ;;
+                compile_failure)
+                    assert_eq "$(cat "$tmpdir/calls")" $'stage\ncompile' || return 1
+                    assert_contains "$output" 'compilation failed' || return 1 ;;
+            esac
+        fi
+    done
+)
+
 test_log_colors_disable_for_non_tty_and_no_color() (
     local output
 
@@ -16,6 +69,52 @@ test_log_colors_disable_for_non_tty_and_no_color() (
 
     output=$(bash -c 'source "$1"; NO_COLOR=1; log_init_colors; log_printf "%b\\n" "${C_GREEN}✓ complete${C_RESET}"' bash "$REPO_ROOT/setup_xdp.sh")
     assert_eq "$output" "✓ complete" "NO_COLOR output"
+)
+
+test_tc_cleanup_uses_filter_kind_including_dispatcher_rollback() (
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+    set +e
+    local tmpdir iface direction
+    tmpdir=$(mktemp -d)
+    local -a IFACES=(eth0 eth1)
+    BPF_PIN_DIR="$tmpdir/pins"
+    TC_EGRESS_OBJ_PATH="$tmpdir/dispatcher.o"
+    mkdir "$BPF_PIN_DIR"
+    touch "$TC_EGRESS_OBJ_PATH"
+    while read -r name; do touch "$BPF_PIN_DIR/$name"; done < "$REPO_ROOT/auto_xdp/xdp_required_maps.txt"
+    tc() {
+        case "$1:$2" in
+            filter:del)
+                [[ "${6:-}:${7:-}:${8:-}:${10:-}:${11:-}:${12:-}" \
+                    == "protocol:all:pref:handle:2:bpf" ]] || return 255
+                case "$5:$9" in ingress:49151|egress:49153) ;; *) return 1 ;; esac
+                rm -f "$tmpdir/tc-$4-$5" ;;
+            filter:replace)
+                [[ "$4" != eth1 ]] || return 1
+                touch "$tmpdir/tc-$4-$5" ;;
+            qdisc:add) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    syncookie_sysctl_release() { touch "$tmpdir/sysctl-released"; }
+    for iface in "${IFACES[@]}"; do
+        for direction in ingress egress; do
+            touch "$tmpdir/tc-$iface-$direction"
+        done
+    done
+    cleanup_tc_egress_dispatch || return 1
+    for iface in "${IFACES[@]}"; do
+        for direction in egress; do
+            [[ ! -e "$tmpdir/tc-$iface-$direction" ]] \
+                || { printf 'runtime TC cleanup left %s %s\n' "$iface" "$direction"; return 1; }
+        done
+    done
+
+    bpftool() { touch "$4"; }
+    load_tc_egress_dispatch >/dev/null 2>&1
+    assert_eq "$?" 1 "second interface attach must fail" || return 1
+    [[ ! -e "$tmpdir/tc-eth0-egress" ]] \
+        || { printf 'Handler dispatcher rollback left the first interface attached\n'; return 1; }
 )
 
 test_detect_os_release_maps_supported_families() (
@@ -156,11 +255,179 @@ test_package_lists_cover_all_supported_managers() (
         assert_contains "$packages" "curl" "$pm packages" || return 1
         assert_contains "$packages" "findutils" "$pm packages" || return 1
         assert_contains "$packages" "python" "$pm packages" || return 1
+        case "$pm" in
+            dnf|yum|zypper) assert_contains "$packages" "dwarves" "$pm BTF tooling" || return 1 ;;
+            *) assert_contains "$packages" "pahole" "$pm BTF tooling" || return 1 ;;
+        esac
         [[ -n "$optional" ]] || {
             printf 'optional package list empty for [%s]\n' "$pm"
             return 1
         }
     done
+)
+
+setup_rpm_repo_fixture() {
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    PKG_MANAGER=dnf
+    DISTRO_ID=rhel
+    DISTRO_LIKE=fedora
+    RPM_TEST_DIR=$(mktemp -d)
+    trap 'rm -rf "$RPM_TEST_DIR"' EXIT
+    RPM_TEST_REPOS=""
+    RPM_TEST_FAIL=""
+    RPM_TEST_ENABLED=""
+    dnf() { :; }
+    as_root() {
+        printf '%s\n' "$*" >>"$RPM_TEST_DIR/commands"
+        if [[ "$*" == "$RPM_TEST_FAIL" ]]; then
+            printf 'repository command failed\n' >&2
+            return 1
+        fi
+        case "$*" in
+            'env LC_ALL=C dnf -q repolist --all') printf '%s\n' "$RPM_TEST_REPOS" ;;
+            'subscription-manager repos --enable '*) RPM_TEST_ENABLED="$4" ;;
+            'dnf config-manager --set-enabled '*) RPM_TEST_ENABLED="$4" ;;
+        esac
+        return 0
+    }
+}
+
+test_rhel_install_enables_subscription_build_repo_before_packages() (
+    setup_rpm_repo_fixture
+    RPM_TEST_REPOS='Updating Subscription Management repositories.
+repo id repo name status
+codeready-builder-for-rhel-10-x86_64-debug-rpms CodeReady Debug disabled
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady Builder disabled
+codeready-builder-for-rhel-10-x86_64-source-rpms CodeReady Source disabled
+rhel-10-for-x86_64-baseos-rpms RHEL 10 BaseOS enabled
+rhui-codeready-builder-for-rhel-10-x86_64-rhui-rpms RHUI CodeReady disabled
+rhui-rhel-10-for-x86_64-baseos-rhui-rpms RHUI BaseOS disabled'
+    pkg_update() { :; }
+    pkg_install() {
+        [[ "$RPM_TEST_ENABLED" == codeready-builder-for-rhel-10-x86_64-rpms ]] || return 1
+        printf '%s\n' "$*" >>"$RPM_TEST_DIR/packages"
+    }
+    install_packages >"$RPM_TEST_DIR/output" 2>&1 || return 1
+    assert_contains "$(cat "$RPM_TEST_DIR/packages")" "libbpf-devel" || return 1
+    assert_contains "$(cat "$RPM_TEST_DIR/commands")" \
+        "subscription-manager repos --enable codeready-builder-for-rhel-10-x86_64-rpms" || return 1
+    [[ "$(cat "$RPM_TEST_DIR/commands")" != *config-manager* ]]
+)
+
+test_rhel_cloud_build_repo_uses_actual_rhui_provider_and_architecture() (
+    setup_rpm_repo_fixture
+    local baseos builder commands
+    while read -r baseos builder; do
+        RPM_TEST_REPOS="repo id repo name status
+$baseos RHEL BaseOS enabled
+$builder CodeReady Builder disabled
+codeready-builder-for-rhel-10-x86_64-rpms Subscription CodeReady disabled
+rhel-10-for-x86_64-baseos-rpms Subscription BaseOS disabled
+$builder-debug Debug disabled
+$builder-source Source disabled"
+        : >"$RPM_TEST_DIR/commands"
+        enable_rpm_build_repos >/dev/null || return 1
+        commands=$(cat "$RPM_TEST_DIR/commands")
+        assert_contains "$commands" "dnf config-manager --set-enabled $builder" || return 1
+        assert_eq "$RPM_TEST_ENABLED" "$builder" || return 1
+        [[ "$commands" != *subscription-manager* && "$commands" != *--enable\ crb* ]] || return 1
+    done <<'EOF_RHUI'
+rhel-10-baseos-rhui-rpms codeready-builder-for-rhel-10-rhui-rpms
+rhui-rhel-10-for-x86_64-baseos-rhui-rpms rhui-codeready-builder-for-rhel-10-x86_64-rhui-rpms
+rhel-9-for-aarch64-baseos-rhui-rpms codeready-builder-for-rhel-9-aarch64-rhui-rpms
+EOF_RHUI
+)
+
+test_rhel_build_repo_preserves_active_update_channel() (
+    setup_rpm_repo_fixture
+    RPM_TEST_REPOS='repo id repo name status
+rhel-9-for-x86_64-baseos-eus-rpms BaseOS EUS enabled
+codeready-builder-for-rhel-9-x86_64-eus-rpms CodeReady EUS disabled
+codeready-builder-for-rhel-9-x86_64-rpms CodeReady disabled
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady 10 disabled
+rhel-10-for-x86_64-baseos-rpms BaseOS 10 disabled'
+    enable_rpm_build_repos >/dev/null || return 1
+    assert_eq "$RPM_TEST_ENABLED" codeready-builder-for-rhel-9-x86_64-eus-rpms
+)
+
+test_rpm_derivatives_enable_available_crb_or_powertools() (
+    setup_rpm_repo_fixture
+    DISTRO_LIKE=""
+    local distro builder
+    while read -r distro builder; do
+        DISTRO_ID="$distro"
+        RPM_TEST_REPOS="repo id repo name status
+baseos BaseOS enabled
+$builder Build Repository disabled"
+        enable_rpm_build_repos >/dev/null || return 1
+        assert_eq "$RPM_TEST_ENABLED" "$builder" "$distro" || return 1
+    done <<'EOF_DERIVATIVES'
+almalinux crb
+rocky powertools
+centos PowerTools
+EOF_DERIVATIVES
+)
+
+test_enabled_rpm_build_repo_does_not_mutate_configuration() (
+    setup_rpm_repo_fixture
+    RPM_TEST_REPOS='repo id repo name status
+rhel-9-for-x86_64-baseos-rpms Old BaseOS enabled
+codeready-builder-for-rhel-9-x86_64-rpms Old CodeReady disabled
+rhel-10-baseos-rhui-rpms RHUI BaseOS enabled
+codeready-builder-for-rhel-10-rhui-rpms RHUI CodeReady disabled
+rhel-10-for-x86_64-baseos-rpms BaseOS enabled
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady enabled'
+    enable_rpm_build_repos >/dev/null || return 1
+    assert_eq "$(cat "$RPM_TEST_DIR/commands")" 'env LC_ALL=C dnf -q repolist --all'
+)
+
+test_missing_or_ambiguous_rpm_build_repo_is_reported_without_guessing() (
+    setup_rpm_repo_fixture
+    local output
+    RPM_TEST_REPOS='repo id repo name status
+rhel-10-for-x86_64-baseos-rpms BaseOS enabled
+codeready-builder-for-rhel-10-x86_64-debug-rpms CodeReady Debug disabled
+codeready-builder-for-rhel-10-x86_64-source-rpms CodeReady Source disabled'
+    output=$(enable_rpm_build_repos) || return 1
+    assert_contains "$output" 'No matching CodeReady Builder/CRB' || return 1
+    assert_contains "$output" 'dnf repolist --all' || return 1
+    RPM_TEST_REPOS+='
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady disabled
+rhel-10-baseos-rhui-rpms RHUI BaseOS enabled
+codeready-builder-for-rhel-10-rhui-rpms RHUI CodeReady disabled'
+    output=$(enable_rpm_build_repos) || return 1
+    assert_contains "$output" 'Multiple build repositories match' || return 1
+    [[ "$(cat "$RPM_TEST_DIR/commands")" != *--enable* ]]
+)
+
+test_rpm_repo_failures_preserve_diagnostics_and_custom_package_install() (
+    setup_rpm_repo_fixture
+    RPM_TEST_REPOS='repo id repo name status
+rhel-10-for-x86_64-baseos-rpms BaseOS enabled
+codeready-builder-for-rhel-10-x86_64-rpms CodeReady disabled'
+    pkg_update() { :; }
+    pkg_install() { printf '%s\n' "$*" >>"$RPM_TEST_DIR/packages"; }
+    local output
+    for RPM_TEST_FAIL in 'env LC_ALL=C dnf -q repolist --all' \
+        'subscription-manager repos --enable codeready-builder-for-rhel-10-x86_64-rpms'; do
+        output=$(install_packages 2>&1) || return 1
+        assert_contains "$output" 'repository command failed' || return 1
+        assert_contains "$output" 'WARN' || return 1
+        assert_contains "$(cat "$RPM_TEST_DIR/packages")" libbpf-devel || return 1
+    done
+)
+
+test_rpm_build_repos_do_not_modify_other_distributions() (
+    setup_rpm_repo_fixture
+    DISTRO_ID=fedora
+    DISTRO_LIKE=""
+    enable_rpm_build_repos || return 1
+    DISTRO_ID=ubuntu
+    DISTRO_LIKE=debian
+    PKG_MANAGER=apt-get
+    enable_rpm_build_repos || return 1
+    [[ ! -e "$RPM_TEST_DIR/commands" ]]
 )
 
 test_dry_run_report_emits_ci_fields() (
@@ -332,6 +599,28 @@ test_backend_phase_dispatch_preserves_remote_ref_across_sudo() (
     assert_file_contains "$tmpdir/as-root.log" "AUTO_XDP_FORCE_REMOTE=1"
 )
 
+test_backend_phase_defers_activation_for_audit_policy() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local calls=""
+    configured_policy_mode() { printf 'audit\n'; }
+    _auto_xdp_resolve_preferred_backend() { printf 'auto\n'; }
+    step_begin() { :; }
+    step_ok() { :; }
+    deactivate_installed_runtime() { calls+="deactivate|"; }
+    run_initial_sync_step() { calls+="sync|"; }
+    install_runtime_service_step() { calls+="service|"; }
+    deploy_backend_step() { calls+="deploy|"; }
+
+    run_backend_phase || return 1
+    assert_eq "$RUN_STATE_DIR" "/run/auto_xdp" || return 1
+    assert_eq "$NFT_FAMILY/$NFT_TABLE" "inet/auto_xdp" || return 1
+    assert_eq "$POLICY_DEFERRED" "1" || return 1
+    assert_eq "$ACTIVE_XDP_MODE" "none" || return 1
+    assert_eq "$calls" "deactivate|sync|service|"
+)
+
 test_readme_release_install_uses_one_local_archive_tree() (
     local readme
     readme=$(<"$REPO_ROOT/README.md")
@@ -417,7 +706,6 @@ test_write_config_enables_queue_auto_tuning() (
     PYTHON3_BIN="/usr/bin/python3"
     BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
     XDP_OBJ_INSTALLED="/tmp/xdp_firewall.o"
-    TC_OBJ_INSTALLED="/tmp/tc_flow_track.o"
     BPF_HELPER_INSTALLED="/tmp/auto_xdp_bpf_helpers.py"
     INSTALL_DIR="/tmp/auto_xdp"
     CURRENT_LINK="/tmp/auto_xdp"
@@ -656,6 +944,55 @@ test_xdp_maps_ready_requires_all_expected_pins() (
     assert_eq "$status" "0"
 )
 
+test_xdp_maps_ready_rejects_endpoint_value_size_mismatch() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir map_name status
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir"
+    while IFS= read -r map_name; do
+        [[ -n "$map_name" ]] && touch "$tmpdir/$map_name"
+    done < <(xdp_required_map_names)
+    _map_value_size_ok() { [[ "$1" != "$BPF_PIN_DIR/tcp_whitelist" ]]; }
+    _xdp_map_abi_ready() { return 0; }
+
+    xdp_maps_ready >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1"
+)
+
+test_xdp_maps_ready_rejects_legacy_totals_even_with_old_manifest() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir map_name counter_size=8 counter_entries=4 status
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BPF_PIN_DIR="$tmpdir"
+    while IFS= read -r map_name; do
+        [[ -n "$map_name" ]] && touch "$tmpdir/$map_name"
+    done < <(xdp_required_map_names)
+    printf '# Old generation did not declare the byte_counters ABI.\n' >"$tmpdir/xdp_map_abi.txt"
+    bpftool() {
+        [[ "$*" == "map show pinned $tmpdir/byte_counters" ]] || return 1
+        printf '1: percpu_array name byte_counters flags 0x0\n'
+        printf '    key 4B value %sB max_entries %s\n' "$counter_size" "$counter_entries"
+    }
+
+    xdp_maps_ready >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1" || return 1
+    counter_size=32
+    xdp_maps_ready >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1" || return 1
+    counter_entries=1
+    xdp_maps_ready >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "0"
+)
+
 test_xdp_required_map_manifest_matches_program_maps() (
     local manifest="$REPO_ROOT/auto_xdp/xdp_required_maps.txt"
 
@@ -668,14 +1005,23 @@ repo_root = Path(sys.argv[1])
 manifest_path = Path(sys.argv[2])
 sources = (
     repo_root / "bpf/include/common.h",
+    repo_root / "bpf/include/counters.h",
+    repo_root / "bpf/include/telemetry.h",
     repo_root / "bpf/include/maps.h",
+    repo_root / "bpf/include/endpoint_maps.h",
+    repo_root / "bpf/include/handler_routing.h",
+    repo_root / "handlers/tc_handler_ctx.h",
+    repo_root / "bpf/include/syncookie_maps.h",
     repo_root / "handlers/xdp_slot_ctx.h",
+    repo_root / "handlers/xdp_profile_ctx.h",
 )
 
 declared = set()
 for source in sources:
     text = source.read_text()
     declared.update(re.findall(r"}\s*([A-Za-z_][A-Za-z0-9_]*)\s+SEC\(\"\.maps\"\);", text))
+    declared.update(re.findall(r"TC_HANDLER_TABLE\(([A-Za-z_][A-Za-z0-9_]*),", text))
+    declared.discard("name")
     declared.update(re.findall(r"DEFINE_RATE_OUTER_V[46]\(([A-Za-z_][A-Za-z0-9_]*)\);", text))
 
 manifest = {
@@ -711,152 +1057,6 @@ test_xdp_required_map_fallback_matches_manifest() (
         <(xdp_required_map_names)
 )
 
-test_load_tc_egress_program_reuses_sctp_conntrack_map() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    TC_OBJ_INSTALLED="$tmpdir/tc_flow_track.o"
-    IFACE="eth9"
-    IFACES=("eth9")
-    mkdir -p "$BPF_PIN_DIR" "$tmpdir/bin"
-    touch "$TC_OBJ_INSTALLED" \
-        "$BPF_PIN_DIR/tcp_ct4" \
-        "$BPF_PIN_DIR/tcp_ct6" \
-        "$BPF_PIN_DIR/udp_ct4" \
-        "$BPF_PIN_DIR/udp_ct6" \
-        "$BPF_PIN_DIR/sctp_conntrack"
-
-    cat >"$tmpdir/bin/bpftool" <<EOF_BPFSH
-#!/bin/sh
-printf '%s\n' "\$*" >> "$tmpdir/bpftool.log"
-exit 0
-EOF_BPFSH
-    cat >"$tmpdir/bin/tc" <<EOF_TCSH
-#!/bin/sh
-printf '%s\n' "\$*" >> "$tmpdir/tc.log"
-exit 0
-EOF_TCSH
-    chmod +x "$tmpdir/bin/bpftool" "$tmpdir/bin/tc"
-
-    PATH="$tmpdir/bin:$BASE_PATH"
-    load_tc_egress_program || return 1
-
-    assert_file_contains "$tmpdir/bpftool.log" "map name sctp_conntrack pinned $BPF_PIN_DIR/sctp_conntrack"
-    assert_file_contains "$tmpdir/tc.log" \
-        "filter replace dev eth9 egress pref 49152 handle 1 bpf direct-action"
-)
-
-test_tc_switch_failure_restores_previous_filter() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    TC_OBJ_INSTALLED="$tmpdir/tc_flow_track.o"
-    TC_ROLLBACK_PROG_PATH="$tmpdir/rollback/tc_egress_prog"
-    IFACES=("eth0" "eth1")
-    mkdir -p "$BPF_PIN_DIR" "$tmpdir/rollback"
-    touch "$TC_OBJ_INSTALLED" "$TC_ROLLBACK_PROG_PATH" \
-        "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" \
-        "$BPF_PIN_DIR/udp_ct4" "$BPF_PIN_DIR/udp_ct6" \
-        "$BPF_PIN_DIR/sctp_conntrack"
-
-    bpftool() {
-        printf 'bpftool %s\n' "$*" >> "$tmpdir/ops.log"
-        touch "$BPF_PIN_DIR/tc_egress_prog"
-        return 0
-    }
-    tc() {
-        printf 'tc %s\n' "$*" >> "$tmpdir/ops.log"
-        case "$*" in
-            "filter show dev "*" egress pref "*) printf 'old filter\n'; return 0 ;;
-            "filter replace dev eth1 "*"object-pinned $BPF_PIN_DIR/tc_egress_prog") return 1 ;;
-        esac
-        return 0
-    }
-
-    load_tc_egress_program >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "1" || return 1
-    assert_file_contains "$tmpdir/ops.log" \
-        "filter replace dev eth0 egress pref 49152 handle 1 bpf direct-action object-pinned $TC_ROLLBACK_PROG_PATH" || return 1
-    if grep -q "filter del dev eth0" "$tmpdir/ops.log"; then
-        printf 'tc rollback deleted eth0 instead of restoring its previous filter\n'
-        return 1
-    fi
-)
-
-test_tc_rollback_failure_retains_candidate_program() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    TC_OBJ_INSTALLED="$tmpdir/tc_flow_track.o"
-    TC_ROLLBACK_PROG_PATH="$tmpdir/rollback/tc_egress_prog"
-    IFACES=("eth0" "eth1")
-    mkdir -p "$BPF_PIN_DIR" "$tmpdir/rollback"
-    touch "$TC_OBJ_INSTALLED" "$TC_ROLLBACK_PROG_PATH" \
-        "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" \
-        "$BPF_PIN_DIR/udp_ct4" "$BPF_PIN_DIR/udp_ct6" \
-        "$BPF_PIN_DIR/sctp_conntrack"
-
-    bpftool() { touch "$BPF_PIN_DIR/tc_egress_prog"; return 0; }
-    tc() {
-        case "$*" in
-            "filter show dev "*) printf 'old filter\n'; return 0 ;;
-            "filter replace dev eth1 "*"object-pinned $BPF_PIN_DIR/tc_egress_prog") return 1 ;;
-            "filter replace dev eth0 "*"object-pinned $TC_ROLLBACK_PROG_PATH") return 1 ;;
-        esac
-        return 0
-    }
-
-    load_tc_egress_program >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "1" || return 1
-    assert_eq "$AUTO_XDP_TC_ROLLBACK_COMPLETE" "0" || return 1
-    [[ -e "$BPF_PIN_DIR/tc_egress_prog" ]]
-)
-
-test_transaction_retains_candidate_after_incomplete_tc_rollback() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
-    IFACES=("eth0")
-    mkdir -p "$BPF_PIN_DIR"
-    printf 'old\n' > "$BPF_PIN_DIR/prog"
-    touch "$XDP_OBJ_INSTALLED"
-
-    _auto_xdp_iface_xdp_mode() { printf 'native'; }
-    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
-    xdp_maps_ready() { return 0; }
-    preseed_xdp_candidate_policy() { return 0; }
-    preseed_xdp_candidate_handlers() { return 0; }
-    _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE="native"; return 0; }
-    _auto_xdp_verify_iface_program() { return 0; }
-    _auto_xdp_attach_mode() { return 0; }
-    load_tc_egress_program() {
-        AUTO_XDP_TC_ROLLBACK_COMPLETE=0
-        return 1
-    }
-
-    transactional_reload_xdp >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "1" || return 1
-    assert_eq "$AUTO_XDP_SWITCH_ROLLED_BACK" "0" || return 1
-    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
-    assert_eq "$(cat "${BPF_PIN_DIR}_next/prog")" "new"
-)
-
 test_xdp_attach_mode_uses_atomic_bpftool_overwrite() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -864,6 +1064,7 @@ test_xdp_attach_mode_uses_atomic_bpftool_overwrite() (
     local tmpdir
     tmpdir=$(mktemp -d)
     bpftool() {
+        [[ "${LC_ALL:-}" == C ]] || return 1
         printf '%s\n' "$*" >> "$tmpdir/ops.log"
         return 0
     }
@@ -908,6 +1109,168 @@ test_xdp_attach_candidate_prefers_saved_per_interface_mode() (
     assert_eq "$(head -n 1 "$tmpdir/modes")" "generic"
 )
 
+test_xdp_attach_candidate_ena_mtu_limit_only_allows_auto_native_fallback() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir test_requested diagnostic status
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    _auto_xdp_saved_iface_mode() { printf '%s:auto\n' "$test_requested"; }
+    _auto_xdp_iface_is_veth() { return 1; }
+    _auto_xdp_attach_mode() {
+        printf '%s\n' "$3" >> "$tmpdir/modes"
+        if [[ "$3" == native || "$test_requested" == generic ]]; then
+            printf '%s\n' "$diagnostic" >&2
+            return 234
+        fi
+    }
+    local ena_error='libbpf: Kernel error message: ena: Failed to set xdp program, the current MTU is larger than the maximum allowed MTU. Check the dmesg for more info; Error: interface xdpdrv attach failed: Invalid argument'
+    for test_requested in auto native generic; do
+        : > "$tmpdir/modes"
+        diagnostic="$ena_error"
+        _auto_xdp_attach_candidate ens5 /pins/prog > "$tmpdir/warnings" 2>&1
+        status=$?
+        if [[ "$test_requested" == auto ]]; then
+            assert_eq "$status" 0 || return 1
+            assert_eq "$(cat "$tmpdir/modes")" $'native\ngeneric' || return 1
+            assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" generic || return 1
+            assert_eq "$AUTO_XDP_ATTACH_FATAL" 0 || return 1
+            assert_file_contains "$tmpdir/warnings" 'without changing the MTU' || return 1
+        else
+            assert_eq "$status" 1 || return 1
+            assert_eq "$(cat "$tmpdir/modes")" "$test_requested" || return 1
+            assert_eq "$AUTO_XDP_ATTACH_FATAL" 1 || return 1
+        fi
+    done
+    test_requested=auto
+    for diagnostic in 'Error: interface xdpdrv attach failed: Invalid argument' 'Error: Operation not permitted'; do
+        : > "$tmpdir/modes"
+        _auto_xdp_attach_candidate ens5 /pins/prog >/dev/null 2>&1
+        assert_eq "$?" 1 || return 1
+        assert_eq "$(cat "$tmpdir/modes")" native || return 1
+        assert_eq "$AUTO_XDP_ATTACH_FATAL" 1 || return 1
+    done
+)
+
+test_xdp_attach_candidate_auto_prefers_generic_for_renamed_veth() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'auto:native\n'; }
+    ip() {
+        printf '%s\n' '[{"ifname":"eth1","linkinfo":{"info_kind":"veth"}}]'
+    }
+    bpftool() { printf '%s\n' "$*" >> "$tmpdir/ops.log"; }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "generic" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpgeneric pinned /tmp/prog dev eth1 overwrite"
+)
+
+test_xdp_attach_candidate_auto_keeps_native_first_for_other_link_kinds() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'auto:auto\n'; }
+    # A prefix is not a reliable link-kind signal in either direction.
+    ip() {
+        printf '%s\n' '[{"ifname":"veth0","linkinfo":{"info_kind":"dummy"}}]'
+    }
+    bpftool() { printf '%s\n' "$*" >> "$tmpdir/ops.log"; }
+
+    _auto_xdp_attach_candidate veth0 /tmp/prog || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "native" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpdrv pinned /tmp/prog dev veth0 overwrite"
+)
+
+test_xdp_attach_candidate_unknown_link_kind_preserves_saved_mode() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'auto:generic\n'; }
+    ip() { printf 'invalid link JSON\n'; }
+    bpftool() { printf '%s\n' "$*" >> "$tmpdir/ops.log"; }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "generic" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpgeneric pinned /tmp/prog dev eth1 overwrite"
+)
+
+test_xdp_attach_candidate_honors_explicit_native_on_veth() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'native:generic\n'; }
+    ip() { printf '%s\n' '[{"linkinfo":{"info_kind":"veth"}}]'; }
+    bpftool() { printf '%s\n' "$*" >> "$tmpdir/ops.log"; }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog >"$tmpdir/warnings" 2>&1 || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "native" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpdrv pinned /tmp/prog dev eth1 overwrite" || return 1
+    assert_file_contains "$tmpdir/warnings" "can disable peer TSO"
+)
+
+test_xdp_attach_candidate_veth_fallback_warns_without_detaching() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'auto:native\n'; }
+    ip() {
+        [[ "$*" == '-j -d link show dev eth1' ]] || return 1
+        printf '%s\n' '[{"linkinfo":{"info_kind":"veth"},"xdp":{"mode":1,"prog":{"id":101}}}]'
+    }
+    bpftool() {
+        printf '%s\n' "$*" >> "$tmpdir/ops.log"
+        if [[ "$3" != "xdpdrv" ]]; then
+            printf 'Error: interface xdpgeneric attach failed: File exists\n' >&2
+            return 1
+        fi
+    }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog >"$tmpdir/warnings" 2>&1 || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "native" || return 1
+    assert_eq "$(wc -l < "$tmpdir/ops.log" | tr -d ' ')" "2" || return 1
+    assert_eq "$(head -n 1 "$tmpdir/ops.log")" \
+        "net attach xdpgeneric pinned /tmp/prog dev eth1 overwrite" || return 1
+    assert_file_contains "$tmpdir/warnings" "existing native attachment is preserved"
+)
+
+test_xdp_attach_candidate_honors_explicit_generic_without_native_fallback() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    _auto_xdp_saved_iface_mode() { printf 'generic:native\n'; }
+    ip() { printf '%s\n' '[{"linkinfo":{"info_kind":"veth"}}]'; }
+    bpftool() {
+        printf '%s\n' "$*" >> "$tmpdir/ops.log"
+        return 1
+    }
+
+    _auto_xdp_attach_candidate eth1 /tmp/prog >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "1" || return 1
+    assert_eq "$AUTO_XDP_LAST_ATTACH_MODE" "" || return 1
+    assert_eq "$(cat "$tmpdir/ops.log")" \
+        "net attach xdpgeneric pinned /tmp/prog dev eth1 overwrite"
+)
+
 test_xdp_switch_mode_reports_mixed_multi_interface_modes() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -936,11 +1299,132 @@ test_xdp_attach_candidate_honors_strict_saved_mode() (
     status=$?
     assert_eq "$status" "1" || return 1
     assert_eq "$(cat "$tmpdir/modes")" "native" || return 1
-    assert_contains "$output" "XDP attach failed on eth1: kernel rejected test candidate"
+    assert_contains "$output" "XDP attach failed on eth1: native [unknown, exit 1]: kernel rejected test candidate"
 )
+
+test_transactional_conntrack_failure_preserves_attachment() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=(eth0)
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' > "$BPF_PIN_DIR/prog"
+    touch "$XDP_OBJ_INSTALLED"
+    ensure_linux_conntrack() { return 1; }
+    bpftool() { touch "$tmpdir/unexpected-load"; }
+    _auto_xdp_attach_candidate() { touch "$tmpdir/unexpected-attach"; }
+    transactional_reload_xdp >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 1 || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" old || return 1
+    [[ ! -e "$tmpdir/unexpected-load" && ! -e "$tmpdir/unexpected-attach" && ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
+test_conntrack_activation_rejects_reserved_fallback_table() (
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+    NFT_FAMILY=inet
+    NFT_TABLE=auto_xdp_conntrack
+    if ensure_linux_conntrack >/dev/null 2>&1; then
+        return 1
+    fi
+)
+
+test_required_icmp_module_failure_preserves_attachment() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BPF_PIN_DIR="$tmpdir/pins"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    TOML_CONFIG="$tmpdir/config.toml"
+    IFACES=(eth0)
+    mkdir -p "$BPF_PIN_DIR"
+    touch "$TOML_CONFIG" "$XDP_OBJ_INSTALLED"
+    printf 'old\n' >"$BPF_PIN_DIR/prog"
+    ensure_linux_conntrack() { return 0; }
+    xdp_maps_ready() { return 0; }
+    preseed_xdp_candidate_policy() { return 0; }
+    load_slot_handlers() { return 0; }
+    python3() { return 1; } # dependency rejection in the ICMP module loader
+    bpftool() { touch "$4"; }
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    _auto_xdp_attach_candidate() { touch "$tmpdir/unexpected-attach"; }
+    transactional_reload_xdp >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 1 || return 1
+    assert_eq "$AUTO_XDP_ATTACH_FATAL" 1 || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" old || return 1
+    [[ ! -e "$tmpdir/unexpected-attach" && ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
+test_boot_missing_icmp_module_blocks_automatic_fallback() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+    local tmpdir status
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    RUN_STATE_DIR="$tmpdir"
+    TOML_CONFIG="$tmpdir/config.toml"
+    printf '[modules.icmp]\nenabled=true\n' >"$TOML_CONFIG"
+    ensure_xdp_loaded() { return 1; }
+    activate_nftables_backend() { touch "$tmpdir/unexpected-fallback"; }
+    status=0
+    select_backend >/dev/null 2>&1 || status=$?
+    assert_eq "$status" 1 || return 1
+    [[ ! -e "$tmpdir/unexpected-fallback" ]]
+)
+
+test_runtime_module_switches_use_current_values_and_ignore_drafts() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    local tmpdir output
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    TOML_CONFIG="$tmpdir/config.toml"
+    printf '[modules.syncookie]\nenabled=true\ndefault_mode="always"\n[modules.icmp]\nenabled=false\n[modules.icmp.draft]\nenabled=true\n' >"$TOML_CONFIG"
+    output=$(_auto_xdp_syncookie_config_flags) || return 1
+    assert_eq "$output" $'1\n1' || return 1
+    output=$(_auto_xdp_resolve_preferred_backend "$TOML_CONFIG" auto) || return 1
+    assert_eq "$output" auto || return 1
+    printf '[syncookie]\nenabled=true\n' >"$TOML_CONFIG"
+    if _auto_xdp_syncookie_config_flags >"$tmpdir/error" 2>&1; then return 1; fi
+    assert_file_contains "$tmpdir/error" 'Unsupported module configuration' || return 1
+    if _auto_xdp_resolve_preferred_backend "$TOML_CONFIG" auto >"$tmpdir/error" 2>&1; then return 1; fi
+    assert_file_contains "$tmpdir/error" 'Unsupported module configuration'
+)
+
+test_candidate_uses_module_config_and_ignores_retired_enable_sources() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    CONFIG_DIR="$tmpdir/config"
+    CURRENT_LINK="$tmpdir/current"
+    SOURCE_ROOT="$REPO_ROOT"
+    mkdir -p "$CONFIG_DIR" "$CURRENT_LINK"
+    printf '[policy]\nmode="audit"\n[modules.icmp]\nenabled = false\n' >"$CONFIG_DIR/config.toml"
+    touch "$CURRENT_LINK/icmp_conntrack.required"
+    AUTO_XDP_ICMP_CT=1
+    prepare_candidate_config || return 1
+    cmp "$CONFIG_DIR/config.toml" "$CANDIDATE_TOML_CONFIG" || return 1
+    printf '\n# keep this edit\n[daemon]\nlog_level="debug"\n' >>"$CONFIG_DIR/config.toml"
+    as_root() { [[ "$1" == chown ]] || "$@"; }
+    install_toml_config >/dev/null || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml" 'enabled = false' || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml" '# keep this edit' || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml" 'log_level="debug"' || return 1
+    printf '[icmp]\nenabled = true\n' >"$CONFIG_DIR/config.toml"
+    if prepare_candidate_config >"$tmpdir/error" 2>&1; then return 1; fi
+    assert_file_contains "$tmpdir/error" 'Unsupported module configuration'
+)
+
 
 test_transactional_xdp_validation_failure_keeps_current_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -974,6 +1458,7 @@ test_transactional_xdp_validation_failure_keeps_current_generation() (
 
 test_transactional_xdp_load_failure_reports_verifier_log() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir output status
@@ -1003,6 +1488,7 @@ test_transactional_xdp_load_failure_reports_verifier_log() (
 
 test_transactional_xdp_load_failure_reports_missing_bpftool() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir output status
@@ -1066,17 +1552,19 @@ test_bpftool_resolver_prefers_exact_kernel_then_usable_fallback() (
 )
 
 test_extract_verifier_metrics_normalizes_bpftool_summary() (
-    local output expected
-    output=$(
-        bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "integration setup" <<'EOF_METRICS'
+    local output expected stack_summary
+    expected=$'integration_setup\t13481\t282798\t27\t11892\t4610\t1519394\t288'
+    for stack_summary in '288' '288+48' '288+48 max 352' '288+48+0 max 352'; do
+        output=$(
+            bash "$REPO_ROOT/tests/bash/extract_verifier_metrics.sh" "integration setup" <<EOF_METRICS
 libbpf: sec 'xdp': found program 'xdp_port_whitelist' at insn offset 0 (0 bytes), code size 13481 insns (107848 bytes)
 verification time 1519394 usec
-stack depth 288
+stack depth $stack_summary
 processed 282798 insns (limit 1000000) max_states_per_insn 27 total_states 11892 peak_states 4610 mark_read 0
 EOF_METRICS
-    )
-    expected=$'integration_setup\t13481\t282798\t27\t11892\t4610\t1519394\t288'
-    assert_eq "$output" "$expected"
+        ) || return 1
+        assert_eq "$output" "$expected" "$stack_summary" || return 1
+    done
 )
 
 test_verifier_summary_prints_processed_and_stack() (
@@ -1098,6 +1586,7 @@ test_verifier_summary_prints_processed_and_stack() (
 
 test_transactional_handler_failure_keeps_current_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -1125,6 +1614,187 @@ test_transactional_handler_failure_keeps_current_generation() (
     assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
     [[ ! -e "${BPF_PIN_DIR}_next" ]] || return 1
     [[ ! -e "$tmpdir/ops.log" ]]
+)
+
+test_transactional_preseed_receives_syncookie_expectation() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
+    set +e
+
+    local tmpdir expectation
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=("eth0")
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' > "$BPF_PIN_DIR/prog"
+    touch "$XDP_OBJ_INSTALLED"
+
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
+    xdp_maps_ready() { return 0; }
+    # Stop after the pre-seed so each round leaves the live generation intact.
+    preseed_xdp_candidate_policy() { printf '%s\n' "${2:-unset}" > "$tmpdir/preseed.arg"; return 1; }
+    for expectation in 0 1; do
+        if [[ $expectation == 1 ]]; then
+            syncookie_program_expected() { return 0; }
+        else
+            syncookie_program_expected() { return 1; }
+        fi
+        transactional_reload_xdp >/dev/null 2>&1
+        assert_eq "$(cat "$tmpdir/preseed.arg")" "$expectation" || return 1
+        assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
+    done
+)
+
+test_syncookie_program_expected_mirrors_load_gate() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir enabled=1 level=2 ready=1
+    tmpdir=$(mktemp -d)
+    SYNCOOKIE_OBJ_PATH="$tmpdir/xdp_syncookie.o"
+    TC_SYNCOOKIE_OBJ_PATH="$tmpdir/tc_syncookie.o"
+    _auto_xdp_syncookie_config_flags() { printf '%s\n0\n' "$enabled"; }
+    _auto_xdp_syncookie_capability() { printf '%s\nprobe reason\n%s\n' "$level" "$ready"; }
+
+    if syncookie_program_expected; then
+        printf 'missing optional objects were accepted\n'
+        return 1
+    fi
+    touch "$SYNCOOKIE_OBJ_PATH" "$TC_SYNCOOKIE_OBJ_PATH"
+    syncookie_program_expected || { printf 'ready Level 2 handoff was rejected\n'; return 1; }
+    enabled=0
+    if syncookie_program_expected; then printf 'disabled config was accepted\n'; return 1; fi
+    enabled=1 level=1
+    if syncookie_program_expected; then printf 'Level 1 capability was accepted\n'; return 1; fi
+    level=2 ready=0
+    if syncookie_program_expected; then printf 'unready handoff environment was accepted\n'; return 1; fi
+    return 0
+)
+
+test_candidate_preseed_passes_syncookie_expectation_to_backend() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir argument expected
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/python/auto_xdp/backends" "$tmpdir/candidate"
+    touch "$tmpdir/config.toml" \
+        "$tmpdir/python/auto_xdp/__init__.py" \
+        "$tmpdir/python/auto_xdp/backends/__init__.py"
+    cat > "$tmpdir/python/auto_xdp/config.py" <<'PY'
+def apply_toml_config(_config):
+    return None
+
+def load_toml_config(_path):
+    return {}
+
+def _set_bpf_pin_dir(_path):
+    return None
+PY
+    cat > "$tmpdir/python/auto_xdp/backends/xdp.py" <<'PY'
+class XdpBackend:
+    syncookie_program_expected = False
+
+    def __init__(self):
+        self.last_apply_failures = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+PY
+    cat > "$tmpdir/python/auto_xdp/syncer.py" <<PY
+def sync_once(backend, dry_run):
+    with open("$tmpdir/expected", "w") as handle:
+        handle.write(repr(backend.syncookie_program_expected))
+PY
+
+    PYTHON_LIB_DIR="$tmpdir/python"
+    PYTHON3_BIN="/usr/bin/python3"
+    TOML_CONFIG="$tmpdir/config.toml"
+    cd "$tmpdir" || return 1
+    for argument in 1 0 omitted; do
+        rm -f "$tmpdir/expected"
+        if [[ $argument == omitted ]]; then
+            preseed_xdp_candidate_policy "$tmpdir/candidate" || return 1
+        else
+            preseed_xdp_candidate_policy "$tmpdir/candidate" "$argument" || return 1
+        fi
+        expected=False
+        [[ $argument == 1 ]] && expected=True
+        assert_eq "$(cat "$tmpdir/expected")" "$expected" || return 1
+    done
+)
+
+test_syncookie_load_failure_closes_preseeded_endpoints() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    mkdir -p "$BPF_PIN_DIR"
+    preseed_xdp_candidate_policy() { printf '%s %s\n' "$1" "${2:-unset}" >> "$tmpdir/preseed.log"; }
+
+    _auto_xdp_syncookie_module() { [[ "$1" == verify && -e "$BPF_PIN_DIR/active-cookie" ]]; }
+
+    # The reload admitted cookie endpoints, then the load fails (strict).
+    _auto_xdp_load_syncookie_program() { return 1; }
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=1
+    load_syncookie_program >/dev/null 2>&1
+    assert_eq "$?" "1" || return 1
+    assert_eq "$(cat "$tmpdir/preseed.log")" "$BPF_PIN_DIR 0" || return 1
+    assert_eq "$AUTO_XDP_SYNCOOKIE_PRESEEDED" "0" || return 1
+
+    # A non-strict fallback returns 0 without installing the program.
+    : > "$tmpdir/preseed.log"
+    _auto_xdp_load_syncookie_program() { return 0; }
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=1
+    load_syncookie_program >/dev/null 2>&1 || return 1
+    assert_eq "$(cat "$tmpdir/preseed.log")" "$BPF_PIN_DIR 0" || return 1
+
+    # Installed program, or no pre-seeded expectation: nothing to close.
+    : > "$tmpdir/preseed.log"
+    _auto_xdp_load_syncookie_program() { touch "$BPF_PIN_DIR/active-cookie"; return 0; }
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=1
+    load_syncookie_program >/dev/null 2>&1 || return 1
+    rm -f "$BPF_PIN_DIR/active-cookie"
+    AUTO_XDP_SYNCOOKIE_PRESEEDED=0
+    load_syncookie_program >/dev/null 2>&1 || return 1
+    [[ ! -s "$tmpdir/preseed.log" ]]
+)
+
+test_syncookie_load_reuses_the_preseed_capability_probe() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    SYNCOOKIE_OBJ_PATH="$tmpdir/xdp_syncookie.o"
+    TC_SYNCOOKIE_OBJ_PATH="$tmpdir/tc_syncookie.o"
+    mkdir -p "$BPF_PIN_DIR"
+    touch "$SYNCOOKIE_OBJ_PATH" "$TC_SYNCOOKIE_OBJ_PATH"
+    _auto_xdp_syncookie_config_flags() { printf '1\n0\n'; }
+    _auto_xdp_syncookie_capability() {
+        printf 'probe\n' >> "$tmpdir/probes.log"
+        printf '2\nready\n1\n'
+    }
+    _auto_xdp_syncookie_module() {
+        printf '%s\n' "$@" > "$tmpdir/module-arguments"
+        printf 'module\n' >> "$tmpdir/probes.log"
+    }
+
+    syncookie_program_expected || { printf 'ready Level 2 handoff was rejected\n'; return 1; }
+    _auto_xdp_load_syncookie_program >/dev/null 2>&1
+    # One probe for the expectation; the module receives the same decision.
+    assert_contains "$(cat "$tmpdir/module-arguments")" "--capability" || return 1
+    assert_contains "$(cat "$tmpdir/module-arguments")" "ready" || return 1
+    assert_eq "$(tr '\n' ' ' < "$tmpdir/probes.log")" "probe module " || return 1
+    assert_eq "${AUTO_XDP_SYNCOOKIE_CAPABILITY:-}" ""
 )
 
 test_candidate_preseed_rejects_map_update_failures() (
@@ -1181,6 +1851,7 @@ PY
 
 test_transactional_xdp_attach_failure_restores_switched_interfaces() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -1211,10 +1882,6 @@ test_transactional_xdp_attach_failure_restores_switched_interfaces() (
         printf 'restore %s %s %s\n' "$1" "$2" "$3" >> "$tmpdir/ops.log"
         return 0
     }
-    load_tc_egress_program() {
-        printf 'unexpected tc switch\n' >> "$tmpdir/ops.log"
-        return 0
-    }
 
     transactional_reload_xdp >/dev/null 2>&1
     local status=$?
@@ -1235,6 +1902,7 @@ test_transactional_xdp_attach_failure_restores_switched_interfaces() (
 
 test_transactional_xdp_verification_failure_restores_current_interface() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -1264,10 +1932,6 @@ test_transactional_xdp_verification_failure_restores_current_interface() (
         printf 'restore %s %s %s\n' "$1" "$2" "$3" >> "$tmpdir/ops.log"
         return 0
     }
-    load_tc_egress_program() {
-        printf 'unexpected tc switch\n' >> "$tmpdir/ops.log"
-        return 0
-    }
 
     transactional_reload_xdp >/dev/null 2>&1
     local status=$?
@@ -1283,58 +1947,9 @@ test_transactional_xdp_verification_failure_restores_current_interface() (
     fi
 )
 
-test_transactional_tc_failure_restores_xdp_generation() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
-    IFACES=("eth0")
-    mkdir -p "$BPF_PIN_DIR"
-    printf 'old\n' > "$BPF_PIN_DIR/prog"
-    touch "$XDP_OBJ_INSTALLED"
-
-    _auto_xdp_iface_xdp_mode() { printf 'native'; }
-    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
-    xdp_maps_ready() { return 0; }
-    preseed_xdp_candidate_policy() { return 0; }
-    preseed_xdp_candidate_handlers() { return 0; }
-    _auto_xdp_attach_candidate() {
-        printf 'candidate %s %s\n' "$1" "$2" >> "$tmpdir/ops.log"
-        AUTO_XDP_LAST_ATTACH_MODE="native"
-        return 0
-    }
-    _auto_xdp_verify_iface_program() { return 0; }
-    _auto_xdp_detach_mode() {
-        printf 'detach %s %s\n' "$1" "$2" >> "$tmpdir/ops.log"
-    }
-    _auto_xdp_attach_mode() {
-        printf 'restore %s %s %s\n' "$1" "$2" "$3" >> "$tmpdir/ops.log"
-        return 0
-    }
-    load_tc_egress_program() {
-        printf 'tc failed\n' >> "$tmpdir/ops.log"
-        return 1
-    }
-
-    transactional_reload_xdp >/dev/null 2>&1
-    local status=$?
-    assert_eq "$status" "1" || return 1
-    assert_eq "$AUTO_XDP_SWITCH_ROLLED_BACK" "1" || return 1
-    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
-    assert_file_contains "$tmpdir/ops.log" "tc failed" || return 1
-    assert_file_contains "$tmpdir/ops.log" \
-        "restore eth0 ${BPF_PIN_DIR}/prog native" || return 1
-    if grep -q "detach eth0 native" "$tmpdir/ops.log"; then
-        printf 'tc failure rollback detached XDP before restoring the previous program\n'
-        return 1
-    fi
-)
-
 test_transactional_xdp_success_commits_candidate_generation() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -1353,46 +1968,15 @@ test_transactional_xdp_success_commits_candidate_generation() (
     preseed_xdp_candidate_handlers() { return 0; }
     _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE="native"; return 0; }
     _auto_xdp_verify_iface_program() { return 0; }
-    load_tc_egress_program() { return 0; }
     _auto_xdp_record_xdp_state() { return 0; }
-    seed_existing_tcp_conntrack() { seed_called=$((seed_called + 1)); return 0; }
-    local seed_called=0
 
     transactional_reload_xdp >/dev/null 2>&1 || return 1
     assert_eq "$(cat "$BPF_PIN_DIR/prog")" "new" || return 1
     assert_eq "$AUTO_XDP_SWITCH_MODE" "native" || return 1
-    assert_eq "$seed_called" "1" || return 1
     [[ ! -e "${BPF_PIN_DIR}_rollback" ]] || {
         printf 'rollback generation remained after successful commit\n'
         return 1
     }
-)
-
-test_transactional_xdp_conntrack_seed_failure_keeps_current_generation() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir status
-    tmpdir=$(mktemp -d)
-    BPF_PIN_DIR="$tmpdir/bpf"
-    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
-    IFACES=("eth0")
-    mkdir -p "$BPF_PIN_DIR"
-    printf 'old\n' > "$BPF_PIN_DIR/prog"
-    touch "$XDP_OBJ_INSTALLED"
-
-    _auto_xdp_iface_xdp_mode() { printf 'native'; }
-    bpftool() { printf 'new\n' > "${BPF_PIN_DIR}/prog"; return 0; }
-    xdp_maps_ready() { return 0; }
-    preseed_xdp_candidate_policy() { return 0; }
-    preseed_xdp_candidate_handlers() { return 0; }
-    seed_existing_tcp_conntrack() { return 1; }
-
-    transactional_reload_xdp >/dev/null 2>&1
-    status=$?
-    assert_eq "$status" "1" || return 1
-    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "old" || return 1
-    [[ ! -e "${BPF_PIN_DIR}_next" ]]
 )
 
 test_interrupted_xdp_reload_resumes_candidate_generation() (
@@ -1415,22 +1999,18 @@ test_interrupted_xdp_reload_resumes_candidate_generation() (
     }
     _auto_xdp_verify_iface_program() { return 0; }
     _auto_xdp_record_xdp_state() { return 0; }
-    load_tc_egress_program() {
-        printf 'tc %s %s\n' "$BPF_PIN_DIR" "$TC_ROLLBACK_PROG_PATH" >> "$tmpdir/ops.log"
-        return 0
-    }
 
     _auto_xdp_finish_interrupted_reload >/dev/null 2>&1 || return 1
     assert_eq "$(cat "$BPF_PIN_DIR/prog")" "new" || return 1
     assert_eq "$AUTO_XDP_RECOVERY_HANDLED" "1" || return 1
     assert_file_contains "$tmpdir/ops.log" "candidate eth0 ${BPF_PIN_DIR}_next/prog" || return 1
     assert_file_contains "$tmpdir/ops.log" "candidate eth1 ${BPF_PIN_DIR}_next/prog" || return 1
-    assert_file_contains "$tmpdir/ops.log" "tc ${BPF_PIN_DIR}_next ${BPF_PIN_DIR}/tc_egress_prog" || return 1
     [[ ! -e "${BPF_PIN_DIR}_next" && ! -e "${BPF_PIN_DIR}_rollback" ]]
 )
 
 test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
     source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
     set +e
 
     local tmpdir
@@ -1442,7 +2022,7 @@ test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
     mkdir -p "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next"
     printf 'old\n' > "$BPF_PIN_DIR/prog"
     printf 'stale\n' > "${BPF_PIN_DIR}_next/prog"
-    touch "$BPF_PIN_DIR/tc_egress_prog" "$XDP_OBJ_INSTALLED"
+    touch "$XDP_OBJ_INSTALLED"
 
     _auto_xdp_finish_interrupted_reload() { return 1; }
     _auto_xdp_pinned_prog_id() {
@@ -1470,10 +2050,6 @@ test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
         expected=$(_auto_xdp_pinned_prog_id "$2") || return 1
         [[ "$TEST_ACTUAL_XDP_ID" == "$expected" ]]
     }
-    tc() {
-        printf 'tc %s\n' "$*" >> "$tmpdir/ops.log"
-        return 0
-    }
     bpftool() {
         printf 'fresh\n' > "$BPF_PIN_DIR/prog"
         return 0
@@ -1487,7 +2063,6 @@ test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
         AUTO_XDP_LAST_ATTACH_MODE="native"
         return 0
     }
-    load_tc_egress_program() { return 0; }
     _auto_xdp_record_xdp_state() { return 0; }
 
     if ! transactional_reload_xdp >"$tmpdir/transaction.log" 2>&1; then
@@ -1521,7 +2096,7 @@ test_ambiguous_interrupted_reload_retains_all_generations() (
         && -e "${BPF_PIN_DIR}_rollback/prog" ]]
 )
 
-test_resolve_target_interfaces_uses_default_route_interface() (
+test_resolve_target_interfaces_uses_kernel_inventory() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
@@ -1533,8 +2108,8 @@ test_resolve_target_interfaces_uses_default_route_interface() (
 
     ip() {
         case "$*" in
-            "route show default")
-                echo "default via 192.0.2.1 dev eth9"
+            "-j -d link show")
+                echo '[{"ifname":"eth9","link_type":"ether","flags":["UP"]}]'
                 ;;
             "link show eth9")
                 return 0
@@ -1565,6 +2140,7 @@ test_resolve_target_interfaces_reuses_installed_env_ifaces() (
 
     ip() {
         case "$*" in
+            "-j -d link show") echo '[{"ifname":"eth7","link_type":"ether","flags":["UP"]},{"ifname":"eth8","link_type":"ether","flags":["UP"]}]' ;;
             "link show eth7"|"link show eth8") return 0 ;;
             *) return 1 ;;
         esac
@@ -1590,6 +2166,7 @@ test_resolve_target_interfaces_drops_missing_saved_ifaces() (
 
     ip() {
         case "$*" in
+            "-j -d link show") echo '[{"ifname":"eth7","link_type":"ether","flags":["UP"]}]' ;;
             "link show eth7") return 0 ;;
             *) return 1 ;;
         esac
@@ -1615,7 +2192,7 @@ test_resolve_target_interfaces_detects_when_saved_ifaces_all_gone() (
 
     ip() {
         case "$*" in
-            "route show default") echo "default via 192.0.2.1 dev eth9" ;;
+            "-j -d link show") echo '[{"ifname":"eth9","link_type":"ether","flags":["UP"]}]' ;;
             "link show eth9") return 0 ;;
             *) return 1 ;;
         esac
@@ -1623,18 +2200,66 @@ test_resolve_target_interfaces_detects_when_saved_ifaces_all_gone() (
 
     resolve_target_interfaces || return 1
     assert_eq "${IFACES[*]}" "eth9" || return 1
-    assert_eq "$IFACE_SOURCE" "default route auto-detect"
+    assert_eq "$IFACE_SOURCE" "host auto-discovery"
+)
+
+test_interface_discovery_failure_cannot_fall_back_to_a_partial_route_list() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    ALL_IFACES=0
+    IFACES=()
+    CONFIG_FILE="/nonexistent/auto_xdp.env"
+    ip() {
+        case "$*" in
+            "route show default") echo "default via 192.0.2.1 dev eth9" ;;
+            *) return 1 ;;
+        esac
+    }
+    local output status
+    output=$(resolve_target_interfaces 2>&1)
+    status=$?
+    [[ $status -ne 0 ]] || return 1
+    assert_contains "$output" "Interface discovery failed"
+)
+
+test_auto_selection_does_not_override_explicit_exclusions() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    ALL_IFACES=0
+    IFACES=()
+    CONFIG_FILE="/nonexistent/auto_xdp.env"
+    INTERFACE_CONFIG_EXCLUDE=(eth9)
+    ip() {
+        case "$*" in
+            "-j -d link show") echo '[{"ifname":"eth9","link_type":"ether","flags":["UP"]}]' ;;
+            "route show default") echo "default via 192.0.2.1 dev eth9" ;;
+            *) return 1 ;;
+        esac
+    }
+    local output status
+    output=$(resolve_target_interfaces 2>&1)
+    status=$?
+    [[ $status -ne 0 ]] || return 1
+    assert_contains "$output" "No eligible active Ethernet interfaces"
 )
 
 test_install_toml_config_preserves_existing_local_config() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
-    local tmpdir
+    local tmpdir ops_log
     tmpdir=$(mktemp -d)
+    ops_log="$tmpdir/ops.log"
     CONFIG_DIR="$tmpdir/etc"
     mkdir -p "$CONFIG_DIR"
     printf 'user_setting = 1\n' >"$CONFIG_DIR/config.toml"
+
+    as_root() {
+        printf '%s\n' "$*" >>"$ops_log"
+        if [[ "$1" == "chmod" ]]; then
+            chmod "$2" "$3"
+        fi
+    }
 
     FORCE=1
     fetch_local_or_remote() { printf 'repo_default = 1\n' >"$3"; }
@@ -1646,6 +2271,36 @@ test_install_toml_config_preserves_existing_local_config() (
     backup=$(find "$CONFIG_DIR/backups" -type f -name 'config.toml.*' | head -n 1)
     [[ -n "$backup" ]] || return 1
     assert_file_contains "$backup" "user_setting = 1"
+    assert_eq "$(stat -c '%a' "$CONFIG_DIR/config.toml" 2>/dev/null || stat -f '%Lp' "$CONFIG_DIR/config.toml")" "600" || return 1
+    assert_eq "$(stat -c '%a' "$backup" 2>/dev/null || stat -f '%Lp' "$backup")" "600" || return 1
+    assert_file_contains "$ops_log" "chown root:root $CONFIG_DIR/config.toml" || return 1
+    assert_file_contains "$ops_log" "chmod 0600 $CONFIG_DIR/config.toml"
+)
+
+test_install_toml_config_secures_new_config() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir ops_log
+    tmpdir=$(mktemp -d)
+    ops_log="$tmpdir/ops.log"
+    CONFIG_DIR="$tmpdir/etc"
+    mkdir -p "$CONFIG_DIR"
+
+    as_root() {
+        printf '%s\n' "$*" >>"$ops_log"
+        if [[ "$1" == "chmod" ]]; then
+            chmod "$2" "$3"
+        fi
+    }
+
+    fetch_local_or_remote() { printf 'repo_default = 1\n' >"$3"; }
+
+    install_toml_config >/dev/null || return 1
+    assert_file_contains "$CONFIG_DIR/config.toml" "repo_default = 1" || return 1
+    assert_eq "$(stat -c '%a' "$CONFIG_DIR/config.toml" 2>/dev/null || stat -f '%Lp' "$CONFIG_DIR/config.toml")" "600" || return 1
+    assert_file_contains "$ops_log" "chown root:root $CONFIG_DIR/config.toml" || return 1
+    assert_file_contains "$ops_log" "chmod 0600 $CONFIG_DIR/config.toml"
 )
 
 test_check_required_tools_step_only_requires_runtime_commands() (
@@ -1657,7 +2312,7 @@ test_check_required_tools_step_only_requires_runtime_commands() (
     mkdir -p "$tmpdir/bin"
 
     local cmd
-    for cmd in python3 curl ip tc nft; do
+    for cmd in python3 curl ip nft; do
         cat >"$tmpdir/bin/$cmd" <<'EOF_CMD'
 #!/bin/sh
 exit 0
@@ -1683,6 +2338,7 @@ test_deploy_backend_step_falls_back_to_nftables() (
     IFACES=("eth9")
     ACTIVE_BACKEND="xdp"
     ACTIVE_XDP_MODE="native"
+    _auto_xdp_resolve_preferred_backend() { printf 'auto\n'; }
 
     deploy_xdp_backend() { return 1; }
     ensure_nftables_available() { return 0; }
@@ -1750,7 +2406,6 @@ test_nftables_cutover_restores_detached_interfaces_on_partial_failure() (
         printf 'attach %s %s\n' "$1" "$3" >>"${tmpdir}/events"
     }
     _auto_xdp_verify_iface_program() { return 0; }
-    cleanup_tc_egress_filter() { printf 'unexpected tc cleanup\n'; return 1; }
 
     local output status
     output=$(finalize_nftables_cutover 2>&1)
@@ -1814,33 +2469,6 @@ test_deploy_backend_step_refuses_fallback_with_active_xdp() (
     local status=$?
     assert_eq "$status" "1" || return 1
     assert_eq "$XDP_FALLBACK_BLOCKED" "1"
-)
-
-test_deploy_xdp_removes_tc_filter_from_removed_interface() (
-    source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
-    touch "$XDP_OBJ_INSTALLED"
-    IFACES=("eth0")
-
-    ensure_bpffs() { return 0; }
-    cleanup_existing_xdp() { XDP_PREVIOUS_IFACES=("eth0" "old0"); }
-    transactional_reload_xdp() { AUTO_XDP_SWITCH_MODE="native"; return 0; }
-    load_sock_state_tracker() { return 0; }
-    auto_tune_interface_parallelism() { return 0; }
-    ip() { printf 'ip %s\n' "$*" >> "$tmpdir/ops.log"; return 0; }
-    tc() { printf 'tc %s\n' "$*" >> "$tmpdir/ops.log"; return 0; }
-
-    deploy_xdp_backend >/dev/null 2>&1 || return 1
-    assert_file_contains "$tmpdir/ops.log" \
-        "tc filter del dev old0 egress pref 49152 handle 1" || return 1
-    if grep -q "tc filter del dev eth0" "$tmpdir/ops.log"; then
-        printf 'tc filter was removed from an active target interface\n'
-        return 1
-    fi
 )
 
 test_install_runtime_service_step_warns_without_init_system() (
@@ -1996,7 +2624,7 @@ printf 'axdp0\naxdp0p\n'
 EOF_LS
     cat >"$tmpdir/bin/ip" <<'EOF_IP'
 #!/bin/sh
-printf '2: %s: <BROADCAST,MULTICAST,UP>\n    link/ether 00:00:00:00:00:01\n' "$4"
+printf '[{"ifname":"%s"}]\n' "$6"
 EOF_IP
     chmod +x "$tmpdir/bin/ls" "$tmpdir/bin/ip"
     PATH="$tmpdir/bin:$PATH"
@@ -2008,6 +2636,7 @@ EOF_IP
 test_relay_service_security_directives() (
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RELAY_GROUP="${RELAY_GROUP:-auto-xdp}"' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RuntimeDirectoryMode=0750' || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RuntimeDirectoryPreserve=yes' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'UMask=0007' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'RuntimeDirectory=auto_xdp' || return 1
     assert_file_contains "$REPO_ROOT/lib/setup/install.sh" 'PartOf=${SERVICE_NAME}.service' || return 1
@@ -2040,30 +2669,78 @@ test_cleanup_build_artifacts_step_preserves_local_sources() (
     tmpdir=$(mktemp -d)
 
     XDP_OBJ="$tmpdir/xdp_firewall.o"
-    TC_OBJ="$tmpdir/tc_flow_track.o"
     XDP_SRC="$tmpdir/xdp_firewall.c"
-    TC_SRC="$tmpdir/tc_flow_track.c"
     BPF_HELPER_SRC="$tmpdir/auto_xdp_bpf_helpers.py"
     BPF_HELPER_BOOTSTRAP="$tmpdir/bootstrap-helper.py"
     PREFER_REMOTE_SOURCES=0
 
     : >"$XDP_OBJ"
-    : >"$TC_OBJ"
     : >"$XDP_SRC"
-    : >"$TC_SRC"
     : >"$BPF_HELPER_SRC"
     : >"$BPF_HELPER_BOOTSTRAP"
 
     cleanup_build_artifacts_step >/dev/null || return 1
 
-    [[ ! -f "$XDP_OBJ" && ! -f "$TC_OBJ" && ! -f "$BPF_HELPER_BOOTSTRAP" ]] || {
+    [[ ! -f "$XDP_OBJ" && ! -f "$BPF_HELPER_BOOTSTRAP" ]] || {
         printf 'expected objects and bootstrap helper to be removed\n'
         return 1
     }
-    [[ -f "$XDP_SRC" && -f "$TC_SRC" && -f "$BPF_HELPER_SRC" ]] || {
+    [[ -f "$XDP_SRC" && -f "$BPF_HELPER_SRC" ]] || {
         printf 'expected local source files to be preserved\n'
         return 1
     }
+)
+
+test_install_slot_handler_sdk_preserves_shared_include_layout() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir sdk_source mode header
+    tmpdir=$(mktemp -d)
+    sdk_source="$tmpdir/sdk source"
+    mkdir -p "$sdk_source/handlers" "$sdk_source/bpf/include"
+    cp "$REPO_ROOT"/handlers/*.h "$sdk_source/handlers/" || return 1
+    cp "$REPO_ROOT/handlers/gre_handler.c" "$sdk_source/handlers/" || return 1
+    cp "$REPO_ROOT"/bpf/include/*.h "$sdk_source/bpf/include/" || return 1
+    PREFER_REMOTE_SOURCES=0
+
+    for mode in staged source; do
+        BUILD_STAGING_DIR="$tmpdir/missing-stage"
+        SOURCE_ROOT="$tmpdir/missing-source"
+        if [[ "$mode" == staged ]]; then
+            BUILD_STAGING_DIR="$sdk_source"
+        else
+            SOURCE_ROOT="$sdk_source"
+        fi
+        INSTALL_DIR="$tmpdir/install-$mode"
+        install_slot_handler_sdk || return 1
+        cmp "$sdk_source/handlers/gre_handler.c" "$INSTALL_DIR/handlers/gre_handler.c" || return 1
+        for header in common.h counters.h telemetry.h flow_keys.h; do
+            cmp "$sdk_source/bpf/include/$header" "$INSTALL_DIR/bpf/include/$header" || return 1
+        done
+        [[ -f "$INSTALL_DIR/bpf/include/../../handlers/xdp_slot_ctx.h" ]] || return 1
+    done
+)
+
+test_install_slot_handler_sdk_remote_includes_shared_headers() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BUILD_STAGING_DIR="$tmpdir/missing-stage"
+    SOURCE_ROOT="$tmpdir/missing-source"
+    INSTALL_DIR="$tmpdir/install"
+    PREFER_REMOTE_SOURCES=1
+    curl() {
+        printf '%s\n' '{"tree":[{"path":"handlers/gre_handler.c"},{"path":"handlers/xdp_slot_ctx.h"},{"path":"bpf/include/common.h"},{"path":"bpf/include/telemetry.h"},{"path":"bpf/xdp_firewall.c"},{"path":"README.md"}]}'
+    }
+    fetch_local_or_remote() { place_file "$REPO_ROOT/$1" "$3"; }
+
+    install_slot_handler_sdk || return 1
+    cmp "$REPO_ROOT/bpf/include/telemetry.h" "$INSTALL_DIR/bpf/include/telemetry.h" || return 1
+    [[ -f "$INSTALL_DIR/handlers/gre_handler.c" && -f "$INSTALL_DIR/bpf/include/common.h" ]] || return 1
+    [[ ! -e "$INSTALL_DIR/bpf/xdp_firewall.c" && ! -e "$INSTALL_DIR/README.md" ]]
 )
 
 test_restore_compiled_slot_handlers_reinstalls_builtin_objects() (
@@ -2093,7 +2770,7 @@ test_restore_compiled_slot_handlers_reinstalls_builtin_objects() (
     done
 )
 
-test_install_python_support_package_includes_state_module() (
+test_install_python_support_package_includes_nested_modules() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
@@ -2110,8 +2787,34 @@ test_install_python_support_package_includes_state_module() (
 
     install_python_support_package || return 1
     assert_file_contains "$fetched" "auto_xdp/state.py -> ${AUTO_XDP_PACKAGE_DIR}/state.py"
+    local module
+    for module in xdp_link.py admin/cli.py admin/approvals.py admin/approval_api.py \
+                  tui/app.py tui/traffic.py tui/widgets.py \
+                  telemetry/events.py telemetry/relay_client.py telemetry/geoip.py \
+                  discovery/listeners.py discovery/proc_events.py discovery/sock_state.py; do
+        assert_file_contains "$fetched" "auto_xdp/${module} -> ${AUTO_XDP_PACKAGE_DIR}/${module}" || return 1
+    done
     assert_file_contains "$fetched" "auto_xdp/default_config.toml -> ${AUTO_XDP_PACKAGE_DIR}/default_config.toml"
     assert_file_contains "$fetched" "auto_xdp/xdp_required_maps.txt -> ${AUTO_XDP_PACKAGE_DIR}/xdp_required_maps.txt"
+)
+
+test_installed_package_validation_rejects_missing_nested_module() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    PYTHON_LIB_DIR="$tmpdir/python"
+    mkdir -p "$PYTHON_LIB_DIR"
+    cp -R "$REPO_ROOT/auto_xdp" "$PYTHON_LIB_DIR/"
+    cd "$REPO_ROOT" || return 1
+    validate_installed_python_support_package || return 1
+    mv "$PYTHON_LIB_DIR/auto_xdp/telemetry/relay_client.py" "$tmpdir/relay_client.py.saved"
+    if validate_installed_python_support_package >"$tmpdir/validation.log" 2>&1; then
+        printf 'installed package validation accepted a missing relay client\n'
+        return 1
+    fi
+    assert_file_contains "$tmpdir/validation.log" "auto_xdp.telemetry.relay_client"
 )
 
 # Write a fake sudo onto PATH that logs its invocation and then runs the wrapped
@@ -2514,7 +3217,7 @@ test_check_required_tools_step_requires_tar_for_remote_sources() (
     local tmpdir output status cmd
     tmpdir=$(mktemp -d)
     mkdir -p "$tmpdir/bin"
-    for cmd in clang bpftool python3 curl ip tc nft; do
+    for cmd in clang bpftool python3 curl ip nft; do
         printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
         chmod +x "$tmpdir/bin/$cmd"
     done
@@ -2557,7 +3260,7 @@ test_check_required_tools_step_dies_when_install_fails() (
     local tmpdir log status output cmd
     tmpdir=$(mktemp -d)
     mkdir -p "$tmpdir/bin"
-    for cmd in clang python3 curl ip tc nft; do
+    for cmd in clang python3 curl ip nft; do
         printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
         chmod +x "$tmpdir/bin/$cmd"
     done
@@ -2578,6 +3281,28 @@ test_check_required_tools_step_dies_when_install_fails() (
     assert_contains "$output" "Package installation failed."
 )
 
+test_check_required_tools_step_installs_missing_kernel_btf_tools() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local installed output missing_tool
+    PKG_MANAGER=apt-get
+    _tool_present() { [[ "$1" != "$missing_tool" || "$installed" == 1 ]]; }
+    bpf_header_exists() { return 0; }
+    install_packages() { installed=1; printf 'installed BTF tooling\n'; }
+    ensure_python_runtime() { :; }
+    ensure_psutil() { :; }
+    ensure_curses() { :; }
+    ensure_tomli_for_python310() { :; }
+
+    for missing_tool in pahole llvm-objcopy; do
+        installed=0
+        output=$(check_required_tools_step 2>&1) || return 1
+        assert_contains "$output" 'installed BTF tooling' || return 1
+        assert_contains "$output" "$missing_tool (after install)" || return 1
+        [[ "$output" != *"$missing_tool still missing"* ]] || return 1
+    done
+)
+
 test_check_required_tools_step_installs_when_bpf_headers_missing() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -2585,7 +3310,7 @@ test_check_required_tools_step_installs_when_bpf_headers_missing() (
     local tmpdir output cmd
     tmpdir=$(mktemp -d)
     mkdir -p "$tmpdir/bin"
-    for cmd in clang bpftool python3 curl tar ip tc nft; do
+    for cmd in clang bpftool python3 curl tar ip nft; do
         printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
         chmod +x "$tmpdir/bin/$cmd"
     done
@@ -2704,7 +3429,7 @@ test_check_update_candidates_cover_installed_sources() (
         }
     done < <(
         printf '%s\n' setup_xdp.sh axdp config.toml xdp_port_sync.py \
-            pkt_relay.py auto_xdp_bpf_helpers.py tc_flow_track.c
+            pkt_relay.py auto_xdp_bpf_helpers.py
         find lib/setup runtime bpf/include handlers auto_xdp \
             \( -name '*.sh' -o -name '*.c' -o -name '*.h' -o -name '*.py' \
                -o -name 'Makefile' -o -name '*.toml' -o -name '*.txt' \) \
@@ -2744,6 +3469,34 @@ test_main_orders_basic_info_checks_then_summary() (
             return 1
         }
         prev_pos=$pos
+    done
+)
+
+test_runtime_sync_uses_the_selected_toml_for_once_and_watch() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    local tmpdir output mode
+    tmpdir=$(mktemp -d)
+    RUN_STATE_DIR="$tmpdir/run"
+    mkdir -p "$RUN_STATE_DIR"
+    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
+    TOML_CONFIG="$tmpdir/custom policy.toml"
+    PYTHON3_BIN="/bin/bash"
+    SYNC_SCRIPT="$tmpdir/arguments.sh"
+    cat > "$SYNC_SCRIPT" <<'SCRIPT'
+printf '<%s>\n' "$@"
+SCRIPT
+    for mode in once watch; do
+        output=$(run_sync_script "$mode" --dry-run) || return 1
+        assert_contains "$output" "<--config>" || return 1
+        assert_contains "$output" "<$TOML_CONFIG>" || return 1
+        assert_contains "$output" "<--backend>" || return 1
+        assert_contains "$output" "<xdp>" || return 1
+        assert_contains "$output" "<--dry-run>" || return 1
+        if [[ "$mode" == watch ]]; then
+            assert_contains "$output" "<--watch>" || return 1
+        else
+            [[ "$output" != *"<--watch>"* ]] || return 1
+        fi
     done
 )
 

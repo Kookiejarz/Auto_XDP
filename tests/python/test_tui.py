@@ -2,9 +2,10 @@ import subprocess
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from auto_xdp.tui import (
+from auto_xdp.tui.app import (
     MapUsageCache,
     RelayClient,
     TuiSnapshot,
@@ -15,16 +16,25 @@ from auto_xdp.tui import (
     _draw_ports,
     _draw_summary,
     _draw_top_traffic,
+    _draw_cookie,
+    _draw_drop_reasons,
+    _read_cookie_runtime,
+    _clip,
     _dump_count,
     _event_bottom_top,
     _event_window,
     _filter_port_rows,
+    _actionable_approval_rows,
+    _approve_tui_request,
+    _audit_fingerprint,
+    _audit_needs_review,
+    _mark_audit_reviewed,
 )
 
 
 class DumpCountTests(unittest.TestCase):
     def _count(self, out: bytes) -> int | None:
-        with mock.patch("auto_xdp.tui.subprocess.check_output", return_value=out):
+        with mock.patch("auto_xdp.tui.app.subprocess.check_output", return_value=out):
             return _dump_count(Path("/sys/fs/bpf/xdp_fw/some_map"))
 
     def test_counts_plain_hash_entries(self):
@@ -55,19 +65,32 @@ class DumpCountTests(unittest.TestCase):
         )
         self.assertEqual(self._count(out), 2)
 
+    def test_raw_and_formatted_keys_are_one_entry(self):
+        out = b'[{"key":["0x01"],"value":["0x02"],"formatted":{"key":1,"value":{"key":2}}}]'
+        self.assertEqual(self._count(out), 1)
+
+    def test_whitespace_and_nested_keys_do_not_inflate_count(self):
+        out = b'[ { "key" : {"key": 1}, "value": {"key": 2}}, {"key":2,"value":3} ]'
+        self.assertEqual(self._count(out), 2)
+
+    def test_invalid_array_is_not_reported_as_an_entry_count(self):
+        for out in (b'[{"key":1},]', b'[{"key":1}', b'[{"value":1}]', b'[{"key":1}] trailing'):
+            with self.subTest(out=out):
+                self.assertIsNone(self._count(out))
+
     def test_empty_map_returns_zero(self):
         self.assertEqual(self._count(b"[]"), 0)
 
     def test_subprocess_failure_returns_none(self):
         with mock.patch(
-            "auto_xdp.tui.subprocess.check_output",
+            "auto_xdp.tui.app.subprocess.check_output",
             side_effect=subprocess.CalledProcessError(1, "bpftool"),
         ):
             self.assertIsNone(_dump_count(Path("/sys/fs/bpf/xdp_fw/some_map")))
 
     def test_missing_bpftool_returns_none(self):
         with mock.patch(
-            "auto_xdp.tui.subprocess.check_output",
+            "auto_xdp.tui.app.subprocess.check_output",
             side_effect=OSError("No such file"),
         ):
             self.assertIsNone(_dump_count(Path("/sys/fs/bpf/xdp_fw/some_map")))
@@ -145,7 +168,7 @@ class TuiEventScrollTests(unittest.TestCase):
         fake_sock.recv.side_effect = [msg, BlockingIOError()]
         relay._sock = fake_sock
 
-        with mock.patch("auto_xdp.tui.select.select", return_value=([fake_sock], [], [])):
+        with mock.patch("auto_xdp.telemetry.relay_client.select.select", return_value=([fake_sock], [], [])):
             relay.poll()
 
         self.assertEqual([ev["id"] for ev in relay.events], [2, 3, 4])
@@ -165,7 +188,7 @@ class TuiEventScrollTests(unittest.TestCase):
         })
         win = FakeWindow()
 
-        with mock.patch("auto_xdp.tui.curses.color_pair", return_value=0):
+        with mock.patch("auto_xdp.tui.app.curses.color_pair", return_value=0):
             _draw_events(win, relay, TuiSnapshot(), top=0, focused=False)
 
         self.assertIn("protocol", win.lines[1])
@@ -218,7 +241,7 @@ class TuiTopTrafficTests(unittest.TestCase):
         })
         win = FakeWindow(height=8, width=120)
 
-        with mock.patch("auto_xdp.tui.curses.color_pair", return_value=0):
+        with mock.patch("auto_xdp.tui.app.curses.color_pair", return_value=0):
             _draw_top_traffic(win, relay)
 
         rendered = "\n".join(win.lines.values())
@@ -229,14 +252,41 @@ class TuiTopTrafficTests(unittest.TestCase):
 
 
 class TuiMapUsageTests(unittest.TestCase):
+    def test_metadata_matches_full_pin_paths_not_truncated_or_duplicate_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            policy = Path(td, "tcp_port_policies")
+            array = Path(td, "tcp_synck_policy")
+            for path in (policy, array, Path(td, "sock_state_prog")):
+                path.touch()
+            entries = [
+                {"id": 10, "name": "tcp_port_polici", "type": "hash", "max_entries": 1024,
+                 "pinned": [str(policy)]},
+                {"id": 20, "name": "tcp_port_polici", "type": "hash", "max_entries": 999,
+                 "pinned": [str(Path(td, "other", "tcp_port_policies"))]},
+                {"id": 30, "name": "tcp_synck_polic", "type": "array", "max_entries": 65536,
+                 "pinned": [str(array)]},
+            ]
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([], [])), \
+                 mock.patch("auto_xdp.tui.app.shutil.which", return_value="/sbin/bpftool"), \
+                 mock.patch("auto_xdp.tui.app._run_json", return_value=entries) as batch, \
+                 mock.patch("auto_xdp.tui.app._dump_count", return_value=1) as dump:
+                rows = {row.name: row for row in _collect_map_usage(td, now=100)}
+            self.assertEqual(set(rows), {"tcp_port_policies", "tcp_synck_policy"})
+            self.assertEqual((rows[policy.name].map_id, rows[policy.name].maximum), (10, 1024))
+            self.assertEqual(rows[policy.name].current, 1)
+            self.assertEqual(rows[array.name].current, 65536)
+            self.assertEqual(rows[array.name].kind, "array")
+            batch.assert_called_once_with(["bpftool", "-j", "-f", "map"])
+            dump.assert_called_once_with(policy)
+
     def test_high_churn_map_is_sampled_outside_under_attack(self):
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tcp_ct4").touch()
+            Path(td, "hblk4").touch()
             cache = MapUsageCache()
 
-            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"tcp_ct4": {"name": "tcp_ct4", "type": "hash", "max_entries": 100}}), \
-                mock.patch("auto_xdp.tui._dump_count", return_value=12) as dump_count:
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([], [])), \
+                mock.patch("auto_xdp.tui.app._all_map_info", return_value={"hblk4": {"name": "hblk4", "type": "hash", "max_entries": 100}}), \
+                mock.patch("auto_xdp.tui.app._dump_count", return_value=12) as dump_count:
                 rows = _collect_map_usage(td, cache=cache, now=100.0)
 
         self.assertEqual(rows[0].current, 12)
@@ -245,12 +295,12 @@ class TuiMapUsageTests(unittest.TestCase):
 
     def test_high_churn_map_uses_cache_within_sample_interval(self):
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tcp_ct4").touch()
-            cache = MapUsageCache(counts={"tcp_ct4": 12}, refreshed_at={"tcp_ct4": 100.0})
+            Path(td, "hblk4").touch()
+            cache = MapUsageCache(counts={"hblk4": 12}, refreshed_at={"hblk4": 100.0})
 
-            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"tcp_ct4": {"name": "tcp_ct4", "type": "hash", "max_entries": 100}}), \
-                mock.patch("auto_xdp.tui._dump_count") as dump_count:
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([], [])), \
+                mock.patch("auto_xdp.tui.app._all_map_info", return_value={"hblk4": {"name": "hblk4", "type": "hash", "max_entries": 100}}), \
+                mock.patch("auto_xdp.tui.app._dump_count") as dump_count:
                 rows = _collect_map_usage(td, cache=cache, now=110.0)
 
         self.assertEqual(rows[0].current, 12)
@@ -259,12 +309,12 @@ class TuiMapUsageTests(unittest.TestCase):
 
     def test_high_churn_map_skips_dump_under_attack(self):
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tcp_ct4").touch()
+            Path(td, "hblk4").touch()
             cache = MapUsageCache()
 
-            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"tcp_ct4": {"name": "tcp_ct4", "type": "hash", "max_entries": 100}}), \
-                mock.patch("auto_xdp.tui._dump_count") as dump_count:
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([], [])), \
+                mock.patch("auto_xdp.tui.app._all_map_info", return_value={"hblk4": {"name": "hblk4", "type": "hash", "max_entries": 100}}), \
+                mock.patch("auto_xdp.tui.app._dump_count") as dump_count:
                 rows = _collect_map_usage(td, under_attack=True, cache=cache, now=100.0)
 
         self.assertIsNone(rows[0].current)
@@ -273,20 +323,20 @@ class TuiMapUsageTests(unittest.TestCase):
 
     def test_fast_map_usage_defers_non_whitelist_counts(self):
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tcp_ct4").touch()
+            Path(td, "hblk4").touch()
             Path(td, "udp_whitelist").touch()
 
-            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([22], [53])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={
-                    "tcp_ct4": {"name": "tcp_ct4", "type": "hash", "max_entries": 100},
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([22], [53])), \
+                mock.patch("auto_xdp.tui.app._all_map_info", return_value={
+                    "hblk4": {"name": "hblk4", "type": "hash", "max_entries": 100},
                     "udp_whitelist": {"name": "udp_whitelist", "type": "hash", "max_entries": 100},
                 }), \
-                mock.patch("auto_xdp.tui._dump_count") as dump_count:
+                mock.patch("auto_xdp.tui.app._dump_count") as dump_count:
                 rows = _collect_map_usage(td, sample_counts=False)
 
         by_name = {row.name: row for row in rows}
-        self.assertIsNone(by_name["tcp_ct4"].current)
-        self.assertEqual(by_name["tcp_ct4"].note, "deferred")
+        self.assertIsNone(by_name["hblk4"].current)
+        self.assertEqual(by_name["hblk4"].note, "deferred")
         self.assertEqual(by_name["udp_whitelist"].current, 1)
         dump_count.assert_not_called()
 
@@ -295,9 +345,9 @@ class TuiMapUsageTests(unittest.TestCase):
             Path(td, "tcp_acl_v4").touch()
             cache = MapUsageCache(counts={"tcp_acl_v4": 7}, refreshed_at={"tcp_acl_v4": 100.0})
 
-            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"tcp_acl_v4": {"name": "tcp_acl_v4", "type": "hash", "max_entries": 100}}), \
-                mock.patch("auto_xdp.tui._dump_count") as dump_count:
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([], [])), \
+                mock.patch("auto_xdp.tui.app._all_map_info", return_value={"tcp_acl_v4": {"name": "tcp_acl_v4", "type": "hash", "max_entries": 100}}), \
+                mock.patch("auto_xdp.tui.app._dump_count") as dump_count:
                 rows = _collect_map_usage(td, cache=cache, now=105.0)
 
         self.assertEqual(rows[0].current, 7)
@@ -306,13 +356,13 @@ class TuiMapUsageTests(unittest.TestCase):
 
     def test_array_map_uses_max_entries_without_dump(self):
         # Array maps are dense: live count == max_entries, so no per-map
-        # `bpftool map dump` subprocess is needed (tsc_port is 65536 entries).
+        # `bpftool map dump` subprocess is needed.
         with tempfile.TemporaryDirectory() as td:
-            Path(td, "tsc_port").touch()
+            Path(td, "weird_array").touch()
 
-            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"tsc_port": {"name": "tsc_port", "type": "array", "max_entries": 65536}}), \
-                mock.patch("auto_xdp.tui._dump_count") as dump_count:
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([], [])), \
+                mock.patch("auto_xdp.tui.app._all_map_info", return_value={"weird_array": {"name": "weird_array", "type": "array", "max_entries": 65536}}), \
+                mock.patch("auto_xdp.tui.app._dump_count") as dump_count:
                 rows = _collect_map_usage(td, now=100.0)
 
         self.assertEqual(rows[0].current, 65536)
@@ -324,9 +374,9 @@ class TuiMapUsageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             Path(td, "weird_array").touch()
 
-            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info", return_value={"weird_array": {"name": "weird_array", "type": "percpu_array"}}), \
-                mock.patch("auto_xdp.tui._dump_count", return_value=5) as dump_count:
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([], [])), \
+                mock.patch("auto_xdp.tui.app._all_map_info", return_value={"weird_array": {"name": "weird_array", "type": "percpu_array"}}), \
+                mock.patch("auto_xdp.tui.app._dump_count", return_value=5) as dump_count:
                 rows = _collect_map_usage(td, now=100.0)
 
         self.assertEqual(rows[0].current, 5)
@@ -340,25 +390,35 @@ class TuiMapUsageTests(unittest.TestCase):
                 map_info_refreshed_at=100.0,
             )
 
-            with mock.patch("auto_xdp.tui._read_xdp_ports", return_value=([], [])), \
-                mock.patch("auto_xdp.tui._all_map_info") as all_map_info, \
-                mock.patch("auto_xdp.tui._dump_count", return_value=3):
+            with mock.patch("auto_xdp.tui.app.read_xdp_ports", return_value=([], [])), \
+                mock.patch("auto_xdp.tui.app._all_map_info") as all_map_info, \
+                mock.patch("auto_xdp.tui.app._dump_count", return_value=3):
                 rows = _collect_map_usage(td, cache=cache, now=105.0)
 
         self.assertEqual(rows[0].maximum, 100)
         all_map_info.assert_not_called()
 
     def test_fast_port_rows_skip_process_lookup(self):
-        with mock.patch("auto_xdp.tui._collect_ports", return_value=([22], [53])), \
-            mock.patch("auto_xdp.tui._lookup_port_procs") as lookup_procs, \
-            mock.patch("auto_xdp.tui._read_policy", return_value={}), \
-            mock.patch("auto_xdp.tui._read_global_udp_rate", return_value=0), \
-            mock.patch("auto_xdp.tui._safe_service", return_value="-"):
+        with mock.patch("auto_xdp.tui.app.collect_ports", return_value=([22], [53])), \
+            mock.patch("auto_xdp.tui.app.lookup_port_procs") as lookup_procs, \
+            mock.patch("auto_xdp.tui.app._read_policy", return_value={}), \
+            mock.patch("auto_xdp.tui.app._read_global_udp_rate", return_value=0), \
+            mock.patch("auto_xdp.tui.app._safe_service", return_value="-"):
             rows = _collect_port_rows("xdp", "/sys/fs/bpf/xdp_fw", "inet", "auto_xdp", include_processes=False)
 
         self.assertEqual(rows[0][3], "-")
         self.assertEqual(rows[1][3], "-")
         lookup_procs.assert_not_called()
+
+    def test_port_rows_use_selected_interface_admission(self):
+        with mock.patch("auto_xdp.tui.app.collect_ports", return_value=([18080], [18081])) as collect, \
+            mock.patch("auto_xdp.tui.app._read_policy", return_value={}), \
+            mock.patch("auto_xdp.tui.app._read_global_udp_rate", return_value=0), \
+            mock.patch("auto_xdp.tui.app._safe_service", return_value="-"):
+            rows = _collect_port_rows("xdp", "/tmp/bpf", "inet", "auto_xdp",
+                                      include_processes=False, interfaces=["enp8s0"])
+        collect.assert_called_once_with("xdp", "/tmp/bpf", "inet", "auto_xdp", interfaces=["enp8s0"])
+        self.assertEqual([(r[0], r[1]) for r in rows], [("TCP", 18080), ("UDP", 18081)])
 
 
 class TuiSummaryTests(unittest.TestCase):
@@ -370,13 +430,97 @@ class TuiSummaryTests(unittest.TestCase):
             attach_targets=[("eth0", "xdp native"), ("eth1", "xdp generic")],
         )
 
-        with mock.patch("auto_xdp.tui.curses.color_pair", side_effect=lambda idx: idx * 10), \
-            mock.patch("auto_xdp.tui.curses.A_BOLD", 1):
+        with mock.patch("auto_xdp.tui.app.curses.color_pair", side_effect=lambda idx: idx * 10), \
+            mock.patch("auto_xdp.tui.app.curses.A_BOLD", 1):
             _draw_summary(win, snap)
 
         attrs = {text: attr for _, _, text, attr in win.calls if text in {"eth0", "eth1"}}
         self.assertEqual(attrs["eth0"], 51)
         self.assertEqual(attrs["eth1"], 61)
+
+
+class TuiObservationTests(unittest.TestCase):
+    def test_cookie_page_uses_unknown_for_missing_counters_and_config_is_not_runtime(self):
+        win = FakeWindow(height=19, width=80)
+        relay = RelayClient("unused")
+        relay.telemetry_status = dict(queue_dropped=7, invalid_records=3)
+        snapshot = TuiSnapshot(cookie_configured=True, stats=[("EVENT_SUPPRESSED", 8, -1, "-")])
+        _draw_cookie(win, snapshot, relay)
+        rendered = "\n".join(win.lines.values())
+        self.assertIn("runtime=unknown; configured=enabled", rendered)
+        self.assertIn("VALID != application accept", rendered)
+        self.assertIn("suppressed=8", rendered)
+        self.assertIn("queue loss=7", rendered)
+        self.assertIn("unknown", rendered)
+        for y, x, text, _ in win.calls:
+            self.assertTrue(0 <= y < 19)
+            self.assertTrue(0 <= x < 80)
+            self.assertLess(x + len(text), 80)
+
+    def test_cookie_page_scroll_reaches_handoff_result(self):
+        win = FakeWindow(height=19, width=80)
+        snapshot = TuiSnapshot(stats=[("SYN_COOKIE_HANDOFF_SUCCESS", 9, -1, "1 pps")])
+        _draw_cookie(win, snapshot, RelayClient("unused"), scroll=100)
+        rendered = "\n".join(win.lines.values())
+        self.assertIn("SYN_COOKIE_HANDOFF_SUCCESS", rendered)
+        self.assertIn("9", rendered)
+
+    def test_reason_panel_explains_only_retained_drop_events(self):
+        relay = RelayClient("unused", max_events=1)
+        relay._append(dict(verdict="DROP", reason="TCP_DROP"))
+        relay._append(dict(verdict="DROP", reason="PORT_NOT_AUTHORIZED"))
+        win = FakeWindow(height=8, width=100)
+        with mock.patch("auto_xdp.tui.app.curses.color_pair", return_value=0):
+            _draw_drop_reasons(win, relay)
+        rendered = "\n".join(win.lines.values())
+        self.assertIn("1 retained events", rendered)
+        self.assertIn("not authorized on this ingress interface", rendered)
+        self.assertNotIn("TCP_DROP", rendered)
+
+    def test_source_geo_lookup_is_bounded_and_sample_coverage_is_visible(self):
+        relay = RelayClient("unused")
+        for index in range(20):
+            relay._append(dict(src=f"2001:4860::{index}", verdict="DROP", proto="TCP", dport=443, pkt_len=60))
+        geo = SimpleNamespace(status="ready", lookup=mock.Mock(return_value=dict(
+            country_code="US", asn=15169, as_org="Organization " * 100, db_updated_at="2026-09-01")))
+        win = FakeWindow(height=30, width=80)
+        with mock.patch("auto_xdp.tui.app.curses.color_pair", return_value=0):
+            _draw_top_traffic(win, relay, geo)
+        rendered = "\n".join(win.lines.values())
+        self.assertEqual(geo.lookup.call_count, 13)  # All rows fitting this terminal, without a fixed top-ten cap.
+        self.assertIn("retained event samples", rendered)
+        self.assertIn("US AS15169", rendered)
+        self.assertIn("bytes* recorded only", rendered)
+        self.assertIn("2026-09-01", rendered)
+        self.assertIn("unverified source", rendered)
+        self.assertTrue(all(x + len(text) < 80 for _, x, text, _ in win.calls))
+
+    def test_event_metadata_and_unknown_old_metadata_are_visible(self):
+        relay = RelayClient("unused")
+        relay._append(dict(verdict="DROP", src="1.1.1.1", reason="SYN_RATE_DROP", ifindex=3, pkt_len=60))
+        relay._append(dict(verdict="DROP", src="1.1.1.1", reason="TCP_DROP"))
+        win = FakeWindow(height=8, width=120)
+        with mock.patch("auto_xdp.tui.app.curses.color_pair", return_value=0):
+            _draw_events(win, relay, TuiSnapshot(), top=0, focused=False)
+        rendered = "\n".join(win.lines.values())
+        self.assertIn("if=3 len=60", rendered)
+        self.assertIn("SYN_RATE_DROP", rendered)
+        self.assertIn("if=? len=?", rendered)
+        self.assertIn("TCP_DROP", rendered)
+
+    def test_runtime_reader_gets_one_value_and_closes_map(self):
+        runtime = mock.Mock()
+        runtime.get.return_value = (1, 90, 200, 1000, 5000000000)
+        with mock.patch("auto_xdp.tui.app.Path.exists", return_value=True), \
+             mock.patch("auto_xdp.tui.app.BpfSyncookieRuntimeMap", return_value=runtime):
+            self.assertEqual(_read_cookie_runtime("/sys/fs/bpf/xdp_fw/sync_run_cfg"), runtime.get.return_value)
+        runtime.get.assert_called_once_with()
+        runtime.close.assert_called_once_with()
+
+    def test_clipping_handles_wide_characters_and_control_text(self):
+        self.assertEqual(_clip("中中", 4), "中")
+        self.assertEqual(_clip("ab\nc", 4), "abc")
+        self.assertEqual(_clip("abc", 1), "")
 
 
 class TuiPortFilterTests(unittest.TestCase):
@@ -404,8 +548,60 @@ class TuiPortFilterTests(unittest.TestCase):
         self.assertIn("[UDP]", title_calls[0])
         self.assertIn("UDP", rendered)
         self.assertIn("domain", rendered)
-        self.assertNotIn("TCP", rendered)
-        self.assertNotIn("ssh", rendered)
+        body = "\n".join(text for y, text in win.lines.items() if 2 <= y < win.height - 1)
+        self.assertNotIn("TCP", body)
+        self.assertNotIn("ssh", body)
+
+
+class TuiAuditMarkerTests(unittest.TestCase):
+    def test_approval_workflow_hides_history_and_selects_pending_first(self):
+        rows = [
+            {"id": 1, "status": "approved"},
+            {"id": 2, "status": "rejected"},
+            {"id": 3, "status": "pending"},
+            {"id": 4, "status": "revoked"},
+            {"id": 5, "status": "pending"},
+        ]
+
+        self.assertEqual(
+            [row["id"] for row in _actionable_approval_rows(rows)],
+            [3, 5, 1],
+        )
+
+    def test_enter_approves_selected_pending_request(self):
+        args = SimpleNamespace(run_state_dir="/run/auto_xdp", config="/etc/auto_xdp/config.toml")
+        with mock.patch("auto_xdp.tui.app.approvals.approve_request") as approve, \
+             mock.patch("auto_xdp.tui.app.approvals.store_path", return_value=Path("/run/auto_xdp/approval_requests.json")), \
+             mock.patch("auto_xdp.tui.app.approvals.reload_daemon") as reload_daemon:
+            message = _approve_tui_request(args, {"id": 7, "status": "pending"})
+
+        approve.assert_called_once_with(
+            Path("/run/auto_xdp/approval_requests.json"),
+            "/etc/auto_xdp/config.toml",
+            7,
+            actor="tui",
+        )
+        reload_daemon.assert_called_once_with()
+        self.assertEqual(message, "approved request #7")
+
+    def test_enter_explains_non_pending_request(self):
+        args = SimpleNamespace(run_state_dir="/run/auto_xdp", config="/etc/auto_xdp/config.toml")
+        with mock.patch("auto_xdp.tui.app.approvals.approve_request") as approve:
+            message = _approve_tui_request(args, {"id": 8, "status": "approved"})
+
+        approve.assert_not_called()
+        self.assertIn("Enter only approves pending requests", message)
+
+    def test_audit_marker_only_requests_first_or_changed_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker = Path(tmpdir) / "audit.json"
+            rows = [{"action": "drop", "port": 443, "subject": "unknown"}]
+            fingerprint = _audit_fingerprint(rows)
+            self.assertTrue(_audit_needs_review(marker, fingerprint))
+            _mark_audit_reviewed(marker, fingerprint)
+            self.assertFalse(_audit_needs_review(marker, fingerprint))
+            changed = _audit_fingerprint(rows + [{"action": "allow", "port": 22, "subject": "ssh"}])
+            self.assertTrue(_audit_needs_review(marker, changed))
 
 
 if __name__ == "__main__":

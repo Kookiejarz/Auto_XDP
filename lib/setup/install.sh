@@ -74,7 +74,8 @@ prepare_candidate_config() {
     candidate=$(mktemp)
     _SETUP_TMPFILES+=("$candidate")
     cp "$source_config" "$candidate" || return 1
-    "${PYTHON3_BIN:-python3}" - "$candidate" <<'PY'
+    PYTHONPATH="${SOURCE_ROOT:-.}${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON3_BIN:-python3}" - \
+        "$candidate" <<'PY' || return 1
 import sys
 try:
     import tomllib
@@ -82,6 +83,8 @@ except ImportError:
     import tomli as tomllib
 with open(sys.argv[1], "rb") as handle:
     value = tomllib.load(handle)
+from auto_xdp.config import parse_toml_config
+parse_toml_config(value)
 backend = str(value.get("daemon", {}).get("preferred_backend", "auto")).lower()
 if backend not in {"auto", "xdp", "nftables"}:
     raise SystemExit(f"invalid daemon.preferred_backend: {backend}")
@@ -130,12 +133,15 @@ SYNC_SCRIPT="${CURRENT_LINK}/xdp_port_sync.py"
 PYTHON3_BIN="${PYTHON3_BIN}"
 BPF_PIN_DIR="${BPF_PIN_DIR}"
 XDP_OBJ_PATH="${CURRENT_LINK}/${XDP_OBJ}"
-TC_OBJ_PATH="${CURRENT_LINK}/${TC_OBJ}"
+SYNCOOKIE_OBJ_PATH="${CURRENT_LINK}/${SYNCOOKIE_OBJ}"
+TC_SYNCOOKIE_OBJ_PATH="${CURRENT_LINK}/${TC_SYNCOOKIE_OBJ}"
+TC_EGRESS_OBJ_PATH="${CURRENT_LINK}/${TC_EGRESS_OBJ}"
 SOCK_STATE_OBJ_PATH="${CURRENT_LINK}/${SOCK_STATE_OBJ}"
 BPFTOOL_BIN="${BPFTOOL_BIN:-}"
 PREFERRED_BACKEND="${REQUESTED_BACKEND}"
 MACHINE_STATE="${MACHINE_STATE}"
 RUNTIME_STATE="${RUNTIME_STATE}"
+APPROVAL_STORE="${APPROVAL_STORE}"
 INSTALL_TRANSACTION_FILE="${INSTALL_TRANSACTION_FILE}"
 RUNTIME_GENERATION="${RELEASE_NAME:-unknown}"
 AUTO_TUNE_QUEUES="1"
@@ -284,15 +290,35 @@ install_axdp_command() {
 }
 
 validate_installed_python_support_package() {
-    PYTHONPATH="${PYTHON_LIB_DIR}" "${PYTHON3_BIN:-python3}" - <<'PY'
+    PYTHONPATH="${PYTHON_LIB_DIR}" "${PYTHON3_BIN:-python3}" - "${PYTHON_LIB_DIR}" <<'PY'
 import sys
+from importlib import import_module, resources
+from pathlib import Path
+
+package_root = Path(sys.argv[1]).resolve()
+# Validate the payload, even when the installer is invoked from its source tree.
+sys.path[:] = [str(package_root)] + [
+    p for p in sys.path if p and Path(p).resolve() not in {Path.cwd(), package_root}
+]
 
 try:
-    import auto_xdp.tui  # noqa: F401
-    from auto_xdp import admin_cli
-    from importlib import resources
+    for name in (
+        "auto_xdp.cli", "auto_xdp.admin.cli", "auto_xdp.admin.main",
+        "auto_xdp.admin.approval_api", "auto_xdp.discovery.listeners",
+        "auto_xdp.discovery.proc_events", "auto_xdp.discovery.sock_state",
+        "auto_xdp.discovery.services", "auto_xdp.telemetry.events",
+        "auto_xdp.telemetry.relay_client", "auto_xdp.telemetry.traffic",
+        "auto_xdp.telemetry.geoip", "auto_xdp.tui.app", "auto_xdp.install_state",
+        "auto_xdp.bpf.conntrack", "auto_xdp.xdp_link",
+    ):
+        module = import_module(name)
+        if not Path(module.__file__).resolve().is_relative_to(package_root):
+            raise RuntimeError(f"{name} was imported outside the installed package")
+    from auto_xdp.admin import cli as admin_cli
+    from auto_xdp import install_state
+    assert install_state.STATE_SCHEMA >= 1
 except Exception as exc:
-    raise SystemExit(f"failed to import installed auto_xdp TUI modules: {exc}")
+    raise SystemExit(f"failed to import installed auto_xdp modules: {exc}")
 
 if not resources.files("auto_xdp").joinpath("default_config.toml").is_file():
     raise SystemExit("installed auto_xdp package is missing default_config.toml")
@@ -302,7 +328,7 @@ required_options = {"--run-state-dir", "--nft-family", "--nft-table", "--iface"}
 missing_options = sorted(required_options - set(parser._option_string_actions))
 if missing_options:
     raise SystemExit(
-        "installed auto_xdp.admin_cli is missing required wrapper options: "
+        "installed auto_xdp.admin.cli is missing required wrapper options: "
         + ", ".join(missing_options)
     )
 command_action = next(
@@ -310,30 +336,35 @@ command_action = next(
     None,
 )
 choices = set(getattr(command_action, "choices", {}) or {})
-if "tui" not in choices:
-    raise SystemExit("installed auto_xdp.admin_cli does not expose the tui command")
+for required in ("tui", "handler"):
+    if required not in choices:
+        raise SystemExit(f"installed auto_xdp.admin.cli does not expose the {required} command")
 PY
 }
 
 install_slot_handler_sdk() {
     local handlers_root="${INSTALL_DIR}/handlers"
     local -a handler_files=()
-    local rel=""
+    local rel="" sdk_root=""
 
     priv_mkdir "$handlers_root"
 
-    if [[ -n "${BUILD_STAGING_DIR:-}" && -d "${BUILD_STAGING_DIR}/handlers" ]]; then
+    for sdk_root in "${BUILD_STAGING_DIR:-}" "${SOURCE_ROOT:-${BOOTSTRAP_LOCAL_ROOT:-.}}"; do
+        [[ -n "$sdk_root" && -d "${sdk_root}/handlers" && -d "${sdk_root}/bpf/include" ]] || continue
         local _staged=()
-        mapfile -t -d '' _staged < <(find "${BUILD_STAGING_DIR}/handlers" -maxdepth 1 \
-            -type f \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) -print0)
+        mapfile -t -d '' _staged < <(
+            find "${sdk_root}/handlers" -maxdepth 1 \
+                -type f \( -name 'Makefile*' -o -name 'Kbuild' -o -name '*.c' -o -name '*.h' -o -name '*.handler.json' \) -print0
+            find "${sdk_root}/bpf/include" -maxdepth 1 -type f -name '*.h' -print0
+        )
         if [[ ${#_staged[@]} -gt 0 ]]; then
             local _sf
             for _sf in "${_staged[@]}"; do
-                place_file "$_sf" "${handlers_root}/$(basename "$_sf")"
+                place_file "$_sf" "${INSTALL_DIR}/${_sf#"${sdk_root}/"}" || return 1
             done
             return 0
         fi
-    fi
+    done
 
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
         local api_url
@@ -347,19 +378,15 @@ install_slot_handler_sdk() {
 import json, sys
 for e in json.load(sys.stdin).get('tree', []):
     p = e['path']
+    if p.startswith('bpf/include/') and p.endswith('.h'):
+        print(p)
+        continue
     if not p.startswith('handlers/'):
         continue
     tail = p.split('/')[-1]
-    if tail == 'Makefile' or p.endswith('.c') or p.endswith('.h'):
+    if tail.startswith('Makefile') or tail == 'Kbuild' or p.endswith(('.c', '.h', '.handler.json')):
         print(p)
 " | sort
-        )
-    else
-        local handler_root="${SOURCE_ROOT:-${BOOTSTRAP_LOCAL_ROOT:-.}}/handlers"
-        mapfile -t handler_files < <(
-            find "$handler_root" -maxdepth 1 -type f \
-                \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) \
-                | sort
         )
     fi
 
@@ -369,7 +396,7 @@ for e in json.load(sys.stdin).get('tree', []):
     fi
 
     for rel in "${handler_files[@]}"; do
-        if ! fetch_local_or_remote "$rel" "$rel" "${handlers_root}/${rel#handlers/}"; then
+        if ! fetch_local_or_remote "$rel" "$rel" "${INSTALL_DIR}/${rel}"; then
             die "Failed to install ${rel}"
         fi
     done
@@ -386,17 +413,22 @@ install_toml_config() {
         local stamp
         stamp=$(date -u +%Y%m%d-%H%M%S)
         priv_mkdir "$backup_dir"
-        place_file "$toml_target" "${backup_dir}/config.toml.${stamp}"
+        local backup_path="${backup_dir}/config.toml.${stamp}"
+        place_file "$toml_target" "$backup_path"
+        as_root chown root:root "$backup_path"
+        as_root chmod 0600 "$backup_path"
         as_root chmod 0700 "$backup_dir"
         info "Preserving existing config.toml (backup: ${backup_dir}/config.toml.${stamp})"
-        return 0
+    else
+        if [[ -n "${CANDIDATE_TOML_CONFIG:-}" && -f "$CANDIDATE_TOML_CONFIG" ]]; then
+            place_file "$CANDIDATE_TOML_CONFIG" "$toml_target"
+        elif ! fetch_local_or_remote "config.toml" "config.toml" "$toml_target"; then
+            die "Failed to install config.toml"
+        fi
     fi
 
-    if [[ -n "${CANDIDATE_TOML_CONFIG:-}" && -f "$CANDIDATE_TOML_CONFIG" ]]; then
-        place_file "$CANDIDATE_TOML_CONFIG" "$toml_target"
-    elif ! fetch_local_or_remote "config.toml" "config.toml" "$toml_target"; then
-        die "Failed to install config.toml"
-    fi
+    as_root chown root:root "$toml_target"
+    as_root chmod 0600 "$toml_target"
 }
 
 build_release_payload() {
@@ -404,7 +436,8 @@ build_release_payload() {
 
     install_compiled_bpf_objects() {
         local object source
-        for object in "$XDP_OBJ" "$TC_OBJ" "$SOCK_STATE_OBJ"; do
+        for object in "$XDP_OBJ" "$SYNCOOKIE_OBJ" "$TC_SYNCOOKIE_OBJ" \
+                      "$TC_EGRESS_OBJ" "$SOCK_STATE_OBJ"; do
             source="${BUILD_STAGING_DIR}/${object}"
             [[ -f "$source" ]] || continue
             place_file "$source" "${INSTALL_DIR}/${object}" || return 1
@@ -472,6 +505,7 @@ User=root
 Group=${RELAY_GROUP}
 RuntimeDirectory=auto_xdp
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -554,11 +588,16 @@ EOF_RELAY_OPENRC
 
 run_initial_sync() {
     info "Running initial sync..."
+    local -a mode_args=()
+    if [[ ${POLICY_DEFERRED:-0} -eq 1 ]]; then
+        mode_args=(--mode "$(configured_policy_mode)")
+    fi
     as_root env \
         "PYTHONPATH=${PYTHON_LIB_DIR}" \
         "$PYTHON3_BIN" "$SYNC_SCRIPT" \
         --config "$TOML_CONFIG" \
-        --backend "$ACTIVE_BACKEND"
+        --backend "$ACTIVE_BACKEND" \
+        "${mode_args[@]}"
 }
 
 run_initial_sync_step() {
@@ -591,11 +630,15 @@ run_initial_sync_step() {
     fi
     if [[ ${PENDING_NFT_CUTOVER:-0} -eq 1 ]]; then
         if ! finalize_nftables_cutover; then
-            step_fail "nftables candidate loaded, but XDP/tc cutover could not be verified"
+            step_fail "nftables candidate loaded, but XDP cutover could not be verified"
             return 1
         fi
     fi
-    step_ok "$ACTIVE_BACKEND policy verified"
+    if [[ ${POLICY_DEFERRED:-0} -eq 1 ]]; then
+        step_ok "audit-only policy verified"
+    else
+        step_ok "$ACTIVE_BACKEND policy verified"
+    fi
 }
 
 install_runtime_service_step() {

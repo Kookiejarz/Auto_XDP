@@ -114,6 +114,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Select the container ingress interface
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Container veth devices require explicit opt-in; automatic discovery
+          # must not silently bypass its exclusions via the default route.
+          axdp_ci_iface=$(ip -j route show default | python3 -c 'import json, sys; print(next(row["dev"] for row in json.load(sys.stdin) if row.get("dev")))')
+          test -n "$axdp_ci_iface"
+          printf 'AXDP_CI_INTERFACE=%s\n' "$axdp_ci_iface" >> "$GITHUB_ENV"
+
       - name: Run installer end to end
         shell: bash
         run: |
@@ -125,7 +135,8 @@ jobs:
             fi
           done
           cd /tmp
-          bash "$GITHUB_WORKSPACE/setup_xdp.sh" 2>&1 | tee "$GITHUB_WORKSPACE/install.log"
+          bash "$GITHUB_WORKSPACE/setup_xdp.sh" --allow-container-interfaces "$AXDP_CI_INTERFACE" \
+            2>&1 | tee "$GITHUB_WORKSPACE/install.log"
 
       - name: Verify installed artifacts and compiled objects
         shell: bash
@@ -136,7 +147,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           cd /tmp
-          bash "$GITHUB_WORKSPACE/setup_xdp.sh" 2>&1 | tee "$GITHUB_WORKSPACE/reinstall.log"
+          bash "$GITHUB_WORKSPACE/setup_xdp.sh" --allow-container-interfaces "$AXDP_CI_INTERFACE" \
+            2>&1 | tee "$GITHUB_WORKSPACE/reinstall.log"
 
       - name: Verify overwrite reinstall
         shell: bash
@@ -207,6 +219,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo grep -qx 'PREFERRED_BACKEND="xdp"' /etc/auto_xdp/auto_xdp.env
+          ! sudo test -e /sys/fs/bpf/xdp_fw/prog
+          sudo /usr/local/bin/axdp enable --force
           deadline=$((SECONDS + 40))
           while ! sudo test -f /run/auto_xdp/backend && (( SECONDS < deadline )); do sleep 0.2; done
           sudo test -f /run/auto_xdp/backend
@@ -223,6 +237,12 @@ jobs:
             RUNTIME_E2E_PEER_IFACE=axdpci1 \
             bash tests/run.sh installed
 
+      - name: Install kernel test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            conntrack "linux-headers-$(uname -r)" libelf-dev kmod pahole llvm
+
       - name: Run real kernel and packet-policy integration
         run: |
           set -Eeuo pipefail
@@ -230,6 +250,7 @@ jobs:
           mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           sudo env \
             REQUIRE_KERNEL_TESTS=1 \
+            KERNEL_TEST_ICMP=1 \
             VERIFIER_METRICS_FILE="$GITHUB_WORKSPACE/verifier-metrics.tsv" \
             bash tests/run.sh kernel 2>&1 | tee kernel-integration.log
 

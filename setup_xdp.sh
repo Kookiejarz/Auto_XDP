@@ -105,8 +105,12 @@ IFACES=()
 ALL_IFACES=0
 XDP_SRC="bpf/xdp_firewall.c"
 XDP_OBJ="xdp_firewall.o"
-TC_SRC="tc_flow_track.c"
-TC_OBJ="tc_flow_track.o"
+SYNCOOKIE_SRC="bpf/xdp_syncookie.c"
+SYNCOOKIE_OBJ="xdp_syncookie.o"
+TC_SYNCOOKIE_SRC="bpf/tc_syncookie_handoff.c"
+TC_SYNCOOKIE_OBJ="tc_syncookie_handoff.o"
+TC_EGRESS_SRC="bpf/tc_egress_dispatch.c"
+TC_EGRESS_OBJ="tc_egress_dispatch.o"
 
 INSTALL_ROOT="/usr/local/lib/auto_xdp"
 RELEASES_DIR="${INSTALL_ROOT}/releases"
@@ -127,6 +131,7 @@ CONFIG_DIR="/etc/auto_xdp"
 INSTALL_TRANSACTION_FILE="${CONFIG_DIR}/install-transaction.json"
 CONFIG_FILE="${CONFIG_DIR}/auto_xdp.env"
 TOML_CONFIG="${CONFIG_DIR}/config.toml"
+RUN_STATE_DIR="/run/auto_xdp"
 SYNC_SCRIPT="${CURRENT_LINK}/xdp_port_sync.py"
 RELAY_SCRIPT="${CURRENT_LINK}/pkt_relay.py"
 AXDP_CMD="/usr/local/bin/axdp"
@@ -134,7 +139,9 @@ RUNNER_SCRIPT="${CURRENT_LINK}/auto_xdp_start.sh"
 RUNNER_SRC="runtime/auto_xdp_start.sh"
 RUNTIME_COMMON_SRC="runtime/auto_xdp_runtime_common.sh"
 XDP_OBJ_INSTALLED="${INSTALL_DIR}/xdp_firewall.o"
-TC_OBJ_INSTALLED="${INSTALL_DIR}/tc_flow_track.o"
+SYNCOOKIE_OBJ_INSTALLED="${INSTALL_DIR}/xdp_syncookie.o"
+TC_SYNCOOKIE_OBJ_INSTALLED="${INSTALL_DIR}/tc_syncookie_handoff.o"
+TC_EGRESS_OBJ_INSTALLED="${INSTALL_DIR}/tc_egress_dispatch.o"
 SOCK_STATE_SRC="bpf/sock_state_track.c"
 SOCK_STATE_OBJ="sock_state_track.o"
 SOCK_STATE_OBJ_INSTALLED="${INSTALL_DIR}/sock_state_track.o"
@@ -148,6 +155,7 @@ SOURCE_REVISION=""
 SOURCE_VERSION=""
 MACHINE_STATE="${CONFIG_DIR}/machine-state.json"
 RUNTIME_STATE="${CONFIG_DIR}/runtime-state.json"
+APPROVAL_STORE="${CONFIG_DIR}/approval_requests.json"
 MACHINE_STATE_CANDIDATE=""
 CANDIDATE_TOML_CONFIG=""
 INTERFACE_CONFIG_MODE="auto"
@@ -159,12 +167,13 @@ INTERFACE_POLICY_PRESENT=0
 AUTO_XDP_ALLOW_CONTAINER=0
 
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
+NFT_FAMILY="inet"
+NFT_TABLE="auto_xdp"
 SERVICE_NAME="xdp-port-sync"
 RELAY_SERVICE_NAME="auto-xdp-relay"
 RAW_BASE_URL="https://raw.githubusercontent.com/Kookiejarz/Auto_XDP"
 AUTO_XDP_SOURCE_REF="${AUTO_XDP_SOURCE_REF:-}"
 RAW_URL=""
-TC_FILTER_PREF=49152
 PREFER_REMOTE_SOURCES=0
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 SYSTEMD_RUN_DIR="${SYSTEMD_RUN_DIR:-/run/systemd/system}"
@@ -224,6 +233,7 @@ ACTIVE_XDP_MODE="none"
 XDP_FALLBACK_REASON=""
 REQUESTED_BACKEND="auto"
 PENDING_NFT_CUTOVER=0
+POLICY_DEFERRED=0
 PYTHON3_BIN=""
 CHECK_UPDATES=0
 FORCE=0
@@ -381,10 +391,41 @@ load_runtime_common_lib
 source_setup_lib "lib/setup/install.sh"
 source_setup_lib "lib/setup/release.sh"
 
-# The backend bring-up: load the XDP/nftables backend, register handlers, seed
-# conntrack, and install + start the system service. These steps run the shared
+# The backend bring-up: load the XDP/nftables backend, register handlers, and
+# install + start the system service. These steps run the shared
 # runtime library in-process, so they execute as a single privileged unit.
+configured_policy_mode() {
+    PYTHONPATH="${PYTHON_LIB_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+        "$PYTHON3_BIN" -c '
+from auto_xdp.config import load_toml_config
+import sys
+print(str(load_toml_config(sys.argv[1]).get("policy", {}).get("mode", "audit")).lower())
+' "$TOML_CONFIG"
+}
+
+deactivate_installed_runtime() {
+    PYTHONPATH="${PYTHON_LIB_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+        "$PYTHON3_BIN" -m auto_xdp.admin.main \
+        --env-config "$CONFIG_FILE" \
+        --bpf-pin-dir "$BPF_PIN_DIR" \
+        --run-state-dir "$RUN_STATE_DIR" \
+        --nft-family "$NFT_FAMILY" \
+        --nft-table "$NFT_TABLE" \
+        deactivate
+}
+
 run_backend_phase() {
+    if [[ "$(configured_policy_mode)" != "enforce" ]]; then
+        POLICY_DEFERRED=1
+        ACTIVE_BACKEND=$(_auto_xdp_resolve_preferred_backend "$TOML_CONFIG" "auto")
+        ACTIVE_XDP_MODE="none"
+        step_begin "Deferring firewall activation until axdp enable"
+        step_ok "audit-only"
+        deactivate_installed_runtime
+        run_initial_sync_step
+        install_runtime_service_step
+        return
+    fi
     deploy_backend_step
     load_configured_slot_handlers_step
     load_configured_port_handlers_step
@@ -402,6 +443,7 @@ _emit_backend_results() {
         printf 'ACTIVE_XDP_MODE=%q\n' "$ACTIVE_XDP_MODE"
         printf 'XDP_FALLBACK_REASON=%q\n' "$XDP_FALLBACK_REASON"
         printf 'REQUESTED_BACKEND=%q\n' "$REQUESTED_BACKEND"
+        printf 'POLICY_DEFERRED=%q\n' "$POLICY_DEFERRED"
     } > "$rf"
 }
 

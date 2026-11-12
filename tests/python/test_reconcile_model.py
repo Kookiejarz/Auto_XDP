@@ -1,0 +1,624 @@
+"""Shared contracts across discovery, policy, and backend application."""
+from dataclasses import replace
+import errno
+import socket
+import struct
+import subprocess
+from unittest import mock
+
+import pytest
+
+from auto_xdp import config as cfg, policy, syncer
+from auto_xdp.backends.nftables import NftablesBackend
+from auto_xdp.backends.xdp import XdpBackend
+from auto_xdp.admin import module_runtime
+from auto_xdp.bpf.maps import BpfEndpointScopeMap, CacheVerifyMixin
+from auto_xdp.state import (
+    AppliedState, BackendProjection, DesiredState, EndpointPolicy, ObservedState, RuntimeEndpoint, ReconcileStep,
+    compute_reconcile_plan, project_endpoint_policies,
+)
+from test_xdp_port_sync import (
+    FakePortMap, FakeTrustedMap, FakeRuntimeConfigMap, _make_failing_backend,
+)
+
+
+KEY = ("tcp", "198.51.100.10", 8080, "public")
+
+
+@pytest.fixture(autouse=True)
+def isolated_bpf_pins(tmp_path, monkeypatch):
+    # Fake maps must not inspect the host's root-only BPF filesystem.
+    monkeypatch.setattr(cfg, "BPF_PIN_DIR", str(tmp_path / "bpf"))
+
+
+def target(policies=None, **settings):
+    snapshot = cfg.ConfigSnapshot({**cfg.snapshot_config().values, **settings})
+    return DesiredState(config=snapshot,
+                        endpoint_policies=policies if policies is not None else {KEY: EndpointPolicy(True, "grant")})
+
+
+def test_snapshot_is_deeply_immutable_and_candidate_validation_is_pure():
+    before = cfg.snapshot_config()
+    raw = {"zones": {"public": {"interfaces": ["eth0"]}}}
+    candidate = cfg.parse_toml_config(raw)
+    raw["zones"]["public"]["interfaces"].append("eth1")
+    assert candidate.ZONES["public"]["interfaces"] == ("eth0",)
+    with pytest.raises(TypeError):
+        candidate.ZONES["public"]["interfaces"] = ()
+    with pytest.raises(ValueError):
+        cfg.parse_toml_config({"policy": {"mode": "invalid"}})
+    assert cfg.snapshot_config().values == before.values
+
+
+def test_policy_and_backend_use_the_supplied_snapshot_after_reload():
+    snapshot = cfg.parse_toml_config({
+        "rate_limits": {"syn_by_proc": {"web": 123}},
+        "zones": {"public": {"interfaces": []}},
+        "subjects": {"web": {"resolver": {"comm": "web"},
+                             "exposure": {"public": {"tcp": {"ports": [8080]}}}}},
+    })
+    endpoint = RuntimeEndpoint("tcp", KEY[1], KEY[2], "address", "public", "web", "delegated",
+                               process_name="web", instance_id="socket:1")
+    with mock.patch.object(cfg, "_SYN_RATE_BY_PROC", {"web": 999}), mock.patch.object(cfg, "ZONES", {}):
+        desired = policy.resolve_desired_state(ObservedState(endpoints=[endpoint]), config=snapshot)
+    assert desired.config is snapshot
+    assert desired.endpoint_policies[KEY].syn_rate == 123
+    assert desired.endpoint_policies[KEY].instance_id == "socket:1"
+
+
+def test_one_round_passes_the_identical_snapshot_to_discovery_and_policy():
+    observed = ObservedState()
+    with mock.patch.object(syncer, "observe_system_state", return_value=observed) as discover, \
+         mock.patch.object(syncer, "resolve_desired_state", return_value=DesiredState()) as resolve:
+        report = syncer.sync_once(None, False, mode="observe")
+    assert discover.call_args.kwargs["config"] is report["config"]
+    assert resolve.call_args.kwargs["config"] is report["config"]
+    assert report["apply_result"] is None
+
+
+def test_projection_preserves_address_zone_and_rejects_unrepresentable_limits():
+    other = ("tcp", "198.51.100.11", 8080, "trusted")
+    desired = target({KEY: EndpointPolicy(True, "grant", syn_rate=5),
+                      other: EndpointPolicy(True, "grant", syn_rate=10)},
+                     ZONES={"public": {"interfaces": []}, "trusted": {"interfaces": ["wg0"]}})
+    effective, blocked = project_endpoint_policies(desired)
+    assert set(blocked) == {KEY, other}
+    assert not effective.tcp_ports and not effective.zone_tcp_ports
+    assert desired.endpoint_policies[KEY].allow  # target intent remains intact
+    compatible = replace(desired, endpoint_policies={key: replace(value, syn_rate=5)
+                                                    for key, value in desired.endpoint_policies.items()})
+    effective, blocked = project_endpoint_policies(compatible)
+    assert not blocked and set(effective.endpoint_policies) == {KEY, other}
+    assert effective.zone_tcp_ports == {"public": {8080}, "trusted": {8080}}
+
+
+def test_listener_restart_requires_close_prepare_open_and_absence_is_unknown():
+    old = EndpointPolicy(True, "grant", instance_id="1", profile="minecraft")
+    desired = target({KEY: replace(old, instance_id="2")})
+    plan = compute_reconcile_plan(desired, AppliedState(endpoint_policies={KEY: old}))
+    assert plan.target is desired
+    assert [step.operation for step in plan.steps] == ["revoke", "prepare", "admit", "cleanup"]
+    assert KEY in plan.steps[0].endpoints and KEY in plan.steps[2].endpoints
+    assert plan.steps[2].depends_on == ("prepare",)
+    assert AppliedState().evidence.get("endpoint_policies", "unknown") == "unknown"
+
+
+def test_xdp_scope_abi_and_private_tombstone_do_not_widen_ipv4_address():
+    backend = XdpBackend.__new__(XdpBackend)
+    desired = target(ZONES={"public": {"interfaces": []}, "trusted": {"interfaces": ["wg0"]}})
+    with mock.patch.object(socket, "if_nametoindex", return_value=7):
+        values, blocked, deferred = backend._scope_values(desired)
+    assert not blocked
+    assert not deferred
+    assert values[struct.pack("=IHBB16s", 0, 8080, 6, 2, socket.inet_aton(KEY[1]) + bytes(12))] == 1
+    assert values[struct.pack("=IHBB16s", 7, 8080, 6, 2, bytes(16))] == 0
+    assert all(len(raw) == 24 and raw[7] == 2 for raw in values)
+    private = target({("udp", "::", 53, "trusted"): EndpointPolicy(True, "grant")}, ZONES={})
+    values, blocked, deferred = backend._scope_values(private)
+    assert not values and blocked
+    assert not deferred
+
+
+class ScopeMap:
+    path = "endpoint_scopes"
+
+    def __init__(self):
+        self.cache = {}
+        self.fail_admit = False
+        self.fail_revoke = False
+        self.unreadable = False
+
+    def active(self):
+        return dict(self.cache)
+
+    def set(self, key, value, dry_run=False):
+        if self.fail_revoke and not value:
+            self.last_error = "injected revoke failure"
+            return False
+        if self.fail_admit and value:
+            self.last_error = "injected ENOSPC"
+            return False
+        if not dry_run:
+            self.cache[key] = value
+        return True
+
+    def delete(self, key, dry_run=False):
+        if not dry_run:
+            self.cache.pop(key, None)
+        return True
+
+    def verify(self):
+        if self.unreadable:
+            raise OSError(errno.EPERM, "injected read failure")
+        return 0
+
+
+def xdp_backend():
+    backend = _make_failing_backend()
+    for name in ("sctp_map", "syn_rate_map", "syn_agg_rate_map", "udp_rate_map", "udp_agg_rate_map",
+                 "acl_maps", "global_rl_map", "sit4_map", "syn4_outer", "syn6_outer", "udprt4_outer", "udprt6_outer"):
+        setattr(backend, name, None)
+    backend.tcp_map, backend.udp_map, backend.trusted_map = FakePortMap(), FakePortMap(), FakeTrustedMap()
+    for resource in (backend.tcp_map, backend.udp_map, backend.trusted_map):
+        resource.verify = lambda: 0
+    backend.runtime_config_map = FakeRuntimeConfigMap()
+    backend.endpoint_map = ScopeMap()
+    backend._save_policy_generations = lambda: None
+    return backend
+
+
+class ZoneMap:
+    path = "zone_ports"
+
+    def __init__(self):
+        self.values = {}
+
+    def entries(self):
+        return set(self.values)
+
+    def active_entries(self):
+        return {key for key, value in self.values.items() if value[0]}
+
+    def value(self, ifindex, port):
+        return self.values.get((ifindex, port))
+
+    def set(self, ifindex, port, value, dry_run=False):
+        if not dry_run:
+            self.values[(ifindex, port)] = value if isinstance(value, tuple) else (value,)
+        return True
+
+    def delete(self, ifindex, port, dry_run=False):
+        if not dry_run:
+            self.values.pop((ifindex, port), None)
+        return True
+
+    def verify(self):
+        return 0
+
+
+@pytest.mark.parametrize("protocol", ["tcp", "udp"])
+@pytest.mark.parametrize("address", ["0.0.0.0", "::"])
+def test_xdp_grants_wait_for_zone_interfaces_and_follow_their_lifecycle(monkeypatch, protocol, address):
+    interfaces = {}
+
+    def index(name):
+        if name not in interfaces:
+            raise OSError("no interface with this name")
+        return interfaces[name]
+
+    monkeypatch.setattr(socket, "if_nametoindex", index)
+    monkeypatch.setattr(socket, "if_nameindex", lambda: [(1, "lo"), (8, "eth0")] +
+                        [(value, name) for name, value in interfaces.items()])
+    private = (protocol, address, 443, "trusted")
+    desired = target({KEY: EndpointPolicy(True, "public grant"),
+                      private: EndpointPolicy(True, "VPN grant")},
+                     ZONES={"public": {"interfaces": []},
+                            "trusted": {"interfaces": ["tailscale0", "wg0"]}})
+    backend = xdp_backend()
+    backend.tcp_zone_map, backend.udp_zone_map = ZoneMap(), ZoneMap()
+    for current in ({}, {"wg0": 7}, {"wg0": 7, "tailscale0": 9}, {}):
+        interfaces.clear()
+        interfaces.update(current)
+        result = backend.reconcile(desired, False)
+        assert result.successful, (result.blocked_endpoints, result.unconfirmed)
+        assert result.applied.endpoint_admission[KEY] == "admitted"
+        allowed_indexes = {
+            struct.unpack("=IHBB16s", raw)[0]
+            for raw, allow in backend.endpoint_map.active().items()
+            if allow and struct.unpack("=IHBB16s", raw)[1] == 443
+        }
+        assert allowed_indexes == set(current.values())  # Never becomes a wildcard grant.
+        assert desired.endpoint_policies[private].allow  # Preserve future intent.
+        if current:
+            assert not result.deferred_endpoints
+            assert result.applied.endpoint_admission[private] == "admitted"
+        else:
+            assert set(result.deferred_endpoints) == {private}
+            assert private in result.closed_endpoints
+            assert result.applied.endpoint_admission[private] == "closed"
+            assert not result.applied.endpoint_policies[private].allow
+
+
+@pytest.mark.parametrize("failure", ["enumeration", "present_lookup", "map_read", "map_write", "gate", "dry_run"])
+def test_deferred_grants_never_hide_real_apply_or_readback_failures(monkeypatch, failure):
+    private = ("tcp", "0.0.0.0", 443, "trusted")
+    desired = target({KEY: EndpointPolicy(True, "public grant"),
+                      private: EndpointPolicy(True, "VPN grant")},
+                     ZONES={"public": {"interfaces": []}, "trusted": {"interfaces": ["wg0"]}})
+    backend = xdp_backend()
+    monkeypatch.setattr(socket, "if_nametoindex", mock.Mock(side_effect=OSError("lookup failed")))
+    monkeypatch.setattr(socket, "if_nameindex", mock.Mock(
+        side_effect=OSError(errno.EPERM, "enumeration denied") if failure == "enumeration" else None,
+        return_value=[(7, "wg0")] if failure == "present_lookup" else [(1, "lo")]))
+    if failure == "map_read":
+        backend.endpoint_map.unreadable = True
+    elif failure == "map_write":
+        backend.endpoint_map.fail_admit = True
+    elif failure == "gate":
+        backend.runtime_config_map.get_cfg_flags = lambda: 0
+    result = backend.reconcile(desired, failure == "dry_run")
+    assert not result.successful
+    if failure in {"enumeration", "present_lookup"}:
+        assert private in result.blocked_endpoints and not result.deferred_endpoints
+    else:
+        assert private in result.deferred_endpoints
+        assert result.failures or result.unconfirmed or result.dry_run
+
+
+def test_deferred_grant_is_not_confirmed_if_interface_appears_during_readback(monkeypatch):
+    private = ("tcp", "0.0.0.0", 443, "trusted")
+    desired = target({KEY: EndpointPolicy(True, "public grant"),
+                      private: EndpointPolicy(True, "VPN grant")},
+                     ZONES={"public": {"interfaces": []}, "trusted": {"interfaces": ["wg0"]}})
+    backend = xdp_backend()
+    reads = 0
+
+    def index(name):
+        if reads < 2:
+            raise OSError("no interface with this name")
+        return 7
+
+    def readback():
+        nonlocal reads
+        reads += 1
+        return 0
+
+    monkeypatch.setattr(socket, "if_nametoindex", index)
+    monkeypatch.setattr(socket, "if_nameindex", lambda: [(1, "lo")] + ([(7, "wg0")] if reads >= 2 else []))
+    backend.endpoint_map.verify = readback
+    result = backend.reconcile(desired, False)
+    assert not result.successful
+    assert private in result.deferred_endpoints and private not in result.closed_endpoints
+    assert result.applied.endpoint_admission[private] == "unknown"
+
+
+class CookieMap:
+    path = "syncookie"
+
+    def __init__(self):
+        self.ops = []
+        self.values = {}
+
+    def set(self, *args, **kwargs):
+        self.ops.append(("set", args))
+        if len(args) == 3:  # port, value, dry_run
+            self.values[args[0]] = args[1]
+        return True
+
+    def delete(self, *args, **kwargs):
+        self.ops.append(("delete", args))
+        self.values.pop(args[0], None)
+        return True
+
+    def active_values(self):
+        return dict(self.values)
+
+    def verify(self):
+        return 0
+
+
+@pytest.mark.component
+@pytest.mark.parametrize("pinned,expected,admitted", [
+    (False, False, False),  # program truly unavailable: keep the endpoint closed
+    (False, True, True),    # reload pre-seed: the runtime will load it next
+    (True, False, True),    # steady state: the pinned program exists
+])
+def test_syncookie_endpoint_follows_program_or_reload_expectation(tmp_path, monkeypatch, pinned, expected, admitted):
+    monkeypatch.setattr(module_runtime, "program_available", lambda root: pinned)
+    if pinned:
+        (tmp_path / "modules/syncookie").mkdir(parents=True)
+        (tmp_path / "modules/syncookie/prog").touch()
+    policies = {KEY: EndpointPolicy(True, "grant", syncookie_mode="auto", syncookie_rate=1000)}
+    desired = target(policies, BPF_PIN_DIR=str(tmp_path), SYNCOOKIE_ENABLED=True)
+    backend = xdp_backend()
+    backend.tcp_syncookie_mode_map = CookieMap()
+    backend.tcp_syncookie_rate_map = CookieMap()
+    backend.syncookie_runtime_map = runtime = CookieMap()
+    backend.syncookie_program_expected = expected
+
+    result = backend.reconcile(desired, False)
+
+    assert (KEY in result.blocked_endpoints) is not admitted
+    assert result.applied.endpoint_admission[KEY] == ("admitted" if admitted else "closed")
+    assert runtime.ops[-1][1][0] is admitted
+
+
+def test_xdp_reports_partial_failure_and_confirms_closed_admission():
+    backend = xdp_backend()
+    backend.endpoint_map.fail_admit = True
+    result = backend.reconcile(target(), False)
+    assert not result.successful
+    assert result.failures[0].reason == "injected ENOSPC"
+    assert KEY in result.blocked_endpoints and KEY in result.closed_endpoints
+    assert result.applied.endpoint_admission[KEY] == "closed"
+    assert all(not value for value in backend.endpoint_map.active().values())
+
+
+@pytest.mark.parametrize("grant", [None, KEY, ("tcp", "0.0.0.0", 22, "public")])
+def test_xdp_confirms_denied_scopes_when_vpn_interfaces_and_zone_are_absent(grant):
+    policies = {
+        ("tcp", address, 22, zone): EndpointPolicy(False, "no grant")
+        for address in ("0.0.0.0", "::") for zone in ("public", "trusted")
+    }
+    policies[("udp", "10.1.0.126", 68, "unknown")] = EndpointPolicy(False, "no attribution")
+    if grant is not None:
+        policies[grant] = EndpointPolicy(True, "grant")
+    desired = target(policies, ZONES={"public": {"interfaces": []},
+                                     "trusted": {"interfaces": ["tailscale0", "wg0"]}})
+    backend = xdp_backend()
+    with mock.patch.object(socket, "if_nametoindex", side_effect=OSError("no interface with this name")), \
+         mock.patch.object(socket, "if_nameindex", return_value=[(1, "lo"), (7, "eth0")]):
+        result = backend.reconcile(desired, False)
+    assert result.successful, result.unconfirmed
+    assert result.closed_endpoints == {key for key, value in policies.items() if not value.allow}
+    assert result.applied.endpoint_admission == {
+        key: "admitted" if value.allow else "closed" for key, value in policies.items()
+    }
+
+
+@pytest.mark.parametrize("address,family,raw_address,ifindex", [
+    ("10.1.0.126", 2, "10.1.0.126", 0),
+    ("10.1.0.126", 2, "0.0.0.0", 7),
+    ("0.0.0.0", 2, "10.1.0.126", 0),
+    ("2001:db8::1", 10, "::", 0),
+    ("::", 10, "2001:db8::1", 7),
+    ("*", 10, "2001:db8::1", 0),
+])
+def test_unresolved_denial_stays_unknown_if_readback_finds_a_matching_allow(address, family, raw_address, ifindex):
+    denied = ("udp", address, 68, "unknown")
+    desired = target({denied: EndpointPolicy(False, "no attribution")}, ZONES={})
+    backend = xdp_backend()
+    packed = socket.inet_pton(socket.AF_INET if family == 2 else socket.AF_INET6, raw_address).ljust(16, b"\0")
+    raw = struct.pack("=IHBB16s", ifindex, 68, 17, family, packed)
+    reads = 0
+
+    def readback():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            backend.endpoint_map.cache[raw] = 1
+            return 1
+        return 0
+
+    backend.endpoint_map.verify = readback
+    result = backend.reconcile(desired, False)
+    assert not result.successful
+    assert result.applied.endpoint_admission[denied] == "unknown"
+    assert denied not in result.closed_endpoints
+    assert "endpoint_map" in result.unconfirmed
+
+
+@pytest.mark.parametrize("failure", ["readback", "gate", "legacy_gate_disabled", "dry_run", "interface_lookup"])
+def test_unresolved_denial_requires_verified_map_and_enabled_gate(failure):
+    denied = ("udp", "10.1.0.126", 68, "trusted" if failure == "interface_lookup" else "unknown")
+    desired = target({denied: EndpointPolicy(False, "no attribution")},
+                     ZONES={"trusted": {"interfaces": ["wg0"]}})
+    backend = xdp_backend()
+    if failure == "readback":
+        backend.endpoint_map.unreadable = True
+    elif failure == "gate":
+        backend.runtime_config_map.get_cfg_flags = lambda: 0
+    elif failure == "legacy_gate_disabled":
+        desired = BackendProjection(config=desired.config, endpoint_policies=desired.endpoint_policies)
+    with mock.patch.object(socket, "if_nametoindex", side_effect=OSError("no interface with this name")), \
+         mock.patch.object(socket, "if_nameindex", side_effect=OSError(errno.EPERM, "lookup denied")):
+        result = backend.reconcile(desired, failure == "dry_run")
+    assert not result.successful
+    assert result.applied.endpoint_admission.get(denied, "unknown") == "unknown"
+    assert denied not in result.closed_endpoints
+
+
+def test_xdp_honors_plan_dependencies_before_admitting_endpoints():
+    backend = xdp_backend()
+    desired = target()
+    plan = compute_reconcile_plan(desired, backend.get_applied_state())
+    plan.steps = (plan.steps[0], ReconcileStep("admit", ("prepare",)))
+    with mock.patch.object(backend, "build_reconcile_plan", return_value=plan):
+        result = backend.reconcile(desired, False)
+    assert "admit" in result.unconfirmed and not result.successful
+    assert not backend.tcp_map.active_ports()
+    assert result.applied.endpoint_admission.get(KEY, "unknown") == "unknown"
+    assert KEY not in result.applied.endpoint_policies
+
+
+def test_profile_cleanup_failure_keeps_its_reason_in_the_same_failure_journal():
+    backend = xdp_backend()
+    backend.tcp_profile_map = mock.Mock()
+    backend.tcp_profile_map.value.return_value = (42,)
+    with mock.patch.object(backend, "_pinned_program_id", return_value=None):
+        result = backend.reconcile(target({}), False)
+    assert backend.last_apply_failures == len(result.failures) == 1
+    assert result.failures[0].operation.stage == "cleanup"
+    assert "inconsistent pinned profile handler" in result.failures[0].reason
+
+
+def test_readback_failure_and_dry_run_never_claim_confirmation():
+    backend = xdp_backend()
+    backend.endpoint_map.unreadable = True
+    result = backend.reconcile(target(), False)
+    assert result.applied.evidence["endpoint_map"] == "unknown"
+    assert "endpoint_map" in result.unconfirmed and not result.closed_endpoints
+    backend = xdp_backend()
+    result = backend.reconcile(target(), True)
+    assert result.dry_run and not result.successful and not result.succeeded
+    assert not backend.endpoint_map.active()
+    assert not getattr(backend, "_endpoint_cache", {})
+    assert "confirmed" not in result.applied.evidence.values()
+
+
+def test_failed_kernel_read_preserves_the_previous_cache():
+    resource = BpfEndpointScopeMap.__new__(BpfEndpointScopeMap)
+    resource.fd, resource.path, resource._cache = 0, "endpoint_scopes", {bytes(24): 1}
+    with mock.patch("auto_xdp.bpf.maps.bpf", side_effect=OSError(errno.EPERM, "denied")):
+        with pytest.raises(OSError):
+            CacheVerifyMixin.verify(resource)
+    resource.fd = -1
+    assert resource.active() == {bytes(24): 1}
+
+
+def test_nft_scope_precedes_trust_and_limits_and_transaction_failure_retains_state():
+    backend = NftablesBackend.__new__(NftablesBackend)
+    desired = target(ZONES={"public": {"interfaces": []}, "trusted": {"interfaces": ["wg0"]}})
+    backend._config = desired.config
+    effective, _ = project_endpoint_policies(desired)
+    rendered = backend._render_ruleset(effective, replace=True)
+    assert 'meta nfproto ipv4 ip daddr 198.51.100.10 tcp dport 8080 counter return' in rendered
+    assert 'iifname != { "wg0" }' in rendered
+    assert rendered.index("jump endpoint_admission") < rendered.index("ip saddr @trusted")
+    assert "ct direction reply counter accept" in rendered
+    backend._policy_signature = None
+    previous = AppliedState(tcp_ports={22}, evidence={"policy": "cached"})
+    backend.get_applied_state = lambda: previous
+    with mock.patch.object(backend, "_install_ruleset", side_effect=RuntimeError("transaction rejected")):
+        result = backend.apply_reconcile_plan(compute_reconcile_plan(desired, previous), False, desired)
+    assert result.applied is previous and result.failures[0].reason == "transaction rejected"
+    assert result.unconfirmed and not result.closed_endpoints
+
+
+def test_revocation_failure_preserves_protection_and_is_not_reported_closed():
+    backend = xdp_backend()
+    desired = target({KEY: EndpointPolicy(True, "grant", instance_id="new")})
+    values, _, _ = backend._scope_values(desired)
+    backend.endpoint_map.cache = values
+    backend.endpoint_map.fail_revoke = True
+    backend._endpoint_cache = {KEY: EndpointPolicy(True, "grant", instance_id="old")}
+    with mock.patch.object(backend, "_ensure_profile_handlers") as prepare, \
+         mock.patch.object(backend, "_remove_stale_profile_handlers") as cleanup:
+        result = backend.reconcile(desired, False)
+    prepare.assert_not_called()
+    cleanup.assert_not_called()
+    assert result.failures and KEY not in result.closed_endpoints
+    assert backend._endpoint_cache[KEY].instance_id == "old"
+
+
+def test_unresolved_denied_listener_cannot_be_shadowed_by_a_wildcard_grant():
+    wildcard = ("tcp", "0.0.0.0", 8080, "public")
+    denied = ("tcp", "198.51.100.10", 8080, "unknown")
+    desired = target({wildcard: EndpointPolicy(True, "grant"), denied: EndpointPolicy(False, "no attribution")}, ZONES={})
+    effective, blocked = project_endpoint_policies(desired)
+    assert wildcard in blocked and not effective.tcp_ports
+
+
+def test_nft_transaction_ack_confirms_state_but_later_cache_is_labeled_cached():
+    backend = NftablesBackend.__new__(NftablesBackend)
+    desired = target()
+    backend._config = desired.config
+    backend._remember_desired(project_endpoint_policies(DesiredState(config=desired.config))[0])
+    with mock.patch.object(backend, "_install_ruleset"):
+        result = backend.reconcile(desired, False)
+    assert result.successful and result.applied.evidence["policy"] == "confirmed"
+    assert result.applied.endpoint_admission[KEY] == "admitted"
+    assert backend.get_applied_state().evidence["policy"] == "cached"
+
+
+def test_canonical_listener_identity_changes_profile_generation_without_legacy_decisions():
+    backend = XdpBackend.__new__(XdpBackend)
+    backend._policy_generations = {}
+    first = target({KEY: EndpointPolicy(True, "grant", instance_id="1", profile="minecraft")})
+    second = replace(first, endpoint_policies={KEY: replace(first.endpoint_policies[KEY], instance_id="2")})
+    first, _ = project_endpoint_policies(first)
+    second, _ = project_endpoint_policies(second)
+    old = backend._endpoint_generation(first, ("public", 8080), "minecraft")
+    assert backend._endpoint_generation(first, ("public", 8080), "minecraft") == old
+    assert backend._endpoint_generation(second, ("public", 8080), "minecraft") != old
+
+
+@pytest.mark.parametrize("value", [-1, 1 << 32])
+def test_candidate_rejects_limits_outside_the_native_rate_abi(value):
+    with pytest.raises(ValueError):
+        cfg.parse_toml_config({"rate_limits": {"udp_by_proc": {"web": value}}})
+
+
+@pytest.mark.parametrize("outcome,expected", [(False, False), (True, True), ("error", None)])
+def test_conntrack_activation_check_reports_repairs_and_never_raises(outcome, expected, caplog):
+    backend = XdpBackend.__new__(XdpBackend)
+    effect = (subprocess.CalledProcessError(1, ["nft"], stderr="nft: permission denied")
+              if outcome == "error" else None)
+    with mock.patch("auto_xdp.backends.xdp.linux_conntrack.ensure_active",
+                    return_value=outcome, side_effect=effect):
+        assert backend.ensure_conntrack_activation() is expected
+    if outcome == "error":
+        assert "permission denied" in caplog.text
+    elif outcome:
+        assert "re-created" in caplog.text
+
+
+def test_conntrack_activation_check_logs_each_distinct_failure_once(caplog):
+    backend = XdpBackend.__new__(XdpBackend)
+    failure = subprocess.CalledProcessError(1, ["nft"], stderr="nft: permission denied")
+    with mock.patch("auto_xdp.backends.xdp.linux_conntrack.ensure_active", side_effect=failure):
+        for _ in range(3):
+            assert backend.ensure_conntrack_activation() is None
+    errors = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1
+    with mock.patch("auto_xdp.backends.xdp.linux_conntrack.ensure_active", return_value=False):
+        assert backend.ensure_conntrack_activation() is False
+    assert backend._conntrack_check_error is None
+
+
+def _minecraft_projection(**policy):
+    fields = {"profile": "minecraft", "syn_rate": 100, "syncookie_rate": 100, **policy}
+    projection, _ = project_endpoint_policies(target({KEY: EndpointPolicy(True, "grant", **fields)}))
+    return projection
+
+
+@pytest.mark.parametrize("syncookie_mode", ["off", "auto"])
+def test_upgrade_to_port_wide_cookie_base_keeps_verified_session_generation(syncookie_mode):
+    # Earlier releases stored syncookie_rate = per-source syn_rate (100); the
+    # same endpoint now derives the built-in 1000. Nothing about authorization
+    # changed, so the generation that verified Minecraft sessions carry stays.
+    backend = XdpBackend.__new__(XdpBackend)
+    endpoint = ("public", KEY[2])
+    old = _minecraft_projection(syncookie_mode=syncookie_mode)
+    backend._policy_generations = {
+        endpoint: (backend._policy_fingerprint(old, endpoint, "minecraft"), 42)}
+    new = _minecraft_projection(syncookie_mode=syncookie_mode,
+                                syncookie_rate=cfg.SYNCOOKIE_PORT_RATE_BUILTIN)
+
+    assert backend._endpoint_generation(new, endpoint, "minecraft") == 42
+    assert backend._policy_generations[endpoint] == (
+        backend._policy_fingerprint(new, endpoint, "minecraft"), 42)
+
+
+def test_real_policy_changes_still_roll_the_generation_after_upgrade():
+    backend = XdpBackend.__new__(XdpBackend)
+    endpoint = ("public", KEY[2])
+    old = _minecraft_projection()
+    backend._policy_generations = {
+        endpoint: (backend._policy_fingerprint(old, endpoint, "minecraft"), 42)}
+    changed = _minecraft_projection(syn_rate=50, syncookie_rate=cfg.SYNCOOKIE_PORT_RATE_BUILTIN)
+
+    assert backend._endpoint_generation(changed, endpoint, "minecraft") != 42
+
+
+@pytest.mark.component
+@pytest.mark.parametrize("content,refused", [("0\n", True), ("2\n", False), ("3\n", False), (None, False)])
+def test_runtime_flags_mirror_host_ecn_refusal(tmp_path, content, refused):
+    from auto_xdp.bpf.maps import XDP_CFG_FLAG_ECN_REFUSED
+    backend = XdpBackend.__new__(XdpBackend)
+    backend._TCP_ECN_SYSCTL = tmp_path / "tcp_ecn"
+    if content is not None:
+        backend._TCP_ECN_SYSCTL.write_text(content)
+    projection, _ = project_endpoint_policies(target())
+    flags = backend._cfg_flags(projection)
+    assert bool(flags & XDP_CFG_FLAG_ECN_REFUSED) is refused

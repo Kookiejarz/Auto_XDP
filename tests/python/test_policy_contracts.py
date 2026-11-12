@@ -2,9 +2,11 @@
 
 import pytest
 
+from support import desired_for_ports
+
 from auto_xdp import config as cfg
 from auto_xdp import policy
-from auto_xdp.state import ObservedState
+from auto_xdp.state import ObservedState, RuntimeEndpoint, project_endpoint_policies
 
 
 DEFAULTS = {
@@ -12,12 +14,6 @@ DEFAULTS = {
     "XDP_DEFAULT_TCP_SYN_RATE_STRICT": 5,
     "XDP_DEFAULT_TCP_SYN_AGG_RATE": 1000,
     "XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT": 50,
-    "XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC": 50,
-    "XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT": 5,
-    "XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX": 200,
-    "XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX_STRICT": 20,
-    "XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT": 5000,
-    "XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT_STRICT": 200,
     "XDP_SENSITIVE_PORT_THRESHOLD": 5,
 }
 
@@ -26,14 +22,14 @@ LIMIT_TABLES = (
     "_SYN_RATE_BY_SERVICE",
     "_SYN_AGG_RATE_BY_PROC",
     "_SYN_AGG_RATE_BY_SERVICE",
-    "_TCP_CONN_BY_PROC",
-    "_TCP_CONN_BY_SERVICE",
-    "_TCP_CONN_PREFIX_BY_PROC",
-    "_TCP_CONN_PREFIX_BY_SERVICE",
-    "_TCP_CONN_PORT_BY_PROC",
-    "_TCP_CONN_PORT_BY_SERVICE",
     "_RATE_MAP_ENTRIES_BY_PROC",
     "_RATE_MAP_ENTRIES_BY_SERVICE",
+    "_SYNCOOKIE_BY_PROC",
+    "_SYNCOOKIE_BY_SERVICE",
+    "_SYNCOOKIE_BY_PORT",
+    "_SYNCOOKIE_PORT_RATE_BY_PROC",
+    "_SYNCOOKIE_PORT_RATE_BY_SERVICE",
+    "_SYNCOOKIE_PORT_RATE_BY_PORT",
 )
 
 
@@ -43,9 +39,16 @@ def isolated_policy(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cfg, name, value)
     for name in LIMIT_TABLES:
         monkeypatch.setattr(cfg, name, {})
-    for name in ("TCP_PERMANENT", "UDP_PERMANENT", "SCTP_PERMANENT", "TRUSTED_SRC_IPS"):
+    for name in ("TRUSTED_SRC_IPS",):
         monkeypatch.setattr(cfg, name, {})
     monkeypatch.setattr(cfg, "ACL_RULES", [])
+    monkeypatch.setattr(cfg, "POLICY_MODE", "audit")
+    monkeypatch.setattr(cfg, "ZONES", {"public": {"interfaces": [], "cidrs": []}})
+    monkeypatch.setattr(cfg, "SUBJECTS", {})
+    monkeypatch.setattr(cfg, "UNKNOWN_SUBJECTS", {"public": "deny"})
+    monkeypatch.setattr(cfg, "SYNCOOKIE_ENABLED", False)
+    monkeypatch.setattr(cfg, "SYNCOOKIE_DEFAULT_MODE", "auto")
+    monkeypatch.setattr(cfg, "SYNCOOKIE_PORT_RATE_DEFAULT", 0)
     monkeypatch.setattr(
         policy,
         "service_name",
@@ -54,46 +57,39 @@ def isolated_policy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def resolved_tcp_policy(port: int = 8080, proc: str = "app") -> tuple[int, ...]:
-    desired = policy.resolve_desired_state(
+    desired = desired_for_ports(
         ObservedState(tcp={port}, tcp_processes={port: proc})
     )
     return (
         desired.tcp_syn_rate_limits[port],
         desired.tcp_syn_agg_rate_limits[port],
-        desired.tcp_conn_limits[port],
-        desired.tcp_conn_prefix_limits[port],
-        desired.tcp_conn_port_limits[port],
     )
 
 
 def test_default_tcp_protection_contract() -> None:
     assert {name: getattr(cfg, name) for name in DEFAULTS} == DEFAULTS
-    assert resolved_tcp_policy() == (100, 1000, 50, 200, 5000)
+    assert resolved_tcp_policy() == (100, 1000)
 
 
 def test_process_overrides_all_tcp_protection_layers() -> None:
     cfg._SYN_RATE_BY_PROC["app"] = 11
     cfg._SYN_AGG_RATE_BY_PROC["app"] = 12
-    cfg._TCP_CONN_BY_PROC["app"] = 13
-    cfg._TCP_CONN_PREFIX_BY_PROC["app"] = 14
-    cfg._TCP_CONN_PORT_BY_PROC["app"] = 15
-
-    assert resolved_tcp_policy() == (11, 12, 13, 14, 15)
+    assert resolved_tcp_policy() == (11, 12)
 
 
 def test_sensitive_service_selects_strict_defaults() -> None:
     cfg._SYN_RATE_BY_SERVICE["ssh"] = 2
-    assert resolved_tcp_policy(port=22, proc="") == (5, 50, 5, 20, 200)
+    assert resolved_tcp_policy(port=22, proc="") == (5, 50)
 
 
 def test_service_value_above_threshold_remains_explicit() -> None:
     cfg._SYN_RATE_BY_SERVICE["ssh"] = 10
-    assert resolved_tcp_policy(port=22, proc="") == (10, 1000, 50, 200, 5000)
+    assert resolved_tcp_policy(port=22, proc="") == (10, 1000)
 
 
 def test_zero_pinned_syn_limit_remains_in_desired_state() -> None:
     cfg._SYN_RATE_BY_PROC["benchmark"] = 0
-    desired = policy.resolve_desired_state(
+    desired = desired_for_ports(
         ObservedState(tcp={9090}, tcp_processes={9090: "benchmark"})
     )
 
@@ -102,10 +98,301 @@ def test_zero_pinned_syn_limit_remains_in_desired_state() -> None:
 
 
 def test_every_observed_port_receives_default_policy() -> None:
-    desired = policy.resolve_desired_state(
+    desired = desired_for_ports(
         ObservedState(
             tcp={8080, 9000},
             tcp_processes={8080: "app-a", 9000: "app-b"},
         )
     )
     assert desired.tcp_syn_rate_limits == {8080: 100, 9000: 100}
+
+
+def test_syncookie_port_overrides_process_and_service() -> None:
+    cfg.SYNCOOKIE_ENABLED = True
+    cfg._SYNCOOKIE_BY_SERVICE["ssh"] = "auto"
+    cfg._SYNCOOKIE_BY_PROC["sshd"] = "off"
+    cfg._SYNCOOKIE_BY_PORT[22] = "always"
+    cfg._SYNCOOKIE_PORT_RATE_BY_PORT[22] = 900
+
+    desired = desired_for_ports(
+        ObservedState(tcp={22}, tcp_processes={22: "sshd"})
+    )
+
+    assert desired.tcp_syncookie_modes == {22: "always"}
+    assert desired.tcp_syncookie_rate_limits == {22: 900}
+
+
+def test_syncookie_port_rate_default_is_port_wide_not_per_source() -> None:
+    # sshd resolves a strict per-source SYN limit of 5/s; the cookie guard
+    # measures the whole port and must not inherit that unit.
+    cfg.SYNCOOKIE_ENABLED = True
+    cfg._SYN_RATE_BY_SERVICE["ssh"] = 2
+
+    desired = desired_for_ports(
+        ObservedState(tcp={22, 8080}, tcp_processes={22: "sshd", 8080: "app"})
+    )
+
+    assert desired.tcp_syn_rate_limits[22] == cfg.XDP_DEFAULT_TCP_SYN_RATE_STRICT
+    assert desired.tcp_syncookie_rate_limits == {
+        22: cfg.SYNCOOKIE_PORT_RATE_BUILTIN,
+        8080: cfg.SYNCOOKIE_PORT_RATE_BUILTIN,
+    }
+
+
+def test_syncookie_port_rate_default_keeps_a_high_per_source_limit_as_floor() -> None:
+    # A load balancer port whose single source may legitimately open 5000/s
+    # must not shed at the built-in 1000/s.
+    cfg.SYNCOOKIE_ENABLED = True
+    cfg._SYN_RATE_BY_PROC["haproxy"] = 5000
+
+    desired = desired_for_ports(ObservedState(tcp={443}, tcp_processes={443: "haproxy"}))
+
+    assert desired.tcp_syncookie_rate_limits == {443: 5000}
+
+
+def test_syncookie_port_rate_default_and_explicit_zero() -> None:
+    cfg.SYNCOOKIE_ENABLED = True
+    cfg.SYNCOOKIE_PORT_RATE_DEFAULT = 4000
+    cfg._SYNCOOKIE_PORT_RATE_BY_PORT[9090] = 0
+
+    desired = desired_for_ports(
+        ObservedState(tcp={8080, 9090}, tcp_processes={8080: "app", 9090: "bench"})
+    )
+
+    assert desired.tcp_syncookie_rate_limits == {8080: 4000, 9090: 0}
+
+
+def test_syncookie_config_rejects_invalid_port_table() -> None:
+    with pytest.raises(ValueError, match="port_rate_by_port must be a table"):
+        cfg.apply_toml_config({"modules": {"syncookie": {"port_rate_by_port": 42}}})
+
+
+def test_service_aware_policy_requires_explicit_grant_and_runtime_owner() -> None:
+    cfg.ZONES = {"public": {"interfaces": []}}
+    cfg.SUBJECTS = {
+        "website": {
+            "resolve": {"systemd_unit": "nginx.service"},
+            "exposure": {"public": {"tcp": {"ports": [443]}}},
+        }
+    }
+    observed = ObservedState(endpoints=[
+        RuntimeEndpoint("tcp", "0.0.0.0", 443, "wildcard", "public", "nginx", "exact"),
+        RuntimeEndpoint("tcp", "0.0.0.0", 8080, "wildcard", "public", "nginx", "exact"),
+        RuntimeEndpoint("tcp", "0.0.0.0", 22, "wildcard", "public", "unknown", "unknown"),
+    ])
+
+    desired = _projected_desired(observed)
+
+    assert desired.tcp_ports == {443}
+    assert [item.action for item in desired.exposure_decisions] == ["allow", "drop", "drop"]
+    assert desired.exposure_decisions[0].protection_profile == ""
+
+
+def test_empty_subject_does_not_shadow_active_subject_with_same_resolver() -> None:
+    cfg.SUBJECTS = {
+        "revoked": {"resolve": {"systemd_unit": "nginx.service"}},
+        "website": {
+            "resolve": {"systemd_unit": "nginx.service"},
+            "exposure": {"public": {"tcp": {"ports": [443]}}},
+        },
+    }
+
+    desired = _projected_desired(ObservedState(endpoints=[
+        RuntimeEndpoint(
+            "tcp", "0.0.0.0", 443, "wildcard", "public",
+            "nginx.service", "exact", "systemd-cgroup",
+        ),
+    ]))
+
+    assert desired.tcp_ports == {443}
+    assert desired.exposure_decisions[0].subject == "website"
+
+
+def test_minecraft_profile_changes_desired_tcp_protection() -> None:
+    cfg.ZONES = {"public": {"interfaces": []}}
+    cfg.SUBJECTS = {
+        "minecraft": {
+            "resolve": {"systemd_unit": "minecraft.service"},
+            "exposure": {"public": {"tcp": {"ports": [25565]}}},
+            "protection": {"profile": " Minecraft "},
+        }
+    }
+
+    desired = _projected_desired(ObservedState(endpoints=[
+        RuntimeEndpoint(
+            "tcp", "0.0.0.0", 25565, "wildcard", "public",
+            "minecraft.service", "exact", "systemd-cgroup",
+        ),
+    ]))
+
+    assert desired.tcp_ports == {25565}
+    assert desired.tcp_protection_profiles == {("public", 25565): "minecraft"}
+
+
+def test_protection_profile_never_falls_back_to_unprotected_protocol() -> None:
+    cfg.ZONES = {"public": {"interfaces": []}}
+    cfg.SUBJECTS = {
+        "minecraft": {
+            "resolve": {"systemd_unit": "minecraft.service"},
+            "exposure": {"public": {"udp": {"ports": [25565]}}},
+            "protection": {"profile": "minecraft"},
+        }
+    }
+
+    desired = _projected_desired(ObservedState(endpoints=[
+        RuntimeEndpoint(
+            "udp", "0.0.0.0", 25565, "wildcard", "public",
+            "minecraft.service", "exact", "systemd-cgroup",
+        ),
+    ]))
+
+    assert desired.udp_ports == set()
+    assert desired.exposure_decisions[0].action == "drop"
+    assert "unavailable" in desired.exposure_decisions[0].reason
+
+
+def test_same_tcp_port_can_use_different_profiles_in_different_zones() -> None:
+    cfg.ZONES = {"public": {"interfaces": ["eth0"]}, "trusted": {"interfaces": ["wg0"]}}
+    cfg.SUBJECTS = {
+        "minecraft": {
+            "resolve": {"systemd_unit": "minecraft.service"},
+            "exposure": {"public": {"tcp": {"ports": [25565]}}},
+            "protection": {"profile": "minecraft"},
+        },
+        "trusted-console": {
+            "resolve": {"systemd_unit": "console.service"},
+            "exposure": {"trusted": {"tcp": {"ports": [25565]}}},
+        },
+    }
+    endpoints = [
+        RuntimeEndpoint(
+            "tcp", "203.0.113.10", 25565, "specific", "public",
+            "minecraft.service", "exact", "systemd-cgroup",
+        ),
+        RuntimeEndpoint(
+            "tcp", "10.0.0.10", 25565, "specific", "trusted",
+            "console.service", "exact", "systemd-cgroup",
+        ),
+    ]
+
+    decisions = policy.resolve_exposure_decisions(ObservedState(endpoints=endpoints))
+
+    assert {
+        (item.endpoint.ingress_zone, item.protection_profile, item.action)
+        for item in decisions
+    } == {
+        ("public", "minecraft", "allow"), ("trusted", "", "allow")
+    }
+    desired = _projected_desired(ObservedState(endpoints=endpoints))
+    assert desired.tcp_protection_profiles == {("public", 25565): "minecraft"}
+
+
+def test_shared_port_with_incompatible_protection_is_closed() -> None:
+    cfg.ZONES = {"public": {"interfaces": []}}
+    cfg.SUBJECTS = {
+        "a": {
+            "resolve": {"process_name": "a"},
+            "exposure": {"public": {"tcp": {"ports": [443]}}},
+            "protection": {"profile": "web"},
+        },
+        "b": {
+            "resolve": {"process_name": "b"},
+            "exposure": {"public": {"tcp": {"ports": [443]}}},
+            "protection": {"profile": "tls"},
+        },
+    }
+    observed = ObservedState(endpoints=[
+        RuntimeEndpoint("tcp", "192.0.2.1", 443, "specific", "public", "a", "shared"),
+        RuntimeEndpoint("tcp", "192.0.2.2", 443, "specific", "public", "b", "shared"),
+    ])
+
+    decisions = policy.resolve_exposure_decisions(observed)
+
+    assert all(item.action == "drop" for item in decisions)
+    assert all("incompatible" in item.reason for item in decisions)
+
+
+def test_shared_port_with_unknown_owner_is_closed() -> None:
+    cfg.ZONES = {"public": {"interfaces": []}}
+    cfg.SUBJECTS = {
+        "dns": {
+            "resolve": {"process_name": "dns-a"},
+            "exposure": {"public": {"udp": {"ports": [5353]}}},
+        }
+    }
+    observed = ObservedState(endpoints=[
+        RuntimeEndpoint("udp", "0.0.0.0", 5353, "specific", "public", "dns-a", "shared"),
+        RuntimeEndpoint("udp", "192.0.2.10", 5353, "specific", "public", "", "ambiguous"),
+    ])
+
+    decisions = policy.resolve_exposure_decisions(observed)
+
+    assert all(item.action == "drop" for item in decisions)
+    assert all("unknown or ambiguous" in item.reason for item in decisions)
+
+
+def test_private_grant_uses_zone_admission_without_public_port() -> None:
+    cfg.ZONES = {
+        "public": {"interfaces": []},
+        "trusted": {"interfaces": ["wg0"]},
+    }
+    cfg.SUBJECTS = {
+        "postgres": {
+            "resolve": {"process_name": "postgres"},
+            "exposure": {"trusted": {"tcp": {"ports": [5432]}}},
+        }
+    }
+
+    desired = _projected_desired(ObservedState(endpoints=[
+        RuntimeEndpoint("tcp", "192.0.2.10", 5432, "specific", "trusted", "postgres", "delegated"),
+    ]))
+
+    assert desired.tcp_ports == set()
+    assert desired.zone_tcp_ports == {"trusted": {5432}}
+    assert desired.tcp_syn_rate_limits == {5432: 100}
+
+
+def test_wildcard_listener_is_evaluated_for_each_ingress_zone() -> None:
+    cfg.ZONES = {
+        "public": {"interfaces": ["eth0"]},
+        "trusted": {"interfaces": ["wg0"]},
+    }
+    cfg.SUBJECTS = {
+        "postgres": {
+            "resolve": {"systemd_unit": "postgres.service"},
+            "exposure": {"trusted": {"tcp": {"ports": [5432]}}},
+        }
+    }
+
+    desired = _projected_desired(ObservedState(endpoints=[
+        RuntimeEndpoint(
+            "tcp", "0.0.0.0", 5432, "wildcard", "public",
+            "postgres.service", "exact", "systemd-cgroup",
+        ),
+    ]))
+
+    by_zone = {item.endpoint.ingress_zone: item.action for item in desired.exposure_decisions}
+    assert by_zone == {"public": "drop", "trusted": "allow"}
+    assert desired.tcp_ports == set()
+    assert desired.zone_tcp_ports == {"trusted": {5432}}
+
+
+def test_interface_scoped_public_grant_does_not_use_global_port_map() -> None:
+    cfg.ZONES = {"public": {"interfaces": ["eth0"]}}
+    cfg.SUBJECTS = {
+        "web": {
+            "resolve": {"process_name": "web"},
+            "exposure": {"public": {"tcp": {"ports": [443]}}},
+        }
+    }
+
+    desired = _projected_desired(ObservedState(endpoints=[
+        RuntimeEndpoint("tcp", "192.0.2.10", 443, "specific", "public", "web", "delegated"),
+    ]))
+
+    assert desired.tcp_ports == set()
+    assert desired.zone_tcp_ports == {"public": {443}}
+
+
+def _projected_desired(observed):
+    return project_endpoint_policies(policy.resolve_desired_state(observed))[0]

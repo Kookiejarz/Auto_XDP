@@ -4,8 +4,8 @@ import unittest
 
 import pytest
 
-import auto_xdp.sock_state as sock_state_mod
-from auto_xdp.sock_state import SockStateReader, SOCK_STATE_EVENT_SIZE
+import auto_xdp.discovery.sock_state as sock_state_mod
+from auto_xdp.discovery.sock_state import SockStateReader, SOCK_STATE_EVENT_SIZE
 
 _STRUCT = struct.Struct("<QHBBB3x")
 _AF_INET  = 2
@@ -202,6 +202,20 @@ class TestRelaySecurity(unittest.TestCase):
                 client.close()
                 server._cleanup()
 
+    def test_initial_history_is_sent_before_client_becomes_nonblocking(self):
+        server = self._relay("/tmp")
+        conn = mock.MagicMock()
+        conn.fileno.return_value = 7
+        server._server = mock.MagicMock()
+        server._server.accept.return_value = (conn, None)
+
+        with mock.patch.object(relay_mod, "_peer_is_authorized", return_value=True):
+            server._accept_client()
+
+        self.assertEqual(conn.method_calls[0], mock.call.settimeout(1.0))
+        self.assertEqual(conn.method_calls[-2], mock.call.setblocking(False))
+        self.assertIs(server._clients[7], conn)
+
     @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "Linux SO_PEERCRED is required")
     def test_peer_credentials_authorize_same_process(self):
         left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -239,7 +253,7 @@ class TestRelaySecurity(unittest.TestCase):
             self.assertEqual(target.read_text(), "protected")
 
 
-import auto_xdp.syncer as syncer_mod
+import auto_xdp.discovery.notifications as notifications_mod
 
 
 class TestSyncerDrainRelayLines(unittest.TestCase):
@@ -251,21 +265,21 @@ class TestSyncerDrainRelayLines(unittest.TestCase):
         }).encode() + b"\n"
         fake_sock = mock.MagicMock()
         fake_sock.recv.side_effect = [line, BlockingIOError()]
-        triggered = syncer_mod._drain_relay_lines(fake_sock)
+        triggered = notifications_mod._drain_relay_lines(fake_sock)
         self.assertTrue(triggered)
 
     def test_non_port_change_line_returns_false(self):
         line = json.dumps({"type": "event", "verdict": "DROP"}).encode() + b"\n"
         fake_sock = mock.MagicMock()
         fake_sock.recv.side_effect = [line, BlockingIOError()]
-        triggered = syncer_mod._drain_relay_lines(fake_sock)
+        triggered = notifications_mod._drain_relay_lines(fake_sock)
         self.assertFalse(triggered)
 
     def test_empty_recv_raises_connection_reset(self):
         fake_sock = mock.MagicMock()
         fake_sock.recv.return_value = b""
         with self.assertRaises(ConnectionResetError):
-            syncer_mod._drain_relay_lines(fake_sock)
+            notifications_mod._drain_relay_lines(fake_sock)
 
     def test_port_change_split_across_reads_is_preserved(self):
         line = json.dumps({
@@ -277,32 +291,22 @@ class TestSyncerDrainRelayLines(unittest.TestCase):
         fake_sock = mock.MagicMock()
         fake_sock.recv.side_effect = [line[:split_at], BlockingIOError()]
 
-        self.assertFalse(syncer_mod._drain_relay_lines(fake_sock, pending))
+        self.assertFalse(notifications_mod._drain_relay_lines(fake_sock, pending))
         self.assertEqual(bytes(pending), line[:split_at])
 
         fake_sock.recv.side_effect = [line[split_at:], BlockingIOError()]
-        self.assertTrue(syncer_mod._drain_relay_lines(fake_sock, pending))
+        self.assertTrue(notifications_mod._drain_relay_lines(fake_sock, pending))
         self.assertEqual(pending, bytearray())
 
 
-import auto_xdp.tui as tui_mod
+import auto_xdp.tui.app as tui_mod
 import threading
 
 
 class TestTuiPortsDirty(unittest.TestCase):
 
     def _make_relay(self):
-        relay = tui_mod.RelayClient.__new__(tui_mod.RelayClient)
-        relay.events = []
-        relay.events_offset = 0
-        relay.max_events = 100
-        relay.status = ""
-        relay.ports_dirty = False
-        relay.reason_totals = {}
-        relay.path = ""
-        relay._sock = None
-        relay._buf = ""
-        return relay
+        return tui_mod.RelayClient("/tmp/test-relay.sock", max_events=100)
 
     def test_port_change_sets_ports_dirty(self):
         relay = self._make_relay()
@@ -320,14 +324,22 @@ class TestSnapshotWorkerWakeup(unittest.TestCase):
 
     def _make_worker(self):
         worker = tui_mod.SnapshotWorker.__new__(tui_mod.SnapshotWorker)
+        worker._lock = threading.Lock()
         worker._stop = threading.Event()
         worker._wakeup = threading.Event()
+        worker._include_approvals = False
         return worker
 
     def test_wakeup_sets_event(self):
         worker = self._make_worker()
         self.assertFalse(worker._wakeup.is_set())
         worker.wakeup()
+        self.assertTrue(worker._wakeup.is_set())
+
+    def test_approval_query_is_opt_in(self):
+        worker = self._make_worker()
+        worker.show_approvals(True)
+        self.assertTrue(worker._include_approvals)
         self.assertTrue(worker._wakeup.is_set())
 
     def test_stop_also_sets_wakeup(self):
@@ -342,3 +354,31 @@ class TestSnapshotWorkerWakeup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_relay_retries_late_socket_tracker_and_closes_owned_resources(monkeypatch):
+    import pkt_relay
+
+    packet_ring, socket_ring = mock.Mock(), mock.Mock()
+    server = pkt_relay.RelayServer(packet_ring, sock_state_pin_path="/late/sock_state_rb")
+    open_ring = mock.Mock(side_effect=[FileNotFoundError(), socket_ring, socket_ring])
+    attach = mock.Mock(side_effect=[[], [42]])
+    monkeypatch.setattr(pkt_relay, "RingBufReader", open_ring)
+    monkeypatch.setattr(pkt_relay, "attach_tracepoint", attach)
+    monkeypatch.setattr(pkt_relay.os.path, "exists", lambda _path: False)
+    server._connect_sock_state()  # Neither the map nor the program is ready.
+    assert server._ss is None
+    server._connect_sock_state()  # Map published, attachment still unavailable.
+    assert server._ss is None
+    socket_ring.close.assert_called_once()
+    socket_ring.reset_mock()
+    server._connect_sock_state()
+    assert server._ss is not None
+    server._connect_sock_state()  # Never attach the same tracker twice.
+    assert open_ring.call_count == 3
+    assert attach.call_count == 2
+    with mock.patch.object(pkt_relay.os, "close") as close, \
+         mock.patch.object(pkt_relay.os, "unlink"):
+        server._cleanup()
+    socket_ring.close.assert_called_once()
+    close.assert_called_once_with(42)

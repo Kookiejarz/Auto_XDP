@@ -7,7 +7,7 @@
 // (generic/skb fallback), then tail-call the registered handler.
 // If no handler is loaded for ip_proto, bpf_tail_call() returns and we
 // apply slot_def_action.  Called only from the main program's default
-// branches, after all extension headers have been traversed.
+// branches or the managed Echo Reply path, after validating IP lengths.
 static __always_inline int dispatch_to_slot(
     struct xdp_md *ctx, __u8 family, __u8 ip_proto,
     __u16 l3_offset, __u16 inner_offset,
@@ -45,9 +45,10 @@ static __always_inline int dispatch_to_slot(
     // bpf_tail_call returned: slot is empty or call failed.
     {
         struct xdp_runtime_cfg *cfg = runtime_cfg();
-        if (cfg && (cfg->cfg_flags & XDP_CFG_FLAG_SLOT_DROP)) {
+        if (ip_proto == IPPROTO_ICMP || ip_proto == IPPROTO_ICMPV6 ||
+            (cfg && (cfg->cfg_flags & XDP_CFG_FLAG_SLOT_DROP))) {
             count(CNT_SLOT_DROP);
-            emit_drop(ip_proto, family, saddr, daddr, 0, 0, (__u8)CNT_SLOT_DROP, bpf_ktime_get_ns());
+            emit_drop(ctx, ip_proto, family, saddr, daddr, 0, 0, (__u8)CNT_SLOT_DROP, bpf_ktime_get_ns());
             return XDP_DROP;
         }
     }

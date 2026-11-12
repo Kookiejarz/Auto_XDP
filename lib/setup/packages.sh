@@ -65,20 +65,19 @@ package_list_for_manager() {
             if [[ "$(uname -m)" == "x86_64" ]]; then
                 multilib=" gcc-multilib"
             fi
-            echo "clang llvm libbpf-dev build-essential iproute2 curl tar findutils python3 python3-pip nftables${multilib}"
+            echo "clang llvm libbpf-dev build-essential pahole iproute2 curl tar findutils python3 python3-pip nftables${multilib}"
             ;;
         dnf|yum)
-            # tc lives in iproute-tc on Fedora/RHEL, not in iproute.
-            echo "clang llvm libbpf-devel bpftool iproute iproute-tc curl tar findutils python3 python3-pip gcc make nftables"
+            echo "clang llvm libbpf-devel bpftool dwarves iproute curl tar findutils python3 python3-pip gcc make nftables"
             ;;
         zypper)
-            echo "clang llvm libbpf-devel bpftool iproute2 curl tar findutils python3 python3-pip gcc make nftables"
+            echo "clang llvm libbpf-devel bpftool dwarves iproute2 curl tar findutils python3 python3-pip gcc make nftables"
             ;;
         pacman)
-            echo "clang llvm libbpf iproute2 curl tar findutils python python-pip bpf base-devel nftables"
+            echo "clang llvm libbpf pahole iproute2 curl tar findutils python python-pip bpf base-devel nftables"
             ;;
         apk)
-            echo "clang llvm libbpf-dev bpftool iproute2 curl tar findutils python3 py3-pip build-base nftables"
+            echo "clang llvm libbpf-dev bpftool pahole iproute2 curl tar findutils python3 py3-pip build-base nftables"
             ;;
         *)
             return 1
@@ -118,14 +117,68 @@ install_bpftool_apt() {
 enable_rpm_build_repos() {
     [[ "$PKG_MANAGER" == "dnf" || "$PKG_MANAGER" == "yum" ]] || return 0
     case " ${DISTRO_ID:-} ${DISTRO_LIKE:-} " in
-        *" rocky "*|*" alma "*|*" rhel "*|*" centos "*) ;;
+        *" rocky "*|*" alma "*|*" almalinux "*|*" rhel "*|*" centos "*) ;;
         *) return 0 ;;
     esac
     command -v dnf >/dev/null 2>&1 || return 0
-    as_root dnf -y install dnf-plugins-core >/dev/null 2>&1 || true
-    as_root dnf config-manager --enable crb >/dev/null 2>&1 \
-        || as_root dnf config-manager --enable powertools >/dev/null 2>&1 \
-        || true
+
+    local repo_list repo details state candidate build_repo=""
+    local -A repo_states=()
+    local -a enabled_baseos=() candidates=()
+    if ! repo_list=$(as_root env LC_ALL=C dnf -q repolist --all); then
+        warn "Could not list build repositories; libbpf-devel may require CodeReady Builder/CRB. Check: dnf repolist --all"
+        return 0
+    fi
+    while read -r repo details; do
+        [[ "$details" =~ [[:space:]](enabled|disabled)$ ]] || continue
+        state="${BASH_REMATCH[1]}"
+        repo_states["$repo"]="$state"
+        if [[ "$state" == enabled && "$repo" == *-baseos-* ]]; then
+            enabled_baseos+=("$repo")
+        fi
+    done <<<"$repo_list"
+
+    for repo in crb powertools PowerTools; do
+        [[ -n "${repo_states[$repo]:-}" ]] && candidates+=("$repo")
+    done
+    # Match the active RHEL BaseOS provider, architecture and update channel.
+    # RHUI IDs differ between cloud images; never enable a wildcard that also
+    # selects debug/source repositories or mixes RHUI and subscription content.
+    for repo in "${enabled_baseos[@]}"; do
+        [[ "$repo" != *-debug-* && "$repo" != *-source-* ]] || continue
+        if [[ "$repo" =~ ^(rhui-)?rhel-([0-9]+)(-for-([[:alnum:]_]+))?-baseos(-[[:alnum:]-]+)?-rpms$ ]]; then
+            candidate="${BASH_REMATCH[1]}codeready-builder-for-rhel-${BASH_REMATCH[2]}${BASH_REMATCH[4]:+-${BASH_REMATCH[4]}}${BASH_REMATCH[5]}-rpms"
+            [[ -n "${repo_states[$candidate]:-}" ]] && candidates+=("$candidate")
+        fi
+    done
+    for candidate in "${candidates[@]}"; do
+        [[ "${repo_states[$candidate]}" != enabled ]] || return 0
+    done
+    for candidate in "${candidates[@]}"; do
+        if [[ -n "$build_repo" && "$build_repo" != "$candidate" ]]; then
+            warn "Multiple build repositories match; enable the one supplying libbpf-devel manually. Check: dnf repolist --all"
+            return 0
+        fi
+        build_repo="$candidate"
+    done
+    if [[ -z "$build_repo" ]]; then
+        warn "No matching CodeReady Builder/CRB repository found for libbpf-devel. Check: dnf repolist --all"
+        return 0
+    fi
+
+    info "Enabling build repository: $build_repo"
+    if [[ "$build_repo" == codeready-builder-for-rhel-* && "$build_repo" != *-rhui-* ]]; then
+        if ! as_root subscription-manager repos --enable "$build_repo"; then
+            warn "Could not enable $build_repo; check subscription/content access with: subscription-manager repos --list"
+        fi
+    else
+        if ! as_root dnf -y install dnf-plugins-core; then
+            warn "Could not install dnf-plugins-core; enable $build_repo manually to obtain libbpf-devel."
+        elif ! as_root dnf config-manager --set-enabled "$build_repo"; then
+            warn "Could not enable $build_repo. Retry: dnf config-manager --set-enabled $build_repo"
+        fi
+    fi
+    return 0
 }
 
 install_packages() {
@@ -244,7 +297,7 @@ check_required_tools_step() {
     local cmd
 
     step_begin "Checking required tools"
-    for cmd in clang bpftool python3 curl tar find ip tc nft; do
+    for cmd in clang bpftool pahole llvm-objcopy python3 curl tar find ip nft; do
         substep_run "$cmd" _tool_present "$cmd" || missing+=("$cmd")
     done
 
@@ -274,11 +327,11 @@ check_required_tools_step() {
                     tar)
                         warn "$cmd still missing — remote source staging will be unavailable"
                         ;;
-                    tc)
-                        warn "tc still missing — TCP/UDP/SCTP egress reply tracking will be skipped"
-                        ;;
                     nft)
-                        warn "nft still missing — nftables fallback backend will be unavailable"
+                        warn "nft still missing — XDP conntrack activation and nftables fallback will be unavailable"
+                        ;;
+                    pahole|llvm-objcopy)
+                        warn "$cmd still missing — ICMP kernel dependency BTF generation will be unavailable"
                         ;;
                 esac
             fi

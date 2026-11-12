@@ -1,5 +1,5 @@
 /* bpf/sock_state_track.c — Tracepoint program for real-time port detection.
- * Hooks inet_sock_set_state to emit events when TCP sockets enter/leave LISTEN. */
+ * Hooks inet_sock_set_state to emit TCP listener open/close events. */
 
 #include <linux/bpf.h>
 #include <linux/types.h>
@@ -32,11 +32,12 @@ struct sock_state_event {
     __u64 ts_ns;    /* bpf_ktime_get_ns() */
     __u16 port;     /* local port, host byte order */
     __u8  proto;    /* IPPROTO_TCP = 6 */
-    __u8  action;   /* 1 = entering LISTEN, 0 = leaving LISTEN */
+    __u8  action;   /* 1 = entering LISTEN, 0 = LISTEN -> CLOSE */
     __u8  family;
     __u8  _pad[3];  /* zeroed padding — avoids leaking kernel memory via ringbuf */
 };
 
+#define TCP_CLOSE       7
 #define TCP_LISTEN      10
 #define IPPROTO_TCP     6
 
@@ -53,8 +54,11 @@ int trace_inet_sock_set_state(struct inet_sock_set_state_args *args)
     if (args->protocol != IPPROTO_TCP)
         return 0;
 
-    /* Reject if neither oldstate nor newstate is TCP_LISTEN */
-    if (args->oldstate != TCP_LISTEN && args->newstate != TCP_LISTEN)
+    /* A newly cloned child inherits LISTEN before entering SYN_RECV; that
+     * transition does not close the original listener. Only LISTEN -> CLOSE
+     * reports a listener stopping (including shutdown or a failed listen). */
+    if (args->newstate != TCP_LISTEN &&
+        (args->oldstate != TCP_LISTEN || args->newstate != TCP_CLOSE))
         return 0;
 
     /* Reject no-op transitions */

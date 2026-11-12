@@ -9,8 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
-import re
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -19,17 +18,8 @@ from typing import Any, Iterable
 
 
 STATE_SCHEMA = 1
-_CONTAINER_NAMES = (
-    "docker",
-    "veth",
-    "virbr",
-    "cni",
-    "flannel",
-    "cali",
-    "kube-ipvs",
-    "podman",
-)
-_VIRTUAL_KINDS = {"veth", "dummy", "ifb"}
+_VIRTUAL_KINDS = {"veth", "dummy", "ifb", "netkit"}
+_L3_KINDS = {"wireguard", "ipip", "sit", "ip6tnl", "gre", "ip6gre", "vti", "vti6"}
 
 
 def _link_kind(link: dict[str, Any]) -> str:
@@ -37,26 +27,68 @@ def _link_kind(link: dict[str, Any]) -> str:
     if isinstance(linkinfo, dict):
         kind = linkinfo.get("info_kind")
         if isinstance(kind, str):
+            if kind.lower() == "tun":
+                data = linkinfo.get("info_data", {})
+                if isinstance(data, dict) and data.get("type") in {"tun", "tap"}:
+                    return str(data["type"])
             return kind.lower()
     kind = link.get("link_type")
     return kind.lower() if isinstance(kind, str) else ""
 
 
+def interface_details(link: dict[str, Any], *, sys_class_net: Path = Path("/sys/class/net")) -> dict[str, Any]:
+    """Describe kernel attributes without inferring ownership or trust."""
+    details: dict[str, Any] = {"kind": _link_kind(link) or "unknown", "link_type": link.get("link_type", "unknown")}
+    for key in ("ifindex", "master", "link", "link_index", "parentbus", "parentdev"):
+        if key in link:
+            details[key] = link[key]
+    name = str(link.get("ifname", ""))
+    if name and "/" not in name and name not in {".", ".."}:
+        for key, relative in (("driver", "device/driver"), ("bus", "device/subsystem")):
+            try:
+                details[key] = (sys_class_net / name / relative).readlink().name
+            except OSError:
+                pass
+    return details
+
+
+def read_system_links() -> list[dict[str, Any]]:
+    """Read a full inventory; discovery errors must never become an empty list."""
+    try:
+        result = subprocess.run(
+            ["ip", "-j", "-d", "link", "show"], capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"Cannot discover network interfaces: {exc}") from exc
+    if result.returncode:
+        raise ValueError(f"Cannot discover network interfaces: {result.stderr.strip()}")
+    return parse_links(result.stdout)
+
+
+def parse_links(raw: str) -> list[dict[str, Any]]:
+    value = json.loads(raw)
+    if not isinstance(value, list) or any(
+        not isinstance(link, dict) or not isinstance(link.get("ifname"), str) or not link["ifname"]
+        for link in value
+    ):
+        raise ValueError("ip link JSON must be an array of named interfaces")
+    return value
+
+
 def exclusion_reason(link: dict[str, Any]) -> str | None:
     """Return why an interface is unsafe for automatic host attachment."""
-    name = str(link.get("ifname", ""))
-    lowered = name.lower()
     flags = {str(flag).upper() for flag in link.get("flags", []) if flag}
     kind = _link_kind(link)
 
-    if name == "lo" or "LOOPBACK" in flags or kind == "loopback":
+    if "LOOPBACK" in flags or kind == "loopback":
         return "loopback"
+    # The current XDP parser consumes Ethernet frames. TUN/WireGuard and IP
+    # tunnels deliver layer-3 packets, unlike TAP/gretap/VLAN/bridge devices.
+    media = str(link.get("link_type", "")).lower()
+    if kind == "tun" or kind in _L3_KINDS or media not in {"", "ether", "unknown"}:
+        return f"unsupported non-Ethernet interface ({kind or media})"
     if kind in _VIRTUAL_KINDS:
         return f"virtual {kind}"
-    if re.fullmatch(r"br-[0-9a-f]{12,}", lowered):
-        return "container bridge"
-    if lowered.startswith(_CONTAINER_NAMES):
-        return "container interface"
     return None
 
 
@@ -70,14 +102,16 @@ def select_interfaces(
     """Select UP host interfaces while retaining observable exclusions.
 
     Explicit names may opt into container/virtual links, but loopback is never
-    attachable.  Automatic selection excludes container plumbing by both link
-    kind and conventional names; bridges/bonds/VLANs are otherwise retained
-    because they can legitimately be a host's public ingress interface.
+    attachable. Automatic selection uses kernel types, never name prefixes.
+    Bridges/bonds/VLANs and unknown types are retained because they can be a
+    host's public ingress. A bridge's type cannot prove container ownership.
     """
     rows = {str(link.get("ifname", "")): link for link in links if link.get("ifname")}
     requested = list(dict.fromkeys(str(item) for item in explicit if item))
-    excluded: dict[str, str] = {}
     configured_excludes = {str(item) for item in excluded_names if item}
+    # Preserve operator intent even while an excluded device is absent, so a
+    # later inventory can distinguish hotplugged exclusions from new ingress.
+    excluded = {name: "configured exclusion" for name in sorted(configured_excludes)}
 
     if requested:
         selected: list[str] = []
@@ -89,7 +123,9 @@ def select_interfaces(
                 raise ValueError(f"Interface '{name}' does not exist.")
             reason = exclusion_reason(link)
             if reason == "loopback":
-                raise ValueError("Loopback interface 'lo' cannot run Auto XDP.")
+                raise ValueError(f"Loopback interface '{name}' cannot run Auto XDP.")
+            if reason and reason.startswith("unsupported"):
+                raise ValueError(f"Interface '{name}' is {reason}; this XDP parser requires Ethernet frames.")
             if reason and not allow_container:
                 raise ValueError(
                     f"Interface '{name}' is classified as {reason}; "
@@ -101,7 +137,6 @@ def select_interfaces(
     selected = []
     for name, link in rows.items():
         if name in configured_excludes:
-            excluded[name] = "configured exclusion"
             continue
         reason = exclusion_reason(link)
         flags = {str(flag).upper() for flag in link.get("flags", []) if flag}
@@ -109,7 +144,8 @@ def select_interfaces(
         if reason:
             excluded[name] = reason
             continue
-        if "UP" not in flags and operstate not in {"UP", "UNKNOWN"}:
+        active = "UP" in flags if "flags" in link else operstate in {"UP", "UNKNOWN"}
+        if not active:
             excluded[name] = "interface down"
             continue
         selected.append(name)
@@ -169,6 +205,7 @@ def merge_machine_state(
     *,
     selection: str,
     default_xdp_mode: str = "auto",
+    links: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     old_interfaces = previous.get("interfaces", {})
     if not isinstance(old_interfaces, dict):
@@ -182,13 +219,13 @@ def merge_machine_state(
             "xdp_mode": old.get("xdp_mode", default_xdp_mode),
             "requested_mode": default_xdp_mode,
             "last_program_id": old.get("last_program_id"),
-            "tc_egress": bool(old.get("tc_egress", False)),
         }
     return {
         "schema": STATE_SCHEMA,
         "selection": selection,
         "interfaces": interfaces,
         "excluded": dict(sorted(excluded.items())),
+        "interface_details": {str(link["ifname"]): interface_details(link) for link in links},
     }
 
 
@@ -228,12 +265,10 @@ def runtime_state(
 
 def _cmd_select(args: argparse.Namespace) -> int:
     if args.input == "-":
-        links = json.load(sys.stdin)
+        links = parse_links(sys.stdin.read())
     else:
         with open(args.input) as handle:
-            links = json.load(handle)
-    if not isinstance(links, list):
-        raise ValueError("ip link JSON must be an array")
+            links = parse_links(handle.read())
     selected, excluded = select_interfaces(
         links,
         explicit=args.interface,
@@ -247,6 +282,7 @@ def _cmd_select(args: argparse.Namespace) -> int:
         excluded,
         selection="explicit" if args.interface else "auto",
         default_xdp_mode=args.default_xdp_mode,
+        links=links,
     )
     if args.write:
         atomic_write_json(Path(args.write), state)
@@ -257,7 +293,7 @@ def _cmd_select(args: argparse.Namespace) -> int:
 def _parse_interface_state(raw: str) -> tuple[str, dict[str, Any]]:
     try:
         name, payload = raw.split("=", 1)
-        mode, program_id, tc_state = payload.split(":")
+        mode, program_id = payload.split(":")
     except ValueError as exc:
         raise ValueError(f"invalid interface state: {raw}") from exc
     if mode not in {"native", "generic", "off"}:
@@ -265,8 +301,7 @@ def _parse_interface_state(raw: str) -> tuple[str, dict[str, Any]]:
     return name, {
         "xdp_mode": mode,
         "program_id": None if program_id in {"", "-"} else int(program_id),
-        "tc_egress": tc_state == "attached",
-        "verified": mode == "off" or (program_id not in {"", "-"} and tc_state == "attached"),
+        "verified": mode == "off" or program_id not in {"", "-"},
     }
 
 
@@ -285,7 +320,6 @@ def _cmd_record(args: argparse.Namespace) -> int:
             {
                 "xdp_mode": state["xdp_mode"],
                 "last_program_id": state["program_id"],
-                "tc_egress": state["tc_egress"],
             }
         )
         old_interfaces[name] = previous

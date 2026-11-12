@@ -6,6 +6,8 @@
 set -Eeuo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)
+# shellcheck source=tests/bash/testlib.sh
+source "$REPO_ROOT/tests/bash/testlib.sh"
 
 fail() {
     printf '[ERROR] nftables-fallback-e2e: %s\n' "$*" >&2
@@ -113,7 +115,7 @@ SOURCE_ROOT="$WORK_DIR/source"
 mkdir -p "$SOURCE_ROOT"
 for source_path in \
     setup_xdp.sh axdp config.toml xdp_port_sync.py pkt_relay.py \
-    auto_xdp_bpf_helpers.py tc_flow_track.c auto_xdp bpf handlers lib runtime; do
+    auto_xdp_bpf_helpers.py auto_xdp bpf handlers lib runtime; do
     cp -a "$REPO_ROOT/$source_path" "$SOURCE_ROOT/"
 done
 sed -i \
@@ -139,6 +141,17 @@ source "$CONFIG_FILE"
 grep -q '^PREFERRED_BACKEND="nftables"$' "$CONFIG_FILE" \
     || fail "installed environment did not select nftables"
 
+# Fresh installs are audit-first and intentionally create no firewall rules.
+if { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; } \
+        || command -v rc-service >/dev/null 2>&1; then
+    "$AXDP_CMD" enable --force >"$WORK_DIR/enable.log" 2>&1 \
+        || { cat "$WORK_DIR/enable.log" >&2; fail "axdp enable failed"; }
+else
+    PYTHONPATH="$PYTHON_LIB_DIR" "$PYTHON3_BIN" -m auto_xdp.admin.cli \
+        --config "$TOML_CONFIG" policy mode enforce >"$WORK_DIR/enable.log" 2>&1 \
+        || { cat "$WORK_DIR/enable.log" >&2; fail "policy activation failed"; }
+fi
+
 if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
     systemctl is-active --quiet xdp-port-sync \
         || fail "xdp-port-sync service is not active"
@@ -162,7 +175,12 @@ nft_policy_schema_present() {
 
 deadline=$((SECONDS + WAIT_SECONDS))
 while [[ ! -f /run/auto_xdp/backend ]] && (( SECONDS < deadline )); do sleep 0.2; done
-[[ -f /run/auto_xdp/backend ]] || fail "backend state file missing"
+[[ -f /run/auto_xdp/backend ]] || {
+    [[ ! -f "$WORK_DIR/launcher.log" ]] || cat "$WORK_DIR/launcher.log" >&2
+    sed -n '/^\[policy\]/,/^\[/p' "$TOML_CONFIG" >&2 || true
+    nft list ruleset >&2 || true
+    fail "backend state file missing"
+}
 grep -qx nftables /run/auto_xdp/backend \
     || fail "installed backend is not nftables"
 deadline=$((SECONDS + WAIT_SECONDS))
@@ -179,9 +197,9 @@ if ! nft_policy_schema_present; then
 fi
 
 set_contains_port() {
-    local port="$1"
-    nft list set "$NFT_FAMILY" "$NFT_TABLE" tcp_ports 2>/dev/null \
-        | grep -E "(^|[{},[:space:]])${port}([},[:space:]]|$)" >/dev/null
+    local port="$1" set_dump
+    set_dump=$(nft list set "$NFT_FAMILY" "$NFT_TABLE" tcp_ports 2>/dev/null) || return 1
+    [[ "$set_dump" =~ (^|[\{\},[:space:]])${port}([\{\},[:space:]]|$) ]]
 }
 
 wait_for_port_state() {
@@ -194,6 +212,10 @@ wait_for_port_state() {
         fi
         sleep 0.2
     done
+    "$AXDP_CMD" exposure >&2 || true
+    "$AXDP_CMD" approval list >&2 || true
+    [[ ! -f "$WORK_DIR/launcher.log" ]] || cat "$WORK_DIR/launcher.log" >&2
+    nft list set "$NFT_FAMILY" "$NFT_TABLE" tcp_ports >&2 || true
     fail "timed out waiting for tcp_ports port $port to become $expected"
 }
 
@@ -234,10 +256,12 @@ import pathlib
 import socket
 import sys
 
-host, ready_path = sys.argv[1], pathlib.Path(sys.argv[2])
+_host, ready_path = sys.argv[1], pathlib.Path(sys.argv[2])
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind((host, 0))
+# Match the default public-zone policy: wildcard listeners are expanded across
+# configured ingress zones, while a concrete address requires interface mapping.
+server.bind(("0.0.0.0", 0))
 server.listen(8)
 ready_path.write_text(str(server.getsockname()[1]), encoding="ascii")
 while True:
@@ -254,6 +278,20 @@ while [[ ! -s "$LISTENER_READY" ]] && (( SECONDS < deadline )); do sleep 0.1; do
 [[ -s "$LISTENER_READY" ]] || fail "listener failed to start"
 LISTENER_PORT=$(<"$LISTENER_READY")
 [[ "$LISTENER_PORT" =~ ^[0-9]+$ ]] || fail "listener returned an invalid port"
+read -r resolver_key resolver_value < <(listener_resolver "$LISTENER_PID") \
+    || fail "listener process identity is unavailable"
+
+approval_output=$("$AXDP_CMD" approval request nft-fallback-e2e public tcp \
+    "$LISTENER_PORT" "--${resolver_key//_/-}" "$resolver_value" \
+    --reason "installed nftables fallback E2E" 2>&1) \
+    || { printf '%s\n' "$approval_output" >&2; fail "approval request failed"; }
+APPROVAL_ID=${approval_output##*#}
+[[ "$APPROVAL_ID" =~ ^[0-9]+$ ]] || fail "could not parse approval request id"
+"$AXDP_CMD" approval approve "$APPROVAL_ID" >"$WORK_DIR/approve.log" 2>&1 \
+    || { cat "$WORK_DIR/approve.log" >&2; fail "approval failed"; }
+if [[ -n "$LAUNCHER_PID" ]]; then
+    kill -HUP "$LAUNCHER_PID"
+fi
 
 printf '[INFO] listener port %s opened; waiting for daemon discovery\n' "$LISTENER_PORT"
 wait_for_port_state "$LISTENER_PORT" present
@@ -263,6 +301,9 @@ printf '[INFO] veth/netns TCP traffic allowed for discovered listener\n'
 kill -TERM "$LISTENER_PID" 2>/dev/null || true
 wait "$LISTENER_PID" 2>/dev/null || true
 LISTENER_PID=""
+if [[ -n "$LAUNCHER_PID" ]]; then
+    kill -HUP "$LAUNCHER_PID"
+fi
 printf '[INFO] listener closed; waiting for daemon policy removal\n'
 wait_for_port_state "$LISTENER_PORT" absent
 tcp_probe "$LISTENER_PORT" blocked

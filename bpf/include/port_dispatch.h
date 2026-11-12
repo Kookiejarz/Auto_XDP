@@ -48,7 +48,7 @@ static __always_inline void try_tcp_port_dispatch(
     struct xdp_md *ctx,
     const struct flow_key *ct,
     __u16 l3_off, __u16 inner_off,
-    __u32 dest_port)
+    __u32 dest_port, __u64 policy_generation)
 {
     __u32 zero = 0;
     struct xdp_slot_ctx *sc = bpf_map_lookup_elem(&slot_ctx_map, &zero);
@@ -65,8 +65,81 @@ static __always_inline void try_tcp_port_dispatch(
         sc->daddr[0] = ct->daddr[0]; sc->daddr[1] = ct->daddr[1];
         sc->daddr[2] = ct->daddr[2]; sc->daddr[3] = ct->daddr[3];
     }
+    remember_handler_route(ctx, ct, IPPROTO_TCP, HANDLER_ROUTE_TCP, dest_port, policy_generation, 0);
     count(CNT_SLOT_CALL);
     bpf_tail_call(ctx, &tcp_port_handlers, dest_port);
+}
+
+/*
+ * Dispatch a protected TCP endpoint by profile identity.  A required profile
+ * is part of admission, so every return from bpf_tail_call() is fail-closed.
+ */
+static __always_inline int dispatch_tcp_profile(
+    struct xdp_md *ctx,
+    const struct flow_key *ct,
+    __u16 l3_off, __u16 inner_off,
+    const struct tcp_endpoint_policy *policy)
+{
+    __u32 zero = 0;
+    struct xdp_slot_ctx *sc = bpf_map_lookup_elem(&slot_ctx_map, &zero);
+    struct xdp_profile_ctx *pc = bpf_map_lookup_elem(&profile_ctx_map, &zero);
+
+    if (sc && pc) {
+        sc->family       = ct->family;
+        sc->ip_proto     = IPPROTO_TCP;
+        sc->l3_offset    = l3_off;
+        sc->inner_offset = inner_off;
+        sc->sport        = ct->sport;
+        sc->dport        = ct->dport;
+        sc->_pad         = 0;
+        sc->saddr[0] = ct->saddr[0]; sc->saddr[1] = ct->saddr[1];
+        sc->saddr[2] = ct->saddr[2]; sc->saddr[3] = ct->saddr[3];
+        sc->daddr[0] = ct->daddr[0]; sc->daddr[1] = ct->daddr[1];
+        sc->daddr[2] = ct->daddr[2]; sc->daddr[3] = ct->daddr[3];
+        pc->policy_generation = policy->policy_generation;
+        pc->profile_generation = policy->profile_generation;
+        pc->profile_id = policy->profile_id;
+        pc->_pad = 0;
+
+        remember_handler_route(ctx, ct, IPPROTO_TCP, HANDLER_ROUTE_PROFILE,
+                               policy->profile_id, policy->policy_generation,
+                               policy->profile_generation);
+        count(CNT_SLOT_CALL);
+        bpf_tail_call(ctx, &tcp_profile_handlers, policy->profile_id);
+    }
+
+    count(CNT_PROFILE_UNAVAILABLE_DROP);
+    emit_drop(ctx, IPPROTO_TCP, ct->family, ct->saddr, ct->daddr,
+              ct->sport, ct->dport, (__u8)CNT_PROFILE_UNAVAILABLE_DROP,
+              bpf_ktime_get_ns());
+    return XDP_DROP;
+}
+
+/* Returns only when the optional cookie program is absent, for example while a
+ * reload installs it into the new generation. Cookies are mitigation, not
+ * authorization: the caller continues on its normal (rate-limited) path. If
+ * the program is not installed, the runtime (after a reload) or the daemon
+ * (on its next sync) closes the cookie endpoints.
+ */
+static __always_inline void try_dispatch_syncookie(
+    struct xdp_md *ctx, const struct flow_key *ct,
+    __u16 l3_off, __u16 inner_off)
+{
+    __u32 zero = 0;
+    struct xdp_slot_ctx *sc = bpf_map_lookup_elem(&slot_ctx_map, &zero);
+    if (sc) {
+        sc->family = ct->family;
+        sc->ip_proto = IPPROTO_TCP;
+        sc->l3_offset = l3_off;
+        sc->inner_offset = inner_off;
+        sc->sport = ct->sport;
+        sc->dport = ct->dport;
+        sc->_pad = 0;
+        __builtin_memcpy(sc->saddr, ct->saddr, sizeof(sc->saddr));
+        __builtin_memcpy(sc->daddr, ct->daddr, sizeof(sc->daddr));
+    }
+    bpf_tail_call(ctx, &syncookie_prog_array, 0);
+    count(CNT_SYN_COOKIE_TAILCALL_MISS);
 }
 
 /* Same as try_tcp_port_dispatch but for UDP. */
@@ -92,5 +165,6 @@ static __always_inline void try_udp_port_dispatch(
         sc->daddr[2] = ct->daddr[2]; sc->daddr[3] = ct->daddr[3];
     }
     count(CNT_SLOT_CALL);
+    remember_handler_route(ctx, ct, IPPROTO_UDP, HANDLER_ROUTE_UDP, dest_port, 0, 0);
     bpf_tail_call(ctx, &udp_port_handlers, dest_port);
 }

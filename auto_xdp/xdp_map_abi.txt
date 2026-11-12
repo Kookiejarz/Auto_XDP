@@ -1,10 +1,15 @@
-# Map capacities derived from bpf/include/map_sizes.h.
-tcp_ct4 196608
-tcp_ct6 196608
-udp_ct4 196608
-udp_ct6 196608
-tcp_pd4 49152
-tcp_pd6 16384
+# Map capacities derived from bpf/include/map_sizes.h and counters.h.
+pkt_counters percpu_array 4 8 67
+byte_counters percpu_array 4 32 1
+endpoint_scopes hash 24 4 16384
+tc_handler_ctx percpu_array 4 96 1
+handler_egress hash 8 4 4096
+handler_flows lru_hash 48 32 65536
+tc_profile_handlers prog_array 4 4 256
+tc_tcp_handlers prog_array 4 4 65536
+tc_udp_handlers prog_array 4 4 65536
+tc_proto_handlers prog_array 4 4 256
+handler_eg_stats percpu_array 4 8 6
 hblk4 49152
 hblk6 16384
 udp_hv4 49152
@@ -13,7 +18,11 @@ synag4 49152
 synag6 16384
 udpag4 49152
 udpag6 16384
-tsc4 49152
-tsc6 16384
-tsc_pfx4 49152
-tsc_pfx6 16384
+tcp_synck_policy array 4 4 65536
+sync_run_cfg array 4 24 1
+sync_port_rate array 4 24 65536
+sync_port_state array 4 16 65536
+sync_port_limit array 4 4 65536
+syncookie_prog_array prog_array 4 4 1
+sync_handoff4 lru_hash 12 20 65536
+sync_handoff6 lru_hash 36 20 65536

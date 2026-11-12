@@ -1,20 +1,18 @@
 """Sync orchestration: one-shot, event-driven, and periodic reconciliation."""
 from __future__ import annotations
 
-import json as _json
 import logging
-import select
 import signal
-import socket as _socket
 import time
 from collections.abc import Callable
 
 from auto_xdp import config as cfg
 from auto_xdp.backends import NftablesBackend, PortBackend, XdpBackend
 from auto_xdp.config import apply_toml_config, load_toml_config
-from auto_xdp.discovery import DiscoveryError, get_listening_ports
+from auto_xdp.state import ApplyResult
+from auto_xdp.discovery.listeners import DiscoveryError, get_listening_ports
+from auto_xdp.discovery.notifications import NotificationReceiver
 from auto_xdp.policy import resolve_desired_state
-from auto_xdp.proc_events import drain_proc_events, open_proc_connector
 
 log = logging.getLogger(__name__)
 
@@ -32,11 +30,15 @@ DEBOUNCE_MAX_WAIT_SECONDS = 1.0
 # Event-triggered reconciles also perform a full discovery, so this interval is
 # the maximum time the daemon may go without re-reading the system state.
 FULL_RECONCILE_INTERVAL_SECONDS = 30.0
-EVENT_SOURCE_RETRY_INTERVAL_SECONDS = 5.0
+# `nft flush ruleset` (e.g. restarting nftables.service) removes the conntrack
+# activation table the XDP data path depends on; re-check it this often, and
+# back off up to the maximum while the check itself keeps failing.
+CONNTRACK_CHECK_INTERVAL_SECONDS = 5.0
+CONNTRACK_CHECK_MAX_INTERVAL_SECONDS = 300.0
 
 
-def observe_system_state():
-    return get_listening_ports()
+def observe_system_state(*, config: cfg.ConfigSnapshot | None = None):
+    return get_listening_ports(config=config)
 
 
 def _reload_config(config_path: str) -> bool:
@@ -49,10 +51,74 @@ def _reload_config(config_path: str) -> bool:
     return True
 
 
-def sync_once(backend: PortBackend, dry_run: bool) -> None:
-    observed = observe_system_state()
-    desired = resolve_desired_state(observed)
-    backend.reconcile(desired, dry_run, observed)
+def sync_once(
+    backend: PortBackend | None,
+    dry_run: bool,
+    mode: str | None = None,
+    explain: bool = False,
+) -> dict[str, object]:
+    started = time.monotonic()
+    config = cfg.snapshot_config()
+    observed = observe_system_state(config=config)
+    desired = resolve_desired_state(observed, config=config)
+    result = None
+    effective_mode = mode or config.POLICY_MODE
+    if effective_mode not in {"observe", "audit", "enforce"}:
+        raise ValueError(f"Unsupported policy mode: {effective_mode}")
+    if explain or desired.exposure_decisions:
+        for decision in desired.exposure_decisions:
+            endpoint = decision.endpoint
+            message = (
+                "exposure %s %s/%s %s:%d subject=%s attribution=%s zone=%s reason=%s%s"
+                % (
+                decision.action.upper(), endpoint.protocol, endpoint.bind_scope,
+                endpoint.host_address, endpoint.host_port,
+                decision.subject or endpoint.subject or "unknown",
+                endpoint.attribution_state, endpoint.ingress_zone, decision.reason,
+                f" profile={decision.protection_profile}" if decision.protection_profile else "",
+                )
+            )
+            if explain:
+                print(message)
+            else:
+                log.info(message)
+    if effective_mode in {"observe", "audit"}:
+        if effective_mode == "audit":
+            log.info(
+                "exposure audit: %d endpoint(s), %d authorized",
+                len(desired.exposure_decisions),
+                sum(item.action == "allow" for item in desired.exposure_decisions),
+            )
+    else:
+        if backend is None:
+            raise RuntimeError("an enforcement backend is required in enforce mode")
+        result = backend.reconcile(desired, dry_run, observed)
+        backend.last_apply_result = result
+        if isinstance(result, ApplyResult):
+            for failure in result.failures:
+                log.error("Apply failed stage=%s resource=%s operation=%s reason=%s",
+                          failure.operation.stage, failure.operation.resource,
+                          failure.operation.operation, failure.reason)
+            for endpoint_key, reason in result.blocked_endpoints.items():
+                log.warning("Endpoint target blocked %s: %s", endpoint_key, reason)
+            for endpoint_key, reason in result.deferred_endpoints.items():
+                log.info("Endpoint target deferred %s: %s", endpoint_key, reason)
+            for resource, reason in result.unconfirmed.items():
+                log.warning("Applied state unconfirmed %s: %s", resource, reason)
+    elapsed = time.monotonic() - started
+    log.info(
+        "reconciliation mode=%s elapsed_ms=%.3f endpoints=%d authorized_endpoints=%d",
+        effective_mode, elapsed * 1000, len(desired.exposure_decisions),
+        sum(policy.allow for policy in desired.endpoint_policies.values()),
+    )
+    return {
+        "mode": effective_mode,
+        "elapsed_seconds": elapsed,
+        "config": config,
+        "apply_result": result,
+        "observed": observed,
+        "desired": desired,
+    }
 
 
 def _format_backend_status(status) -> str:
@@ -68,6 +134,11 @@ def _probe_backend(backend_cls: type[PortBackend]):
 
 
 def open_backend(name: str) -> PortBackend:
+    if cfg.ICMP_REPLY_ENABLED:
+        if name == BACKEND_NFTABLES:
+            raise RuntimeError("ICMP Echo Reply protection requires the XDP backend")
+        if name == BACKEND_AUTO:
+            name = BACKEND_XDP
     if name == BACKEND_XDP:
         status = XdpBackend.probe()
         if not status.available:
@@ -95,52 +166,6 @@ def open_backend(name: str) -> PortBackend:
     return backend
 
 
-def _open_relay_client(sock_path: str) -> "_socket.socket | None":
-    """Connect to pkt_relay Unix socket as a non-blocking subscriber."""
-    try:
-        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.connect(sock_path)
-        s.setblocking(False)
-        return s
-    except OSError:
-        return None
-
-
-def _drain_relay_lines(
-    relay_sock: "_socket.socket",
-    pending: bytearray | None = None,
-) -> bool:
-    """Read available lines from the relay socket.
-
-    Returns True if any port_change event was found.
-    Raises ConnectionResetError if the relay closed the connection.
-    """
-    if pending is None:
-        pending = bytearray()
-    try:
-        while True:
-            chunk = relay_sock.recv(4096)
-            if not chunk:
-                raise ConnectionResetError("relay disconnected")
-            pending.extend(chunk)
-    except BlockingIOError:
-        pass
-
-    found = False
-    while (line_end := pending.find(b"\n")) >= 0:
-        raw_line = bytes(pending[:line_end])
-        del pending[: line_end + 1]
-        if not raw_line:
-            continue
-        try:
-            msg = _json.loads(raw_line)
-        except _json.JSONDecodeError:
-            continue
-        if msg.get("type") == "port_change":
-            found = True
-    return found
-
-
 def watch(
     dry_run: bool,
     backend_name: str,
@@ -149,39 +174,60 @@ def watch(
     cli_log_level: str | None = None,
     *,
     monotonic: Callable[[], float] = time.monotonic,
+    mode: str | None = None,
+    explain: bool = False,
 ) -> None:
     backend = None
-    nl = None
-
-    last_event_t = 0.0
-    first_event_t = 0.0
+    last_event_t: float | None = None
+    first_event_t: float | None = None
+    immediate = False
     last_reconcile_t = 0.0
-    last_gc_t = 0.0
     last_stale_check_t = 0.0
-    last_netlink_connect_t = -EVENT_SOURCE_RETRY_INTERVAL_SECONDS
+    last_conntrack_check_t: float | None = None
+    conntrack_check_interval = CONNTRACK_CHECK_INTERVAL_SECONDS
     reload_requested = False
+    mode_only_synced = False
 
     def _on_sighup(signum: int, frame: object) -> None:
         nonlocal reload_requested
         reload_requested = True
 
-    signal.signal(signal.SIGHUP, _on_sighup)
+    previous_sighup = signal.signal(signal.SIGHUP, _on_sighup)
+    notifications = NotificationReceiver(cfg.RINGBUF_SOCKET_PATH, monotonic=monotonic)
 
-    relay_sock: "_socket.socket | None" = None
-    relay_pending = bytearray()
-    last_relay_connect_t = -EVENT_SOURCE_RETRY_INTERVAL_SECONDS
+    def _sync() -> dict[str, object]:
+        if mode is None and not explain:
+            return sync_once(backend, dry_run)
+        return sync_once(backend, dry_run, mode=mode, explain=explain)
 
     try:
+        notifications.start()
         while True:
+            # Observe/audit are useful without root or an installed backend.
+            needs_backend = (mode or cfg.POLICY_MODE) not in {"observe", "audit"}
+            if not needs_backend:
+                if backend is not None:
+                    backend.close()
+                    backend = None
+                if not mode_only_synced:
+                    try:
+                        _sync()
+                        last_reconcile_t = monotonic()
+                        mode_only_synced = True
+                    except DiscoveryError as exc:
+                        log.error("Initial discovery failed; retrying: %s", exc)
+                        last_reconcile_t = monotonic()
+                        continue
             # Re-initialize backend if needed
-            if backend is None:
+            elif backend is None:
+                mode_only_synced = False
                 try:
                     backend = open_backend(backend_name)
                     log.info("Backend initialized.")
-                    sync_once(backend, dry_run)
+                    _sync()
                     last_reconcile_t = monotonic()
-                    last_event_t = 0.0
-                    first_event_t = 0.0
+                    last_event_t = first_event_t = None
+                    immediate = False
                 except DiscoveryError as exc:
                     log.error("Initial discovery failed; keeping existing policy: %s", exc)
                     last_reconcile_t = monotonic()
@@ -191,87 +237,21 @@ def watch(
                     time.sleep(5)
                     continue
 
-            # Netlink is an optional acceleration path. Failure must not stop
-            # relay events, the periodic safety reconcile, GC, or drift checks.
-            now_mono = monotonic()
-            if (
-                nl is None
-                and now_mono - last_netlink_connect_t
-                >= EVENT_SOURCE_RETRY_INTERVAL_SECONDS
-            ):
-                nl = open_proc_connector()
-                last_netlink_connect_t = now_mono
-
-            # Optionally subscribe to pkt_relay for instant port_change triggers.
-            if (
-                relay_sock is None
-                and now_mono - last_relay_connect_t
-                >= EVENT_SOURCE_RETRY_INTERVAL_SECONDS
-            ):
-                relay_sock = _open_relay_client(cfg.RINGBUF_SOCKET_PATH)
-                last_relay_connect_t = now_mono
-                if relay_sock:
-                    relay_pending.clear()
-                    log.info("Connected to pkt_relay for port_change events.")
-
-            debounce_s = cfg.DEBOUNCE_SECONDS
-            timeout = max(0.05, debounce_s - (monotonic() - last_event_t)) if last_event_t else 1.0
-            if last_reconcile_t:
-                until_reconcile = max(
-                    0.05,
-                    FULL_RECONCILE_INTERVAL_SECONDS
-                    - (monotonic() - last_reconcile_t),
-                )
-                timeout = min(timeout, until_reconcile)
-
-            select_fds = []
-            if nl is not None:
-                select_fds.append(nl)
-            if relay_sock is not None:
-                select_fds.append(relay_sock)
-
-            try:
-                if select_fds:
-                    rdy, _, _ = select.select(select_fds, [], [], timeout)
-                else:
-                    time.sleep(timeout)
-                    rdy = []
-                if nl is not None and nl in rdy and drain_proc_events(nl):
-                    log.debug("Proc event -> debounce armed.")
-                    _now = monotonic()
-                    if not first_event_t:
-                        first_event_t = _now
-                    last_event_t = _now
-                if relay_sock is not None and relay_sock in rdy:
-                    try:
-                        if _drain_relay_lines(relay_sock, relay_pending):
-                            log.debug("port_change from relay → immediate sync.")
-                            try:
-                                sync_once(backend, dry_run)
-                                last_reconcile_t = monotonic()
-                                last_event_t = 0.0
-                                first_event_t = 0.0
-                            except DiscoveryError as exc:
-                                log.error("Discovery failed; keeping existing policy: %s", exc)
-                                last_event_t = monotonic()
-                                first_event_t = last_event_t
-                                continue
-                            except (OSError, RuntimeError) as exc:
-                                log.error("Sync error (port_change): %s", exc)
-                                backend.close()
-                                backend = None
-                    except (ConnectionResetError, OSError):
-                        log.info("pkt_relay disconnected; reverting to proc_connector only.")
-                        relay_sock.close()
-                        relay_sock = None
-                        relay_pending.clear()
-                        last_relay_connect_t = monotonic()
-            except OSError as exc:
-                log.warning("Netlink event error (%s); reconnecting proc connector.", exc)
-                if nl:
-                    nl.close()
-                nl = None
-                last_netlink_connect_t = monotonic()
+            now = monotonic()
+            timeout = min(1.0, max(0.0, FULL_RECONCILE_INTERVAL_SECONDS - (now - last_reconcile_t)))
+            if last_event_t is not None and first_event_t is not None:
+                timeout = min(timeout, max(0.0, min(
+                    cfg.DEBOUNCE_SECONDS - (now - last_event_t),
+                    DEBOUNCE_MAX_WAIT_SECONDS - (now - first_event_t),
+                )))
+            if immediate:
+                timeout = 0.0
+            notification = notifications.wait(timeout)
+            if notification is not None:
+                first_event_t = (notification.first_seen if first_event_t is None
+                                 else min(first_event_t, notification.first_seen))
+                last_event_t = notification.last_seen
+                immediate = immediate or notification.immediate
 
             if reload_requested:
                 reload_requested = False
@@ -280,6 +260,9 @@ def watch(
                 _old_nft_family = cfg.NFT_FAMILY
                 _old_nft_table = cfg.NFT_TABLE
                 _old_preferred = cfg.PREFERRED_BACKEND
+                _old_icmp = cfg.ICMP_REPLY_ENABLED
+                _old_resources = {name: value for name, value in cfg.snapshot_config().values.items()
+                                  if name.startswith(("ABUSEIPDB_", "NFT_"))}
                 if not _reload_config(config_path):
                     continue
                 if cli_trusted_ips:
@@ -288,10 +271,14 @@ def watch(
                     _lvl = getattr(logging, cfg.LOG_LEVEL.upper(), logging.WARNING)
                     logging.getLogger().setLevel(_lvl)
                     log.setLevel(_lvl)
+                _new_resources = cfg.snapshot_config()
                 _backend_stale = (
                     cfg.BPF_PIN_DIR != _old_pin_dir
+                    or cfg.ICMP_REPLY_ENABLED != _old_icmp
                     or cfg.NFT_FAMILY != _old_nft_family
                     or cfg.NFT_TABLE != _old_nft_table
+                    or any(_new_resources.values[name] != value
+                           for name, value in _old_resources.items())
                 )
                 if cfg.PREFERRED_BACKEND != _old_preferred and backend_name == _old_preferred:
                     backend_name = cfg.PREFERRED_BACKEND
@@ -304,38 +291,44 @@ def watch(
                     backend = None
                 last_event_t = monotonic() - cfg.DEBOUNCE_SECONDS
                 first_event_t = last_event_t
+                immediate = True
+                continue  # Re-evaluate mode and backend ownership after publishing config.
 
-            if backend is None:
+            if backend is None and needs_backend:
                 continue
 
             now = monotonic()
-            if last_event_t and (
-                now - last_event_t >= cfg.DEBOUNCE_SECONDS
-                or now - first_event_t >= DEBOUNCE_MAX_WAIT_SECONDS
-            ):
-                if nl:
-                    drain_proc_events(nl)
-                log.debug("Sync triggered by event.")
+            event_due = immediate or (
+                last_event_t is not None and first_event_t is not None and (
+                    now - last_event_t >= cfg.DEBOUNCE_SECONDS
+                    or now - first_event_t >= DEBOUNCE_MAX_WAIT_SECONDS
+                )
+            )
+            if event_due or now - last_reconcile_t >= FULL_RECONCILE_INTERVAL_SECONDS:
+                log.debug("Sync triggered by %s.", "event" if event_due else "periodic safety check")
+                # Consume only this round's hints; the receiver retains new ones during apply.
+                last_event_t = first_event_t = None
+                immediate = False
                 try:
-                    sync_once(backend, dry_run)
+                    _sync()
                     last_reconcile_t = monotonic()
                 except DiscoveryError as exc:
                     log.error("Discovery failed; keeping existing policy: %s", exc)
+                    last_reconcile_t = monotonic()
                     last_event_t = monotonic()
                     first_event_t = last_event_t
                     continue
                 except (OSError, RuntimeError) as exc:
                     log.error("Sync error: %s", exc)
                     log.warning("Backend may be broken; will attempt to re-initialize.")
-                    backend.close()
+                    if backend is not None:
+                        backend.close()
                     backend = None
                     continue
 
-                last_event_t = 0.0
-                first_event_t = 0.0
-
-                apply_failures = getattr(backend, "last_apply_failures", 0)
-                if apply_failures and hasattr(backend, "verify_kernel_state"):
+                result = getattr(backend, "last_apply_result", None)
+                apply_failures = len(result.failures) + len(result.unconfirmed) if isinstance(result, ApplyResult) else getattr(backend, "last_apply_failures", 0)
+                if backend is not None and apply_failures and hasattr(backend, "verify_kernel_state"):
                     log.warning(
                         "Reconcile had %d failed map update(s); verifying kernel state.",
                         apply_failures,
@@ -345,59 +338,38 @@ def watch(
                     last_event_t = monotonic()
                     first_event_t = last_event_t
 
-            if (
-                monotonic() - last_reconcile_t
-                >= FULL_RECONCILE_INTERVAL_SECONDS
-            ):
-                log.debug("Periodic safety reconcile.")
-                try:
-                    sync_once(backend, dry_run)
-                    last_reconcile_t = monotonic()
-                    # This was a full discovery, so it also satisfies any
-                    # pending event-triggered reconcile.
-                    last_event_t = 0.0
-                    first_event_t = 0.0
-                except DiscoveryError as exc:
-                    log.error("Periodic discovery failed; keeping existing policy: %s", exc)
-                    last_reconcile_t = monotonic()
-                except (OSError, RuntimeError) as exc:
-                    log.error("Periodic sync error: %s", exc)
-                    log.warning("Backend may be broken; will attempt to re-initialize.")
-                    backend.close()
-                    backend = None
-                    continue
-
-            gc_interval = cfg.XDP_CONNTRACK_GC_INTERVAL_SECONDS
-            if gc_interval > 0 and (monotonic() - last_gc_t >= gc_interval):
-                try:
-                    backend.run_ct_gc()
-                except OSError as exc:
-                    log.warning("Conntrack GC error: %s", exc)
-                last_gc_t = monotonic()
+            if (backend is not None and not dry_run
+                    and hasattr(backend, "ensure_conntrack_activation")
+                    and (last_conntrack_check_t is None
+                         or monotonic() - last_conntrack_check_t >= conntrack_check_interval)):
+                last_conntrack_check_t = monotonic()
+                if backend.ensure_conntrack_activation() is None:
+                    conntrack_check_interval = min(
+                        conntrack_check_interval * 2, CONNTRACK_CHECK_MAX_INTERVAL_SECONDS)
+                else:
+                    conntrack_check_interval = CONNTRACK_CHECK_INTERVAL_SECONDS
 
             if monotonic() - last_stale_check_t >= 30.0:
                 last_stale_check_t = monotonic()
-                if hasattr(backend, "is_stale") and backend.is_stale():
+                if backend is not None and hasattr(backend, "is_stale") and backend.is_stale():
                     log.warning(
                         "XDP map FDs are stale (BPF program was reloaded); "
                         "reinitializing backend."
                     )
                     backend.close()
                     backend = None
-                elif hasattr(backend, "verify_kernel_state"):
+                elif backend is not None and hasattr(backend, "verify_kernel_state"):
                     if backend.verify_kernel_state():
                         # Drift found: arm debounce to schedule a corrective sync.
                         _now = monotonic()
-                        if not first_event_t:
+                        if first_event_t is None:
                             first_event_t = _now
                         last_event_t = _now
 
     except KeyboardInterrupt:
         log.info("Shutting down.")
     finally:
-        if nl:
-            nl.close()
-        if relay_sock:
-            relay_sock.close()
+        notifications.close()
+        signal.signal(signal.SIGHUP, previous_sighup)
         if backend:
             backend.close()

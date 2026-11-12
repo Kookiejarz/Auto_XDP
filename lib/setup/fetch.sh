@@ -55,7 +55,7 @@ print(value.lower())
         local path
         local required=(
             setup_xdp.sh axdp config.toml xdp_port_sync.py pkt_relay.py
-            auto_xdp_bpf_helpers.py tc_flow_track.c auto_xdp bpf handlers
+            auto_xdp_bpf_helpers.py auto_xdp bpf handlers
             lib runtime
         )
         for path in "${required[@]}"; do
@@ -164,16 +164,16 @@ _check_update_candidate_files() {
         "xdp_port_sync.py"
         "pkt_relay.py"
         "auto_xdp_bpf_helpers.py"
-        "tc_flow_track.c"
     )
 
     for path in "${fixed_files[@]}"; do
         [[ -f "$path" ]] && printf '%s\n' "$path"
     done
 
-    for path in lib/setup/*.sh runtime/*.sh bpf/*.c bpf/include/*.h handlers/Makefile handlers/*.c handlers/*.h auto_xdp/*.py auto_xdp/admin/*.py auto_xdp/backends/*.py auto_xdp/bpf/*.py auto_xdp/default_config.toml auto_xdp/xdp_required_maps.txt auto_xdp/xdp_map_abi.txt; do
+    for path in lib/setup/*.sh runtime/*.sh bpf/*.c bpf/include/*.h handlers/Makefile* handlers/Kbuild handlers/*.c handlers/*.h; do
         [[ -f "$path" ]] && printf '%s\n' "$path"
     done | sort -u
+    find auto_xdp -type f \( -name '*.py' -o -name '*.toml' -o -name '*.txt' \) | sort
 }
 
 check_github_updates_once() {

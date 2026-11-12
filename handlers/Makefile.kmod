@@ -1,0 +1,29 @@
+KVER ?= $(shell uname -r)
+KDIR ?= /lib/modules/$(KVER)/build
+VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
+
+.PHONY: all clean install
+all:
+	$(MAKE) -C "$(KDIR)" M="$(CURDIR)" modules
+	# New kernels emit detached BTF/ID files; their helper embeds both in the module.
+	@if ! readelf -SW axdp_icmp.ko | grep -q '\.BTF '; then \
+		test "$(KVER)" = "$$(uname -r)" || { echo 'Provide a matching vmlinux in KDIR for cross-kernel builds'; exit 1; }; \
+		if test -f "$(KDIR)/scripts/gen-btf.sh"; then \
+			PAHOLE=pahole OBJCOPY=objcopy \
+			RESOLVE_BTFIDS="$(KDIR)/tools/bpf/resolve_btfids/resolve_btfids" \
+			$(SHELL) "$(KDIR)/scripts/gen-btf.sh" --btf_base "$(VMLINUX_BTF)" axdp_icmp.ko; \
+		else \
+			pahole -J --btf_base "$(VMLINUX_BTF)" axdp_icmp.ko && \
+			"$(KDIR)/tools/bpf/resolve_btfids/resolve_btfids" -b "$(VMLINUX_BTF)" axdp_icmp.ko; \
+		fi || { rm -f axdp_icmp.ko; exit 1; }; \
+	fi
+	@readelf -SW axdp_icmp.ko | grep -q '\.BTF '
+	strip --strip-debug axdp_icmp.ko
+
+install: all
+	install -D -m 0644 axdp_icmp.ko "/lib/modules/$(KVER)/extra/auto_xdp/axdp_icmp.ko"
+	depmod -a "$(KVER)"
+
+clean:
+	rm -f axdp_icmp.o axdp_icmp.ko axdp_icmp.mod axdp_icmp.mod.c axdp_icmp.mod.o \
+		.axdp_icmp.*.cmd Module.symvers modules.order .Module.symvers.cmd .modules.order.cmd

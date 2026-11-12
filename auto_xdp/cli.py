@@ -8,6 +8,7 @@ import sys
 
 from auto_xdp import config as cfg
 from auto_xdp.config import apply_toml_config, load_toml_config
+from auto_xdp.state import ApplyResult
 from auto_xdp.syncer import open_backend, sync_once, watch
 
 log = logging.getLogger(__name__)
@@ -28,7 +29,8 @@ def main() -> None:
         metavar="PATH",
     )
     bootstrap_args, _ = bootstrap.parse_known_args(sys.argv[1:])
-    apply_toml_config(load_toml_config(bootstrap_args.config))
+    if not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        apply_toml_config(load_toml_config(bootstrap_args.config))
 
     def _parse_trusted_ip(ip_str: str) -> str:
         try:
@@ -49,6 +51,17 @@ def main() -> None:
         "--watch",
         action="store_true",
         help="Run as a daemon (event-driven reconciliation)",
+    )
+    p.add_argument(
+        "--mode",
+        choices=["observe", "audit", "enforce"],
+        default=None,
+        help="Exposure policy mode; observe/audit never change the backend",
+    )
+    p.add_argument(
+        "--explain",
+        action="store_true",
+        help="Log endpoint ownership, zone, grant reason, and protection profile",
     )
     p.add_argument(
         "--dry-run",
@@ -92,11 +105,27 @@ def main() -> None:
         p.error(str(exc))
 
     if args.watch:
-        watch(
-            args.dry_run, args.backend, args.config,
-            cli_trusted_ips, cli_log_level=args.log_level,
-        )
+        if args.mode is None and not args.explain:
+            watch(
+                args.dry_run, args.backend, args.config,
+                cli_trusted_ips, cli_log_level=args.log_level,
+            )
+        else:
+            watch(
+                args.dry_run, args.backend, args.config, cli_trusted_ips,
+                cli_log_level=args.log_level, mode=args.mode, explain=args.explain,
+            )
     else:
+        effective_mode = args.mode or cfg.POLICY_MODE
+        if effective_mode in {"observe", "audit"}:
+            sync_once(None, args.dry_run, mode=effective_mode, explain=args.explain)
+            return
         with open_backend(args.backend) as backend:
-            sync_once(backend, args.dry_run)
+            if args.mode is None and not args.explain:
+                report = sync_once(backend, args.dry_run)
+            else:
+                report = sync_once(backend, args.dry_run, mode=args.mode, explain=args.explain)
+            result = report.get("apply_result") if isinstance(report, dict) else None
+            if isinstance(result, ApplyResult) and not args.dry_run and not result.successful:
+                raise SystemExit(1)
             log.info("Sync completed.")

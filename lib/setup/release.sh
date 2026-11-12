@@ -137,9 +137,11 @@ PY
 validate_runtime_release() {
     local release_dir="$1" required
     local required_paths=(
-        python/auto_xdp/__init__.py python/auto_xdp/install_state.py
+        python/auto_xdp/__init__.py python/auto_xdp/install_state.py python/auto_xdp/xdp_link.py
         python/auto_xdp/default_config.toml
-        handlers xdp_required_maps.txt xdp_map_abi.txt auto_xdp_runtime_common.sh
+        bpf/include/common.h bpf/include/counters.h bpf/include/telemetry.h bpf/include/icmp_ct_tuple.h
+        handlers/minecraft_handler.o handlers/icmp_handler.o handlers/axdp_icmp.c handlers/Kbuild handlers/Makefile.kmod
+        tc_egress_dispatch.o xdp_required_maps.txt xdp_map_abi.txt auto_xdp_runtime_common.sh
         auto_xdp_bpf_helpers.py xdp_port_sync.py pkt_relay.py axdp
         auto_xdp_start.sh release.json
     )
@@ -152,11 +154,7 @@ validate_runtime_release() {
     bash -n "${release_dir}/auto_xdp_start.sh" \
         "${release_dir}/auto_xdp_runtime_common.sh" \
         "${release_dir}/axdp" || return 1
-    PYTHONPATH="${release_dir}/python" "${PYTHON3_BIN:-python3}" - <<'PY'
-from auto_xdp import admin_cli, install_state
-parser = admin_cli.build_parser()
-assert parser is not None and install_state.STATE_SCHEMA >= 1
-PY
+    PYTHON_LIB_DIR="${release_dir}/python" validate_installed_python_support_package
 }
 
 stage_runtime_release() {
@@ -243,8 +241,10 @@ begin_install_transaction_step() {
 
 _remove_obsolete_install_layout() {
     local path bin_dir
+    # Retired Minecraft-specific artifacts appear only in this removal list.
     local -a obsolete_root=(
-        python handlers xdp_required_maps.txt xdp_map_abi.txt xdp_firewall.o tc_flow_track.o
+        python handlers xdp_required_maps.txt xdp_map_abi.txt xdp_firewall.o xdp_syncookie.o
+        tc_syncookie_handoff.o minecraft_egress.o tc_egress_dispatch.o
         sock_state_track.o auto_xdp_runtime_common.sh auto_xdp_bpf_helpers.py
         xdp_port_sync.py pkt_relay.py axdp auto_xdp_start.sh release.json
     )
