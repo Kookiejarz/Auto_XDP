@@ -50,9 +50,10 @@
 
 [![Auto XDP Overview showing XDP Generic, live traffic, two allowed TCP ports, and BPF packet counters.](assets/readme/xdp-overview.png)](assets/readme/xdp-overview.png)
 
-**XDP Generic** on isolated Linux, captured November 8, 2026.
-Real HTTP requests reach approved ports 8080 and 9100; unapproved port 9090 is
-blocked.
+<p><sub><em>
+XDP Generic on isolated Linux, captured November 8, 2026.<br>
+Real HTTP requests reach approved ports 8080 and 9100; unapproved port 9090 is blocked.
+</em></sub></p>
 
 ## Why Auto XDP?
 
@@ -153,42 +154,44 @@ Click any preview to open the full-size image.
     <td width="50%" valign="top">
       <strong>Events · packet decisions</strong><br>
       <a href="assets/readme/xdp-events.png"><img src="assets/readme/xdp-events.png" width="100%" alt="XDP Events showing sampled allow and drop decisions, including PORT_NOT_AUTHORIZED for TCP 9090."></a>
-      <br><sub>Recorded packet samples with allow/drop reasons.</sub>
+      <br><sub><em>Recorded packet samples with allow/drop reasons.</em></sub>
     </td>
     <td width="50%" valign="top">
       <strong>BPF Maps · live firewall state</strong><br>
       <a href="assets/readme/xdp-maps.png"><img src="assets/readme/xdp-maps.png" width="100%" alt="Live XDP BPF maps showing their types, entry counts, and kernel-reported memory."></a>
-      <br><sub>Pinned maps, entry counts, and reported memory.</sub>
+      <br><sub><em>Pinned maps, entry counts, and reported memory.</em></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <strong>Audit · service authorization</strong><br>
       <a href="assets/readme/xdp-audit.png"><img src="assets/readme/xdp-audit.png" width="100%" alt="XDP audit showing approved web and metrics services and the denied admin service on TCP 9090."></a>
-      <br><sub>Approved web and metrics services; admin access denied.</sub>
+      <br><sub><em>Approved web and metrics services; admin access denied.</em></sub>
     </td>
     <td width="50%" valign="top">
       <strong>Requests · review before approval</strong><br>
       <a href="assets/readme/xdp-requests.png"><img src="assets/readme/xdp-requests.png" width="100%" alt="Pending approval request for the admin service on TCP 9090 in the XDP session."></a>
-      <br><sub>The admin listener stays blocked while approval is pending.</sub>
+      <br><sub><em>The admin listener stays blocked while approval is pending.</em></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <strong>Handlers · optional protection</strong><br>
       <a href="assets/readme/xdp-handlers.png"><img src="assets/readme/xdp-handlers.png" width="100%" alt="XDP handler catalog with optional protection modules listed and none enabled in this demonstration."></a>
-      <br><sub>Module availability; optional handlers are not enabled here.</sub>
+      <br><sub><em>Module availability; optional handlers are not enabled here.</em></sub>
     </td>
     <td width="50%" valign="top">
       <strong>nftables · fallback example</strong><br>
       <a href="assets/readme/linux-overview.png"><img src="assets/readme/linux-overview.png" width="100%" alt="Separate same-day nftables capture showing real traffic and two allowed TCP ports."></a>
-      <br><sub>A separate same-day Linux test using the fallback backend.</sub>
+      <br><sub><em>A separate same-day Linux test using the fallback backend.</em></sub>
     </td>
   </tr>
 </table>
 
-Images are rendered from real terminal captures in an isolated Linux test
-environment. They show functional behavior, not a throughput benchmark.
+<p><sub><em>
+Images are rendered from real terminal captures in an isolated Linux test environment.
+They show functional behavior, not a throughput benchmark.
+</em></sub></p>
 
 ## Documentation
 
