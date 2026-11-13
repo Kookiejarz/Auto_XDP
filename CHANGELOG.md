@@ -2,6 +2,103 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Documentation
+- Refreshed the README with a theme-aware logo, grouped icon badges, clearer
+  navigation, and seven screenshots from real isolated Linux sessions.
+  Screenshot captions now use consistent small italic text.
+- Updated the roadmap around distribution compatibility, the operator panel,
+  native packaging and repository inclusion, and protection-module quality.
+
+## v26.11.12a - 2026-11-12
+
+### Added
+- **Service-aware authorization:** explicit workload grants matched against
+  live listeners, service ownership, destination addresses, interfaces, and
+  network zones. Discovery alone does not authorize incoming connections.
+  The CLI and TUI support discovery, audit explanations, approval requests,
+  and approval history.
+- **Connection-aware reply admission:** Linux conntrack checks for replies to
+  outgoing IPv4/IPv6 TCP and UDP connections, with managed activation rules
+  and recovery if those rules disappear. Optional ICMP Echo Reply validation
+  uses the bundled `axdp_icmp` kernel dependency.
+- **Optional SYN-cookie protection:** service-aware IPv4/IPv6 challenges,
+  listener handoff through a TC ingress companion, and shared challenge,
+  validation, and handoff telemetry.
+- **Protection-module management:** discovery, installation, configuration,
+  draft/save/apply operations, and build/activation diagnostics for built-in
+  and custom modules through the CLI and TUI. Modules can declare typed
+  compiler settings and kernel dependencies.
+- **Paired handler entries and compatible state reuse:** one module can share
+  private state between XDP ingress and TC egress. Declared public maps and
+  private-state contracts are checked before activation; compatible replacement
+  preserves existing state, while incompatible replacement retains the running
+  handler.
+- **Operator visibility:** responsive dashboard, service approvals, packet
+  decisions, handler inventory, and BPF map views; versioned packet events,
+  explicit loss counters, bounded relay replay, and optional local GeoIP
+  enrichment.
+
+### Changed
+- Policy reconciliation now uses a shared configuration snapshot and explicit
+  observed, desired, and applied state. Revocation precedes preparation and
+  admission, and failed or unconfirmed operations remain visible.
+- SYN Cookie, ICMP, and protocol/port/profile handlers use a common module
+  lifecycle with verified publication, rollback, and ownership-aware cleanup.
+  Minecraft session proof is tied to full policy/profile generations and
+  observed server progress.
+- Dedicated notification reception and relay wakeups reduce avoidable discovery
+  delays. XDP reply paths defer unnecessary timestamp/configuration reads;
+  per-CPU traffic totals and batched map verification reduce repeated work.
+- Interface discovery uses kernel attributes. Attachment mode and backend
+  coverage are verified, container interfaces require explicit opt-in, and ENA
+  fallback preserves the configured MTU.
+
+### Fixed
+- Grants tied to temporarily absent zone interfaces wait for those interfaces
+  instead of widening access. Port inspection reports effective scoped policy.
+- Corrected UDP policy structure writes and bounded transport parsing by the
+  declared IP length rather than trailing packet bytes.
+- Corrected SYN-cookie rate budgets, ACK grace handling, ECN negotiation,
+  packet lengths, and native-XDP handoff tailroom. Unsupported or unverifiable
+  NAT configurations are rejected before listener handoff.
+- Relay reconnects retry while packet events are unavailable, reset retained
+  socket history when sessions change, and report listener closure accurately.
+- Improved vendor-kernel verifier diagnostics, host architecture build flags,
+  and ICMP kfunc resolution on newer kernels. Installed payload validation,
+  transactional reload/recovery, and configuration permissions were hardened.
+
+### Upgrade notes
+- Back up `/etc/auto_xdp/config.toml`. Non-empty legacy `permanent_ports` rules
+  must be migrated to workload exposure grants and zones; empty legacy port
+  sections remain accepted.
+- Fresh installations start in audit mode. Authorize SSH and intended public
+  services, inspect the decisions, then enable enforcement explicitly.
+- Upgrade the controller, BPF objects, map manifests, and handlers together.
+  Incompatible pinned programs/maps fail readiness checks.
+- XDP requires the kernel conntrack lookup/release capabilities checked by the
+  loader. Required XDP profiles and SYN-cookie protection remain closed when
+  unavailable, including on nftables fallback. Optional SYN-cookie handoff
+  also requires request-socket support and a verified NAT-free namespace.
+- Optional ICMP validation needs the running kernel's development files and
+  module BTF support when its dependency must be built. Secure Boot requires
+  a trusted module signature; this dependency is not managed by DKMS.
+
+### Validation
+- Release validation passed **11/11 jobs**, including static/type/unit/component
+  checks, installer smoke tests, and Ubuntu nftables fallback end-to-end checks.
+- Installation, compilation, and overwrite reinstall passed on Debian, Ubuntu,
+  Fedora, openSUSE, Arch, Alpine, AlmaLinux, and Rocky Linux containers. These
+  share the runner kernel and do not establish eight separate kernel-support
+  results.
+- Ubuntu XDP lifecycle validation passed **35/35 real kernel integration cases**,
+  including generic/native ICMP replies and SYN-cookie native handoff, plus
+  upgrade/rollback, uninstall, and reinstall checks. These are functional
+  results, not a new throughput or latency benchmark.
+
+[Release and migration details](https://github.com/Kookiejarz/Auto_XDP/releases/tag/v26.11.12a)
+· [Release validation](https://github.com/Kookiejarz/Auto_XDP/actions/runs/43178017402)
 
 ## 2026-08-31
 
