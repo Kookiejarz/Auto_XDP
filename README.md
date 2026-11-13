@@ -1,18 +1,44 @@
-# Auto XDP
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="svg/Auto_XDP_logo_white.svg">
+    <source media="(prefers-color-scheme: light)" srcset="svg/Auto_XDP_logo_smooth.svg">
+    <img src="svg/Auto_XDP_logo_smooth.svg" width="180" height="180" alt="Auto XDP raptor logo">
+  </picture>
+</p>
 
-Auto XDP is a Linux firewall that keeps incoming access aligned with the services you approve. Manually maintained port rules can become outdated as services start, stop, or change. You choose which services and ports may accept connections; with enforcement enabled, Auto XDP adds or removes allow rules as matching listeners appear and disappear. This reduces repetitive firewall maintenance and prevents unapproved listeners from being exposed automatically.
+<h1 align="center">Auto XDP</h1>
+
+<p align="center">
+  <strong>A service-aware firewall for Linux</strong>
+</p>
+
+<p align="center">
+  Approve the services you want to expose.<br>
+  Auto XDP keeps incoming access in sync as they start and stop.
+</p>
+
+<p align="center">
+  <a href="https://axdp.dev/"><strong>Website</strong></a> ·
+  <a href="#installation"><strong>Install</strong></a> ·
+  <a href="#first-run">First run</a> ·
+  <a href="#more-screenshots">Screenshots</a> ·
+  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki">Wiki</a>
+</p>
 
 <p align="center">
   <a href="https://github.com/Kookiejarz/Auto_XDP/releases/latest"><img src="https://img.shields.io/github/v/release/Kookiejarz/Auto_XDP?style=flat-square&amp;label=Release&amp;logo=github&amp;logoColor=white" width="172" height="24" alt="Latest release"></a>
   <a href="https://github.com/Kookiejarz/Auto_XDP/actions/workflows/distro-check.yml"><img src="https://img.shields.io/github/actions/workflow/status/Kookiejarz/Auto_XDP/distro-check.yml?branch=main&amp;style=flat-square&amp;label=CI&amp;logo=githubactions&amp;logoColor=white" width="109" height="24" alt="Distro Checks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg?style=flat-square&amp;logo=opensourceinitiative&amp;logoColor=white" width="145" height="24" alt="License: MPL 2.0"></a>
-  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade#requirements"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB.svg?style=flat-square&amp;logo=python&amp;logoColor=white" width="131" height="24" alt="Python 3.10 or newer"></a>
-  <a href="https://ebpf.io/"><img src="https://img.shields.io/badge/eBPF%2FXDP-blue.svg?style=flat-square&amp;logo=linux&amp;logoColor=white" width="100" height="24" alt="eBPF / XDP"></a>
-  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade#requirements"><img src="https://img.shields.io/badge/systemd%20%2F%20OpenRC-555555.svg?style=flat-square&amp;logo=linux&amp;logoColor=white" width="157" height="24" alt="systemd and OpenRC"></a>
 </p>
 
 <p align="center">
+  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade#requirements"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB.svg?style=flat-square&amp;logo=python&amp;logoColor=white" width="131" height="24" alt="Python 3.10 or newer"></a>
+  <a href="https://ebpf.io/"><img src="https://img.shields.io/badge/eBPF%2FXDP-blue.svg?style=flat-square&amp;logo=linux&amp;logoColor=white" width="100" height="24" alt="eBPF / XDP"></a>
+  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade#requirements"><img src="https://img.shields.io/badge/systemd%20%2F%20OpenRC-555555.svg?style=flat-square&amp;logo=linux&amp;logoColor=white" width="157" height="24" alt="systemd and OpenRC"></a>
   <a href="https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade#requirements"><img src="https://img.shields.io/badge/XDP_needs-CT_kfuncs-blue.svg?style=flat-square&amp;logo=linux&amp;logoColor=white" width="181" height="24" alt="XDP backend requires kernel conntrack lookup and release kfuncs"></a>
+</p>
+
+<p align="center">
   <a href="https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade#requirements"><img src="https://img.shields.io/badge/Debian%2FUbuntu-A81D33.svg?style=flat-square&amp;logo=debian&amp;logoColor=white" width="133" height="24" alt="Debian and Ubuntu supported"></a>
   <a href="https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade#requirements"><img src="https://img.shields.io/badge/Fedora%2FRHEL-294172.svg?style=flat-square&amp;logo=fedora&amp;logoColor=white" width="119" height="24" alt="Fedora and RHEL supported"></a>
   <a href="https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade#requirements"><img src="https://img.shields.io/badge/openSUSE-73BA25.svg?style=flat-square&amp;logo=opensuse&amp;logoColor=white" width="102" height="24" alt="openSUSE supported"></a>
@@ -20,13 +46,7 @@ Auto XDP is a Linux firewall that keeps incoming access aligned with the service
   <a href="https://github.com/Kookiejarz/Auto_XDP/wiki/Installation-and-Upgrade#requirements"><img src="https://img.shields.io/badge/Alpine-0D597F.svg?style=flat-square&amp;logo=alpinelinux&amp;logoColor=white" width="73" height="24" alt="Alpine Linux supported"></a>
 </p>
 
-<p align="center">
-  <a href="#installation">📦 Install</a> ·
-  <a href="#first-run">🚀 First run</a> ·
-  <a href="#more-screenshots">🖼️ Screenshots</a> ·
-  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki">📚 Wiki</a> ·
-  <a href="https://axdp.dev/">🌐 Website</a>
-</p>
+<br>
 
 [![Auto XDP Overview showing XDP Generic, live traffic, two allowed TCP ports, and BPF packet counters.](assets/readme/xdp-overview.png)](assets/readme/xdp-overview.png)
 
@@ -35,6 +55,10 @@ Real HTTP requests reach approved ports 8080 and 9100; unapproved port 9090 is
 blocked.
 
 ## Why Auto XDP?
+
+Manually maintained port rules can become outdated as services start, stop or
+change. Auto XDP matches your approvals to live listeners and keeps active
+allow rules current, reducing repetitive firewall maintenance.
 
 - **Keep rules aligned with services.** Approve access once; active allow rules
   follow the service's listeners.
