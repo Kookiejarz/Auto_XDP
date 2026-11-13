@@ -15,3 +15,13 @@ docs/
 /reproducible-tests/
 /verifier-variants*
 /tests/website-theme.cjs
+
+# Publish only the screenshots used by the project README.
+/assets/readme/*
+!/assets/readme/xdp-overview.png
+!/assets/readme/xdp-events.png
+!/assets/readme/xdp-maps.png
+!/assets/readme/xdp-audit.png
+!/assets/readme/xdp-requests.png
+!/assets/readme/xdp-handlers.png
+!/assets/readme/linux-overview.png
