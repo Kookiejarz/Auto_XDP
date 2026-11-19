@@ -651,6 +651,33 @@ def test_handler_editor_save_apply_and_cancel_are_distinct(tmp_path, monkeypatch
     assert [call.kwargs["apply"] for call in configure.call_args_list] == expected
 
 
+@pytest.mark.component
+def test_handler_editor_rejects_a_form_opened_before_another_edit(tmp_path, monkeypatch):
+    import os
+    from auto_xdp.admin import config_file, handler_catalog as catalog
+    from auto_xdp.tui.handler_editor import edit_handler
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "fchown", lambda *args: None)
+    context = catalog.Context(tmp_path / "config", tmp_path, tmp_path / "custom", tmp_path / "bpf", tmp_path / "run")
+    config_file.write_toml(context.config, {"modules": {"icmp": {"enabled": False}}})
+    module = catalog.select(context, "icmp")
+    keys = iter([ord("s"), 27])
+    class EditorScreen(Canvas):
+        def timeout(self, value):
+            pass
+        def getch(self):
+            key = next(keys)
+            if key == ord("s"):
+                document = config_file.read_snapshot(context.config)
+                document.data["modules"]["icmp"]["enabled"] = True
+                document.save()
+            return key
+    result = edit_handler(EditorScreen(24, 80), HandlerRow("AVAILABLE", 1, None, "ICMP", "available", module=module),
+                          context, lambda *args: "")
+    assert "Configuration changed" in result
+    assert config_file.load_toml(context.config) == {"modules": {"icmp": {"enabled": True}}}
+
+
 def test_runtime_row_edits_its_binding_instead_of_last_saved_target():
     from auto_xdp.admin import handler_catalog as catalog
     from auto_xdp.tui.handler_editor import form_values
@@ -861,3 +888,42 @@ def test_audit_mouse_selects_without_approving(mouse_main, monkeypatch):
     draw = mouse_main(snap, [(0, 10, 5, 0, curses.BUTTON1_DOUBLE_CLICKED)], initial="audit")
     approve.assert_not_called()
     assert draw.call_args.args[15] == 1
+
+
+@pytest.mark.component
+@pytest.mark.parametrize("intervening_edit", [False, True])
+def test_retry_after_saved_activation_failure(tmp_path, monkeypatch, intervening_edit):
+    import os
+    from auto_xdp.admin import config_file, handler_catalog as catalog
+    from auto_xdp.tui.handler_editor import edit_handler
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "fchown", lambda *args: None)
+    context = catalog.Context(tmp_path / "config", tmp_path, tmp_path / "custom", tmp_path / "bpf", tmp_path / "run")
+    config_file.write_toml(context.config, {"policy": {"mode": "audit"}})
+    module = catalog.select(context, "icmp")
+    activate = mock.Mock(side_effect=[RuntimeError("activation deferred"), {}])
+    monkeypatch.setattr(catalog, "_refresh_managed_runtime", activate)
+    keys = iter([ord("a"), ord("a"), 27])
+
+    class EditorScreen(Canvas):
+        def timeout(self, value):
+            pass
+
+        def getch(self):
+            key = next(keys)
+            if key == ord("a") and activate.call_count and intervening_edit:
+                other = config_file.read_snapshot(context.config)
+                other.data["daemon"] = {"log_level": "debug"}
+                other.save()
+            return key
+
+    result = edit_handler(EditorScreen(24, 90), HandlerRow("AVAILABLE", 1, None, "ICMP", "available", module=module),
+                          context, lambda *args: "")
+    if intervening_edit:
+        assert "Configuration changed" in result
+        assert config_file.load_toml(context.config)["daemon"]["log_level"] == "debug"
+        assert activate.call_count == 1
+    else:
+        assert "Configuration saved" in result
+        assert activate.call_count == 2

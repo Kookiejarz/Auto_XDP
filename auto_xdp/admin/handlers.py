@@ -970,14 +970,15 @@ def _cleanup_existing_port_handler(bpf_pin_dir: Path, proto: str, port: int) -> 
 
 
 def port_handler_config_update(config_path: Path, proto: str, port: int, path: str | None) -> None:
-    cfg_path, data = config_file.load_config(str(config_path))
+    document = config_file.read_snapshot(config_path)
+    data = document.data
     port_handlers = data.setdefault("port_handlers", {})
     table = port_handlers.setdefault(proto, {})
     if path is None:
         table.pop(str(port), None)
     else:
         table[str(port)] = path
-    config_file.write_toml(cfg_path, data)
+    document.save()
 
 
 def iter_configured_port_handlers(config_path: Path) -> list[tuple[str, int, str]]:

@@ -50,9 +50,9 @@ def test_approval_retry_keeps_original_port_contribution(request_files, failure)
     published = failure == "ledger"
     assert approvals.list_grants(config)[0]["ports"] == ([80, 443] if published else [80])
     # An unrelated edit between the crash and the next management command survives recovery.
-    data = config_file.load_toml(config)
-    data["daemon"] = {"log_level": "debug"}
-    config_file.write_toml(config, data)
+    document = config_file.read_snapshot(config)
+    document.data["daemon"] = {"log_level": "debug"}
+    document.save()
     assert approvals.list_requests(store)[0]["status"] == ("approved" if published else "pending")
     assert approvals.reload_daemon.call_count == int(published)
 
@@ -121,7 +121,7 @@ def test_allow_reports_saved_policy_when_openrc_restart_fails(tmp_path, monkeypa
     config.write_text("[zones.public]\ninterfaces = []\n")
     monkeypatch.delenv("AUTO_XDP_APPROVAL_STORE", raising=False)
     monkeypatch.setattr(approvals.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(approvals.os, "chown", Mock())
+    monkeypatch.setattr(approvals.os, "fchown", Mock())
     is_dir = Path.is_dir
     monkeypatch.setattr(Path, "is_dir", lambda path: path != Path("/run/systemd/system") and is_dir(path))
     monkeypatch.setattr(approvals.shutil, "which", lambda name: "/sbin/rc-service")

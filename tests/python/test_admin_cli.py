@@ -115,7 +115,7 @@ with tempfile.TemporaryDirectory() as directory:
             config_path.write_text("[zones.public]\ninterfaces = []\n[policy]\nmode = \"audit\"\n")
 
             with mock.patch.object(admin_cli.os, "geteuid", return_value=0), \
-                 mock.patch.object(admin_cli.os, "chown"), \
+                 mock.patch.object(admin_cli.os, "fchown"), mock.patch.object(admin_cli.os, "chown"), \
                  mock.patch.object(approvals, "reload_daemon"):
                 self.assertEqual(admin_cli.main([
                     "--config", str(config_path), "--run-state-dir", str(run_dir),
@@ -144,7 +144,7 @@ with tempfile.TemporaryDirectory() as directory:
             config_path.write_text("[zones.public]\ninterfaces = []\n[policy]\nmode = \"audit\"\n")
 
             with mock.patch.object(admin_cli.os, "geteuid", return_value=0), \
-                 mock.patch.object(admin_cli.os, "chown"), \
+                 mock.patch.object(admin_cli.os, "fchown"), mock.patch.object(admin_cli.os, "chown"), \
                  mock.patch.object(approvals, "reload_daemon"):
                 self.assertEqual(admin_cli.main([
                     "--config", str(config_path), "--run-state-dir", str(run_dir),
@@ -165,7 +165,7 @@ with tempfile.TemporaryDirectory() as directory:
             config_path.write_text("[firewall]\nbogon_filter = false\n[policy]\nmode = \"audit\"\n")
 
             with mock.patch.object(admin_cli.os, "geteuid", return_value=0), \
-                 mock.patch.object(admin_cli.os, "chown"):
+                 mock.patch.object(admin_cli.os, "fchown"), mock.patch.object(admin_cli.os, "chown"):
                 self.assertEqual(
                     admin_cli.main(["--config", str(config_path), "policy", "mode", "enforce"]),
                     0,
@@ -466,7 +466,7 @@ with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(admin_cli.main(["--config", str(config_path), "config", "init"]), 0)
             self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
 
-            config_file.write_toml(config_path, {"policy": {"mode": "enforce"}})
+            config_file.read_snapshot(config_path).save({"policy": {"mode": "enforce"}})
             self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
 
     def test_approval_new_subject_requires_runtime_identity(self):

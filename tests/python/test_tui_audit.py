@@ -23,6 +23,7 @@ def audit(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "get_listening_ports", lambda **kwargs: observed)
     monkeypatch.setattr(app.os, "geteuid", lambda: 0)
     monkeypatch.setattr(app.os, "chown", lambda *args: None)
+    monkeypatch.setattr(app.os, "fchown", lambda *args: None)
     monkeypatch.setattr(approvals, "reload_daemon", Mock())
     monkeypatch.delenv("AUTO_XDP_APPROVAL_STORE", raising=False)
     args = SimpleNamespace(config=str(config), run_state_dir=str(tmp_path / "run"))
@@ -76,9 +77,10 @@ def test_audit_requires_usable_identity(audit, attribution):
 
 
 def test_audit_approval_respects_explicit_deny(audit):
-    config = config_file.load_toml(audit.config)
+    document = config_file.read_snapshot(audit.config)
+    config = document.data
     config["subjects"] = {"ssh_admin": {"resolve": {"systemd_unit": "sshd.service"}, "exposure": {"public": {"deny": True}}}}
-    config_file.write_toml(audit.config, config)
+    document.save()
     with pytest.raises(ValueError, match="policy conflict"):
         app._approve_audit_row(audit.args, selected(audit))
     assert config_file.load_toml(audit.config) == config

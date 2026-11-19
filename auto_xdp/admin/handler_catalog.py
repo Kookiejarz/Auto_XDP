@@ -650,14 +650,26 @@ def _managed_result(context: Context, module: Module, values: dict[str, Any], en
     return f"{module.name} applied; program {program_id} is in the dispatch table."
 
 
-def configure(context: Context, module: Module, updates: dict[str, Any], *, apply: bool = False) -> str:
+class ActivationError(RuntimeError):
+    """Live activation failed after this specific configuration revision was saved."""
+
+    def __init__(self, cause: Exception, revision: str):
+        super().__init__(f"Configuration saved, but activation failed: {cause}")
+        self.revision = revision
+
+
+def configure(context: Context, module: Module, updates: dict[str, Any], *, apply: bool = False,
+              expected_revision: str | None = None) -> str:
     if os.geteuid() != 0:
         raise PermissionError("Handler changes require root; re-run axdp with sudo")
     if module.error:
         raise ValueError(module.error)
     context.handlers_dir.mkdir(parents=True, exist_ok=True)
     with handlers._handler_lock(context.handlers_dir):
-        data = config_file.load_toml(context.config)
+        document = config_file.read_snapshot(context.config)
+        if expected_revision is not None and document.revision != expected_revision:
+            raise config_file.ConfigConflictError("Configuration changed; reload the settings and retry (no changes saved)")
+        data = document.data
         values = validate(module, {**settings(module, data), **updates})
         obj = None
         if apply and values["enabled"] and module.kind not in {"minecraft", "syncookie", "icmp"}:
@@ -669,7 +681,7 @@ def configure(context: Context, module: Module, updates: dict[str, Any], *, appl
                 # Validate built-in configuration fields even when saving a draft.
                 if module.kind in {"minecraft", "syncookie", "icmp"}:
                     _effective_config(module, values, data, Path(module.path))
-            config_file.write_toml(context.config, candidate)
+            saved_revision = document.save(candidate)
         except Exception:
             if obj is not None and (obj.parent / ".catalog-build.json").is_file():
                 # A writer may have failed after its atomic rename. Retain the
@@ -711,7 +723,7 @@ def configure(context: Context, module: Module, updates: dict[str, Any], *, appl
                 pass
             return f"{'Applied' if values['enabled'] else 'Disabled'} {module.name} at {kind}/{target}."
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"Configuration saved, but activation failed: {exc}") from exc
+            raise ActivationError(exc, saved_revision) from exc
 
 
 def install(context: Context, source: Path, *, name: str = "", kind: str = "custom", target: int = 0) -> Module:

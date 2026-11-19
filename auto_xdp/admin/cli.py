@@ -66,20 +66,16 @@ def _cmd_config_show(args: argparse.Namespace) -> int:
 
 def _cmd_config_init(args: argparse.Namespace) -> int:
     path = Path(args.config)
-    if path.exists():
+    if not config_file.ensure_config_exists(path):
         print(f"Config already exists: {path}  (use 'axdp config show' to view)")
         return 0
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(config_file.default_config_template())
-    path.chmod(0o600)
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        os.chown(path, 0, 0)
     print(f"Created: {path}")
     return 0
 
 
 def _cmd_log_level(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     if not args.level:
         print(str(data.get("daemon", {}).get("log_level", "warning")).lower())
         return 0
@@ -92,13 +88,14 @@ def _cmd_log_level(args: argparse.Namespace) -> int:
 
     daemon = data.setdefault("daemon", {})
     daemon["log_level"] = level
-    config_file.write_toml(path, data)
+    document.save()
     print(f"daemon.log_level={level}")
     return 0
 
 
 def _cmd_under_attack(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     under_attack = data.setdefault("under_attack", {})
 
     if not args.mode:
@@ -114,7 +111,7 @@ def _cmd_under_attack(args: argparse.Namespace) -> int:
 
     enabled = mode == "on"
     under_attack["enabled"] = enabled
-    config_file.write_toml(path, data)
+    document.save()
     print(f"under_attack.enabled={'true' if enabled else 'false'}")
     return 0
 
@@ -132,19 +129,21 @@ def _cmd_trust_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_trust_add(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     cidr = _normalize_cidr(args.cidr)
     data.setdefault("trusted_ips", {})[cidr] = args.label
-    config_file.write_toml(path, data)
+    document.save()
     print(f"Added trusted: {cidr} ({args.label})")
     return 0
 
 
 def _cmd_trust_del(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     cidr = _normalize_cidr(args.cidr)
     data.setdefault("trusted_ips", {}).pop(cidr, None)
-    config_file.write_toml(path, data)
+    document.save()
     print(f"Removed trusted: {cidr}")
     return 0
 
@@ -168,7 +167,8 @@ def _cmd_acl_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_acl_add(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     cidr = _normalize_cidr(args.cidr)
     ports = _normalize_ports(args.ports)
     rules = data.setdefault("acl", [])
@@ -182,13 +182,14 @@ def _cmd_acl_add(args: argparse.Namespace) -> int:
     ]
     rules.append({"proto": args.proto, "cidr": cidr, "ports": ports})
     data["acl"] = rules
-    config_file.write_toml(path, data)
+    document.save()
     print(f"Added ACL: {args.proto} {cidr} ports {' '.join(str(port) for port in ports)}")
     return 0
 
 
 def _cmd_acl_del(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     cidr = _normalize_cidr(args.cidr)
     data["acl"] = [
         rule
@@ -198,34 +199,37 @@ def _cmd_acl_del(args: argparse.Namespace) -> int:
             and _normalize_cidr(str(rule.get("cidr"))) == cidr
         )
     ]
-    config_file.write_toml(path, data)
+    document.save()
     print(f"Removed ACL: {args.proto} {cidr}")
     return 0
 
 
 def _cmd_slot_enable_builtin(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     slots = data.setdefault("slots", {})
     enabled = slots.setdefault("enabled", [])
     if args.name not in enabled:
         enabled.append(args.name)
-    config_file.write_toml(path, data)
+    document.save()
     return 0
 
 
 def _cmd_slot_enable_custom(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     slots = data.setdefault("slots", {})
     enabled = slots.setdefault("enabled", [])
     enabled = [entry for entry in enabled if not (isinstance(entry, dict) and entry.get("proto") == args.proto)]
     enabled.append({"proto": args.proto, "path": args.path})
     slots["enabled"] = enabled
-    config_file.write_toml(path, data)
+    document.save()
     return 0
 
 
 def _cmd_slot_disable(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     builtin_name = handlers.BUILTIN_SLOT_PROTO.get(args.proto)
     slots = data.setdefault("slots", {})
     enabled = slots.get("enabled", [])
@@ -235,7 +239,7 @@ def _cmd_slot_disable(args: argparse.Namespace) -> int:
         if not (isinstance(entry, str) and entry == builtin_name)
         and not (isinstance(entry, dict) and int(entry.get("proto", -1)) == args.proto)
     ]
-    config_file.write_toml(path, data)
+    document.save()
     return 0
 
 
@@ -811,45 +815,49 @@ def _cmd_exclude_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_exclude_port_add(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     new_ports = _normalize_ports(args.ports)
     discovery = data.setdefault("discovery", {})
     existing = sorted({int(p) for p in discovery.get("exclude_ports", [])} | set(new_ports))
     discovery["exclude_ports"] = existing
-    config_file.write_toml(path, data)
+    document.save()
     for port in new_ports:
         print(f"Excluded port: {port}")
     return 0
 
 
 def _cmd_exclude_port_del(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     del_ports = set(_normalize_ports(args.ports))
     discovery = data.setdefault("discovery", {})
     existing = sorted({int(p) for p in discovery.get("exclude_ports", [])} - del_ports)
     discovery["exclude_ports"] = existing
-    config_file.write_toml(path, data)
+    document.save()
     for port in sorted(del_ports):
         print(f"Un-excluded port: {port}")
     return 0
 
 
 def _cmd_exclude_src_add(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     new_cidrs = [_normalize_cidr(c) for c in args.cidrs]
     discovery = data.setdefault("discovery", {})
     existing = sorted(
         set(_normalize_cidr(c) for c in discovery.get("exclude_bind_cidrs", [])) | set(new_cidrs)
     )
     discovery["exclude_bind_cidrs"] = existing
-    config_file.write_toml(path, data)
+    document.save()
     for cidr in new_cidrs:
         print(f"Excluded src: {cidr}")
     return 0
 
 
 def _cmd_exclude_src_del(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     del_cidrs = {_normalize_cidr(c) for c in args.cidrs}
     discovery = data.setdefault("discovery", {})
     existing = sorted(
@@ -858,7 +866,7 @@ def _cmd_exclude_src_del(args: argparse.Namespace) -> int:
         if _normalize_cidr(c) not in del_cidrs
     )
     discovery["exclude_bind_cidrs"] = existing
-    config_file.write_toml(path, data)
+    document.save()
     for cidr in sorted(del_cidrs):
         print(f"Un-excluded src: {cidr}")
     return 0
@@ -981,14 +989,15 @@ def _cmd_policy_grants(args: argparse.Namespace) -> int:
 
 
 def _cmd_policy_mode(args: argparse.Namespace) -> int:
-    path, data = config_file.load_config(args.config)
+    document = config_file.read_snapshot(Path(args.config))
+    data = document.data
     policy_config = data.setdefault("policy", {})
     current = str(policy_config.get("mode", "audit")).lower()
     if args.mode is None:
         print(current)
         return 0
     policy_config["mode"] = args.mode
-    config_file.write_toml(path, data)
+    document.save()
     print(f"policy.mode={args.mode}")
     return 0
 

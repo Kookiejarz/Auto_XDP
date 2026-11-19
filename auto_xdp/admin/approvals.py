@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from auto_xdp.admin.config_file import load_toml, stage_toml
+from auto_xdp.admin.config_file import ConfigDocument, checked_revision, load_toml, read_snapshot, stage_toml
 from auto_xdp.install_state import atomic_write_json
 
 
@@ -83,18 +83,19 @@ def _finish_policy_change(path: Path, journal: Path, staged: Path, state: dict[s
     return published
 
 
-def _commit_policy_change(path: Path, state: dict[str, Any], config_path: Path, config: dict[str, Any]) -> None:
-    journal = Path(f"{path}.transaction")
-    staged = stage_toml(config_path, config)
-    try:
-        _sync_directory(staged.parent)
-        _save(journal, {"staged_config": str(staged.absolute()), "state": state})
-        staged.replace(config_path)
-        _finish_policy_change(path, journal, staged, state)
-    finally:
-        # Keep an unpublished stage as evidence until its journal is removed.
-        if not journal.exists():
-            staged.unlink(missing_ok=True)
+def _commit_policy_change(path: Path, state: dict[str, Any], document: ConfigDocument) -> None:
+    with checked_revision(document.path, document.revision):
+        journal = Path(f"{path}.transaction")
+        staged = stage_toml(document.path, document.data)
+        try:
+            _sync_directory(staged.parent)
+            _save(journal, {"staged_config": str(staged.absolute()), "state": state})
+            staged.replace(document.path)
+            _finish_policy_change(path, journal, staged, state)
+        finally:
+            # Keep an unpublished stage as evidence until its journal is removed.
+            if not journal.exists():
+                staged.unlink(missing_ok=True)
 
 
 def _recover_policy_change(path: Path) -> None:
@@ -448,8 +449,8 @@ def approve_request(path: Path, config_path: str | Path, request_id: int, *, act
             return dict(request)
         if request.get("status") != "pending":
             raise ValueError(f"approval request {request_id} is {request.get('status')}")
-        config_path = Path(config_path)
-        config = load_toml(config_path)
+        document = read_snapshot(Path(config_path))
+        config = document.data
         _validate_request(dict(request), config=config)
         added = _apply_grant(config, request)
         request.update({
@@ -460,7 +461,7 @@ def approve_request(path: Path, config_path: str | Path, request_id: int, *, act
         })
         state["revision"] = int(state["revision"]) + 1
         _history(state, request, "approve", request["approver"])
-        _commit_policy_change(path, state, config_path, config)
+        _commit_policy_change(path, state, document)
         result = dict(request)
     return result
 
@@ -486,8 +487,8 @@ def revoke_request(path: Path, config_path: str | Path, request_id: int, *, acto
             return dict(request)
         if request.get("status") != "approved":
             raise ValueError(f"approval request {request_id} is {request.get('status')}")
-        config_path = Path(config_path)
-        config = load_toml(config_path)
+        document = read_snapshot(Path(config_path))
+        config = document.data
         protocol_spec = (
             config.get("subjects", {})
             .get(request["subject"], {})
@@ -501,7 +502,7 @@ def revoke_request(path: Path, config_path: str | Path, request_id: int, *, acto
         request.update({"status": "revoked", "revoker": _actor(actor), "revoked_at": time.time()})
         state["revision"] = int(state["revision"]) + 1
         _history(state, request, "revoke", request["revoker"])
-        _commit_policy_change(path, state, config_path, config)
+        _commit_policy_change(path, state, document)
         return dict(request)
 
 
@@ -525,8 +526,8 @@ def deny_grant(
         raise ValueError("denial reason is required")
 
     with _locked(path) as state:
-        config_path = Path(config_path)
-        config = load_toml(config_path)
+        document = read_snapshot(Path(config_path))
+        config = document.data
         subject_spec = config.get("subjects", {}).get(subject, {})
         protocol_spec = (
             subject_spec
@@ -569,7 +570,7 @@ def deny_grant(
         state["revision"] = int(state["revision"]) + 1
         state["requests"].append(request)
         _history(state, request, "deny", who)
-        _commit_policy_change(path, state, config_path, config)
+        _commit_policy_change(path, state, document)
         return dict(request)
 
 

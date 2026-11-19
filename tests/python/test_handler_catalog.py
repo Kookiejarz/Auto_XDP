@@ -16,6 +16,7 @@ from auto_xdp.tui.handlers import HandlerCache, collect_handlers
 def context(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr(os, "chown", lambda *args: None)
+    monkeypatch.setattr(os, "fchown", lambda *args: None)
     install = tmp_path / "release"
     (install / "handlers").mkdir(parents=True)
     root = tmp_path / "bpffs"
@@ -421,8 +422,8 @@ def test_post_rename_config_error_retains_referenced_object(context, compiler):
     source.write_text("int x;")
     module = catalog.Module("custom", "Custom", str(source), "tcp", 8080)
     real_write = config_file.write_toml
-    def write_then_fail(path, data):
-        real_write(path, data)
+    def write_then_fail(path, data, **kwargs):
+        real_write(path, data, **kwargs)
         raise OSError("post-rename failure")
     with mock.patch.object(config_file, "write_toml", side_effect=write_then_fail):
         with pytest.raises(OSError, match="post-rename"):

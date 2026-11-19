@@ -1,14 +1,18 @@
-"""TOML file loading and atomic writing shared by management clients."""
+"""Versioned TOML read/modify/write transactions shared by management clients."""
 from __future__ import annotations
 
 from importlib import resources
+from contextlib import contextmanager
+from dataclasses import dataclass
+import fcntl
+import hashlib
 import json
 import math
 import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 try:
     import tomllib
@@ -20,6 +24,62 @@ except ImportError:
 
 
 _BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+MISSING_REVISION = "missing"
+
+
+class ConfigConflictError(ValueError):
+    """The configuration changed since this edit was read."""
+
+
+@dataclass(frozen=True)
+class ConfigDocument:
+    path: Path
+    data: dict[str, Any]
+    revision: str
+
+    def save(self, data: dict[str, Any] | None = None) -> str:
+        """Commit this edit once, rejecting any intervening writer."""
+        return write_toml(self.path, self.data if data is None else data,
+                          expected_revision=self.revision)
+
+
+def _read_version(path: Path) -> tuple[bytes | None, str]:
+    try:
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            raw = handle.read()
+            after = os.fstat(handle.fileno())
+    except FileNotFoundError:
+        return None, MISSING_REVISION
+    def identity(value: os.stat_result) -> tuple[int, ...]:
+        return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    if identity(before) != identity(after):
+        raise ConfigConflictError(f"Configuration changed while reading {path}; reload and retry")
+    # Include file identity as well as content: replacing A with B and then A
+    # must not make an old editor's revision current again.
+    digest = hashlib.sha256(repr(identity(after)).encode("ascii") + b"\0" + raw).hexdigest()
+    return raw, digest
+
+
+def read_snapshot(path: Path) -> ConfigDocument:
+    path = path.resolve()
+    raw, revision = _read_version(path)
+    return ConfigDocument(path, {} if raw is None else _parse_toml(raw.decode("utf-8")), revision)
+
+
+@contextmanager
+def _config_lock(path: Path) -> Iterator[None]:
+    # Lock a stable sibling, never the TOML inode replaced by a commit. All
+    # writers use canonical paths, so symlink aliases share this lock.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(f"{path}.lock", flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def default_config_template() -> str:
@@ -30,12 +90,17 @@ def default_config_template() -> str:
 
 
 def load_toml(path: Path) -> dict[str, Any]:
-    if not path.exists():
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
+    return _parse_toml(text)
+
+
+def _parse_toml(text: str) -> dict[str, Any]:
     if tomllib is not None:
-        with path.open("rb") as fh:
-            return tomllib.load(fh)
-    return _parse_toml_fallback(path.read_text())
+        return tomllib.loads(text)
+    return _parse_toml_fallback(text)
 
 
 def _parse_toml_fallback(text: str) -> dict[str, Any]:
@@ -203,18 +268,16 @@ def _emit_table_body(table: dict[str, Any], path_parts: list[Any]) -> list[str]:
     return lines
 
 
-def stage_toml(path: Path, data: dict[str, Any]) -> Path:
-    """Prepare a complete replacement on the same filesystem as the destination."""
-    lines = _emit_table_body(data, [])
+def _stage_text(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     staged = Path(name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-            tmp.write("\n".join(lines).rstrip() + "\n")
-            staged.chmod(0o600)
-            if hasattr(os, "geteuid") and os.geteuid() == 0:
-                os.chown(staged, 0, 0)
+            os.fchmod(tmp.fileno(), 0o600)
+            if os.geteuid() == 0:
+                os.fchown(tmp.fileno(), 0, 0)
+            tmp.write(text)
             tmp.flush()
             os.fsync(tmp.fileno())
     except BaseException:
@@ -223,12 +286,44 @@ def stage_toml(path: Path, data: dict[str, Any]) -> Path:
     return staged
 
 
-def write_toml(path: Path, data: dict[str, Any]) -> None:
-    staged = stage_toml(path, data)
+def _toml_text(data: dict[str, Any]) -> str:
+    return "\n".join(_emit_table_body(data, [])).rstrip() + "\n"
+
+
+def stage_toml(path: Path, data: dict[str, Any]) -> Path:
+    """Create the durable same-directory stage used by the approval journal."""
+    return _stage_text(path, _toml_text(data))
+
+
+@contextmanager
+def checked_revision(path: Path, expected: str) -> Iterator[None]:
+    """Hold the common writer lock from revision validation through publication."""
+    with _config_lock(path):
+        if _read_version(path)[1] != expected:
+            raise ConfigConflictError(f"Configuration changed at {path}; reload and retry (no changes saved)")
+        yield
+
+
+def _atomic_write(path: Path, text: str) -> str:
+    staged = _stage_text(path, text)
     try:
         staged.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return _read_version(path)[1]
     finally:
         staged.unlink(missing_ok=True)
+
+
+def write_toml(path: Path, data: dict[str, Any], *, expected_revision: str = MISSING_REVISION) -> str:
+    """Publish a versioned edit. The default revision allows initial creation."""
+    text = _toml_text(data)
+    path = path.resolve()
+    with checked_revision(path, expected_revision):
+        return _atomic_write(path, text)
 
 
 def load_config(path: str) -> tuple[Path, dict[str, Any]]:
@@ -236,8 +331,13 @@ def load_config(path: str) -> tuple[Path, dict[str, Any]]:
     return config_path, load_toml(config_path)
 
 
-def ensure_config_exists(path: Path) -> None:
-    if path.exists():
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(default_config_template())
+def ensure_config_exists(path: Path, *, template: str | None = None) -> bool:
+    """Create a template once, without overwriting a concurrent initialization."""
+    path = path.resolve()
+    with _config_lock(path):
+        if _read_version(path)[1] != MISSING_REVISION:
+            return False
+        text = default_config_template() if template is None else template
+        _parse_toml(text)
+        _atomic_write(path, text)
+        return True

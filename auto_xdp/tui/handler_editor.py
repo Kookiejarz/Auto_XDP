@@ -87,7 +87,9 @@ def draw_errors(screen: Any, row: HandlerRow, scroll: int, *, operation_error: s
 
 def edit_handler(screen: Any, row: HandlerRow, context: handler_catalog.Context,
                  prompt: Callable[[Any, str], str]) -> str:
-    data = config_file.load_toml(context.config)
+    document = config_file.read_snapshot(context.config)
+    revision = document.revision
+    data = document.data
     module = row.module
     fields = handler_catalog.fields_for(module) if module else ()
     # Existing subjects are a finite selection, without creating exposure grants.
@@ -159,12 +161,22 @@ def edit_handler(screen: Any, row: HandlerRow, context: handler_catalog.Context,
             elif ch in (ord("s"), ord("a")) and module is not None:
                 try:
                     draw_form(screen, row, fields, values, cursor, "Applying…" if ch == ord("a") else "Saving…")
-                    result = handler_catalog.configure(context, module, values, apply=ch == ord("a"))
+                    result = handler_catalog.configure(context, module, values, apply=ch == ord("a"),
+                                                       expected_revision=revision)
+                    # Pair the next edit's values with the version actually read,
+                    # including a concurrent change made after our successful save.
+                    document = config_file.read_snapshot(context.config)
+                    revision = document.revision
+                    values = handler_catalog.settings(module, document.data)
+                    fields = tuple(replace(item, choices=tuple(sorted(document.data.get("subjects", {}))))
+                                   if item.name == "subject" else item for item in fields)
                     message = result
                     # Saving a draft does not resolve a failed activation.
                     if ch == ord("a"):
                         operation_error = ""
                 except (OSError, RuntimeError, ValueError) as exc:
+                    if isinstance(exc, handler_catalog.ActivationError):
+                        revision = exc.revision
                     message = str(exc)
                     result = message
                     operation_error = message

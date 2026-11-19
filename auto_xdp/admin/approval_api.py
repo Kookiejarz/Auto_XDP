@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from auto_xdp.admin import approvals
+from auto_xdp.admin.config_file import ConfigConflictError
 
 
 class _UnixHTTPServer(socketserver.UnixStreamServer):
@@ -98,6 +99,8 @@ class ApprovalHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"grants": approvals.list_grants(self.server.config_path)})
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except ConfigConflictError as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except approvals.PolicyReloadError as exc:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc), "policy_saved": True})
         except ValueError as exc:
@@ -149,6 +152,8 @@ class ApprovalHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, result)
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except ConfigConflictError as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except approvals.PolicyReloadError as exc:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc), "policy_saved": True})
         except (ValueError, RuntimeError, OSError) as exc:
