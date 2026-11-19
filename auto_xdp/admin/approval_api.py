@@ -85,20 +85,25 @@ class ApprovalHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self._authorized():
             return
-        if self.path.startswith("/v1/approvals"):
-            status = "all"
-            if "?status=" in self.path:
-                status = self.path.split("?status=", 1)[1].split("&", 1)[0]
-            self._json(HTTPStatus.OK, {"requests": approvals.list_requests(self.server.approval_store, status)})
-            return
-        if self.path == "/v1/audit":
-            revision, history = approvals.list_history(self.server.approval_store)
-            self._json(HTTPStatus.OK, {"revision": revision, "history": history})
-            return
-        if self.path == "/v1/grants":
-            self._json(HTTPStatus.OK, {"grants": approvals.list_grants(self.server.config_path)})
-            return
-        self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        try:
+            if self.path.startswith("/v1/approvals"):
+                status = "all"
+                if "?status=" in self.path:
+                    status = self.path.split("?status=", 1)[1].split("&", 1)[0]
+                self._json(HTTPStatus.OK, {"requests": approvals.list_requests(self.server.approval_store, status)})
+            elif self.path == "/v1/audit":
+                revision, history = approvals.list_history(self.server.approval_store)
+                self._json(HTTPStatus.OK, {"revision": revision, "history": history})
+            elif self.path == "/v1/grants":
+                self._json(HTTPStatus.OK, {"grants": approvals.list_grants(self.server.config_path)})
+            else:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except approvals.PolicyReloadError as exc:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc), "policy_saved": True})
+        except ValueError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except (RuntimeError, OSError) as exc:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
     def do_POST(self) -> None:
         if not self._authorized():
@@ -144,6 +149,8 @@ class ApprovalHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, result)
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except approvals.PolicyReloadError as exc:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc), "policy_saved": True})
         except (ValueError, RuntimeError, OSError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 

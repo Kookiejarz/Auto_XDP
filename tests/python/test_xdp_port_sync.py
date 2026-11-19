@@ -1516,7 +1516,7 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
 
         run_nft.assert_called_once()
         script = run_nft.call_args.kwargs["input_text"]
-        self.assertIn("delete table inet auto_xdp\ntable inet auto_xdp", script)
+        self.assertTrue(script.startswith("add table inet auto_xdp\ndelete table inet auto_xdp\ntable inet auto_xdp"))
         self.assertIn("elements = { 22, 443 }", script)
         self.assertIn("ip saddr @bogon_v4 counter drop", script)
         self.assertIn("ip saddr 203.0.113.0/24 tcp flags", script)
@@ -1566,14 +1566,22 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
         desired = state_mod.BackendProjection(tcp_ports={443})
         backend._remember_desired(desired)
 
-        with mock.patch.object(nftables_mod, "_run_nft") as run_nft:
+        present = subprocess.CompletedProcess([], 0)
+        missing = subprocess.CompletedProcess([], 1)
+        with mock.patch.object(nftables_mod, "_run_nft", return_value=present) as run_nft:
             backend.apply_reconcile_plan(
                 state_mod.ReconcilePlan(),
                 dry_run=False,
                 desired_state=desired,
             )
 
-        run_nft.assert_not_called()
+        run_nft.assert_called_once_with(["list", "set", "inet", "auto_xdp", "policy_schema_v2"], check=False)
+
+        with mock.patch.object(nftables_mod, "_run_nft", side_effect=[missing, present]) as run_nft:
+            result = backend.reconcile(desired, False)
+        self.assertTrue(result.successful)
+        self.assertEqual(run_nft.call_args.args[0], ["-f", "-"])
+        self.assertIn("elements = { 443 }", run_nft.call_args.kwargs["input_text"])
 
     def test_open_backend_validates_requested_backend(self):
         status = backends_mod.BackendStatus(

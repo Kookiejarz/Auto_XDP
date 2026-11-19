@@ -1060,6 +1060,7 @@ def _cmd_allow(args: argparse.Namespace) -> int:
         resolve=resolve,
         protection_profile=profile,
         actor=args.actor,
+        reuse_matching=True,
     )
     approved = approvals.approve_request(
         _approval_store(args), args.config, request["id"], actor=args.actor
@@ -1586,7 +1587,7 @@ def main(argv: list[str] | None = None) -> int:
         print("This command needs root; try re-running with sudo.", file=sys.stderr)
         return 77
     except (OSError, RuntimeError) as exc:
-        if args.command != "handler":
+        if args.command not in {"handler", "allow", "deny", "approval"}:
             raise
         print(str(exc), file=sys.stderr)
         return 1

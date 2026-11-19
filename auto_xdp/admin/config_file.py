@@ -203,19 +203,32 @@ def _emit_table_body(table: dict[str, Any], path_parts: list[Any]) -> list[str]:
     return lines
 
 
-def write_toml(path: Path, data: dict[str, Any]) -> None:
+def stage_toml(path: Path, data: dict[str, Any]) -> Path:
+    """Prepare a complete replacement on the same filesystem as the destination."""
     lines = _emit_table_body(data, [])
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as tmp:
-        tmp.write("\n".join(lines).rstrip() + "\n")
-        tmp_path = Path(tmp.name)
-    tmp_path.chmod(0o600)
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        os.chown(tmp_path, 0, 0)
-    tmp_path.replace(path)
-    path.chmod(0o600)
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        os.chown(path, 0, 0)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    staged = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write("\n".join(lines).rstrip() + "\n")
+            staged.chmod(0o600)
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                os.chown(staged, 0, 0)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def write_toml(path: Path, data: dict[str, Any]) -> None:
+    staged = stage_toml(path, data)
+    try:
+        staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def load_config(path: str) -> tuple[Path, dict[str, Any]]:

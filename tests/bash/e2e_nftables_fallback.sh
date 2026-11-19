@@ -108,9 +108,8 @@ ip netns exec "$NETNS" ip addr add "$NS_CIDR" dev "$PEER_IFACE"
 ip netns exec "$NETNS" ip link set dev "$PEER_IFACE" up
 ip netns exec "$NETNS" ip link set dev lo up
 
-# Stage the same local source tree the installer would consume, changing only
-# the supported TOML preference.  This exercises setup_xdp.sh's real install
-# and backend path; no nftables rule is created by this test.
+# Stage the local source with nftables selected and the private test subnet
+# allowed. The installer and controller manage the host-side rules.
 SOURCE_ROOT="$WORK_DIR/source"
 mkdir -p "$SOURCE_ROOT"
 for source_path in \
@@ -308,5 +307,8 @@ printf '[INFO] listener closed; waiting for daemon policy removal\n'
 wait_for_port_state "$LISTENER_PORT" absent
 tcp_probe "$LISTENER_PORT" blocked
 printf '[INFO] nftables policy removed listener port and blocked new traffic\n'
+
+ip netns exec "$NETNS" env PYTHONPATH="$PYTHON_LIB_DIR" "$PYTHON3_BIN" \
+    "$REPO_ROOT/tests/python/kernel_nftables_recovery.py"
 
 printf '[INFO] nftables fallback E2E passed; teardown will run test_uninstall.sh\n'

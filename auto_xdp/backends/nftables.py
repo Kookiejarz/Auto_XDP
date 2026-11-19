@@ -461,14 +461,17 @@ class NftablesBackend(PortBackend):
         else:
             rules.append("        counter accept")
 
-        prefix = f"delete table {desired.config.NFT_FAMILY} {desired.config.NFT_TABLE}\n" if replace else ""
+        table = f"table {desired.config.NFT_FAMILY} {desired.config.NFT_TABLE}"
+        # In the same batch, add is a no-op for an existing table and gives
+        # delete a valid target if the system firewall removed it since startup.
+        prefix = f"add {table}\ndelete {table}\n" if replace else ""
         body = "\n\n".join(blocks)
         chain = "\n".join(rules)
         scope_chain = ""
         if desired.endpoint_policy_enabled:
             scope_chain = "    chain endpoint_admission {\n" + "\n".join(self._endpoint_rules(desired)) + "\n    }\n\n"
         return (
-            f"{prefix}table {desired.config.NFT_FAMILY} {desired.config.NFT_TABLE} {{\n"
+            f"{prefix}{table} {{\n"
             f"{body}\n\n"
             f"{scope_chain}"
             "    chain input {\n"
@@ -592,15 +595,20 @@ class NftablesBackend(PortBackend):
                 zone_tcp_ports={zone: ports - {port for z, port in protected if z == zone}
                                 for zone, ports in desired_state.zone_tcp_ports.items()})
         signature = _policy_signature(desired_state)
-        if signature == self._policy_signature and not desired_state.endpoint_policy_enabled:
-            result.applied = self.get_applied_state()
-            return result
         operation = ApplyOperation("admit", "nftables", "atomic policy replacement")
         try:
+            if signature == self._policy_signature and not desired_state.endpoint_policy_enabled:
+                # A cached legacy projection may be reused while its table exists.
+                if dry_run or _run_nft(
+                    ["list", "set", self.config.NFT_FAMILY, self.config.NFT_TABLE, _NFT_SCHEMA_MARKER],
+                    check=False,
+                ).returncode == 0:
+                    result.applied = self.get_applied_state()
+                    return result
             self._install_ruleset(desired_state, replace=True, dry_run=dry_run)
         except (RuntimeError, OSError) as exc:
             result.failures.append(ApplyFailure(operation, str(exc)))
-            result.unconfirmed["target"] = "transaction rejected; previous rules remain active"
+            result.unconfirmed["target"] = "could not confirm the active nftables policy"
         else:
             if not dry_run:
                 self._remember_desired(desired_state)

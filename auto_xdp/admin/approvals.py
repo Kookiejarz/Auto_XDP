@@ -1,18 +1,22 @@
 """Root-owned exposure approval workflow and management API primitives."""
 from __future__ import annotations
 
+import copy
 import fcntl
 import json
 import os
 import re
+import shutil
+import signal
+import stat
 import subprocess
-import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from auto_xdp.admin.config_file import load_toml, write_toml
+from auto_xdp.admin.config_file import load_toml, stage_toml
+from auto_xdp.install_state import atomic_write_json
 
 
 APPROVAL_SCHEMA = 1
@@ -48,15 +52,67 @@ def _load(path: Path) -> dict[str, Any]:
     return data
 
 
+def _sync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _save(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-        tmp_path = Path(fh.name)
-    tmp_path.chmod(0o600)
-    tmp_path.replace(path)
-    path.chmod(0o600)
+    atomic_write_json(path, data, mode=0o600)
+    _sync_directory(path.parent)
+
+
+def _finish_policy_change(path: Path, journal: Path, staged: Path, state: dict[str, Any]) -> bool:
+    # Renaming the staged TOML is the commit point. Recovery only finishes the
+    # ledger, so a later edit to the live configuration is never overwritten.
+    try:
+        staged.stat()
+    except FileNotFoundError:
+        published = True
+        _sync_directory(staged.parent)
+        _save(path, state)
+    else:
+        published = False
+    journal.unlink()
+    _sync_directory(journal.parent)
+    if not published:
+        staged.unlink()
+    return published
+
+
+def _commit_policy_change(path: Path, state: dict[str, Any], config_path: Path, config: dict[str, Any]) -> None:
+    journal = Path(f"{path}.transaction")
+    staged = stage_toml(config_path, config)
+    try:
+        _sync_directory(staged.parent)
+        _save(journal, {"staged_config": str(staged.absolute()), "state": state})
+        staged.replace(config_path)
+        _finish_policy_change(path, journal, staged, state)
+    finally:
+        # Keep an unpublished stage as evidence until its journal is removed.
+        if not journal.exists():
+            staged.unlink(missing_ok=True)
+
+
+def _recover_policy_change(path: Path) -> None:
+    journal = Path(f"{path}.transaction")
+    try:
+        fd = os.open(journal, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return
+    with os.fdopen(fd, encoding="utf-8") as src:
+        info = os.fstat(src.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise RuntimeError(f"Approval transaction has unexpected ownership or permissions: {journal}")
+        record = json.load(src)
+    if (not isinstance(record, dict) or not isinstance(record.get("staged_config"), str)
+            or not isinstance(record.get("state"), dict) or record["state"].get("schema") != APPROVAL_SCHEMA):
+        raise RuntimeError(f"Invalid approval transaction: {journal}")
+    if _finish_policy_change(path, journal, Path(record["staged_config"]), record["state"]):
+        reload_daemon()
 
 
 @contextmanager
@@ -68,6 +124,7 @@ def _locked(path: Path) -> Iterator[dict[str, Any]]:
     with lock_path.open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
+            _recover_policy_change(path)
             yield _load(path)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -202,6 +259,25 @@ def _request(data: dict[str, Any], request_id: int) -> dict[str, Any]:
     raise ValueError(f"approval request not found: {request_id}")
 
 
+def _last_port_change(
+    state: dict[str, Any], subject: str, zone: str, protocol: str, ports: list[int]
+) -> tuple[str, dict[str, Any]]:
+    # Older history entries only carry the request ID. Use the original
+    # request for its scope and history order for the last effective decision.
+    requests = {str(item["id"]): item for item in state["requests"] if "id" in item}
+    scope = (subject, zone, protocol)
+    wanted = set(ports)
+    for entry in reversed(state["history"]):
+        action = entry.get("action")
+        if action not in {"approve", "deny", "revoke"}:
+            continue
+        previous = requests.get(str(entry.get("request_id")), {})
+        previous_scope = (previous.get("subject"), previous.get("zone"), previous.get("protocol"))
+        if previous_scope == scope and not wanted.isdisjoint(previous.get("ports", [])):
+            return action, previous
+    return "", {}
+
+
 def create_request(
     path: Path,
     config_path: str | Path,
@@ -220,10 +296,10 @@ def create_request(
     resolve: dict[str, Any] | None = None,
     protection_profile: str = "",
     actor: str | None = None,
+    reuse_matching: bool = False,
 ) -> dict[str, Any]:
     if not reason.strip():
         raise ValueError("approval reason is required")
-    config = load_toml(Path(config_path))
     request: dict[str, Any] = {
         "subject": subject,
         "zone": zone,
@@ -242,22 +318,33 @@ def create_request(
     }
     if resolve is not None:
         request["resolve"] = dict(resolve)
-    if not request["resolve"]:
-        existing = config.get("subjects", {}).get(subject, {})
-        existing_resolve = existing.get("resolve", {}) if isinstance(existing, dict) else {}
-        if isinstance(existing_resolve, dict):
-            request["resolve"] = dict(existing_resolve)
-    _validate_request(request, config=config)
     request["requester"] = _actor(actor)
     request["requested_at"] = time.time()
     request["status"] = "pending"
     with _locked(path) as state:
+        config = load_toml(Path(config_path))
+        if not request["resolve"]:
+            existing = config.get("subjects", {}).get(subject, {})
+            existing_resolve = existing.get("resolve", {}) if isinstance(existing, dict) else {}
+            if isinstance(existing_resolve, dict):
+                request["resolve"] = dict(existing_resolve)
+        _validate_request(request, config=config)
+        retry_fields = ("ports", "resolve", "protection_profile", "reason", "requester")
         for existing in state["requests"]:
             if existing.get("status") == "pending" and all(
                 existing.get(key) == request.get(key)
                 for key in ("subject", "zone", "protocol", "ports")
             ):
+                if reuse_matching and all(existing.get(k) == request[k] for k in retry_fields):
+                    return dict(existing)
                 raise ValueError(f"matching approval request already pending: {existing['id']}")
+        if reuse_matching:
+            action, previous = _last_port_change(state, subject, zone, request["protocol"], request["ports"])
+            if action == "approve" and all(previous.get(k) == request[k] for k in retry_fields):
+                candidate = copy.deepcopy(config)
+                _apply_grant(candidate, request)
+                if candidate == config:
+                    return dict(previous)
         request["id"] = int(state["next_id"])
         state["next_id"] = request["id"] + 1
         state["revision"] = int(state["revision"]) + 1
@@ -357,13 +444,14 @@ def _apply_grant(config: dict[str, Any], request: dict[str, Any]) -> list[int]:
 def approve_request(path: Path, config_path: str | Path, request_id: int, *, actor: str | None = None) -> dict[str, Any]:
     with _locked(path) as state:
         request = _request(state, request_id)
+        if request.get("status") == "approved":
+            return dict(request)
         if request.get("status") != "pending":
             raise ValueError(f"approval request {request_id} is {request.get('status')}")
         config_path = Path(config_path)
         config = load_toml(config_path)
         _validate_request(dict(request), config=config)
         added = _apply_grant(config, request)
-        write_toml(config_path, config)
         request.update({
             "status": "approved",
             "approver": _actor(actor),
@@ -372,7 +460,7 @@ def approve_request(path: Path, config_path: str | Path, request_id: int, *, act
         })
         state["revision"] = int(state["revision"]) + 1
         _history(state, request, "approve", request["approver"])
-        _save(path, state)
+        _commit_policy_change(path, state, config_path, config)
         result = dict(request)
     return result
 
@@ -394,6 +482,8 @@ def reject_request(path: Path, request_id: int, *, reason: str, actor: str | Non
 def revoke_request(path: Path, config_path: str | Path, request_id: int, *, actor: str | None = None) -> dict[str, Any]:
     with _locked(path) as state:
         request = _request(state, request_id)
+        if request.get("status") == "revoked":
+            return dict(request)
         if request.get("status") != "approved":
             raise ValueError(f"approval request {request_id} is {request.get('status')}")
         config_path = Path(config_path)
@@ -408,11 +498,10 @@ def revoke_request(path: Path, config_path: str | Path, request_id: int, *, acto
         if isinstance(protocol_spec, dict):
             keep = set(int(port) for port in protocol_spec.get("ports", [])) - set(request.get("applied_ports", []))
             protocol_spec["ports"] = sorted(keep)
-            write_toml(config_path, config)
         request.update({"status": "revoked", "revoker": _actor(actor), "revoked_at": time.time()})
         state["revision"] = int(state["revision"]) + 1
         _history(state, request, "revoke", request["revoker"])
-        _save(path, state)
+        _commit_policy_change(path, state, config_path, config)
         return dict(request)
 
 
@@ -450,9 +539,12 @@ def deny_grant(
         current = {int(port) for port in protocol_spec.get("ports", [])}
         removed = sorted(current & set(requested_ports))
         if not removed:
+            action, previous = _last_port_change(state, subject, zone, protocol, requested_ports)
+            if (action == "deny" and previous.get("ports") == requested_ports
+                    and previous.get("reason") == reason.strip() and previous.get("revoker") == _actor(actor)):
+                return dict(previous)
             raise ValueError(f"none of the requested ports are granted to {subject}")
         protocol_spec["ports"] = sorted(current - set(removed))
-        write_toml(config_path, config)
 
         who = _actor(actor)
         request_id = int(state["next_id"])
@@ -477,25 +569,37 @@ def deny_grant(
         state["revision"] = int(state["revision"]) + 1
         state["requests"].append(request)
         _history(state, request, "deny", who)
-        _save(path, state)
+        _commit_policy_change(path, state, config_path, config)
         return dict(request)
 
 
+class PolicyReloadError(RuntimeError):
+    """The policy was saved but the service manager could not apply it."""
+
+
 def reload_daemon() -> None:
-    """Best-effort SIGHUP after a policy write; absent daemons are allowed."""
+    """Notify the running controller after a policy write. Offline edits are allowed."""
     try:
-        result = subprocess.run(
-            ["systemctl", "show", "-p", "MainPID", "--value", "xdp-port-sync"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        pid = int(result.stdout.strip() or "0")
-        if pid > 1:
-            os.kill(pid, 1)
-            return
-    except (FileNotFoundError, OSError, ValueError, subprocess.SubprocessError):
-        pass
+        if Path("/run/systemd/system").is_dir():
+            result = subprocess.run(
+                ["systemctl", "show", "-p", "MainPID", "--value", "xdp-port-sync"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 4:  # Unit is not installed.
+                return
+            result.check_returncode()
+            pid = int(result.stdout.strip())
+            if pid > 1:
+                os.kill(pid, signal.SIGHUP)
+        elif shutil.which("rc-service"):
+            # These flags leave absent and stopped installations alone.
+            subprocess.run(
+                ["rc-service", "--ifexists", "--ifstarted", "xdp-port-sync", "restart"],
+                check=True, capture_output=True, text=True, timeout=60,
+            )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
+        raise PolicyReloadError(f"Policy saved, but xdp-port-sync reload failed: {detail}") from exc
 
 
 def run_api(config_path: str | Path, run_state_dir: str | Path, socket_path: str | Path) -> int:
