@@ -17,6 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, NamedTuple
@@ -293,13 +294,33 @@ def _pin_state_marker(candidate: Path, digest: bytes) -> None:
         raise RuntimeError("Handler state marker verification failed")
 
 
+class HandlerBusy(RuntimeError):
+    """Another loader owns the handler transaction; retry maintenance later."""
+
+
+_NONBLOCKING_LOCKS: ContextVar[bool] = ContextVar("handler_nonblocking_locks", default=False)
+
+
+@contextmanager
+def nonblocking_locks():
+    """Background policy updates must never wait for another module loader."""
+    token = _NONBLOCKING_LOCKS.set(True)
+    try:
+        yield
+    finally:
+        _NONBLOCKING_LOCKS.reset(token)
+
+
 @contextmanager
 def _handler_lock(root: Path):
     # bpffs cannot hold regular lock files. Lock its stable directory inode so
     # loads and unloads cannot race state-map pin reuse or rollback ownership.
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if _NONBLOCKING_LOCKS.get() else 0))
+        except BlockingIOError as exc:
+            raise HandlerBusy(f"Another loader holds the handler lock at {root}; retry later") from exc
         yield
     finally:
         os.close(fd)
@@ -563,11 +584,29 @@ def protocol_handler_pin(root: Path, proto: int) -> Path:
     return protocol_handler_dir(root, proto) / "prog"
 
 
+def _reject_reserved_icmp_slot(root: Path, proto: int) -> None:
+    """The main program sends only Echo Replies to slots 1 and 58, and only
+    while the managed ICMP module's reply gate is set; an empty slot then drops
+    them. Another program there would receive them instead. Called under the
+    root's handler lock, the same lock degrade_icmp holds to set the gate."""
+    if proto not in (1, 58) or not (root / "xdp_runtime_cfg").exists():
+        return
+    from auto_xdp.admin import module_runtime
+    try:
+        reserved = module_runtime._icmp_gate(root)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"Cannot check whether protocol slot {proto} is reserved: {exc}") from exc
+    if reserved:
+        raise RuntimeError(f"Protocol slot {proto} is reserved for the managed ICMP module while "
+                           "[modules.icmp] is enabled; use 'axdp handler apply icmp' instead")
+
+
 def load_protocol_handler(root: Path, proto: int, obj: Path) -> bool:
     live = protocol_handler_dir(root, proto)
-    shared = handler_shared_maps(obj, root)
     try:
         with _handler_lock(root):
+            _reject_reserved_icmp_slot(root, proto)
+            shared = handler_shared_maps(obj, root)
             return _load_handler_object(root / "proto_handlers", proto, obj, live, shared)
     except OSError as exc:
         raise RuntimeError(f"Protocol handler replacement failed: {exc}") from exc
@@ -778,15 +817,32 @@ def _transactional_handler_bindings(
     _retire_handler_generations(live_dir, key)
 
 
+def _load_with_dependencies(command: list[str], obj: Path) -> None:
+    """Load an object after its kernel dependencies, retrying once after a stale module.
+
+    A kfunc the loaded module does not register fails with "calling kernel
+    function ... is not allowed". If the module file on disk has since been
+    repaired, the broken copy is still loaded; reload it and try once more.
+    """
+    with kernel_modules.dependency_lock(obj):
+        kernel_modules.ensure(obj)
+        tokens = kernel_modules.reload_tokens(obj)
+        try:
+            run_checked(command, f"Failed to load {obj}", include_detail=True)
+        except RuntimeError as exc:
+            if "is not allowed" not in str(exc) or not kernel_modules.reload_stale(obj, tokens):
+                raise
+            run_checked(command, f"Failed to load {obj}", include_detail=True)
+
+
 def stage_handler_program(obj: Path, pin: Path, program_type: str,
                           shared: list[tuple[str, Path]], maps: Path) -> None:
     """Load a single entry without making any live hook reach it."""
-    kernel_modules.ensure(obj)
     command = ["bpftool", "prog", "load", str(obj), str(pin), "type", program_type,
                "pinmaps", str(maps)]
     for name, path in shared:
         command.extend(["map", "name", name, "pinned", str(path)])
-    run_checked(command, f"Failed to load {obj}", include_detail=True)
+    _load_with_dependencies(command, obj)
 
 
 def _load_handler_bundle(
@@ -857,12 +913,11 @@ def _load_handler_object(
             stage_handler_program(obj_path, candidate_dir / "prog", "xdp", shared_maps + preserved, candidate_dir)
         else:
             # A global type override would turn the TC entry into XDP.
-            kernel_modules.ensure(obj_path)
             load_cmd = ["bpftool", "prog", "loadall", str(obj_path), str(candidate_dir / "programs"),
                         "pinmaps", str(candidate_dir / "maps")]
             for name, map_path in shared_maps + preserved:
                 load_cmd.extend(["map", "name", name, "pinned", str(map_path)])
-            run_checked(load_cmd, f"Failed to load {obj_path}", include_detail=True)
+            _load_with_dependencies(load_cmd, obj_path)
         if egress is not None:
             (candidate_dir / "programs" / ingress).rename(candidate_dir / "prog")
             (candidate_dir / "programs" / egress).rename(candidate_dir / "egress")

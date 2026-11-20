@@ -57,7 +57,11 @@ deploy_xdp_backend() {
     ensure_bpffs
     cleanup_existing_xdp || return 1
 
-    if ! transactional_reload_xdp; then
+    # Installation is an explicit operation: on a host without an attached
+    # firewall, an enabled ICMP module that cannot be loaded fails it instead
+    # of installing a degraded firewall. Replacing a generation that already
+    # runs without an ICMP handler (an upgrade of a degraded host) is allowed.
+    if ! AUTO_XDP_ICMP_STRICT_START=1 transactional_reload_xdp; then
         XDP_FALLBACK_REASON="transactional XDP switch failed; previous attachment was preserved or restored"
         warn "XDP upgrade failed transactionally; previous protection was preserved or restored."
         if [[ ${AUTO_XDP_ATTACH_FATAL:-0} -eq 1 ]]; then

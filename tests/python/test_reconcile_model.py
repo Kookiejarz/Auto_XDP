@@ -196,6 +196,115 @@ class ZoneMap:
         return 0
 
 
+@pytest.mark.parametrize("endpoint_policy", [False, True])
+def test_removed_grants_close_before_module_maintenance(monkeypatch, endpoint_policy):
+    backend = xdp_backend()
+    backend.sctp_map = FakePortMap({9899})
+    backend.sctp_map.verify = lambda: 0
+    backend.tcp_map.set(8080, 1)
+    backend.udp_map.set(5353, 1)
+    backend.trusted_map.set("192.0.2.1/32", 1)
+    backend.tcp_zone_map, backend.udp_zone_map = ZoneMap(), ZoneMap()
+    backend.tcp_zone_map.set(7, 8080, (1, 0, 0, 0))
+    backend.udp_zone_map.set(7, 5353, 1)
+    desired = target({KEY: EndpointPolicy(False, "revoked")}, ICMP_REPLY_ENABLED=False)
+    if not endpoint_policy:
+        desired = BackendProjection(config=desired.config)
+    visited = []
+    def maintenance(*args):
+        assert not backend.tcp_map.active_ports()
+        assert not backend.udp_map.active_ports()
+        assert not backend.sctp_map.active_ports()
+        assert not backend.trusted_map.active_keys()
+        assert not backend.tcp_zone_map.active_entries()
+        assert not backend.udp_zone_map.active_entries()
+        visited.append(True)
+        raise RuntimeError("maintenance is busy")
+    monkeypatch.setattr(backend, "_ensure_profile_handlers", maintenance)
+    result = backend.reconcile(desired, False)
+    assert visited and not result.successful
+    assert any("maintenance is busy" in failure.reason for failure in result.failures)
+    assert not backend.tcp_map.active_ports() and not backend.udp_map.active_ports()
+
+
+def test_acl_shrink_revokes_before_maintenance_without_admitting_added_ports(monkeypatch):
+    backend = xdp_backend()
+    key = ("tcp", "192.0.2.0/24")
+    entries = {key: frozenset({80, 443})}
+    backend.acl_maps = mock.Mock()
+    backend.acl_maps.active_entries.side_effect = lambda: dict(entries)
+    backend.acl_maps.verify.return_value = 0
+    def write(proto, cidr, ports, dry_run=False):
+        if not dry_run:
+            entries[(proto, cidr)] = frozenset(ports)
+        return True
+    backend.acl_maps.set.side_effect = write
+    desired = BackendProjection(config=target(ICMP_REPLY_ENABLED=False).config,
+                                acl_rules={key: frozenset({443, 8443})})
+    def maintenance(*args):
+        assert entries == {key: frozenset({443})}
+        raise RuntimeError("maintenance is busy")
+    monkeypatch.setattr(backend, "_ensure_profile_handlers", maintenance)
+    result = backend.reconcile(desired, False)
+    assert not result.successful and entries == {key: frozenset({443})}
+
+
+@pytest.mark.parametrize("proto,parent,child", [
+    ("tcp", "192.0.2.0/24", "192.0.2.64/26"),
+    ("udp", "2001:db8::/48", "2001:db8:0:1::/64"),
+])
+@pytest.mark.parametrize("remove_child", [False, True])
+def test_acl_prefix_changes_hold_revocations_across_a_failed_prepare(
+        monkeypatch, proto, parent, child, remove_child):
+    backend = xdp_backend()
+    wide = (proto, parent)
+    narrow = (proto, child)
+    broad_ports = frozenset({80, 443})
+    child_ports = frozenset({443, 8443})
+    entries = {wide: broad_ports}
+    wanted = dict(entries)
+    if remove_child:
+        entries[narrow] = child_ports
+    else:
+        wanted[narrow] = child_ports
+
+    acl = backend.acl_maps = mock.Mock()
+    acl.verify.return_value = 0
+    acl.active_entries.side_effect = lambda: dict(entries)
+
+    def write(proto, cidr, ports, dry_run=False):
+        entries[(proto, cidr)] = frozenset(ports)
+        return True
+
+    def delete(proto, cidr, dry_run=False):
+        del entries[(proto, cidr)]
+        return True
+
+    acl.set.side_effect = write
+    acl.delete.side_effect = delete
+    desired = BackendProjection(config=target(ICMP_REPLY_ENABLED=False).config, acl_rules=wanted)
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "_ensure_profile_handlers", mock.Mock(side_effect=RuntimeError("busy")))
+        assert not backend.reconcile(desired, False).successful
+    assert entries == {wide: broad_ports, narrow: frozenset({443})}
+    assert backend.reconcile(desired, False).successful
+    assert entries == wanted
+
+
+def test_direct_plan_revokes_before_icmp_load_failure(monkeypatch):
+    backend = xdp_backend()
+    backend.tcp_map.set(8080, 1)
+    desired = BackendProjection(config=target(ICMP_REPLY_ENABLED=True).config)
+    def failed_load(*args, **kwargs):
+        assert not backend.tcp_map.active_ports()
+        raise RuntimeError("ICMP loader busy")
+    monkeypatch.setattr(module_runtime, "prepare_icmp", failed_load)
+    plan = backend.build_reconcile_plan(desired, backend.get_applied_state())
+    with pytest.raises(RuntimeError, match="ICMP loader busy"):
+        backend.apply_reconcile_plan(plan, False, desired)
+    assert not backend.tcp_map.active_ports()
+
+
 @pytest.mark.parametrize("protocol", ["tcp", "udp"])
 @pytest.mark.parametrize("address", ["0.0.0.0", "::"])
 def test_xdp_grants_wait_for_zone_interfaces_and_follow_their_lifecycle(monkeypatch, protocol, address):

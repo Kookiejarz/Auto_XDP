@@ -74,6 +74,9 @@ class NotificationReceiver:
         self._pending: Notification | None = None
         self._error: Exception | None = None
         self._stop = threading.Event()
+        self._wake_reader, self._wake_writer = socket.socketpair()
+        self._wake_reader.setblocking(False)
+        self._wake_writer.setblocking(False)
         self._thread = threading.Thread(target=self._run, name="auto-xdp-notifications", daemon=True)
 
     def start(self) -> None:
@@ -81,8 +84,23 @@ class NotificationReceiver:
 
     def close(self) -> None:
         self._stop.set()
+        self.wake()
         if self._thread.ident is not None:
             self._thread.join()
+        self._wake_reader.close()
+        self._wake_writer.close()
+
+    def wake(self) -> None:
+        """Wake the worker from a signal handler without taking its condition lock.
+
+        The receiver thread publishes the notification, so a wake arriving
+        between wait's predicate check and waiter registration cannot be lost.
+        """
+        try:
+            self._wake_writer.send(b"\0")
+        except (BlockingIOError, OSError):
+            # A full channel already carries a wake; a closed one is shutting down.
+            pass
 
     def _notify(self, *, immediate: bool) -> None:
         with self._condition:
@@ -123,21 +141,23 @@ class NotificationReceiver:
                         # A reconnect can hide changes made during the gap.
                         self._notify(immediate=True)
 
-                readers = [sock for sock in (nl, relay) if sock is not None]
-                if not readers:
-                    self._stop.wait(0.2)
-                    continue
+                readers = [self._wake_reader, *[sock for sock in (nl, relay) if sock is not None]]
                 try:
                     ready, _, _ = select.select(readers, [], [], 0.2)
                 except OSError as exc:
                     log.warning("Notification polling failed (%s); reconnecting.", exc)
-                    for sock in readers:
-                        sock.close()
+                    for sock in (nl, relay):
+                        if sock is not None:
+                            sock.close()
                     nl = relay = None
                     relay_pending.clear()
                     next_netlink = next_relay = self._monotonic() + EVENT_SOURCE_RETRY_INTERVAL_SECONDS
                     self._notify(immediate=True)
                     continue
+
+                if self._wake_reader in ready:
+                    self._wake_reader.recv(4096)
+                    self._notify(immediate=True)
 
                 if nl is not None and nl in ready:
                     try:

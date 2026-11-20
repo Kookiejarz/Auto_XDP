@@ -187,13 +187,14 @@ def watch(
     conntrack_check_interval = CONNTRACK_CHECK_INTERVAL_SECONDS
     reload_requested = False
     mode_only_synced = False
+    notifications = NotificationReceiver(cfg.RINGBUF_SOCKET_PATH, monotonic=monotonic)
 
     def _on_sighup(signum: int, frame: object) -> None:
         nonlocal reload_requested
         reload_requested = True
+        notifications.wake()
 
     previous_sighup = signal.signal(signal.SIGHUP, _on_sighup)
-    notifications = NotificationReceiver(cfg.RINGBUF_SOCKET_PATH, monotonic=monotonic)
 
     def _sync() -> dict[str, object]:
         if mode is None and not explain:
@@ -274,7 +275,11 @@ def watch(
                 _new_resources = cfg.snapshot_config()
                 _backend_stale = (
                     cfg.BPF_PIN_DIR != _old_pin_dir
-                    or cfg.ICMP_REPLY_ENABLED != _old_icmp
+                    # XDP applies ICMP changes during reconciliation. Other
+                    # backends must re-check ICMP support via open_backend().
+                    or (cfg.ICMP_REPLY_ENABLED != _old_icmp
+                        and (backend is None or backend.name != BACKEND_XDP
+                             or not hasattr(backend, "is_stale") or backend.is_stale()))
                     or cfg.NFT_FAMILY != _old_nft_family
                     or cfg.NFT_TABLE != _old_nft_table
                     or any(_new_resources.values[name] != value
@@ -369,7 +374,7 @@ def watch(
     except KeyboardInterrupt:
         log.info("Shutting down.")
     finally:
-        notifications.close()
         signal.signal(signal.SIGHUP, previous_sighup)
+        notifications.close()
         if backend:
             backend.close()

@@ -214,10 +214,13 @@ ensure_xdp_loaded() {
             fi
         done
         [[ -f "$BPF_PIN_DIR/sock_state_link" ]] || load_sock_state_tracker || true
-        # Strict cookie requirements and incompatible NAT both abort activation.
-        # Keep XDP attached and forbid a silent nftables downgrade.
-        load_syncookie_program || return 2
-        load_icmp_module || return 2
+        # A SYN-cookie module that cannot be activated (strict requirement,
+        # incompatible NAT) leaves its endpoints closed and is reported as
+        # degraded. XDP stays attached; nftables is never substituted for it.
+        AUTO_XDP_SYNCOOKIE_DEGRADE_OK=1 load_syncookie_program || return 2
+        # Nothing is replaced here: a handler that cannot load leaves this
+        # generation attached with Echo Replies dropped, reported as degraded.
+        AUTO_XDP_ICMP_DEGRADE_OK=1 load_icmp_module || return 2
         load_tc_egress_dispatch || return 1
         load_port_handlers || true
         auto_tune_interface_parallelism || true
@@ -249,7 +252,7 @@ ensure_xdp_loaded() {
     fi
 
     load_sock_state_tracker || true
-    load_syncookie_program || return 2
+    AUTO_XDP_SYNCOOKIE_DEGRADE_OK=1 load_syncookie_program || return 2
     load_tc_egress_dispatch || return 1
     auto_tune_interface_parallelism || true
     echo "$AUTO_XDP_SWITCH_MODE" > "${RUN_STATE_DIR}/xdp_mode"

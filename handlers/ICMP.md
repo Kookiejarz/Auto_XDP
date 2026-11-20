@@ -37,6 +37,18 @@ RHEL). The kernel needs modules, conntrack, BPF and module BTF support, includin
 `CONFIG_DEBUG_INFO_BTF_MODULES`. Secure Boot hosts need a trusted module signature.
 The dependency loader does not download packages or replace the kernel. An
 already-installed module rejected by the kernel is reported without rebuilding.
+The one exception is a module this loader installed whose kfunc ID set was never
+resolved (`.BTF_ids` count 0): it loads, but the verifier rejects the handler
+with "calling kernel function bpf_axdp_icmp_reply is not allowed". Such a module
+is rebuilt with the installed SDK and the unused old copy is unloaded. A rebuild
+that completes but still leaves the set empty is not repeated until the SDK, the
+kernel headers or the BTF tools (pahole, resolve_btfids) change, or the host
+reboots. If the file on disk is fine but a broken copy is still loaded (for
+example after a manual `make install`), the same verifier error makes the loader
+reload the unused module once and retry. A damaged module file (for example
+truncated by an interrupted install) is rebuilt. Loads that need the module
+are serialized with builds and reloads, so one loader never unloads a module
+another has just loaded.
 
 For a manual build from this checkout:
 
@@ -72,6 +84,27 @@ force removal of the shared kernel module.
 - An enabled but missing handler fails closed. ICMP requires XDP; activation
   cannot silently fall back to nftables. Disable clears the runtime gate and
   removes both bindings, restoring normal Echo Reply handling.
+- A handler that cannot be loaded does not stop the firewall service. The
+  main program then runs with the runtime gate set and no handler: every
+  inbound Echo Reply is dropped (`SLOT_DROP`), all other policy is enforced.
+  This happens when no interface on the host runs the generation being
+  replaced (boot, an interrupted first start, pins left by an nftables
+  cutover), when the service re-activates the attached generation, or when the
+  generation being replaced has no working ICMP protection (no handler bound,
+  or its gate off). A reload records this decision under `/run/auto_xdp`, so
+  resuming it after an interruption reaches the same one. Each start reports
+  one error naming the cause; the daemon repeats it only when the cause
+  changes. `axdp status` shows `Degraded  : icmp (...)` while health stays
+  `healthy`, and the full loader output is kept in `/run/auto_xdp/icmp_degraded`.
+  The daemon retries every five minutes without building the kernel module or
+  waiting for another loader; a restart or
+  `axdp handler apply icmp --set enabled=true` also builds it.
+  Still refused: replacing a generation whose bound handler protects Echo
+  Replies; enabling ICMP through a live config reload (the gate is not set,
+  and the module may be built then); a fresh installation where no firewall
+  runs yet (upgrading a degraded host is allowed); and any case where protocol
+  slot 1 or 58 holds another program. While the gate is set, those two slots
+  are reserved for this module.
 
 ## Verification
 

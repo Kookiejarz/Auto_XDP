@@ -400,6 +400,10 @@ class XdpPortSyncTests(unittest.TestCase):
                     "load", 1, Path("/opt/auto_xdp/handlers/minecraft_handler.o")
                 )
             )
+            self.assertIn("--no-wait", run.call_args.args[0])
+            backend.module_maintenance = True
+            self.assertTrue(backend._profile_command("load", 1, Path("/opt/auto_xdp/handlers/minecraft_handler.o")))
+            self.assertNotIn("--no-wait", run.call_args.args[0])
 
         command = run.call_args.args[0]
         self.assertEqual(command[-4:], [
@@ -1054,7 +1058,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(backend.tcp_map.ops[1][1][2:], (0, 0))
         self.assertEqual(backend.tcp_map.ops[1][1][3], 0)
         self.assertEqual(backend.udp_map.ops, [(9999, 0, False)])
-        self.assertEqual(backend.sctp_map.ops, [(2905, 1, False), (9899, 0, False)])
+        self.assertEqual(backend.sctp_map.ops, [(9899, 0, False), (2905, 1, False)])
         self.assertEqual(backend.trusted_map.set_ops, [("198.51.100.5/32", 1, False)])
         self.assertEqual(backend.trusted_map.delete_ops, [("203.0.113.1/32", False)])
         self.assertEqual(backend.syn_rate_map.set_ops, [(22, 2, False)])
@@ -1924,12 +1928,15 @@ def _failing_desired_state():
 
 @pytest.mark.component
 class ApplyFailureCountingTests(unittest.TestCase):
-    def _reconcile(self, backend, dry_run):
+    def _apply_plan(self, backend, dry_run):
+        # Exercise the low-level writer independently of the stage scheduler,
+        # which must now stop before prepare when revocation fails.
         desired = _failing_desired_state()
         with mock.patch.object(cfg, "TRUSTED_SRC_IPS", {}), \
              mock.patch.object(cfg, "SIT4_ENDPOINTS", ["198.51.100.77"]):
             desired.config = cfg.snapshot_config()
-            backend.reconcile(desired, dry_run=dry_run, observed_state=state_mod.ObservedState())
+            plan = backend.build_reconcile_plan(desired, backend.get_applied_state())
+            backend.apply_reconcile_plan(plan, dry_run, desired, state_mod.ObservedState())
 
     def _total_ops(self, backend):
         return (
@@ -1967,7 +1974,7 @@ class ApplyFailureCountingTests(unittest.TestCase):
     def test_counts_every_failed_map_update_and_warns(self):
         backend = _make_failing_backend()
         with self.assertLogs("auto_xdp.backends.xdp", level="WARNING") as logs:
-            self._reconcile(backend, dry_run=False)
+            self._apply_plan(backend, dry_run=False)
 
         total = self._total_ops(backend)
         self.assertEqual(backend.last_apply_failures, total)
@@ -1996,20 +2003,32 @@ class ApplyFailureCountingTests(unittest.TestCase):
 
     def test_dry_run_counts_no_failures(self):
         backend = _make_failing_backend()
-        self._reconcile(backend, dry_run=True)
+        self._apply_plan(backend, dry_run=True)
         self.assertEqual(backend.last_apply_failures, 0)
 
     def test_counter_resets_on_clean_round(self):
         backend = _make_failing_backend()
-        self._reconcile(backend, dry_run=False)
+        self._apply_plan(backend, dry_run=False)
         self.assertGreater(backend.last_apply_failures, 0)
         # Fakes updated their local state despite returning False, so the next
         # round has nothing to apply and the counter must reset to zero.
         backend.tcp_map.set = lambda port, val, dry_run=False: FakePortMap.set(
             backend.tcp_map, port, val, dry_run
         )
-        self._reconcile(backend, dry_run=False)
+        self._apply_plan(backend, dry_run=False)
         self.assertEqual(backend.last_apply_failures, 0)
+
+    def test_failed_revoke_skips_maintenance_and_reports_attempted_failures(self):
+        backend = _make_failing_backend()
+        with self.assertLogs("auto_xdp.backends.xdp", level="WARNING") as logs, \
+                mock.patch.object(backend, "_ensure_profile_handlers") as maintenance:
+            result = backend.reconcile(_failing_desired_state(), dry_run=False)
+        maintenance.assert_not_called()
+        self.assertEqual(backend.last_apply_failures, self._total_ops(backend))
+        self.assertTrue(result.failures)
+        self.assertFalse(backend.syn_rate_map.set_ops)
+        self.assertFalse(backend.acl_maps.set_ops)
+        self.assertTrue(any("failed this reconcile" in line for line in logs.output))
 
 
 def _make_outer_backend():

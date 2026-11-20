@@ -14,7 +14,7 @@ from typing import Any
 from auto_xdp import config as cfg, policy
 from auto_xdp.admin import approvals
 from auto_xdp.discovery import listeners as discovery
-from auto_xdp.admin import config_file, detect, formatting, handler_catalog, handlers, ports, stats
+from auto_xdp.admin import config_file, detect, formatting, handler_catalog, handlers, kernel_modules, ports, stats
 
 
 _LOG_LEVELS = {"debug", "info", "warning", "error"}
@@ -1329,6 +1329,8 @@ def _cmd_handler(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="axdp")
+    parser.add_argument("--no-wait", action="store_true",
+                        help="Defer module maintenance when a loader is busy or a kernel build is needed")
     parser.add_argument("--config", required=True)
     parser.add_argument("--bpf-pin-dir", default="/sys/fs/bpf/xdp_fw")
     parser.add_argument("--install-dir", default="/usr/local/lib/auto_xdp/current")
@@ -1587,7 +1589,13 @@ def main(argv: list[str] | None = None) -> int:
         print("policy changes require root; try re-running with sudo", file=sys.stderr)
         return 77
     try:
+        if args.no_wait:
+            with handlers.nonblocking_locks(), kernel_modules.builds_disabled():
+                return int(args.func(args))
         return int(args.func(args))
+    except (handlers.HandlerBusy, kernel_modules.BuildRequired) as exc:
+        print(str(exc), file=sys.stderr)
+        return 75
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1

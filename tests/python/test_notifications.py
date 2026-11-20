@@ -28,6 +28,32 @@ def test_notifications_coalesce_and_consume_before_the_next_round():
     assert receiver.wait(0) is None
     receiver._notify(immediate=False)
     assert receiver.wait(0) == events.Notification(1.0, 1.0, False)
+    receiver.close()
+
+
+@pytest.mark.parametrize("when", ["before_start", "during_wait_registration"])
+def test_explicit_wake_is_retained_without_event_sources(monkeypatch, when):
+    monkeypatch.setattr(events, "open_proc_connector", lambda: None)
+    monkeypatch.setattr(events, "_open_relay_client", lambda path: None)
+    receiver = events.NotificationReceiver("unused")
+    if when == "before_start":
+        receiver.wake()
+    else:
+        original_wait = receiver._condition.wait
+        def register(timeout):
+            # The condition predicate was checked, but no waiter exists yet.
+            receiver.wake()
+            return original_wait(timeout)
+        monkeypatch.setattr(receiver._condition, "wait", register)
+    receiver.start()
+    try:
+        notification = receiver.wait(2)
+        assert notification is not None and notification.immediate
+        assert receiver.wait(0) is None
+    finally:
+        receiver.close()
+    assert not receiver._thread.is_alive()
+    assert receiver._wake_reader.fileno() == receiver._wake_writer.fileno() == -1
 
 
 def test_busy_relay_yields_and_ignores_malformed_messages():
@@ -259,6 +285,120 @@ def test_reload_changes_mode_on_the_worker_without_restarting_receiver(monkeypat
     assert all(active_backend is None for mode, active_backend in calls if mode == "audit")
     assert all(active_backend is backend for mode, active_backend in calls if mode == "enforce")
     receiver.start.assert_called_once()
+    receiver.wake.assert_called_once()
     receiver.close.assert_called_once()
     backend.close.assert_called_once()
     assert signal.getsignal(signal.SIGHUP) is previous_sighup
+
+
+def _watch_config_reloads(monkeypatch, backend_name, backends, updates):
+    receiver = mock.Mock()
+    opener = mock.Mock(side_effect=backends)
+    calls = []
+    waits = reloads = 0
+
+    def wait(timeout):
+        nonlocal waits
+        waits += 1
+        if waits > len(updates) * 2:
+            raise KeyboardInterrupt()
+        if waits % 2:
+            signal.getsignal(signal.SIGHUP)(signal.SIGHUP, None)
+        return None
+
+    def reload(path):
+        nonlocal reloads
+        for name, value in updates[reloads].items():
+            monkeypatch.setattr(cfg, name, value)
+        reloads += 1
+        return True
+
+    for backend in backends:
+        backend.is_stale.return_value = False
+        backend.verify_kernel_state.return_value = 0
+        backend.last_apply_failures = 0
+    receiver.wait.side_effect = wait
+    monkeypatch.setattr(syncer, "NotificationReceiver", lambda *args, **kwargs: receiver)
+    monkeypatch.setattr(syncer, "open_backend", opener)
+    monkeypatch.setattr(syncer, "_reload_config", reload)
+    monkeypatch.setattr(syncer, "sync_once", lambda backend, *args, **kwargs:
+                        calls.append((backend, cfg.snapshot_config())))
+    syncer.watch(False, backend_name, mode="enforce", monotonic=lambda: 100.0)
+    assert reloads == len(updates)
+    receiver.start.assert_called_once()
+    receiver.close.assert_called_once()
+    return opener, calls
+
+
+@pytest.mark.parametrize("backend_name", ["xdp", "auto"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_icmp_toggles_reconcile_on_the_same_active_xdp_backend(monkeypatch, backend_name, enabled):
+    monkeypatch.setattr(cfg, "ICMP_REPLY_ENABLED", enabled)
+    backend = mock.Mock()
+    backend.name = "xdp"
+    opener, calls = _watch_config_reloads(monkeypatch, backend_name, [backend], [
+        {"ICMP_REPLY_ENABLED": not enabled}, {"ICMP_REPLY_ENABLED": enabled},
+    ])
+    opener.assert_called_once_with(backend_name)
+    assert [snapshot.ICMP_REPLY_ENABLED for _, snapshot in calls] == [enabled, not enabled, enabled]
+    assert all(active is backend for active, _ in calls)
+    backend.close.assert_called_once()  # Only watch shutdown owns the final close.
+
+
+@pytest.mark.parametrize("setting,new_value", [
+    ("BPF_PIN_DIR", "/sys/fs/bpf/other_generation"),
+    ("NFT_FAMILY", "ip"),
+    ("NFT_TABLE", "another_firewall"),
+    ("NFT_TCP_SET", "another_tcp_set"),
+    ("ABUSEIPDB_ENABLED", True),
+    ("ABUSEIPDB_REFRESH_SECONDS", 17.0),
+    ("PREFERRED_BACKEND", "nftables"),
+])
+def test_icmp_toggle_keeps_resource_and_backend_rebuilds(monkeypatch, setting, new_value):
+    monkeypatch.setattr(cfg, "ICMP_REPLY_ENABLED", True)
+    monkeypatch.setattr(cfg, "PREFERRED_BACKEND", "xdp")
+    assert getattr(cfg, setting) != new_value
+    original, replacement = mock.Mock(), mock.Mock()
+    original.name = "xdp"
+    replacement.name = "nftables" if setting == "PREFERRED_BACKEND" else "xdp"
+    opener, calls = _watch_config_reloads(monkeypatch, "xdp", [original, replacement], [
+        {"ICMP_REPLY_ENABLED": False, setting: new_value},
+    ])
+    assert opener.call_args_list == [mock.call("xdp"), mock.call(replacement.name)]
+    assert calls[0][0] is original
+    assert all(active is replacement for active, _ in calls[1:])
+    assert calls[-1][1].values[setting] == new_value
+    original.close.assert_called_once()
+    replacement.close.assert_called_once()
+
+
+def test_icmp_enable_reselects_an_auto_backend_currently_using_nftables(monkeypatch):
+    monkeypatch.setattr(cfg, "ICMP_REPLY_ENABLED", False)
+    original, replacement = mock.Mock(), mock.Mock()
+    original.name, replacement.name = "nftables", "xdp"
+    opener, calls = _watch_config_reloads(monkeypatch, "auto", [original, replacement], [
+        {"ICMP_REPLY_ENABLED": True},
+    ])
+    assert opener.call_args_list == [mock.call("auto"), mock.call("auto")]
+    assert calls[0][0] is original
+    assert all(active is replacement for active, _ in calls[1:])
+    assert calls[-1][1].ICMP_REPLY_ENABLED
+    original.close.assert_called_once()
+    replacement.close.assert_called_once()
+
+
+def test_icmp_toggle_keeps_recovery_for_replaced_kernel_maps(monkeypatch):
+    monkeypatch.setattr(cfg, "ICMP_REPLY_ENABLED", False)
+    original, replacement = mock.Mock(), mock.Mock()
+    original.name = replacement.name = "xdp"
+    original.is_stale.side_effect = [True]
+    opener, calls = _watch_config_reloads(monkeypatch, "xdp", [original, replacement], [
+        {"ICMP_REPLY_ENABLED": True},
+    ])
+    assert opener.call_count == 2
+    assert calls[0][0] is original
+    assert all(active is replacement for active, _ in calls[1:])
+    assert calls[-1][1].ICMP_REPLY_ENABLED
+    original.is_stale.assert_called_once()
+    original.close.assert_called_once()
+    replacement.close.assert_called_once()

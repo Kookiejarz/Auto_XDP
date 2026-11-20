@@ -20,8 +20,15 @@ all:
 	@readelf -SW axdp_icmp.ko | grep -q '\.BTF '
 	strip --strip-debug axdp_icmp.ko
 
+# Write beside the destination, then rename: an interrupted install must never
+# leave a truncated module that modprobe finds and no loader rebuilds.
 install: all
-	install -D -m 0644 axdp_icmp.ko "/lib/modules/$(KVER)/extra/auto_xdp/axdp_icmp.ko"
+	@set -eu; dir="/lib/modules/$(KVER)/extra/auto_xdp"; \
+		install -d "$$dir"; \
+		tmp=$$(mktemp "$$dir/.axdp_icmp.ko.XXXXXXXX"); \
+		trap 'rm -f "$$tmp"' EXIT; \
+		install -m 0644 axdp_icmp.ko "$$tmp"; \
+		mv -f "$$tmp" "$$dir/axdp_icmp.ko"
 	depmod -a "$(KVER)"
 
 clean:

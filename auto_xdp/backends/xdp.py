@@ -1,6 +1,7 @@
 """XDP/BPF backend — syncs port whitelist and rate-limit maps directly."""
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import replace
 import errno
 import hashlib
@@ -15,11 +16,12 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 from typing import Mapping
 
 from auto_xdp import config as cfg
 from auto_xdp.admin import handlers as handler_admin
-from auto_xdp.admin import module_runtime
+from auto_xdp.admin import kernel_modules, module_runtime
 from auto_xdp.install_state import atomic_write_json
 from auto_xdp.backends.base import BackendStatus, PortBackend
 from auto_xdp.abuseipdb import AbuseIPDBSyncer, BpfRiskMaps
@@ -68,6 +70,10 @@ _TCP_ENDPOINT_VALUE_FORMAT = "=IIQQ"
 _TCP_ALLOW = 1
 
 
+# Throttle degraded retries; background attempts never compile or wait for loaders.
+_ICMP_RETRY_SECONDS = 300.0
+
+
 def _map_open_log_level(exc: OSError) -> int:
     # A missing optional map is expected; any other failure (for example a
     # value_size mismatch) silently disables a protection, so surface it.
@@ -112,6 +118,8 @@ def _legacy_syncookie_policy(policy: EndpointPolicy) -> EndpointPolicy:
 
 class XdpBackend(PortBackend):
     name = cfg.BACKEND_XDP
+    # Runtime startup can build dependencies while staging an unattached candidate.
+    module_maintenance = False
     # Set by the transactional reload pre-seed when the runtime has verified
     # that it will load the optional SYN-cookie program into this generation.
     syncookie_program_expected = False
@@ -608,6 +616,7 @@ class XdpBackend(PortBackend):
             sys.executable,
             "-m",
             "auto_xdp.admin.cli",
+            *([] if self.module_maintenance else ["--no-wait"]),
             "--config",
             self.config.TOML_CONFIG_PATH,
             "--bpf-pin-dir",
@@ -859,7 +868,7 @@ class XdpBackend(PortBackend):
         return bool(self.syncookie_program_expected)
 
     def is_stale(self) -> bool:
-        """Return True if the pinned tcp_whitelist map has been replaced since init."""
+        """Reopen if the active generation no longer matches or cannot be verified."""
         try:
             fd = obj_get(self.config.TCP_MAP_PATH)
             try:
@@ -868,7 +877,7 @@ class XdpBackend(PortBackend):
                 os.close(fd)
             return pinned_id != self.tcp_map.map_id()
         except OSError:
-            return False
+            return True
 
     def close(self) -> None:
         if hasattr(self, "endpoint_map"):
@@ -1103,6 +1112,95 @@ class XdpBackend(PortBackend):
             )
         return total
 
+    def _prepare_icmp(self, root: Path, enabled: bool, gate_published: bool) -> None:
+        """Load the ICMP handler without letting its failure stop policy sync.
+
+        Enabling it on a running generation stays all-or-nothing: the gate is
+        not published and the error is raised. Once Echo Replies are already
+        closed by the gate, or the runtime start says no XDP is attached that a
+        rejected candidate would protect, a failed load is reported once and
+        retried later while every other policy keeps being applied.
+        """
+        tolerated = enabled and (gate_published or getattr(self, "icmp_degrade_ok", False))
+        now = time.monotonic()
+        if not self.module_maintenance and tolerated and now < getattr(self, "_icmp_retry_at", 0.0):
+            return
+        try:
+            # Policy sync never waits for module maintenance or starts a build.
+            # Manual apply/start owns that work; background retries are best effort.
+            with ExitStack() as limits:
+                if not self.module_maintenance:
+                    limits.enter_context(handler_admin.nonblocking_locks())
+                    limits.enter_context(kernel_modules.builds_disabled())
+                module_runtime.prepare_icmp(root, enabled=enabled)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            if not tolerated or not self._icmp_slots_free(root):
+                raise
+            self._icmp_retry_at = now + _ICMP_RETRY_SECONDS
+            if isinstance(exc, (kernel_modules.BuildRequired, handler_admin.HandlerBusy)):
+                # The runtime start (or `axdp handler apply`) builds it and
+                # reports the outcome; the gate already holds replies closed.
+                log.info("ICMP handler not retried: %s", exc)
+                return
+            message = module_runtime.note_icmp_degraded(exc)
+            # Candidate pre-seed (gate not yet published): the runtime start
+            # reports once, from its handler step; only the daemon reports here.
+            if message and gate_published:
+                log.error("%s", message)
+            elif message:
+                log.info("ICMP handler not loaded yet: %s", exc)
+        else:
+            self._icmp_retry_at = 0.0
+
+    @staticmethod
+    def _icmp_slots_free(root: Path) -> bool:
+        # Echo Replies only drop while both protocol slots are empty.
+        try:
+            return module_runtime.icmp_slots_free(root)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return False
+
+    @staticmethod
+    def _effective_acl_ports(rules: dict[tuple[str, str], frozenset[int]],
+                             proto: str, cidr: str) -> frozenset[int]:
+        network = ipaddress.ip_network(cidr)
+        while True:
+            ports = rules.get((proto, str(network)))
+            if ports is not None:
+                return ports
+            if network.prefixlen == 0:
+                return frozenset()
+            network = network.supernet()
+
+    def _revoke_admission(self, plan: ReconcilePlan,
+                          desired_acl: dict[tuple[str, str], frozenset[int]], dry_run: bool) -> bool:
+        """Close removed grants before any module preparation can fail or defer."""
+        changed = False
+        for proto in ("tcp", "udp", "sctp"):
+            table = getattr(self, f"{proto}_map", None)
+            if table is None:
+                continue
+            for port in sorted(getattr(plan, f"{proto}_ports_to_remove")):
+                if self._map_operation(table, 'set', port, 0, dry_run):
+                    log.debug("%s -%d (stopped)", proto.upper(), port)
+                    changed = True
+        # Trust and ACL entries can also admit traffic independently of a grant.
+        for cidr in sorted(plan.trusted_cidrs_to_remove):
+            if self._map_operation(self.trusted_map, 'delete', cidr, dry_run):
+                log.info("TRUST -%s (removed)", cidr)
+                changed = True
+        if (plan.acl_rules_to_remove or plan.acl_rules_to_upsert) and self.acl_maps is not None:
+            current_acl = self.acl_maps.active_entries()
+            for proto, cidr in plan.acl_rules_to_remove | plan.acl_rules_to_upsert.keys():
+                old_ports = self._effective_acl_ports(current_acl, proto, cidr)
+                desired_ports = self._effective_acl_ports(desired_acl, proto, cidr)
+                if old_ports - desired_ports:
+                    # Retain a shadow over any broader LPM rule until admission.
+                    if self._map_operation(self.acl_maps, 'set', proto, cidr,
+                                           sorted(old_ports & desired_ports), dry_run):
+                        changed = True
+        return changed
+
     def apply_reconcile_plan(
         self,
         plan: ReconcilePlan,
@@ -1114,48 +1212,27 @@ class XdpBackend(PortBackend):
             desired_state, _ = project_endpoint_policies(desired_state)
         if not getattr(self, "_defer_global_admission", False):
             self._apply_result = ApplyResult(dry_run=dry_run, plan=plan)
+        changed = self._revoke_admission(plan, desired_state.acl_rules, dry_run)
+        if desired_state.endpoint_policy_enabled and self.last_apply_failures:
+            log.warning("Revocation failed; preserving protection state and skipping admission")
+            return
         if not dry_run and self.runtime_config_map is not None:
             root = Path(desired_state.config.BPF_PIN_DIR)
             enabled = desired_state.config.ICMP_REPLY_ENABLED
-            if (enabled or (self.runtime_config_map.get_cfg_flags() or 0) & XDP_CFG_FLAG_ICMP_REPLY
-                    or (root / "modules/icmp").exists()):
-                module_runtime.prepare_icmp(root, enabled=enabled)
-        changed = False
-        for port in sorted(plan.tcp_ports_to_remove):
-            if self._map_operation(self.tcp_map, 'set', port, 0, dry_run):
-                log.debug("TCP -%d  (stopped)", port)
-                changed = True
-
-        for port in sorted(plan.udp_ports_to_remove):
-            if self._map_operation(self.udp_map, 'set', port, 0, dry_run):
-                log.debug("UDP -%d  (stopped)", port)
-                changed = True
-
+            gate = bool((self.runtime_config_map.get_cfg_flags() or 0) & XDP_CFG_FLAG_ICMP_REPLY)
+            if enabled or gate or (root / "modules/icmp").exists():
+                self._prepare_icmp(root, enabled, gate)
         if self.sctp_map is not None:
             for port in sorted(plan.sctp_ports_to_add if not desired_state.endpoint_policy_enabled else set()):
                 if self._map_operation(self.sctp_map, 'set', port, 1, dry_run):
                     log.info("SCTP +%d", port)
                     changed = True
 
-            for port in sorted(plan.sctp_ports_to_remove):
-                if self._map_operation(self.sctp_map, 'set', port, 0, dry_run):
-                    log.info("SCTP -%d  (stopped)", port)
-                    changed = True
-
-        if desired_state.endpoint_policy_enabled and self.last_apply_failures:
-            log.warning("Revocation failed; preserving protection state and skipping admission")
-            return
-
         # HASH maps need delete, not write-zero, when trust entries disappear.
         for ip_str in sorted(plan.trusted_cidrs_to_add):
             tag = f" [{desired_state.config.TRUSTED_SRC_IPS[ip_str]}]" if ip_str in desired_state.config.TRUSTED_SRC_IPS else ""
             if self._map_operation(self.trusted_map, 'set', ip_str, 1, dry_run):
                 log.info("TRUST +%s%s", ip_str, tag)
-                changed = True
-
-        for ip_str in sorted(plan.trusted_cidrs_to_remove):
-            if self._map_operation(self.trusted_map, 'delete', ip_str, dry_run):
-                log.info("TRUST -%s  (removed)", ip_str)
                 changed = True
 
         if not changed:
@@ -1303,7 +1380,7 @@ class XdpBackend(PortBackend):
         elif not getattr(self, "_defer_global_admission", False):
             self._apply_global_admission(plan, dry_run)
 
-        if self.last_apply_failures and not dry_run:
+        if self.last_apply_failures and not dry_run and not getattr(self, "_defer_global_admission", False):
             log.warning(
                 "%d BPF map update%s failed this reconcile; kernel state may lag desired state.",
                 self.last_apply_failures,
@@ -1384,6 +1461,8 @@ class XdpBackend(PortBackend):
 
         def revoke() -> None:
             nonlocal projection, tentative_profile_generation
+            physical_plan = self.build_reconcile_plan(projection, self.get_applied_state())
+            self._revoke_admission(physical_plan, projection.acl_rules, dry_run)
             if projection.endpoint_policy_enabled:
                 if scope_map is None or self.runtime_config_map is None:
                     result.failures.append(ApplyFailure(ApplyOperation("prepare", "endpoint_scopes", "open"),
@@ -1424,6 +1503,10 @@ class XdpBackend(PortBackend):
                 projection, tentative_profile_generation
             )
             desired_udp_zone = self._desired_udp_zone_values(projection)
+            if tcp_zone_map is not None:
+                self._apply_zone_delta(tcp_zone_map, desired_zone, dry_run, additions=False)
+            if udp_zone_map is not None:
+                self._apply_zone_delta(udp_zone_map, desired_udp_zone, dry_run, additions=False)
 
             # Policy/profile replacement is close-before-open.  Removing the old
             # admission also guarantees the base reconcile sees the endpoint as an
@@ -1432,7 +1515,6 @@ class XdpBackend(PortBackend):
                 current = self.tcp_map.value(port) if hasattr(self.tcp_map, "value") else None
                 if current is not None and current != desired_global[port]:
                     self._map_operation(self.tcp_map, 'set', port, (0, 0, 0, 0), dry_run)
-            tcp_zone_map = getattr(self, "tcp_zone_map", None)
             if tcp_zone_map is not None:
                 for key in tcp_zone_map.entries() & set(desired_zone):
                     current = tcp_zone_map.value(*key) if hasattr(tcp_zone_map, "value") else None
@@ -1441,7 +1523,6 @@ class XdpBackend(PortBackend):
                 for key, tcp_value in desired_zone.items():
                     if tcp_zone_map.value(*key) != tcp_value and key[1] in desired_global:
                         self._map_operation(self.tcp_map, 'set', key[1], (0, 0, 0, 0), dry_run)
-            udp_zone_map = getattr(self, "udp_zone_map", None)
             if udp_zone_map is not None:
                 for key in udp_zone_map.entries() & set(desired_udp_zone):
                     current = udp_zone_map.value(*key) if hasattr(udp_zone_map, "value") else None
@@ -1471,14 +1552,6 @@ class XdpBackend(PortBackend):
             )
             udp_zone_values = self._desired_udp_zone_values(projection)
 
-            if tcp_zone_map is not None:
-                self._apply_zone_delta(
-                    tcp_zone_map, tcp_zone_values, dry_run, additions=False
-                )
-            if udp_zone_map is not None:
-                self._apply_zone_delta(
-                    udp_zone_map, udp_zone_values, dry_run, additions=False
-                )
             if projection.endpoint_policy_enabled and result.failures:
                 return
             self._defer_global_admission = True
@@ -1635,6 +1708,9 @@ class XdpBackend(PortBackend):
                     result.closed_endpoints.add(key)
                 if result.applied.endpoint_admission[key] == "unknown":
                     result.unconfirmed[str(key)] = "endpoint admission could not be confirmed"
+        if result.failures and not dry_run:
+            log.warning("%d XDP operation(s) failed this reconcile; kernel state may lag desired state.",
+                        len(result.failures))
         self.last_apply_result = result
         self._apply_result = None
         return result
@@ -1642,13 +1718,20 @@ class XdpBackend(PortBackend):
     def _apply_acl_delta(self, plan: ReconcilePlan, dry_run: bool) -> None:
         if self.acl_maps is None:
             return
-        for (proto, cidr), ports in plan.acl_rules_to_upsert.items():
-            if self._map_operation(self.acl_maps, 'set', proto, cidr, sorted(ports), dry_run):
-                log.info("ACL %s %s ports %s", proto.upper(), cidr, sorted(ports))
+        # Install exceptions before widening their parent. Remove obsolete
+        # parents before their children so a child only falls back to a final rule.
+        def prefixlen(key: tuple[str, str]) -> int:
+            return ipaddress.ip_network(key[1]).prefixlen
 
-        for (proto, cidr) in plan.acl_rules_to_remove:
-            if self._map_operation(self.acl_maps, 'delete', proto, cidr, dry_run):
-                log.info("ACL %s %s removed", proto.upper(), cidr)
+        for proto, cidr in sorted(plan.acl_rules_to_upsert, key=prefixlen, reverse=True):
+            ports = plan.acl_rules_to_upsert[(proto, cidr)]
+            if not self._map_operation(self.acl_maps, 'set', proto, cidr, sorted(ports), dry_run):
+                return
+            log.info("ACL %s %s ports %s", proto.upper(), cidr, sorted(ports))
+        for proto, cidr in sorted(plan.acl_rules_to_remove, key=prefixlen):
+            if not self._map_operation(self.acl_maps, 'delete', proto, cidr, dry_run):
+                return
+            log.info("ACL %s %s removed", proto.upper(), cidr)
 
     def _apply_rate_outer_delta(
         self,

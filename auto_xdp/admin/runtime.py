@@ -33,6 +33,7 @@ class BackendReport:
     generation: str
     healthy: bool
     fallback_reason: str | None
+    degraded: dict[str, str]
     excluded_interfaces: dict[str, str]
     policy: str
     release: str
@@ -435,6 +436,7 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
             Path(f"{ctx.bpf_pin_dir}_rollback"),
         )
     )
+    degraded: dict[str, str] = {}
     if backend == "inactive":
         policy = f"{policy_mode} (data plane inactive)"
         healthy = clean_generation and all(value in {"off", "missing"} for value in xdp_attach.values())
@@ -453,6 +455,12 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
                     break
         policy = "BPF maps pinned"
         healthy = attachments_ok and ids_ok and clean_generation
+        # The core firewall is attached; an optional module that could not be
+        # loaded is reported beside its health, not as a failed activation.
+        from auto_xdp.admin.module_runtime import degraded_modules
+        # Same default as the runtime launcher and the daemon.
+        toml_config = env.get("TOML_CONFIG") or "/etc/auto_xdp/config.toml"
+        degraded = degraded_modules(ctx.bpf_pin_dir, ctx.run_state_dir, Path(toml_config), interfaces)
     else:
         schema = _nft_policy_schema(ctx.nft_family, ctx.nft_table)
         policy = f"{ctx.nft_family} {ctx.nft_table} / {schema}"
@@ -481,6 +489,7 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
             if persistent.get("fallback_reason")
             else None
         ),
+        degraded=degraded,
         excluded_interfaces={str(key): str(value) for key, value in excluded.items()},
         policy=policy,
         release=release,
@@ -505,6 +514,8 @@ def render_backend_text(report: BackendReport) -> str:
             f"XDP mode  : {report.xdp_mode}",
             f"XDP attach: {xdp_attach}",
         ]
+    for name, reason in sorted(report.degraded.items()):
+        lines.append(f"Degraded  : {name} ({reason})")
     if report.fallback_reason:
         lines.append(f"Fallback  : {report.fallback_reason}")
     if report.install_transition:
@@ -538,6 +549,7 @@ def render_backend_json(report: BackendReport) -> str:
             "generation": report.generation,
             "healthy": report.healthy,
             "fallback_reason": report.fallback_reason,
+            "degraded": report.degraded,
             "excluded_interfaces": report.excluded_interfaces,
             "policy": report.policy,
             "release": report.release,

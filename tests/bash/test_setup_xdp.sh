@@ -1361,6 +1361,257 @@ test_required_icmp_module_failure_preserves_attachment() (
     [[ ! -e "$tmpdir/unexpected-attach" && ! -e "${BPF_PIN_DIR}_next" ]]
 )
 
+test_icmp_module_failure_degrades_only_a_cold_start() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir status attached
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    TOML_CONFIG="$tmpdir/config.toml"
+    IFACES=(eth0)
+    touch "$TOML_CONFIG" "$XDP_OBJ_INSTALLED"
+    ensure_linux_conntrack() { return 0; }
+    xdp_maps_ready() { return 0; }
+    load_slot_handlers() { return 0; }
+    load_port_handlers() { return 0; }
+    # The handler cannot be loaded. The module loader only reports success
+    # (gate published, Echo Replies dropped) when a degraded module is allowed.
+    # `unprotected icmp` answers whether the generation at --root has no ICMP
+    # handler bound (degraded, disabled, or never published).
+    python3() {
+        printf '%s\n' "$*" >>"$tmpdir/loader.log"
+        if [[ " $* " == *" unprotected icmp "* ]]; then
+            [[ -e "$tmpdir/live-degraded" ]]
+            return
+        fi
+        [[ " $* " == *" --allow-degraded "* ]]
+    }
+    # The live generation's program is 7; `running` is what the interface runs.
+    local running=""
+    _auto_xdp_pinned_prog_id() { printf '7\n'; }
+    _auto_xdp_prog_attached_anywhere() { [[ "$running" == "$1" ]]; }
+    RUN_STATE_DIR="$tmpdir/run"
+    preseed_xdp_candidate_policy() {
+        _auto_xdp_icmp_degrade_ok && printf 'policy-degrade-ok\n' >>"$tmpdir/loader.log"
+        return 0
+    }
+    bpftool() { printf 'new\n' >"$5"; }
+    _auto_xdp_iface_xdp_mode() { printf '%s' "$attached"; }
+    _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE=native; touch "$tmpdir/attach"; }
+    _auto_xdp_verify_iface_program() { return 0; }
+    _auto_xdp_record_xdp_state() { return 0; }
+
+    # Cold start: no XDP on any interface, so rejecting the candidate would
+    # leave no firewall. It is attached without the ICMP handler.
+    attached=none
+    BPF_PIN_DIR="$tmpdir/cold"
+    transactional_reload_xdp >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 0 || return 1
+    assert_eq "$AUTO_XDP_ATTACH_FATAL" 0 || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" new || return 1
+    [[ -e "$tmpdir/attach" && ! -e "${BPF_PIN_DIR}_next" ]] || return 1
+    assert_file_contains "$tmpdir/loader.log" "policy-degrade-ok" || return 1
+    assert_file_contains "$tmpdir/loader.log" "apply icmp --root ${BPF_PIN_DIR}_next" || return 1
+    assert_file_contains "$tmpdir/loader.log" "--allow-degraded" || return 1
+
+    # Reload: a working generation is attached and is never replaced by a
+    # candidate whose requested ICMP handler cannot be loaded.
+    rm -f "$tmpdir/attach" "$tmpdir/loader.log"
+    attached=native
+    running=7
+    BPF_PIN_DIR="$tmpdir/live"
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' >"$BPF_PIN_DIR/prog"
+    transactional_reload_xdp >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 1 || return 1
+    assert_eq "$AUTO_XDP_ATTACH_FATAL" 1 || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" old || return 1
+    [[ ! -e "$tmpdir/attach" && ! -e "${BPF_PIN_DIR}_next" ]] || return 1
+    if grep -q -e "--allow-degraded" -e "policy-degrade-ok" "$tmpdir/loader.log"; then
+        printf 'a replacement candidate was allowed to degrade\n'
+        return 1
+    fi
+    assert_file_contains "$tmpdir/loader.log" "unprotected icmp --root $BPF_PIN_DIR" || return 1
+
+    # The attached generation is itself degraded (gate set, no handler):
+    # refusing its replacement protects nothing and would freeze the policy,
+    # e.g. on an upgrade that changes a map layout.
+    rm -f "$tmpdir/loader.log"
+    touch "$tmpdir/live-degraded"
+    transactional_reload_xdp >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 0 || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" new || return 1
+    assert_file_contains "$tmpdir/loader.log" "policy-degrade-ok" || return 1
+    assert_file_contains "$tmpdir/loader.log" "--allow-degraded" || return 1
+
+    # Pins without an attachment (left by an nftables cutover): the live
+    # generation protects nothing, as on a cold start.
+    rm -f "$tmpdir/loader.log" "$tmpdir/live-degraded"
+    printf 'old\n' >"$BPF_PIN_DIR/prog"
+    attached=none
+    running=""
+    transactional_reload_xdp >/dev/null 2>&1 || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" new || return 1
+    if grep -q "unprotected icmp" "$tmpdir/loader.log"; then
+        printf 'queried a generation that no interface runs\n'
+        return 1
+    fi
+
+    # The installer refuses to install a degraded firewall where nothing runs
+    # yet, but may upgrade a host whose attached generation is degraded.
+    rm -f "$tmpdir/attach" "$tmpdir/loader.log"
+    BPF_PIN_DIR="$tmpdir/install"
+    AUTO_XDP_ICMP_STRICT_START=1 transactional_reload_xdp >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" 1 || return 1
+    [[ ! -e "$tmpdir/attach" && ! -e "$BPF_PIN_DIR/prog" ]] || return 1
+    if grep -q -e "--allow-degraded" -e "policy-degrade-ok" "$tmpdir/loader.log"; then
+        printf 'the installer was allowed to degrade a fresh install\n'
+        return 1
+    fi
+    BPF_PIN_DIR="$tmpdir/live"
+    printf 'old\n' >"$BPF_PIN_DIR/prog"
+    attached=native
+    running=7
+    touch "$tmpdir/live-degraded"
+    AUTO_XDP_ICMP_STRICT_START=1 transactional_reload_xdp >/dev/null 2>&1 || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" new || return 1
+    assert_file_contains "$REPO_ROOT/lib/setup/backend_xdp.sh" "AUTO_XDP_ICMP_STRICT_START=1 transactional_reload_xdp"
+)
+
+test_resuming_an_interrupted_first_start_may_degrade_icmp() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    RUN_STATE_DIR="$tmpdir/run"
+    BPF_PIN_DIR="$tmpdir/bpf"
+    TOML_CONFIG="$tmpdir/config.toml"
+    IFACES=(eth0)
+    touch "$TOML_CONFIG"
+    # The first start attached its candidate and was killed before committing:
+    # the only attached program is the candidate itself, nothing is committed.
+    mkdir -p "${BPF_PIN_DIR}_next"
+    printf 'candidate\n' >"${BPF_PIN_DIR}_next/prog"
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    load_slot_handlers() { return 0; }
+    load_port_handlers() { return 0; }
+    python3() {
+        printf '%s\n' "$*" >>"$tmpdir/loader.log"
+        [[ " $* " == *" --allow-degraded "* ]]
+    }
+    _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE=native; }
+    _auto_xdp_verify_iface_program() { return 0; }
+    _auto_xdp_record_xdp_state() { return 0; }
+    _auto_xdp_finish_interrupted_reload >/dev/null 2>&1 || return 1
+    assert_file_contains "$tmpdir/loader.log" "apply icmp --root ${BPF_PIN_DIR}_next" || return 1
+    assert_file_contains "$tmpdir/loader.log" "--allow-degraded" || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" candidate || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" ]] || return 1
+    # The decision does not leak out of the recovery.
+    [[ -z "${AUTO_XDP_ICMP_DEGRADE_OK+set}" && -z "${AUTO_XDP_ICMP_PROTECTED+set}" ]] || return 1
+
+    # Same, but an older generation is still pinned (no interface runs it, e.g.
+    # after an nftables cutover): the resume reaches the decision the
+    # interrupted reload made, instead of re-attaching that stale generation.
+    rm -rf "$BPF_PIN_DIR" "$tmpdir/loader.log"
+    mkdir -p "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next"
+    printf 'stale\n' >"$BPF_PIN_DIR/prog"
+    printf 'candidate\n' >"${BPF_PIN_DIR}_next/prog"
+    _auto_xdp_pinned_prog_id() { [[ "$(<"$1")" == stale ]] && printf '7\n' || printf '9\n'; }
+    _auto_xdp_prog_attached_anywhere() { [[ "$1" == 9 ]]; }
+    _auto_xdp_finish_interrupted_reload >/dev/null 2>&1 || return 1
+    assert_file_contains "$tmpdir/loader.log" "--allow-degraded" || return 1
+    if grep -q "unprotected icmp" "$tmpdir/loader.log"; then return 1; fi
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" candidate
+)
+
+test_resume_reuses_the_interrupted_reload_icmp_decision() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BPF_PIN_DIR="$tmpdir/bpf"
+    RUN_STATE_DIR="$tmpdir/run"
+    TOML_CONFIG="$tmpdir/config.toml"
+    IFACES=(eth0)
+    touch "$TOML_CONFIG"
+    load_slot_handlers() { return 0; }
+    load_port_handlers() { return 0; }
+    python3() {
+        printf '%s\n' "$*" >>"$tmpdir/loader.log"
+        [[ " $* " == *" --allow-degraded "* ]]
+    }
+    _auto_xdp_iface_xdp_mode() { printf 'native'; }
+    _auto_xdp_pinned_prog_id() { printf '7\n'; }
+    _auto_xdp_prog_attached_anywhere() { return 1; }  # only the candidate runs now
+    _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE=native; }
+    _auto_xdp_verify_iface_program() { return 0; }
+    _auto_xdp_record_xdp_state() { return 0; }
+
+    # A non-strict reload decided to degrade, attached its candidate and was
+    # killed. The installer (strict start) resumes it: the recorded decision
+    # wins over its own flag, so it neither re-attaches the stale generation
+    # nor reverses the decision.
+    mkdir -p "$BPF_PIN_DIR" "${BPF_PIN_DIR}_next" "$RUN_STATE_DIR"
+    printf 'stale\n' >"$BPF_PIN_DIR/prog"
+    printf 'candidate\n' >"${BPF_PIN_DIR}_next/prog"
+    printf '1\n' >"$RUN_STATE_DIR/icmp-reload-decision"
+    AUTO_XDP_ICMP_STRICT_START=1 _auto_xdp_finish_interrupted_reload >/dev/null 2>&1 || return 1
+    assert_file_contains "$tmpdir/loader.log" "--allow-degraded" || return 1
+    assert_eq "$(<"$BPF_PIN_DIR/prog")" candidate || return 1
+    # Committed: the record is gone, a later transaction decides afresh.
+    [[ ! -e "$RUN_STATE_DIR/icmp-reload-decision" ]] || return 1
+
+    # A strict decision is reused the same way.
+    rm -f "$tmpdir/loader.log"
+    mkdir -p "${BPF_PIN_DIR}_next"
+    printf 'candidate2\n' >"${BPF_PIN_DIR}_next/prog"
+    printf '0\n' >"$RUN_STATE_DIR/icmp-reload-decision"
+    _auto_xdp_finish_interrupted_reload >/dev/null 2>&1
+    if grep -q -e "--allow-degraded" "$tmpdir/loader.log"; then return 1; fi
+    assert_file_contains "$RUN_STATE_DIR/icmp-reload-decision" "0"
+)
+
+test_reload_records_its_icmp_decision_and_scans_every_interface() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BPF_PIN_DIR="$tmpdir/bpf"
+    RUN_STATE_DIR="$tmpdir/run"
+    IFACES=(eth1)
+    mkdir -p "$BPF_PIN_DIR"
+    printf 'old\n' >"$BPF_PIN_DIR/prog"
+    _auto_xdp_pinned_prog_id() { printf '7\n'; }
+    # The protected generation runs on eth0 only, outside the new target set.
+    ip() { printf '%s\n' '[{"ifname":"eth0","xdp":{"prog":{"id":7}}},{"ifname":"eth1"}]'; }
+    python3() {
+        if [[ "$1" == "-c" ]]; then command python3 "$@"; return; fi
+        printf '%s\n' "$*" >>"$tmpdir/query.log"
+        return 0  # no working handler in the protected generation
+    }
+    _auto_xdp_icmp_protected_attached "$BPF_PIN_DIR" || return 1
+    local AUTO_XDP_ICMP_PROTECTED="$BPF_PIN_DIR" AUTO_XDP_ICMP_DEGRADE_OK=""
+    AUTO_XDP_ICMP_STRICT_START=1 _auto_xdp_icmp_degrade_ok || return 1
+    assert_file_contains "$tmpdir/query.log" "unprotected icmp --root $BPF_PIN_DIR" || return 1
+    assert_eq "$(<"$RUN_STATE_DIR/icmp-reload-decision")" 1 || return 1
+    # Cached for the rest of the transaction: no second query.
+    _auto_xdp_icmp_degrade_ok || return 1
+    assert_eq "$(wc -l <"$tmpdir/query.log" | tr -d ' ')" 1 || return 1
+    ip() { printf '%s\n' '[{"ifname":"eth0"},{"ifname":"eth1"}]'; }
+    if _auto_xdp_icmp_protected_attached "$BPF_PIN_DIR"; then return 1; fi
+    ip() { return 1; }
+    _auto_xdp_icmp_protected_attached "$BPF_PIN_DIR"  # unreadable inventory: assume attached
+)
+
 test_boot_missing_icmp_module_blocks_automatic_fallback() (
     source "$REPO_ROOT/runtime/auto_xdp_start.sh"
     source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
@@ -1708,6 +1959,7 @@ class XdpBackend:
 PY
     cat > "$tmpdir/python/auto_xdp/syncer.py" <<PY
 def sync_once(backend, dry_run):
+    assert backend.module_maintenance
     with open("$tmpdir/expected", "w") as handle:
         handle.write(repr(backend.syncookie_program_expected))
 PY
@@ -2077,6 +2329,91 @@ test_failed_interrupted_reload_restores_stable_then_builds_fresh_candidate() (
     [[ ! -e "${BPF_PIN_DIR}_next" && ! -e "${BPF_PIN_DIR}_rollback" ]]
 )
 
+test_orphan_candidate_without_committed_generation_is_discarded() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    ensure_linux_conntrack() { return 0; }
+    set +e
+
+    local tmpdir output status
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BPF_PIN_DIR="$tmpdir/bpf"
+    XDP_OBJ_INSTALLED="$tmpdir/xdp.o"
+    IFACES=("eth0")
+    touch "$XDP_OBJ_INSTALLED"
+    # A start was killed during candidate pre-seed: only xdp_fw_next exists.
+    mkdir -p "${BPF_PIN_DIR}_next/modules"
+    printf 'stale\n' > "${BPF_PIN_DIR}_next/prog"
+
+    _auto_xdp_pinned_prog_id() { [[ "$(cat "$1")" == stale ]] && printf '202\n' || printf '303\n'; }
+    ip() { printf '%s\n' '[{"ifname":"lo"}]'; }
+    _auto_xdp_iface_xdp_mode() { printf 'none'; }
+    # The stale candidate cannot be resumed (its handler pre-seed fails).
+    _auto_xdp_finish_interrupted_reload() { return 1; }
+
+    output=$(_auto_xdp_restore_interrupted_reload 2>&1)
+    status=$?
+    assert_eq "$status" "0" || return 1
+    assert_contains "$output" "Discarded an interrupted XDP candidate" || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" ]] || return 1
+
+    # The whole start: recovery, then a fresh candidate becomes the generation.
+    mkdir -p "${BPF_PIN_DIR}_next"
+    printf 'stale\n' > "${BPF_PIN_DIR}_next/prog"
+    bpftool() { printf 'fresh\n' > "$BPF_PIN_DIR/prog"; }
+    xdp_maps_ready() { return 0; }
+    preseed_xdp_candidate_policy() { return 0; }
+    preseed_xdp_candidate_handlers() { return 0; }
+    _auto_xdp_attach_candidate() { AUTO_XDP_LAST_ATTACH_MODE="native"; }
+    _auto_xdp_verify_iface_program() { return 0; }
+    _auto_xdp_record_xdp_state() { return 0; }
+    if ! transactional_reload_xdp >"$tmpdir/transaction.log" 2>&1; then
+        cat "$tmpdir/transaction.log"
+        return 1
+    fi
+    assert_eq "$(cat "$BPF_PIN_DIR/prog")" "fresh" || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" && ! -e "${BPF_PIN_DIR}_rollback" ]]
+)
+
+test_orphan_candidate_is_retained_while_its_program_is_attached() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir output status attached_id
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+    BPF_PIN_DIR="$tmpdir/bpf"
+    IFACES=("eth0" "eth1")
+    mkdir -p "${BPF_PIN_DIR}_next"
+    touch "${BPF_PIN_DIR}_next/prog"
+    _auto_xdp_pinned_prog_id() { printf '202\n'; }
+    _auto_xdp_iface_xdp_mode() { [[ "$1" == eth1 ]] && printf 'native' || printf 'none'; }
+    _auto_xdp_iface_prog_id() { printf '%s\n' "$attached_id"; }
+
+    # The first start attached the candidate to eth1 before it was killed.
+    # Deleting its pins would leave that program unmanageable.
+    attached_id=202
+    output=$(_auto_xdp_restore_interrupted_reload 2>&1)
+    status=$?
+    assert_eq "$status" "1" || return 1
+    assert_contains "$output" "is attached to eth1" || return 1
+    [[ -e "${BPF_PIN_DIR}_next/prog" ]] || return 1
+
+    # Another program on the interface does not keep the orphan alive; the
+    # following reload applies its own rule to that program.
+    attached_id=999
+    ip() { printf '%s\n' '[{"ifname":"old0","xdp":{"prog":{"id":202}}}]'; }
+    if _auto_xdp_restore_interrupted_reload >/dev/null 2>&1; then return 1; fi
+    [[ -e "${BPF_PIN_DIR}_next/prog" ]] || return 1
+    ip() { return 1; }
+    if _auto_xdp_restore_interrupted_reload >/dev/null 2>&1; then return 1; fi
+    ip() { printf '%s\n' '[{"ifname":"eth1","xdp":{"attached":"driver"}}]'; }
+    if _auto_xdp_restore_interrupted_reload >/dev/null 2>&1; then return 1; fi
+    ip() { printf '%s\n' '[{"ifname":"eth1","xdp":{"prog":{"id":999}}}]'; }
+    _auto_xdp_restore_interrupted_reload >/dev/null 2>&1 || return 1
+    [[ ! -e "${BPF_PIN_DIR}_next" ]]
+)
+
 test_ambiguous_interrupted_reload_retains_all_generations() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -2256,8 +2593,8 @@ test_install_toml_config_preserves_existing_local_config() (
 
     as_root() {
         printf '%s\n' "$*" >>"$ops_log"
-        if [[ "$1" == "chmod" ]]; then
-            chmod "$2" "$3"
+        if [[ "$1" != "chown" ]]; then
+            "$@"
         fi
     }
 
@@ -2289,9 +2626,7 @@ test_install_toml_config_secures_new_config() (
 
     as_root() {
         printf '%s\n' "$*" >>"$ops_log"
-        if [[ "$1" == "chmod" ]]; then
-            chmod "$2" "$3"
-        fi
+        [[ "$1" == chown ]] || "$@"
     }
 
     fetch_local_or_remote() { printf 'repo_default = 1\n' >"$3"; }

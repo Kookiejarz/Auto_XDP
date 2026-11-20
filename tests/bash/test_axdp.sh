@@ -584,6 +584,98 @@ test_ensure_xdp_blocks_fallback_when_required_syncookie_is_unavailable() (
     assert_eq "$status" "2"
 )
 
+test_ensure_xdp_keeps_running_when_syncookie_module_cannot_activate() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir status path
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+    _IFACES=(eth0)
+    TOML_CONFIG="$tmpdir/config.toml"
+    printf '[modules.syncookie]\nenabled = true\ndefault_mode = "always"\n' >"$TOML_CONFIG"
+    _auto_xdp_verify_iface_program() { return 0; }
+    ip() { printf '%s\n' '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":77}}}]'; }
+    # Use the real loader wrapper (the shared setup stubs it); only the module
+    # transaction is replaced. Strict activation is refused unless the runtime
+    # allowed a degraded module.
+    eval "$(source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+            declare -f load_syncookie_program _auto_xdp_load_syncookie_program)"
+    _auto_xdp_syncookie_module() {
+        printf '%s\n' "$*" >>"$tmpdir/module.log"
+        [[ "$1" != apply || " $* " == *" --allow-degraded "* ]]
+    }
+
+    # Fast path: the attached generation keeps running, the service starts.
+    ensure_xdp_loaded >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "0" || return 1
+    assert_file_contains "$tmpdir/module.log" "--allow-degraded" || return 1
+
+    # Outside runtime activation (installer, tests) the refusal stays a failure.
+    : >"$tmpdir/module.log"
+    if load_syncookie_program >/dev/null 2>&1; then
+        printf 'load_syncookie_program degraded without the runtime opt-in\n'
+        return 1
+    fi
+    if grep -q -e "--allow-degraded" "$tmpdir/module.log"; then return 1; fi
+
+    # After a committed reload the candidate is already the only generation.
+    : >"$tmpdir/module.log"
+    rm -f "$BPF_PIN_DIR/prog"
+    transactional_reload_xdp() { touch "$BPF_PIN_DIR/prog"; AUTO_XDP_SWITCH_MODE=native; }
+    ensure_xdp_loaded >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "0" || return 1
+    assert_file_contains "$tmpdir/module.log" "--allow-degraded"
+)
+
+test_ensure_xdp_keeps_running_when_icmp_module_cannot_load() (
+    source "$REPO_ROOT/runtime/auto_xdp_start.sh"
+    set +e
+
+    local tmpdir status loader_status=0
+    tmpdir=$(mktemp -d)
+    _setup_reattach_test_env "$tmpdir"
+    _IFACES=(eth0)
+    TOML_CONFIG="$tmpdir/config.toml"
+    printf '[modules.icmp]\nenabled = true\n' >"$TOML_CONFIG"
+    _auto_xdp_verify_iface_program() { return 0; }
+    # eth0 already runs this generation; restarting the service replaces nothing.
+    ip() { printf '%s\n' '[{"ifname":"eth0","xdp":{"mode":1,"prog":{"id":77}}}]'; }
+    python3() {
+        if [[ "$*" == *"auto_xdp.admin.module_runtime unprotected icmp"* ]]; then
+            # Only the fast path's explicit opt-in may allow the degrade here.
+            printf 'queried\n' >>"$tmpdir/loader.log"
+            return 1
+        fi
+        if [[ "$*" != *"auto_xdp.admin.module_runtime apply icmp"* ]]; then
+            command python3 "$@"
+            return
+        fi
+        printf '%s\n' "$*" >>"$tmpdir/loader.log"
+        [[ $loader_status -eq 0 && " $* " == *" --allow-degraded "* ]]
+    }
+
+    # The handler cannot load: the attached generation keeps running, degraded.
+    ensure_xdp_loaded >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "0" || return 1
+    assert_file_contains "$tmpdir/loader.log" "--allow-degraded" || return 1
+    if grep -q queried "$tmpdir/loader.log"; then
+        printf 'the fast path asked for a decision instead of stating it\n'
+        return 1
+    fi
+    assert_eq "$(cat "$RUN_STATE_DIR/xdp_mode")" "native" || return 1
+
+    # Echo Replies could not be closed either: activation is still refused,
+    # without an nftables fallback.
+    loader_status=1
+    ensure_xdp_loaded >/dev/null 2>&1
+    status=$?
+    assert_eq "$status" "2"
+)
+
 test_select_backend_refuses_nftables_while_xdp_remains_attached() (
     source "$REPO_ROOT/runtime/auto_xdp_start.sh"
     set +e

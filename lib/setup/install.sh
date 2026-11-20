@@ -420,11 +420,23 @@ install_toml_config() {
         as_root chmod 0700 "$backup_dir"
         info "Preserving existing config.toml (backup: ${backup_dir}/config.toml.${stamp})"
     else
+        local template
         if [[ -n "${CANDIDATE_TOML_CONFIG:-}" && -f "$CANDIDATE_TOML_CONFIG" ]]; then
-            place_file "$CANDIDATE_TOML_CONFIG" "$toml_target"
-        elif ! fetch_local_or_remote "config.toml" "config.toml" "$toml_target"; then
-            die "Failed to install config.toml"
+            template="$CANDIDATE_TOML_CONFIG"
+        else
+            template=$(mktemp) || return 1
+            _SETUP_TMPFILES+=("$template")
+            fetch_local_or_remote "config.toml" "config.toml" "$template" || die "Failed to fetch config.toml"
         fi
+        # A concurrent CLI initialization or approval must win over this
+        # previously missing-file check. Use the same commit lock as every editor.
+        as_root env "PYTHONPATH=${PYTHON_LIB_DIR:-${SOURCE_ROOT:-.}}${PYTHONPATH:+:$PYTHONPATH}" \
+            "${PYTHON3_BIN:-python3}" - "$toml_target" "$template" <<'PY' || return 1
+import sys
+from pathlib import Path
+from auto_xdp.admin.config_file import ensure_config_exists
+ensure_config_exists(Path(sys.argv[1]), template=Path(sys.argv[2]).read_text(encoding="utf-8"))
+PY
     fi
 
     as_root chown root:root "$toml_target"

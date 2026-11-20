@@ -12,6 +12,12 @@ from auto_xdp.admin import handlers, module_runtime as modules
 pytestmark = pytest.mark.component
 
 
+@pytest.fixture(autouse=True)
+def private_run_state(tmp_path, monkeypatch):
+    # Degraded-module markers are written under the runtime directory.
+    monkeypatch.setenv("RUN_STATE_DIR", str(tmp_path / "run"))
+
+
 @pytest.fixture
 def generation(tmp_path, monkeypatch):
     root = tmp_path / "pins"
@@ -250,3 +256,153 @@ def test_tc_readback_is_strict_and_scoped_to_the_owned_filter(status, rows, expe
                 modules.tc_program_id("eth0")
         else:
             assert modules.tc_program_id("eth0") == expected
+
+
+def syncookie_apply(root, xdp, tc, config, tmp_path, capability, *extra):
+    return modules.main(["apply", "syncookie", "--root", str(root), "--iface", "eth0", "--iface", "eth1",
+                         "--config", str(config), "--xdp", str(xdp), "--tc", str(tc),
+                         "--sysctl-state", str(tmp_path / "sysctl-state"), "--capability", capability, *extra])
+
+
+@pytest.mark.parametrize("level,ready,mode,cause", [
+    (1, True, "always", "SYN-cookie listener handoff unavailable: reason"),
+    (2, False, "auto", "refusing SYN-cookie enablement: reason"),
+])
+def test_refused_activation_is_fatal_unless_the_runtime_allows_degrading(
+        generation, tmp_path, capsys, level, ready, mode, cause):
+    root, live, xdp, tc, state, _ = generation
+    config = tmp_path / "config.toml"
+    config.write_text(f'[modules.syncookie]\nenabled = true\ndefault_mode = "{mode}"\n')
+    capability = f"{level}\nreason\n{int(ready)}"
+    marker = tmp_path / "run/syncookie_degraded"
+
+    # Installer, tests and explicit module operations keep the hard failure.
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, capability) == 1
+    assert f"[auto_xdp] error: {cause}" in capsys.readouterr().err and not marker.exists()
+
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, capability, "--allow-degraded") == 0
+    error = capsys.readouterr().err
+    assert error.count("\n") == 1 and error.startswith("[auto_xdp] error: SYN-cookie protection is degraded")
+    assert cause in error and "stay closed" in error and str(marker) in error
+    assert "axdp handler apply syncookie --set enabled=true" in error
+    # Both hooks are withdrawn: the backend then blocks every cookie endpoint.
+    assert state["xdp"] is state["eth0"] is state["eth1"] is None and not live.exists()
+    assert not modules.program_available(root)
+    assert modules.degraded_reason("syncookie", tmp_path / "run") == cause
+
+    # Each runtime start reports once, even with an unchanged cause.
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, capability, "--allow-degraded") == 0
+    assert capsys.readouterr().err.count("SYN-cookie protection is degraded") == 1
+
+
+def test_degraded_syncookie_state_ends_when_the_module_loads_or_is_disabled(generation, tmp_path, monkeypatch):
+    root, _, xdp, tc, state, _ = generation
+    config = tmp_path / "config.toml"
+    config.write_text('[modules.syncookie]\nenabled = true\ndefault_mode = "always"\n')
+    monkeypatch.setattr(modules, "acquire_sysctl", lambda path: None)
+    monkeypatch.setattr(modules, "release_sysctl", lambda path: True)
+    run = tmp_path / "run"
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "1\nreason\n1", "--allow-degraded") == 0
+    assert modules.degraded_reason("syncookie", run)
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "2\nready\n1", "--allow-degraded") == 0
+    assert state["xdp"] == 21 and modules.degraded_reason("syncookie", run) is None
+
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "1\nreason\n1", "--allow-degraded") == 0
+    assert modules.degraded_reason("syncookie", run)
+    config.write_text('[modules.syncookie]\nenabled = false\n')
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "1\nreason\n1", "--allow-degraded") == 0
+    assert modules.degraded_reason("syncookie", run) is None
+
+
+def test_non_strict_fallback_is_visible_as_degraded(generation, tmp_path, capsys):
+    root, _, xdp, tc, _, _ = generation
+    config = tmp_path / "config.toml"
+    config.write_text('[modules.syncookie]\nenabled = true\ndefault_mode = "auto"\n')
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "1\nneeds Linux 6.11\n1") == 0
+    assert "warning: SYN-cookie listener handoff unavailable: needs Linux 6.11" in capsys.readouterr().err
+    assert modules.degraded_reason("syncookie", tmp_path / "run") == \
+        "SYN-cookie listener handoff unavailable: needs Linux 6.11"
+
+
+def test_failed_module_replacement_keeps_the_loaded_module_and_is_not_degraded(generation, tmp_path, monkeypatch, capsys):
+    root, live, xdp, tc, state, _ = generation
+    config = tmp_path / "config.toml"
+    config.write_text('[modules.syncookie]\nenabled = true\ndefault_mode = "always"\n')
+    monkeypatch.setattr(modules, "acquire_sysctl", lambda path: None)
+    monkeypatch.setattr(modules, "obj_get", lambda path: 123)
+    monkeypatch.setattr(modules, "program_id", lambda fd: 11)
+    monkeypatch.setattr(modules.os, "close", lambda fd: None)
+    def reject(*args, **kwargs):
+        raise RuntimeError("verifier rejected the new cookie program")
+    monkeypatch.setattr(modules, "load_syncookie", reject)
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "2\nready\n1", "--allow-degraded") == 0
+    assert "the loaded module stays active: verifier rejected the new cookie program" in capsys.readouterr().err
+    assert state["xdp"] == 11 and (live / "prog").exists()
+    assert modules.degraded_reason("syncookie", tmp_path / "run") is None
+
+
+def test_configuration_errors_are_never_degraded(generation, tmp_path, capsys):
+    root, _, xdp, tc, _, _ = generation
+    config = tmp_path / "config.toml"
+    config.write_text('[syncookie]\nenabled = true\n')  # retired section name
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "2\nready\n1", "--allow-degraded") == 1
+    assert "Unsupported module configuration" in capsys.readouterr().err
+    assert modules.degraded_reason("syncookie", tmp_path / "run") is None
+
+
+def test_disable_failure_is_never_reported_as_a_degraded_activation(generation, tmp_path, monkeypatch, capsys):
+    root, live, xdp, tc, state, _ = generation
+    config = tmp_path / "config.toml"
+    config.write_text('[modules.syncookie]\nenabled = false\n')
+    def fail(*args, **kwargs):
+        raise RuntimeError("Cannot update SYN Cookie TC ingress on eth1")
+    monkeypatch.setattr(modules, "remove_syncookie", fail)
+    # The runtime opt-in only covers activation: a failed Disable stays fatal.
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "2\nready\n1", "--allow-degraded") == 1
+    error = capsys.readouterr().err
+    assert "[auto_xdp] error: Cannot update SYN Cookie TC ingress on eth1" in error and "degraded" not in error
+    assert modules.degraded_reason("syncookie", tmp_path / "run") is None
+
+
+def test_partially_restored_module_is_reported_degraded_not_active(generation, tmp_path, monkeypatch, capsys):
+    root, live, xdp, tc, state, _ = generation
+    config = tmp_path / "config.toml"
+    config.write_text('[modules.syncookie]\nenabled = true\ndefault_mode = "always"\n')
+    monkeypatch.setattr(modules, "acquire_sysctl", lambda path: None)
+    monkeypatch.setattr(modules, "program_available", lambda root: True)  # old dispatch entry restored
+    def reject(*args, **kwargs):
+        raise RuntimeError("Cannot update SYN Cookie TC ingress on eth1")
+    monkeypatch.setattr(modules, "load_syncookie", reject)
+    state["eth1"] = None  # eth1 was added to IFACES; it has no TC handoff
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "2\nready\n1", "--allow-degraded") == 0
+    error = capsys.readouterr().err
+    assert "SYN-cookie protection is degraded" in error and "the loaded module stays active" not in error
+    assert "not verified on every interface (SYN Cookie TC ingress is not attached on eth1)" in error
+    assert modules.degraded_reason("syncookie", tmp_path / "run") == "Cannot update SYN Cookie TC ingress on eth1"
+
+
+def test_failed_withdrawal_of_a_refused_module_stays_fatal(generation, tmp_path, monkeypatch, capsys):
+    root, live, xdp, tc, state, _ = generation
+    config = tmp_path / "config.toml"
+    config.write_text('[modules.syncookie]\nenabled = true\ndefault_mode = "always"\n')
+    def fail(*args, **kwargs):
+        raise RuntimeError("Cannot update SYN Cookie TC ingress on eth1")
+    monkeypatch.setattr(modules, "remove_syncookie", fail)
+    # NAT makes the module refused; its withdrawal then fails, so the refused
+    # module may still run. That must not be reported as "stays active".
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "2\nNAT\n0", "--allow-degraded") == 1
+    error = capsys.readouterr().err
+    assert "refused but could not be withdrawn: Cannot update SYN Cookie TC ingress on eth1" in error
+    assert "stays active" not in error and "degraded" not in error
+
+
+def test_strict_refusal_after_a_non_strict_fallback_is_still_reported(generation, tmp_path, capsys):
+    root, _, xdp, tc, _, _ = generation
+    config = tmp_path / "config.toml"
+    config.write_text('[modules.syncookie]\nenabled = true\ndefault_mode = "auto"\n')
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "1\nneeds Linux 6.11\n1", "--allow-degraded") == 0
+    capsys.readouterr()
+    # Same cause text, now as a strict refusal: the full explanation must appear.
+    config.write_text('[modules.syncookie]\nenabled = true\ndefault_mode = "always"\n')
+    assert syncookie_apply(root, xdp, tc, config, tmp_path, "1\nneeds Linux 6.11\n1", "--allow-degraded") == 0
+    assert "SYN-cookie protection is degraded" in capsys.readouterr().err

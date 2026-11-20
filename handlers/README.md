@@ -110,6 +110,14 @@ Successful updates retire unreferenced catalog builds while preserving builds
 used by other bindings. Choosing a new target adds a binding; it does not
 remove the old target automatically.
 
+Configuration edits use the same version check and commit lock as approvals
+and other management commands. Compilation runs outside that short lock. If
+the configuration changes while an object is built, the edit reports a conflict
+and does not activate its stale candidate; reload the settings and retry.
+The daemon requests nonblocking handler locks and never compiles a kernel
+dependency during policy updates. A busy loader defers maintenance while removed
+grants are revoked first. Manual Apply retains the normal waiting behavior.
+
 Minecraft config selects an existing policy subject and changes its
 `protection.profile`; it never creates exposure grants. SYN Cookie exposes its
 existing policy modes, thresholds and per-port/process/service overrides.
@@ -143,6 +151,19 @@ Old root-level program pins are not adopted. Pins are retired only
 after a verified switch/removal. New generations live under
 `BPF_PIN_DIR/modules/syncookie/` (`prog` and `ingress`). Capability checks and
 namespace-scoped sysctl ownership remain requirements of this module.
+
+A module that cannot be activated does not stop the firewall service. When
+the service activates SYN Cookie and it is refused (a strict `always` mode
+without Level 2 handoff, NAT in the namespace, a rejected program), or cannot
+load the ICMP handler (see [ICMP](ICMP.md) for exactly when), XDP stays attached
+and policy sync keeps running with that module's traffic closed: TCP endpoints
+whose SYN-cookie mode is not `off` are not admitted, Echo Replies are dropped.
+One error names the cause, and `axdp status` shows `Degraded  : <module> (...)`
+while health stays `healthy`. The state is read from the live generation; the
+full loader output is kept in `/run/auto_xdp/<module>_degraded`. Restarting the
+service or `axdp handler apply <module> --set enabled=true` retries. Failures to
+*disable* or withdraw a module, configuration errors and a fresh installation
+stay fatal, and nftables is never substituted for either module.
 
 ICMP uses the same generation transaction for protocol slots 1 and 58, with
 one ownership pin under `BPF_PIN_DIR/modules/icmp/prog`. Disable clears its

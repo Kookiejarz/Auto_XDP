@@ -863,6 +863,42 @@ except (IndexError, ValueError, json.JSONDecodeError):
 '
 }
 
+# Succeeds when any interface on the host, configured or not, runs program $1.
+# An unreadable inventory counts as "runs it".
+_auto_xdp_prog_attached_anywhere() {
+    local links="" result=""
+    # Not a pipeline: under pipefail a failing `ip` would read as "not attached".
+    links=$(ip -j -d link show 2>/dev/null) || return 0
+    result=$(printf '%s' "$links" | "${PYTHON3_BIN:-python3}" -c '
+import json, sys
+
+def ids(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if (key == "id" or key.endswith("prog_id")) and isinstance(child, int):
+                yield child
+            else:
+                yield from ids(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from ids(child)
+
+links = json.load(sys.stdin)
+wanted = int(sys.argv[1])
+if isinstance(links, list) and links:
+    for link in links:
+        if not isinstance(link, dict):
+            break
+        if "xdp" in link:
+            attached = set(ids(link["xdp"]))
+            if not attached or wanted in attached:
+                break
+    else:
+        print("clear")
+' "$1" 2>/dev/null) || return 0
+    [[ "$result" != clear ]]
+}
+
 _auto_xdp_verify_iface_program() {
     local iface="$1" prog="$2" expected_id="" actual_id=""
     expected_id=$(_auto_xdp_pinned_prog_id "$prog") || return 1
@@ -896,7 +932,12 @@ preseed_xdp_candidate_policy() {
     local config_path="${TOML_CONFIG:-/etc/auto_xdp/config.toml}"
     local python_path="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
 
+    local icmp_degrade_ok=0
+    _auto_xdp_icmp_degrade_ok && icmp_degrade_ok=1
+
     AUTO_XDP_SYNCOOKIE_EXPECTED="$syncookie_expected" \
+    AUTO_XDP_ICMP_DEGRADE_OK="$icmp_degrade_ok" \
+    RUN_STATE_DIR="${RUN_STATE_DIR:-/run/auto_xdp}" \
     PYTHONPATH="$python_path${PYTHONPATH:+:$PYTHONPATH}" \
         "$py_bin" - "$candidate_dir" "$config_path" <<'PYEOF'
 import os
@@ -911,10 +952,14 @@ pin_dir, config_path = sys.argv[1:]
 apply_toml_config(load_toml_config(config_path))
 cfg._set_bpf_pin_dir(pin_dir)
 with XdpBackend() as backend:
+    backend.module_maintenance = True
     # The optional cookie program is loaded into this generation only after
     # the switch. Without the runtime's decision, every cookie endpoint would
     # be closed across it, established connections included.
     backend.syncookie_program_expected = os.environ.get("AUTO_XDP_SYNCOOKIE_EXPECTED") == "1"
+    # With no XDP attached, an unloadable ICMP handler degrades (Echo Replies
+    # dropped by the gate) instead of rejecting the only candidate.
+    backend.icmp_degrade_ok = os.environ.get("AUTO_XDP_ICMP_DEGRADE_OK") == "1"
     sync_once(backend, dry_run=False)
     if backend.last_apply_failures:
         print(
@@ -955,6 +1000,11 @@ _auto_xdp_finish_interrupted_reload() {
 
     if [[ -e "$candidate_dir" ]]; then
         _auto_xdp_warn "Interrupted XDP reload detected; resuming the staged candidate generation."
+        # The generation to protect is the committed live one, if any; an
+        # interrupted first start may already have attached the candidate.
+        local AUTO_XDP_ICMP_PROTECTED="$live_dir"
+        local AUTO_XDP_ICMP_DEGRADE_OK
+        AUTO_XDP_ICMP_DEGRADE_OK=$(_auto_xdp_icmp_saved_decision)
         saved_pin_dir="$BPF_PIN_DIR"
         BPF_PIN_DIR="$candidate_dir"
         if ! preseed_xdp_candidate_handlers; then
@@ -983,6 +1033,7 @@ _auto_xdp_finish_interrupted_reload() {
             return 1
         fi
         rm -rf "$rollback_dir"
+        _auto_xdp_icmp_forget_decision
         AUTO_XDP_HANDLERS_PRELOADED=1
         AUTO_XDP_RECOVERY_HANDLED=1
         return 0
@@ -992,6 +1043,10 @@ _auto_xdp_finish_interrupted_reload() {
     # replacement before deleting the rollback generation.
     [[ -e "$live_dir/prog" && -e "$rollback_dir/prog" ]] || return 1
     _auto_xdp_warn "Interrupted XDP commit detected; verifying the live generation before cleanup."
+    # The previous committed generation is now the rollback directory.
+    local AUTO_XDP_ICMP_PROTECTED="$rollback_dir"
+    local AUTO_XDP_ICMP_DEGRADE_OK
+    AUTO_XDP_ICMP_DEGRADE_OK=$(_auto_xdp_icmp_saved_decision)
     preseed_xdp_candidate_handlers || return 1
     AUTO_XDP_SWITCH_MODE=""
     for iface in "${recovery_ifaces[@]}"; do
@@ -1007,8 +1062,45 @@ _auto_xdp_finish_interrupted_reload() {
         return 1
     fi
     rm -rf "$rollback_dir"
+    _auto_xdp_icmp_forget_decision
     AUTO_XDP_HANDLERS_PRELOADED=1
     AUTO_XDP_RECOVERY_HANDLED=1
+}
+
+# Removes a candidate generation that has no committed generation beside it.
+# Its pins are only safe to delete while no interface runs its program: an
+# attached program whose maps are unpinned can no longer be managed.
+_auto_xdp_discard_orphan_candidate() {
+    local candidate_dir="$1" candidate_id="" iface_var="" iface actual_id=""
+
+    if [[ -e "$candidate_dir/prog" ]]; then
+        candidate_id=$(_auto_xdp_pinned_prog_id "$candidate_dir/prog") || {
+            _auto_xdp_warn "Could not identify interrupted XDP program at $candidate_dir/prog; its pins were retained."
+            return 1
+        }
+        iface_var=$(_auto_xdp_iface_var_name) || return 1
+        local -n orphan_ifaces="$iface_var"
+        for iface in "${orphan_ifaces[@]}"; do
+            [[ "$(_auto_xdp_iface_xdp_mode "$iface")" != "none" ]] || continue
+            actual_id=$(_auto_xdp_iface_prog_id "$iface") || {
+                _auto_xdp_warn "Could not identify the XDP program attached to $iface; interrupted candidate pins were retained."
+                return 1
+            }
+            if [[ "$actual_id" == "$candidate_id" ]]; then
+                _auto_xdp_warn "Interrupted XDP candidate $candidate_id is attached to $iface and no committed generation exists; its pins were retained."
+                return 1
+            fi
+        done
+        if _auto_xdp_prog_attached_anywhere "$candidate_id"; then
+            _auto_xdp_warn "Cannot confirm interrupted XDP candidate $candidate_id is detached from every interface; its pins were retained."
+            return 1
+        fi
+    fi
+
+    rm -rf "$candidate_dir" || return 1
+    AUTO_XDP_HANDLERS_PRELOADED=0
+    AUTO_XDP_RECOVERY_HANDLED=0
+    _auto_xdp_warn "Discarded an interrupted XDP candidate that was never attached; continuing with a fresh candidate."
 }
 
 _auto_xdp_restore_interrupted_reload() {
@@ -1022,6 +1114,14 @@ _auto_xdp_restore_interrupted_reload() {
     if [[ -e "$live_dir" && -e "$candidate_dir" && -e "$rollback_dir" ]]; then
         _auto_xdp_warn "Live, candidate, and rollback XDP generations all exist; refusing ambiguous recovery."
         return 1
+    fi
+
+    if [[ -e "$candidate_dir" && ! -e "$live_dir/prog" && ! -e "$rollback_dir" ]]; then
+        # A start was interrupted before its first generation was committed
+        # (for example killed during candidate pre-seed). There is nothing to
+        # restore, and the leftover would fail this check on every later start.
+        _auto_xdp_discard_orphan_candidate "$candidate_dir"
+        return
     fi
 
     if [[ -e "$candidate_dir" ]]; then
@@ -1087,6 +1187,7 @@ _auto_xdp_restore_interrupted_reload() {
 
     AUTO_XDP_HANDLERS_PRELOADED=0
     AUTO_XDP_RECOVERY_HANDLED=0
+    _auto_xdp_icmp_forget_decision
     _auto_xdp_warn "Restored the last committed XDP generation; continuing with a fresh candidate."
     return 0
 }
@@ -1151,6 +1252,7 @@ _auto_xdp_syncookie_module() {
         for iface in "${module_ifaces[@]}"; do arguments+=(--iface "$iface"); done
     fi
     local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+    RUN_STATE_DIR="${RUN_STATE_DIR:-/run/auto_xdp}" \
     PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
         "${PYTHON3_BIN:-python3}" -m auto_xdp.admin.module_runtime "${arguments[@]}" "$@"
 }
@@ -1228,6 +1330,12 @@ _auto_xdp_settle_syncookie_preseed() {
         _auto_xdp_warn "Could not close pre-seeded cookie endpoints; the daemon closes them on its first sync."
 }
 
+# Fails when the enabled SYN-cookie module cannot be activated (strict mode
+# without Level 2 handoff, incompatible NAT, rejected program). Its endpoints
+# are fail-closed either way: the backend only admits a cookie endpoint while
+# the cookie program is dispatched. Runtime activation therefore sets
+# AUTO_XDP_SYNCOOKIE_DEGRADE_OK=1: the failure is recorded as a degraded module
+# and the firewall keeps running, instead of the service refusing to start.
 load_syncookie_program() {
     local status=0
     _auto_xdp_load_syncookie_program || status=$?
@@ -1239,10 +1347,12 @@ _auto_xdp_load_syncookie_program() {
     local xdp_obj="" tc_obj="" capability="${AUTO_XDP_SYNCOOKIE_CAPABILITY:-}"
     xdp_obj=$(_auto_xdp_first_value SYNCOOKIE_OBJ_PATH SYNCOOKIE_OBJ_INSTALLED) || true
     tc_obj=$(_auto_xdp_first_value TC_SYNCOOKIE_OBJ_PATH TC_SYNCOOKIE_OBJ_INSTALLED) || true
+    local -a degrade=()
+    [[ "${AUTO_XDP_SYNCOOKIE_DEGRADE_OK:-0}" == 1 ]] && degrade=(--allow-degraded)
     AUTO_XDP_SYNCOOKIE_CAPABILITY=""
     _auto_xdp_syncookie_module apply --config "$TOML_CONFIG" \
         --xdp "$xdp_obj" --tc "$tc_obj" --sysctl-state "$(syncookie_sysctl_state_path)" \
-        --capability "$capability"
+        --capability "$capability" ${degrade[@]+"${degrade[@]}"}
 }
 
 ensure_linux_conntrack() {
@@ -1316,6 +1426,13 @@ transactional_reload_xdp() {
             return 1
         fi
     done
+
+    # The ICMP decision is about the generation this candidate would replace.
+    # It is made on first use (only when the module is loaded) and kept for
+    # the transaction; the pre-seed steps run with BPF_PIN_DIR at the candidate.
+    local AUTO_XDP_ICMP_PROTECTED="$live_dir"
+    local AUTO_XDP_ICMP_DEGRADE_OK="${AUTO_XDP_ICMP_DEGRADE_OK:-}"
+    _auto_xdp_icmp_forget_decision  # no candidate exists now: any record is stale
 
     mkdir -p "$candidate_dir" || return 1
 
@@ -1428,6 +1545,7 @@ transactional_reload_xdp() {
         return 1
     fi
     rm -rf "$rollback_dir"
+    _auto_xdp_icmp_forget_decision
     AUTO_XDP_SWITCH_MODE=""
     for mode in "${new_modes[@]}"; do
         _auto_xdp_record_switch_mode "$mode"
@@ -1550,14 +1668,88 @@ load_sock_state_tracker() {
     return 0
 }
 
+# The ICMP handler is optional to the core firewall: with the runtime gate set
+# and no handler bound, the main program itself drops Echo Replies. A handler
+# that cannot load may therefore only veto a candidate that would replace an
+# attached generation with working ICMP protection (its handler bound). In
+# every other case the candidate is kept and the module reported as degraded:
+#   - no target runs the protected generation ($1, default BPF_PIN_DIR): a cold
+#     start, an interrupted first start whose candidate is attached, or pins
+#     left by an nftables cutover. Rejecting would leave no firewall at all.
+#     AUTO_XDP_ICMP_STRICT_START=1 (the installer) refuses this case instead.
+#   - the attached protected generation has no handler bound (degraded, ICMP
+#     disabled, or enabled but never published): nothing is lost by replacing it.
+# AUTO_XDP_ICMP_DEGRADE_OK=1/0 states the decision explicitly; a reload or a
+# resume computes it once for the generation it would replace.
+_auto_xdp_icmp_protected_attached() {
+    local protected="$1" protected_id=""
+    [[ -e "$protected/prog" ]] || return 1
+    # Any doubt counts as attached: the decision then rests on its handler.
+    # Every interface counts, not only the targets: an installer may move the
+    # firewall to other interfaces and detach the old ones only afterwards.
+    protected_id=$(_auto_xdp_pinned_prog_id "$protected/prog") || return 0
+    _auto_xdp_prog_attached_anywhere "$protected_id"
+}
+
+# A reload records its ICMP decision, so that resuming it after an
+# interruption (when its candidate, not the protected generation, may be the
+# attached program) reaches the same decision. /run and bpffs pins share a
+# lifetime, so the record never outlives the generations it is about.
+_auto_xdp_icmp_decision_file() {
+    printf '%s/icmp-reload-decision\n' "${RUN_STATE_DIR:-/run/auto_xdp}"
+}
+
+_auto_xdp_icmp_saved_decision() {
+    local saved=""
+    saved=$(cat "$(_auto_xdp_icmp_decision_file)" 2>/dev/null) || saved=""
+    case "$saved" in
+        0|1) printf '%s\n' "$saved" ;;
+        *) printf '%s\n' "${AUTO_XDP_ICMP_DEGRADE_OK:-}" ;;
+    esac
+}
+
+_auto_xdp_icmp_forget_decision() {
+    rm -f "$(_auto_xdp_icmp_decision_file)" 2>/dev/null || true
+}
+
+_auto_xdp_icmp_degrade_ok() {
+    case "${AUTO_XDP_ICMP_DEGRADE_OK:-}" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+    local protected="${1:-${AUTO_XDP_ICMP_PROTECTED:-$BPF_PIN_DIR}}" decision=1
+    if _auto_xdp_iface_var_name >/dev/null 2>&1; then
+        if ! _auto_xdp_icmp_protected_attached "$protected"; then
+            [[ "${AUTO_XDP_ICMP_STRICT_START:-0}" == 1 ]] || decision=0
+        else
+            local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+            PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON3_BIN:-python3}" \
+                -m auto_xdp.admin.module_runtime unprotected icmp --root "$protected" >/dev/null 2>&1 \
+                && decision=0
+        fi
+    fi
+    # Inside a reload or resume (AUTO_XDP_ICMP_PROTECTED set by it), keep the
+    # first answer for the rest of that transaction and for its resumption:
+    # attachments change while it runs, the generation it protects does not.
+    if [[ -n "${AUTO_XDP_ICMP_PROTECTED:-}" ]]; then
+        AUTO_XDP_ICMP_DEGRADE_OK=$((1 - decision))
+        { mkdir -p "${RUN_STATE_DIR:-/run/auto_xdp}" \
+            && printf '%s\n' "$AUTO_XDP_ICMP_DEGRADE_OK" >"$(_auto_xdp_icmp_decision_file)"; } 2>/dev/null || true
+    fi
+    return "$decision"
+}
+
 load_icmp_module() {
     local install_dir="${INSTALL_DIR:-/usr/local/lib/auto_xdp/current}"
     local handlers_dir="${AUTO_XDP_BUILTIN_HANDLERS_DIR:-${install_dir}/handlers}"
     local python_root="${PYTHON_LIB_DIR:-${AUTO_XDP_RUNTIME_COMMON_DIR}/..}"
+    local -a degrade=()
     [[ -f "${TOML_CONFIG:-}" ]] || return 0
-    if ! PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON3_BIN:-python3}" \
+    _auto_xdp_icmp_degrade_ok && degrade=(--allow-degraded)
+    if ! RUN_STATE_DIR="${RUN_STATE_DIR:-/run/auto_xdp}" \
+            PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" "${PYTHON3_BIN:-python3}" \
             -m auto_xdp.admin.module_runtime apply icmp --root "$BPF_PIN_DIR" \
-            --config "$TOML_CONFIG" --xdp "$handlers_dir/icmp_handler.o"; then
+            --config "$TOML_CONFIG" --xdp "$handlers_dir/icmp_handler.o" ${degrade[@]+"${degrade[@]}"}; then
         AUTO_XDP_ATTACH_FATAL=1
         AUTO_XDP_LAST_ATTACH_ERRORS="ICMP module or its kernel dependency could not be activated"
         return 1

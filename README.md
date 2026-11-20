@@ -82,6 +82,12 @@ Discovering a listening port does **not** authorize it. Rules update after
 service changes are detected and reconciled; updates are not instantaneous.
 Other host firewalls and cloud security groups still apply.
 
+The CLI, dashboard, approval API, and module settings check whether the
+configuration changed while you were editing it. If an edit conflicts, reload
+the latest configuration and retry. The controller closes revoked access before
+retrying modules. Starting the runtime or applying module settings can build a
+missing dependency.
+
 XDP is used when supported, with nftables fallback when permitted. Services
 requiring XDP-specific protection stay closed when it is unavailable.
 See [how it works and how it compares](https://github.com/Kookiejarz/Auto_XDP/wiki#how-it-works).
