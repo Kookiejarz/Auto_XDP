@@ -1405,12 +1405,12 @@ class RateMapEntriesPolicyTests(unittest.TestCase):
             ["nft"],
             0,
             stdout=(
-                "set policy_schema_v2\n"
-                f"set {cfg.NFT_TCP_SET}\n"
-                f"set {cfg.NFT_UDP_SET}\n"
-                f"set {cfg.NFT_SCTP_SET}\n"
-                f"set {cfg.NFT_TRUSTED_SET4}\n"
-                "chain input\n"
+                "set policy_schema_v2 { type mark; }\n"
+                f"set {cfg.NFT_TCP_SET} {{ type inet_service; }}\n"
+                f"set {cfg.NFT_UDP_SET} {{ type inet_service; }}\n"
+                f"set {cfg.NFT_SCTP_SET} {{ type inet_service; }}\n"
+                f"set {cfg.NFT_TRUSTED_SET4} {{ type ipv4_addr; }}\n"
+                "chain input { }\n"
             ),
         )
 

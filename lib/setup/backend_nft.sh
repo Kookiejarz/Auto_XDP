@@ -26,8 +26,12 @@ verify_nftables_policy() {
     command -v nft &>/dev/null || return 1
     local body
     body=$(nft list table "${NFT_FAMILY:-inet}" "${NFT_TABLE:-auto_xdp}" 2>/dev/null) || return 1
-    printf '%s' "$body" | grep -Fq 'set tcp_ports' || return 1
-    printf '%s' "$body" | grep -Fq 'chain input'
+    awk '
+        $1 == "set" && $2 == "policy_schema_v2" && $3 == "{" { marker = 1 }
+        $1 == "set" && $2 == "tcp_ports" && $3 == "{" { ports = 1 }
+        $1 == "chain" && $2 == "input" && $3 == "{" { input_chain = 1 }
+        END { exit !(marker && ports && input_chain) }
+    ' <<< "$body"
 }
 
 finalize_nftables_cutover() {

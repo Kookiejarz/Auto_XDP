@@ -290,6 +290,11 @@ _tool_present() {
     fi
 }
 
+_bpf_headers_present() {
+    bpf_header_exists "linux/bpf.h" /usr/include "${ASM_INC:-}" \
+        && bpf_header_exists "bpf/bpf_helpers.h" /usr/include /usr/local/include
+}
+
 # One checklist line per tool: ✓ when present, ✗ when missing. Missing tools
 # are installed via the package manager, then re-checked line by line.
 check_required_tools_step() {
@@ -302,12 +307,7 @@ check_required_tools_step() {
     done
 
     local missing_bpf_headers=0
-    if declare -F bpf_header_exists >/dev/null 2>&1; then
-        if ! substep_run "BPF development headers" bpf_header_exists \
-                "bpf/bpf_helpers.h" "/usr/include" "/usr/local/include"; then
-            missing_bpf_headers=1
-        fi
-    elif [[ ! -f /usr/include/bpf/bpf_helpers.h && ! -f /usr/local/include/bpf/bpf_helpers.h ]]; then
+    if ! substep_run "BPF development headers" _bpf_headers_present; then
         missing_bpf_headers=1
     fi
 
@@ -336,18 +336,10 @@ check_required_tools_step() {
                 esac
             fi
         done
-        if [[ $missing_bpf_headers -eq 1 ]]; then
-            if declare -F bpf_header_exists >/dev/null 2>&1 \
-                    && ! substep_run "BPF development headers (after install)" bpf_header_exists \
-                        "bpf/bpf_helpers.h" "/usr/include" "/usr/local/include"; then
-                warn "BPF development headers still missing — XDP backend may be unavailable"
-            fi
+        if [[ $missing_bpf_headers -eq 1 ]] \
+                && ! substep_run "BPF development headers (after install)" _bpf_headers_present; then
+            warn "BPF development headers still missing — XDP backend may be unavailable"
         fi
-    fi
-
-    if declare -F bpf_header_exists >/dev/null 2>&1 \
-            && ! bpf_header_exists "bpf/bpf_helpers.h" "/usr/include" "/usr/local/include"; then
-        substep_run "Installing BPF headers via $PKG_MANAGER" install_packages || true
     fi
 
     _tool_present python3 || die_with_next "python3 not found after installation." "install Python 3.10 or newer, then rerun: bash setup_xdp.sh --force ${IFACES[*]}"

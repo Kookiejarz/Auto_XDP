@@ -3640,26 +3640,26 @@ test_check_required_tools_step_installs_missing_kernel_btf_tools() (
 
 test_check_required_tools_step_installs_when_bpf_headers_missing() (
     source "$REPO_ROOT/setup_xdp.sh"
-    set +e
-
-    local tmpdir output cmd
-    tmpdir=$(mktemp -d)
-    mkdir -p "$tmpdir/bin"
-    for cmd in clang bpftool python3 curl tar ip nft; do
-        printf '#!/bin/sh\nexit 0\n' >"$tmpdir/bin/$cmd"
-        chmod +x "$tmpdir/bin/$cmd"
-    done
-
-    PKG_MANAGER="apk"
-    PYTHON3_BIN=""
-    install_packages() { printf 'install_packages_ran\n'; }
+    local missing_header output installed
+    PKG_MANAGER=apk
+    _tool_present() { return 0; }
+    bpf_header_exists() { [[ "$1" != "$missing_header" || "$installed" == 1 ]]; }
+    install_packages() { installed=1; printf 'installed BPF headers\n'; }
+    ensure_python_runtime() { :; }
     ensure_psutil() { :; }
+    ensure_curses() { :; }
     ensure_tomli_for_python310() { :; }
-    bpf_header_exists() { return 1; }
 
-    output=$(PATH="$tmpdir/bin" check_required_tools_step 2>&1) || return 1
-    assert_contains "$output" "install_packages_ran" || return 1
-    assert_contains "$output" "BPF development headers"
+    for missing_header in linux/bpf.h bpf/bpf_helpers.h; do
+        installed=0
+        output=$(check_required_tools_step 2>&1) || return 1
+        assert_contains "$output" 'installed BPF headers' || return 1
+        assert_contains "$output" 'BPF development headers (after install)' || return 1
+        [[ "$output" != *"headers still missing"* ]] || return 1
+    done
+    installed=1
+    output=$(check_required_tools_step 2>&1) || return 1
+    [[ "$output" != *"installed BPF headers"* ]]
 )
 
 test_check_required_tools_step_rechecks_missing_tools() (

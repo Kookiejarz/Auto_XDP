@@ -47,6 +47,13 @@ _BOGON_V6 = (
 )
 
 
+def has_policy_schema(body: str, *required_sets: str) -> bool:
+    declarations = set(re.findall(r"^[ \t]*(set|chain)[ \t]+(\w+)[ \t]*\{", body, re.MULTILINE))
+    return ("chain", "input") in declarations and all(
+        ("set", name) in declarations for name in (_NFT_SCHEMA_MARKER, *required_sets)
+    )
+
+
 def _set_block(name: str, value_type: str, elements: list[str], *, interval: bool = False) -> str:
     lines = [f"    set {name} {{", f"        type {value_type}"]
     if interval:
@@ -496,16 +503,9 @@ class NftablesBackend(PortBackend):
     def _ensure_ruleset(self) -> None:
         result = _run_nft(["list", "table", self.config.NFT_FAMILY, self.config.NFT_TABLE], check=False)
         exists = result.returncode == 0
-        if exists and all(
-            marker in result.stdout
-            for marker in (
-                f"set {_NFT_SCHEMA_MARKER}",
-                f"set {self.config.NFT_TCP_SET}",
-                f"set {self.config.NFT_UDP_SET}",
-                f"set {self.config.NFT_SCTP_SET}",
-                f"set {self.config.NFT_TRUSTED_SET4}",
-                "chain input",
-            )
+        if exists and has_policy_schema(
+            result.stdout, self.config.NFT_TCP_SET, self.config.NFT_UDP_SET,
+            self.config.NFT_SCTP_SET, self.config.NFT_TRUSTED_SET4,
         ):
             return
         bootstrap = BackendProjection(config=self.config, bogon_filter_enabled=self.config.BOGON_FILTER_ENABLED)

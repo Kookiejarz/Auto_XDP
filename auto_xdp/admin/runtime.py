@@ -84,12 +84,14 @@ def _load_json_file(path: Path) -> dict[str, object]:
 
 
 def _nft_policy_schema(family: str, table: str) -> str:
+    from auto_xdp.backends.nftables import has_policy_schema
+
     if not _command_exists("nft"):
         return "unavailable"
     result = _run_text(["nft", "list", "table", family, table])
     if result.returncode != 0:
         return "missing"
-    if "set tcp_ports" in result.stdout and "chain input" in result.stdout:
+    if has_policy_schema(result.stdout, "tcp_ports"):
         return "policy_schema_v2"
     return "legacy"
 
