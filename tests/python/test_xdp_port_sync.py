@@ -293,7 +293,7 @@ class DiscoveryDumpTests(unittest.TestCase):
             )
 
     def test_nldiag_valid_listen_message_is_parsed(self):
-        src = socket.inet_pton(socket.AF_INET6, "::ffff:203.0.113.10")
+        src = socket.inet_aton("203.0.113.10").ljust(16, b"\0")
         dst = bytes(16)
         msg = discovery_mod._NLMSGHDR.pack(
             discovery_mod._NLMSGHDR_SZ + discovery_mod._DIAG_MSG_SZ,
@@ -307,7 +307,38 @@ class DiscoveryDumpTests(unittest.TestCase):
         with mock.patch.object(discovery_mod.socket, "AF_NETLINK", 16, create=True), \
              mock.patch.object(discovery_mod.socket, "socket", return_value=FakeDiagSocket(msg)):
             rows = list(discovery_mod._nldiag_dump(socket.AF_INET, socket.IPPROTO_TCP, 1))
-        self.assertEqual(rows, [(443, 0, src, dst, 4242, 0)])
+        self.assertEqual(rows, [discovery_mod._DiagSocket(443, 0, ("203.0.113.10",), 4242, 0)])
+
+    def test_nldiag_ipv4_coverage_requires_socket_evidence(self):
+        def attribute(kind, data):
+            size = 4 + len(data)
+            return struct.pack("=HH", size, kind) + data + bytes(-size % 4)
+
+        dual = attribute(11, b"\0")
+        cases = [
+            ("::", 0, attribute(8, b"\1") + dual, ("::", "0.0.0.0")),
+            ("::", 0, attribute(11, b"\1"), ("::",)),
+            ("::", 0, b"", ("::",)),
+            ("::", 0, attribute(11, b"\2"), ("::",)),
+            ("::", 0, attribute(11, b""), ("::",)),
+            ("::", 0, dual + attribute(11, b"\1"), ("::",)),
+            ("::", 0, struct.pack("=HH", 8, 11), ("::",)),
+            ("2001:db8::1", 0, dual, ("2001:db8::1",)),
+            ("::", 2, dual, ("::",)),
+        ]
+        messages = bytearray()
+        for address, ifindex, attrs, _ in cases:
+            record = discovery_mod._DIAG_MSG.pack(
+                socket.AF_INET6, 10, 0, 0, socket.htons(443), 0,
+                socket.inet_pton(socket.AF_INET6, address), bytes(16),
+                ifindex, 0, 0, 0, 0, 0, 0, 4242,
+            ) + attrs
+            messages += discovery_mod._NLMSGHDR.pack(16 + len(record), 20, 0, 1, 0) + record
+        messages += discovery_mod._NLMSGHDR.pack(16, 3, 0, 1, 0)
+        with mock.patch.object(discovery_mod.socket, "AF_NETLINK", 16, create=True), \
+             mock.patch.object(discovery_mod.socket, "socket", return_value=FakeDiagSocket(messages)):
+            rows = list(discovery_mod._nldiag_dump(socket.AF_INET6, socket.IPPROTO_TCP, 1))
+        self.assertEqual([row.bind_addresses for row in rows], [case[-1] for case in cases])
 
 
 class XdpPortSyncTests(unittest.TestCase):
@@ -880,11 +911,9 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(state.udp, set())
 
     def test_netlink_preserves_exact_systemd_unit_subject(self):
-        address = socket.inet_aton("0.0.0.0")
-
         def fake_dump(family, protocol, _states):
-            if family == socket.AF_INET and protocol == socket.IPPROTO_TCP:
-                return iter([(8080, 0, address, b"", 101, 0)])
+            if family == socket.AF_INET6 and protocol in (socket.IPPROTO_TCP, socket.IPPROTO_UDP):
+                return iter([discovery_mod._DiagSocket(8080, 0, ("::", "0.0.0.0"), 101, 0)])
             return iter(())
 
         with mock.patch.object(discovery_mod, "_nldiag_dump", side_effect=fake_dump), \
@@ -896,18 +925,22 @@ class XdpPortSyncTests(unittest.TestCase):
              mock.patch.object(discovery_mod, "_parse_proc_udp", return_value={}):
             state = discovery_mod._get_listening_ports_netlink()
 
-        self.assertEqual(state.endpoints[0].subject, "my-web.service")
-        self.assertEqual(state.endpoints[0].attribution_source, "systemd-cgroup")
+        self.assertEqual(
+            [(ep.protocol, ep.host_address) for ep in state.endpoints],
+            [(proto, address) for proto in ("tcp", "udp") for address in ("::", "0.0.0.0")],
+        )
+        self.assertEqual(
+            {(ep.subject, ep.attribution_source, ep.instance_id) for ep in state.endpoints},
+            {("my-web.service", "systemd-cgroup", "101")},
+        )
+        self.assertNotIn(8080, state.udp_sock_opts)
 
     def test_netlink_keeps_each_udp_owner_for_shared_port_policy(self):
-        wildcard = socket.inet_aton("0.0.0.0")
-        specific = socket.inet_aton("192.0.2.10")
-
         def fake_dump(family, protocol, _states):
             if family == socket.AF_INET and protocol == socket.IPPROTO_UDP:
                 return iter([
-                    (5353, 0, wildcard, b"", 101, 0),
-                    (5353, 0, specific, b"", 202, 0),
+                    discovery_mod._DiagSocket(5353, 0, ("0.0.0.0",), 101, 0),
+                    discovery_mod._DiagSocket(5353, 0, ("192.0.2.10",), 202, 0),
                 ])
             return iter(())
 

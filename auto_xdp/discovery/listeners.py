@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from types import ModuleType
 
@@ -40,6 +41,7 @@ if psutil is not None:
 
 _NETLINK_INET_DIAG = 4
 _SOCK_DIAG_BY_FAMILY = 20
+_INET_DIAG_SKV6ONLY = 11
 _NLMSG_DONE = 3
 _NLMSG_ERROR = 2
 _NLM_F_REQUEST = 0x01
@@ -56,6 +58,7 @@ _NLMSGHDR = struct.Struct("=IHHII")
 _DIAG_REQ = struct.Struct("=BBBBIHH16s16sIII")
 # struct inet_diag_msg (72 bytes)
 _DIAG_MSG = struct.Struct("=BBBBHH16s16sIIIIIIII")
+_NLA_HDR = struct.Struct("=HH")
 
 _NLMSGHDR_SZ = _NLMSGHDR.size   # 16
 _DIAG_REQ_SZ = _DIAG_REQ.size   # 56
@@ -95,12 +98,34 @@ _CONTAINER_CGROUP_RE = re.compile(
 
 # low-level netlink helpers
 
-def _nldiag_dump(family: int, proto: int, states: int):
-    """Yield (sport_h, dport_h, src_16b, dst_16b, inode, rqueue) per matching socket.
+@dataclass(frozen=True)
+class _DiagSocket:
+    port: int
+    peer_port: int
+    bind_addresses: tuple[str, ...]
+    inode: int
+    rqueue: int
 
-    Ports are returned in host byte order.  Addresses are 16-byte big-endian
-    buffers suitable for socket.inet_ntop / struct.pack("!...").
-    """
+
+def _diag_allows_ipv4(buf: bytearray, offset: int, end: int) -> bool:
+    """Require an explicit, well-formed SKV6ONLY=0 on this socket."""
+    found = False
+    while offset < end:
+        if offset + _NLA_HDR.size > end:
+            return False
+        size, kind = _NLA_HDR.unpack_from(buf, offset)
+        if size < _NLA_HDR.size or offset + size > end:
+            return False
+        if kind == _INET_DIAG_SKV6ONLY:
+            if found or size != _NLA_HDR.size + 1 or buf[offset + _NLA_HDR.size] != 0:
+                return False
+            found = True
+        offset += (size + 3) & ~3
+    return found
+
+
+def _nldiag_dump(family: int, proto: int, states: int) -> Iterator[_DiagSocket]:
+    """Yield one record per kernel socket, including the bind addresses it covers."""
     with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, _NETLINK_INET_DIAG) as nl:
         nl.bind((0, 0))
         req = (
@@ -138,20 +163,26 @@ def _nldiag_dump(family: int, proto: int, states: int):
                     (error,) = struct.unpack_from("=i", buf, offset + _NLMSGHDR_SZ)
                     if error:
                         raise DiscoveryError(f"SOCK_DIAG dump failed with errno {-error}")
-                if (
-                    msg_type == _SOCK_DIAG_BY_FAMILY
-                    and offset + _NLMSGHDR_SZ + _DIAG_MSG_SZ <= n
-                ):
+                if msg_type == _SOCK_DIAG_BY_FAMILY:
+                    if msg_len < _NLMSGHDR_SZ + _DIAG_MSG_SZ:
+                        raise DiscoveryError("SOCK_DIAG returned a truncated socket record")
                     (
-                        _fam, _st, _ti, _re,
-                        sport_raw, dport_raw, src, dst,
-                        _if, _c0, _c1,
+                        diag_family, _st, _ti, _re,
+                        sport_raw, dport_raw, src, _dst,
+                        bound_if, _c0, _c1,
                         _exp, rqueue, _wq, _uid, inode,
                     ) = _DIAG_MSG.unpack_from(buf, offset + _NLMSGHDR_SZ)
-                    yield (
-                        socket.ntohs(sport_raw),
-                        socket.ntohs(dport_raw),
-                        src, dst, inode, rqueue,
+                    addresses: tuple[str, ...] = (_addr_str(family, src),)
+                    # A device-bound socket cannot establish a host-wide IPv4 bind.
+                    if (
+                        family == diag_family == socket.AF_INET6
+                        and src == _ZERO16
+                        and not bound_if
+                        and _diag_allows_ipv4(buf, offset + _NLMSGHDR_SZ + _DIAG_MSG_SZ, offset + msg_len)
+                    ):
+                        addresses = ("::", "0.0.0.0")
+                    yield _DiagSocket(
+                        socket.ntohs(sport_raw), socket.ntohs(dport_raw), addresses, inode, rqueue,
                     )
                 offset += (msg_len + 3) & ~3
             if offset != n and not done:
@@ -631,14 +662,21 @@ def _get_listening_ports_netlink(*, config: cfg.ConfigSnapshot | None = None) ->
             systemd_socket_map = _build_systemd_socket_map()
         return systemd_socket_map.get(port, name)
 
+    def _exposed_addresses(listener: _DiagSocket) -> tuple[str, ...]:
+        if listener.port in config.DISCOVERY_EXCLUDE_PORTS:
+            return ()
+        return tuple(
+            address for address in listener.bind_addresses
+            if _bind_ip_is_exposed(address, exclude_nets, config=config)
+        )
+
     # TCP LISTEN
     for family in (socket.AF_INET, socket.AF_INET6):
-        for sport_h, _dp, src, _dst, inode, _rq in _nldiag_dump(family, socket.IPPROTO_TCP, _SS_LISTEN):
-            port = sport_h
-            if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets, config=config):
+        for listener in _nldiag_dump(family, socket.IPPROTO_TCP, _SS_LISTEN):
+            addresses = _exposed_addresses(listener)
+            if not addresses:
                 continue
-            if port in config.DISCOVERY_EXCLUDE_PORTS:
-                continue
+            port, inode = listener.port, listener.inode
             state.tcp.add(port)
             raw_name = _proc_name(inode)
             name = _resolve_systemd(raw_name, port)
@@ -649,11 +687,12 @@ def _get_listening_ports_netlink(*, config: cfg.ConfigSnapshot | None = None) ->
                 subject, attribution, source, container = name, "exact", "systemd-socket", None
             if attribution != "exact" and name and name != "systemd" and container is None:
                 subject = name
-            state.endpoints.append(
+            state.endpoints.extend(
                 _endpoint(
-                    "tcp", _addr_str(family, src), port, subject, attribution,
+                    "tcp", address, port, subject, attribution,
                     source, container, str(inode),
                     config=config, process_name=name)
+                for address in addresses
             )
 
     # UDP — collect drops from /proc, rqueue from SOCK_DIAG
@@ -665,36 +704,25 @@ def _get_listening_ports_netlink(*, config: cfg.ConfigSnapshot | None = None) ->
             else:
                 proc_udp[_port] = {"drops": _data["drops"]}
 
-    udp_sockets: list[dict] = []
+    udp_sockets: list[_DiagSocket] = []
     udp_agg: dict[int, dict] = {}
     for family in (socket.AF_INET, socket.AF_INET6):
-        for sport_h, dport_h, src, _dst, inode, rqueue in _nldiag_dump(
-            family, socket.IPPROTO_UDP, _SS_ALL
-        ):
-            port = sport_h
+        for listener in _nldiag_dump(family, socket.IPPROTO_UDP, _SS_ALL):
+            port = listener.port
             if port == 0:
                 continue
-            connected = dport_h != 0
-            udp_sockets.append({
-                "port": port,
-                "family": family,
-                "src": src,
-                "inode": inode,
-                "connected": connected,
-            })
+            udp_sockets.append(listener)
             aggregate = udp_agg.setdefault(port, {"rqueue": 0, "count": 0})
-            aggregate["rqueue"] += rqueue
+            aggregate["rqueue"] += listener.rqueue
             aggregate["count"] += 1
 
-    for info in udp_sockets:
-        port = info["port"]
-        family, src = info["family"], info["src"]
-        if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets, config=config):
+    for listener in udp_sockets:
+        addresses = _exposed_addresses(listener)
+        if not addresses:
             continue
-        if port in config.DISCOVERY_EXCLUDE_PORTS:
-            continue
+        port, inode = listener.port, listener.inode
         aggregate = udp_agg[port]
-        if info["connected"]:
+        if listener.peer_port:
             server_signal = (
                 aggregate["count"] > 1           # SO_REUSEPORT proxy
                 or aggregate["rqueue"] > 0       # receive backlog (from SOCK_DIAG)
@@ -703,17 +731,18 @@ def _get_listening_ports_netlink(*, config: cfg.ConfigSnapshot | None = None) ->
             if not server_signal:
                 continue
         state.udp.add(port)
-        name = _resolve_systemd(_proc_name(info["inode"]), port)
+        name = _resolve_systemd(_proc_name(inode), port)
         if name:
             state.udp_processes.setdefault(port, name)
-        subject, attribution, source, container = _proc_attribution(info["inode"])
+        subject, attribution, source, container = _proc_attribution(inode)
         if attribution != "exact" and name and name != "systemd" and container is None:
             subject = name
-        state.endpoints.append(
+        state.endpoints.extend(
             _endpoint(
-                "udp", _addr_str(family, src), port, subject, attribution,
-                source, container, str(info["inode"]),
+                "udp", address, port, subject, attribution,
+                source, container, str(inode),
                 config=config, process_name=name)
+            for address in addresses
         )
         opts: set[str] = set()
         if aggregate["count"] > 1:
@@ -728,18 +757,18 @@ def _get_listening_ports_netlink(*, config: cfg.ConfigSnapshot | None = None) ->
     # SCTP LISTEN
     try:
         for family in (socket.AF_INET, socket.AF_INET6):
-            for sport_h, _dp, src, _dst, _in, _rq in _nldiag_dump(
-                family, _IPPROTO_SCTP, _SS_LISTEN
-            ):
-                if _bind_ip_is_exposed(_addr_str(family, src), exclude_nets, config=config) and sport_h not in config.DISCOVERY_EXCLUDE_PORTS:
-                    state.sctp.add(sport_h)
-                    subject, attribution, source, container = _proc_attribution(_in)
-                    state.endpoints.append(
-                        _endpoint(
-                            "sctp", _addr_str(family, src), sport_h, subject,
-                            attribution, source, container, str(_in),
-                         process_name=subject, config=config)
-                    )
+            for listener in _nldiag_dump(family, _IPPROTO_SCTP, _SS_LISTEN):
+                addresses = _exposed_addresses(listener)
+                if not addresses:
+                    continue
+                state.sctp.add(listener.port)
+                subject, attribution, source, container = _proc_attribution(listener.inode)
+                state.endpoints.extend(
+                    _endpoint(
+                        "sctp", address, listener.port, subject, attribution, source,
+                        container, str(listener.inode), process_name=subject, config=config)
+                    for address in addresses
+                )
     except OSError:
         pass
 
