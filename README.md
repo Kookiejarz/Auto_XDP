@@ -22,7 +22,8 @@
   <a href="#installation"><strong>Install</strong></a> ·
   <a href="#first-run">First run</a> ·
   <a href="#more-screenshots">Screenshots</a> ·
-  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki">Wiki</a>
+  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki">Wiki</a> ·
+  <a href="#support-auto-xdp">Support</a>
 </p>
 
 <p align="center">
