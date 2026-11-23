@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Fixed
+- The dashboard no longer keeps a CPU core busy after an input prompt or the
+  module settings page is closed.
+
 ### Documentation
 - Refreshed the README with a theme-aware logo, grouped icon badges, clearer
   navigation, and seven screenshots from real isolated Linux sessions.

@@ -104,8 +104,6 @@ def test_input_survives_terminal_resizing_without_losing_unicode_or_long_paths(m
             pass
         def timeout(self, value):
             self.delay = value
-        def getdelay(self):
-            return 200
         def move(self, y, x):
             assert 0 <= y < self.h and 0 <= x < self.w
         def clearok(self, value):

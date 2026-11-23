@@ -10,7 +10,7 @@ from auto_xdp.admin import config_file, handler_catalog
 from auto_xdp.tui.handlers import HandlerRow
 from auto_xdp.tui.layout import wrap_cells
 from auto_xdp.tui.maps import _field
-from auto_xdp.tui.widgets import _add, _box, _color, _CP_MUTED, _CP_SELECTED, _CP_YELLOW
+from auto_xdp.tui.widgets import _add, _box, _color, _CP_MUTED, _CP_SELECTED, _CP_YELLOW, POLL_DELAY_MS
 
 
 def format_value(value: Any) -> str:
@@ -102,7 +102,6 @@ def edit_handler(screen: Any, row: HandlerRow, context: handler_catalog.Context,
     diagnostics = False
     operation_error = ""
     error_scroll = 0
-    previous_delay = screen.getdelay() if hasattr(screen, "getdelay") else 0
     if hasattr(screen, "clearok"):
         screen.clearok(True)
     screen.timeout(150)
@@ -193,4 +192,4 @@ def edit_handler(screen: Any, row: HandlerRow, context: handler_catalog.Context,
     finally:
         if hasattr(screen, "clearok"):
             screen.clearok(True)
-        screen.timeout(previous_delay)
+        screen.timeout(POLL_DELAY_MS)

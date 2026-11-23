@@ -22,6 +22,10 @@ _CP_GRAPH_RX = 15
 _CP_GRAPH_TX = 16
 _CP_FOCUS = 17
 
+# The main loop waits this long for a key. Python's curses windows cannot report
+# their current delay, so a prompt or editor that changed it restores this value.
+POLL_DELAY_MS = 200
+
 
 def _color(pair: int) -> int:
     try:

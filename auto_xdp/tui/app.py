@@ -37,7 +37,7 @@ from auto_xdp.tui.traffic import (
 from auto_xdp.tui.widgets import (
     _add, _box, _clip, _color, _init_colors, _CP_GREEN, _CP_RED, _CP_YELLOW,
     _CP_BLACK_ON_GREEN, _CP_BLACK_ON_YELLOW, _CP_WHITE_ON_RED,
-    _CP_CYAN, _CP_BLACK_ON_CYAN, _CP_MUTED, _CP_TEXT, _CP_SELECTED,
+    _CP_CYAN, _CP_BLACK_ON_CYAN, _CP_MUTED, _CP_TEXT, _CP_SELECTED, POLL_DELAY_MS,
 )
 from auto_xdp.tui.metrics import HostMetrics, NetworkMetrics, ResourceSampler
 from auto_xdp.tui.maps import _draw_maps, _cells
@@ -1052,7 +1052,6 @@ def _draw_approvals_page(stdscr: Any, snap: TuiSnapshot, cursor: int, scroll: in
 
 
 def _tui_prompt(stdscr: Any, label: str) -> str:
-    previous_delay = stdscr.getdelay() if hasattr(stdscr, "getdelay") else 0
     stdscr.nodelay(False)
     curses.noecho()
     curses.curs_set(1)
@@ -1119,7 +1118,7 @@ def _tui_prompt(stdscr: Any, label: str) -> str:
     finally:
         curses.noecho()
         curses.curs_set(0)
-        stdscr.timeout(previous_delay)
+        stdscr.timeout(POLL_DELAY_MS)
         if old_mouse_mask:
             curses.mousemask(old_mouse_mask)
 
@@ -1332,7 +1331,7 @@ def _curses_main(stdscr: Any, args: Any) -> int:
     _init_colors()
     stdscr.bkgd(" ", _color(_CP_TEXT))
     stdscr.nodelay(True)
-    stdscr.timeout(200)
+    stdscr.timeout(POLL_DELAY_MS)
     mouse_enabled = _enable_mouse()
     copy_mode = False
     restore_mouse = False

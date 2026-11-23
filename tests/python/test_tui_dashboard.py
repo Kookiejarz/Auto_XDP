@@ -908,7 +908,7 @@ def test_retry_after_saved_activation_failure(tmp_path, monkeypatch, intervening
 
     class EditorScreen(Canvas):
         def timeout(self, value):
-            pass
+            self.delay = value
 
         def getch(self):
             key = next(keys)
@@ -918,8 +918,11 @@ def test_retry_after_saved_activation_failure(tmp_path, monkeypatch, intervening
                 other.save()
             return key
 
-    result = edit_handler(EditorScreen(24, 90), HandlerRow("AVAILABLE", 1, None, "ICMP", "available", module=module),
+    screen = EditorScreen(24, 90)
+    result = edit_handler(screen, HandlerRow("AVAILABLE", 1, None, "ICMP", "available", module=module),
                           context, lambda *args: "")
+    # Real curses windows have no getdelay(); the main loop's poll delay is restored explicitly.
+    assert not hasattr(screen, "getdelay") and screen.delay == 200
     if intervening_edit:
         assert "Configuration changed" in result
         assert config_file.load_toml(context.config)["daemon"]["log_level"] == "debug"
