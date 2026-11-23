@@ -4,19 +4,20 @@
 # To apply changes immediately: axdp restart
 
 [firewall]
-# Drop packets with obviously invalid or reserved source addresses.
-# Set to false only on environments where private/internal source ranges are expected.
-# Set to false on private/internal networks where RFC1918 source addresses are legitimate.
-bogon_filter = false
+# Drop packets with obviously invalid or reserved source addresses
+# (RFC1918, loopback, multicast, etc.). Disable only on private networks
+# where these source ranges are legitimately expected inbound.
+bogon_filter = true
 
 [under_attack]
-# under_attack mode favors survivability under high packet rates.
-# When enabled, drop telemetry is disabled in the XDP data path to avoid
-# per-drop ringbuf writes and reduce hot-path CPU cost.
+# Favors survivability under very high packet rates: packet-event telemetry is
+# switched off in the XDP data path to avoid per-packet ring-buffer writes.
+# Filtering and rate limits are unchanged; counters stay available. Leave it off
+# for normal operation so `axdp tui` can show packet decisions.
 enabled = false
 
-# Workload-aware exposure is explicit: LISTEN != AUTHORIZATION.
-# Use observe/audit before enabling enforcement on an existing host.
+# Service-aware exposure policy. A listener is not an authorization grant.
+# Start with audit while introducing grants, then switch to enforce.
 [policy]
 mode = "audit" # observe | audit | enforce; switch to enforce after grants are audited
 
@@ -27,11 +28,12 @@ interfaces = []
 [zones.trusted]
 interfaces = ["tailscale0", "wg0"]
 
+# Unknown ownership is always denied; this table documents the decision per zone.
 [unknown_subjects]
 public = "deny"
 trusted = "deny"
 
-# Minecraft Java example (the profile loads protocol-aware XDP protection):
+# Minecraft Java example (copy/uncomment and adjust the unit name/port):
 # [subjects.minecraft.resolve]
 # systemd_unit = "minecraft.service"
 # [subjects.minecraft.exposure.public.tcp]
@@ -43,19 +45,20 @@ trusted = "deny"
 # Log verbosity for the Python sync daemon: debug, info, warning, error.
 log_level = "warning"
 
-# Event debounce window before reconciling after proc connector activity.
-# Larger values reduce churn during bursty process/socket changes.
-debounce_seconds = 0.4
+# How long (seconds) to wait for process/socket change events to settle
+# before triggering a reconcile. Larger values reduce churn during
+# bursty process restarts; smaller values react faster to port changes.
+debounce_seconds = 0.5
 
 # Preferred runtime backend: auto, xdp, nftables.
-# auto = choose the best available backend at runtime.
-# xdp  = require XDP mode when possible.
-# nftables = force nftables fallback mode.
+# auto      = choose the best available backend at runtime.
+# xdp       = require XDP mode; fail if unavailable.
+# nftables  = force nftables fallback regardless of XDP availability.
 preferred_backend = "auto"
 
 [interfaces]
-# Auto discovery reads kernel interface types, not name prefixes. Loopback,
-# veth/dummy/ifb/netkit and non-Ethernet links (e.g. TUN/WireGuard) are excluded.
+# auto reads kernel interface types, not name prefixes. Loopback, veth,
+# dummy/ifb/netkit and non-Ethernet (e.g. TUN/WireGuard) links are excluded.
 # Bridges, bonds, VLANs, TAP and unknown types remain candidates. Use exclude
 # for container bridges you do not want covered, or include for a stable list.
 mode = "auto"
@@ -74,10 +77,9 @@ xdp_mode = "auto"
 # Unix socket used by pkt_relay.py and axdp tui.
 socket_path = "/var/run/auto_xdp/pkt_events.sock"
 
-# Relay-side history retention. The relay keeps recent events for clients
-# that connect after drops/new connections already happened.
+# Relay-side history retention for clients that connect later.
 retention_seconds = 300
-max_events = 100000
+max_events = 10000
 max_history_send = 5000
 
 # TUI-side event scrollback kept in the local client process.
@@ -92,32 +94,42 @@ asn_db = ""     # e.g. /usr/share/GeoIP/GeoLite2-ASN.mmdb
 cache_size = 4096 # bounded cache, 1..65536; restart TUI after updating databases
 
 [discovery]
-# Exclude loopback-only listeners from exposure discovery.
-# When true, listeners bound only to 127.0.0.0/8 or ::1 are ignored.
+# When true, services bound only to 127.0.0.0/8 or ::1 are ignored;
+# they are unreachable from outside anyway.
 exclude_loopback = true
 
-# Exclude listeners bound to these addresses/CIDRs from automatic exposure.
-# Useful for admin sockets, VPN-only services, or addresses handled elsewhere.
+
+# Source CIDRs whose bound listeners are excluded from auto-discovery.
+# Useful for admin sockets, VPN-only services, or addresses managed elsewhere.
+# Example: exclude_bind_cidrs = ["10.0.0.0/8"]
 exclude_bind_cidrs = []
+
+# Port numbers to exclude from auto-discovery regardless of owning process.
+# Useful for ports only open to local networks.
+# Example: exclude_ports = [22, 3306]
+exclude_ports = []
 
 [trusted_ips]
 # Source IPs/CIDRs with elevated handling.
 # Trusted sources may bypass selected mitigation checks, but never authorize a
 # closed or ungranted destination port. The destination must already be allowed.
-# Format:  "CIDR" = "label"
-# "10.0.0.0/8" = "internal network"
+# Format: "CIDR" = "label"
+# "10.0.0.0/8"    = "internal network"
+# "203.0.113.5/32" = "monitoring host"
 
-# SYN rate limits (new connections per second per source IP).
-# Lookup order: syn_by_proc (process name) → syn_by_service (IANA name).
-# Ports absent from both tables are not rate-limited (e.g. HTTP/HTTPS).
-# These limits apply only to new inbound TCP SYN traffic.
+
+# TCP rate limits
+# New SYN packets allowed per second per source (see source_cidr_v4/v6 below).
+# Lookup order: syn_by_proc (process name) → syn_by_service (IANA service name).
+# Ports absent from both tables use the default tier (see [xdp.runtime] below).
 
 [rate_limits]
-# Source grouping for per-source rate limits.
-# Defaults preserve per-IP behavior: IPv4 /32 and IPv6 /128.
-# Set to 24/64, for example, to make all sources in each CIDR share one bucket.
-source_cidr_v4 = 32
-source_cidr_v6 = 128
+# Source grouping for the per-source and aggregate rate limits: every source in
+# one prefix shares one bucket. /24 (IPv4) and /64 (IPv6, a typical end-site)
+# make a distributed flood from one network count as one source.
+# Use 32 and 128 to limit each address on its own.
+source_cidr_v4 = 24
+source_cidr_v6 = 64
 
 [modules.icmp]
 # Managed Echo Reply protection; axdp handler apply icmp --set enabled=true
@@ -156,9 +168,8 @@ port_rate_default = 0
 # "25565" = 1000
 
 [rate_limits.syn_by_proc]
-# Key: process name as seen on the local host.
-# Value: allowed new SYN packets per second per source IP for ports owned by that process.
-sshd           = 2
+# Key: process name as reported by /proc. Value: max new SYNs/s per source.
+sshd           = 2    # SSH brute-force protection
 vsftpd         = 10
 proftpd        = 10
 "pure-ftpd"    = 10
@@ -174,8 +185,7 @@ xrdp           = 2
 telnetd        = 2
 
 [rate_limits.syn_by_service]
-# Key: service name from /etc/services when no per-process override exists.
-# Value: allowed new SYN packets per second per source IP.
+# Fallback when no per-process match exists. Key: IANA service name from /etc/services.
 ssh             = 2
 ftp             = 10
 "ftp-data"      = 10
@@ -190,78 +200,163 @@ mysql           = 2
 postgresql      = 2
 redis           = 2
 mongodb         = 2
-"ms-wbt-server" = 2
+"ms-wbt-server" = 2   # RDP
 vnc             = 2
 telnet          = 2
 
 [rate_limits.syn_agg_by_proc]
-# Optional per-process aggregate SYN rate limits.
-# These apply across source prefixes, not just a single IP.
+# Second SYN rate cap for a given process's ports, counted per destination port
+# and source prefix (source_cidr_v4/v6), in addition to the per-source limit.
+# Format: process_name = max_syns_per_second
+# Example:
+# caddy = 5000      # each Caddy TCP port: max 5000 SYN/s per source prefix
+# sshd  = 50        # each SSH port: max 50 SYN/s per source prefix
 
 [rate_limits.syn_agg_by_service]
-# Optional service-name fallback for aggregate SYN rate limits.
+# Same as syn_agg_by_proc but keyed by IANA service name. Used when no
+# per-process match exists.
+# Example:
+# http  = 5000
+# https = 5000
+# ssh   = 50
 
-# UDP rate limits (packets per second per source IP).
-# UDP is stateless at the protocol level, so these controls help bound abuse.
+# UDP rate limits
+# UDP is connectionless, so rate limits are the primary abuse control.
 
 [rate_limits.udp_by_proc]
-# Key: process name.
-# Value: allowed UDP packets per second per source IP for ports owned by that process.
-named   = 5000
+# Max UDP packets per second per source for ports owned by this process.
+named   = 5000   # DNS — high volume expected from resolvers
 unbound = 5000
 dnsmasq = 5000
 openvpn = 200
 
 [rate_limits.udp_by_service]
-# Service-name fallback for UDP per-source packet rate limits.
-domain  = 5000
-ntp     = 500
-isakmp  = 100
+# Fallback per-source UDP packet rate cap keyed by IANA service name.
+domain  = 5000   # DNS
+ntp     = 500    # NTP amplification mitigation
+isakmp  = 100    # IKE/VPN negotiation
 openvpn = 200
 
 [rate_limits.udp_agg_bytes_by_proc]
-# Optional per-process aggregate UDP byte-rate caps across source prefixes.
+# UDP byte rate cap (bytes/s) per source prefix for this process's ports.
+# Blocks amplification floods where many sources each stay under the per-IP limit.
+# Format: process_name = max_bytes_per_second
 
 [rate_limits.udp_agg_bytes_by_service]
-# Service-name fallback for aggregate UDP byte-rate caps.
+# Fallback aggregate UDP byte-rate cap keyed by IANA service name.
 
-# Per-CIDR port ACL rules.
+
+# Per-CIDR port ACL
 # ACL entries restrict already-authorized destination ports; they never create
 # exposure. Matching traffic may bypass selected mitigation checks.
-# Use ACL when a service should be reachable only from specific source ranges.
-
+#
 # [[acl]]
-# proto = "tcp"
-# cidr  = "10.0.0.0/8"
-# ports = [5432, 6379]  # destination ports covered by this ACL
+# proto = "tcp"          # "tcp" or "udp"
+# cidr  = "10.0.0.0/8"  # source CIDR to allow
+# ports = [5432, 6379]   # destination ports covered by this ACL
 
 
-# Protocol slot handlers (bpf_tail_call dispatch for non-TCP/UDP/ICMP traffic).
+# Protocol slot handlers
+# bpf_tail_call dispatch table for non-TCP/UDP/ICMP protocols (GRE, ESP, SCTP…).
+
+[tunnel]
+# Allowed outer IPv4 source addresses for 6in4 (protocol 41) tunnel endpoints.
+# XDP passes proto-41 only from these IPs; all others are dropped at line rate
+# before the kernel wastes CPU on SIT decapsulation.
+# Obtain the remote endpoint IP from your tunnel provider (e.g. Hurricane Electric).
+# Example: sit4_endpoints = ["216.218.226.238"]
+sit4_endpoints = []
 
 [slots]
-# Action for protocols with no handler loaded.
-# "pass" preserves existing behaviour; "drop" enforces an explicit allow-list.
-# This affects non-TCP/UDP/ICMP traffic dispatched through the slot table.
+# Action when a non-TCP/UDP/ICMP packet arrives and no handler is loaded.
+# "pass" = forward to kernel (backward-compatible default before handlers existed).
+# "drop" = enforce an explicit allow-list; unknown protocols are blocked.
 default_action = "drop"
 
-# Built-in handlers to load at startup: "gre" (proto 47), "esp" (proto 50),
-# "sctp" (proto 132).  Custom handlers: { proto = N, path = "/path/to.o" }
-# Use built-ins by name, or point custom entries at compiled BPF object files.
-# enabled = ["sctp", "gre", "esp"]
+# Built-in handlers to load at startup.
+# Named options: "gre" (proto 47), "esp" (proto 50), "sctp" (proto 132).
+# Custom handlers: { proto = N, path = "/path/to/handler.o" }
+# Example: enabled = ["sctp", "gre"]
 enabled = []
 
+[abuseipdb]
+# Threat-intel blocklist: drops source IPs listed in borestad/blocklist-abuseipdb.
+# No API key required. trusted_ips still bypass AbuseIPDB (trusted wins).
+# enabled = false  →  maps stay empty, no traffic blocked (fail-open).
+enabled = false
+
+# Blocklist sources to fetch (confidence score 100 = max confidence).
+# Available windows: 1d, 3d, 7d, 14d, 30d, 60d, 90d, 120d.
+# Shorter windows = fewer stale entries (esp. for IPv6 SLAAC privacy churn).
+# Example: sources = ["s1003d"]  or  sources = ["s10030d"]
+sources = ["s1003d"]
+
+# Refresh interval in seconds. Minimum 60s. Recommended: 3600 (1 hour).
+refresh_seconds = 3600
+
+[port_handlers]
+# Per-port BPF tail-call handlers for deep packet inspection.
+# Handlers run after the main whitelist/rate-limit pass for the port.
+
 [port_handlers.tcp]
-# Per-port TCP handlers: "PORT" = "/path/to/handler.o" or ".c".
-# Minecraft is loaded automatically by protection.profile = "minecraft" and
-# must not be configured here as a legacy per-port handler.
+# Example: 443 = "/etc/auto_xdp/handlers/tls_sni.o"
 
 [port_handlers.udp]
-# Per-port UDP handlers: "PORT" = "/path/to/handler.o" or ".c".
+# Example: 53 = "/etc/auto_xdp/handlers/dns_validate.o"
+
+
+# XDP backend
+
+[xdp]
+# BPF map pin directory. All per-map pin paths are derived from this prefix.
+# Change only if bpffs is mounted at a non-standard location.
+# Requires daemon restart to take effect.
+bpf_pin_dir = "/sys/fs/bpf/xdp_fw"
 
 [xdp.runtime]
-# Hot-updated XDP data-path tunables. Set a duration to 0 to let the BPF
-# program use its compiled default.
+# Maximum number of ICMP echo requests queued in the token bucket before
+# rate limiting kicks in (burst allowance).
 icmp_burst_packets = 100
+
+# Sustained ICMP echo request rate allowed per second (packets/s).
+# Requests beyond this rate are dropped after the burst bucket empties.
 icmp_rate_pps = 100
+
+# Sliding-window duration (seconds) for the global UDP byte-rate limiter.
+# A shorter window reacts faster; a longer window smooths out bursts.
 udp_global_window_seconds = 1
+
+# Global UDP byte-rate cap across all whitelisted ports (megabits/s). 0 = disabled.
+# Blocks volumetric floods from many low-rate sources that bypass per-IP limits.
+# Example: 1000 caps total ingress UDP at ~1 Gbps (~125 MB/s).
+udp_global_byte_rate_mbps = 997
+
+# Sliding-window duration (seconds) for per-IP and per-prefix rate limiters
+# (SYN rate, UDP packet rate, aggregate byte rate).
 rate_window_seconds = 1
+
+# --- Default-on TCP protection ---
+# Sensitivity threshold: a port is "sensitive" when its owning process or
+# service has an explicit syn-rate ≤ this value in [rate_limits.syn_by_proc]
+# / [rate_limits.syn_by_service]. Sensitive ports get the strict default tier;
+# everything else gets the normal tier.
+sensitive_port_threshold = 5
+
+# Per-source SYN rate (SYN/s). L1 — narrowest layer.
+default_tcp_syn_rate_strict = 5      # SSH, DBs, RDP — already in syn_by_*
+default_tcp_syn_rate        = 100    # HTTP/HTTPS/games/RPC/anything else
+
+# Per-prefix aggregate SYN rate (SYN/s). L2 — caps distributed floods.
+default_tcp_syn_agg_rate_strict = 50
+default_tcp_syn_agg_rate        = 1000
+
+# nftables fallback
+# Used only when the nftables backend is active instead of XDP.
+# Requires daemon restart to take effect.
+
+[nftables]
+# nftables table address family: inet (IPv4+IPv6), ip (IPv4 only), ip6 (IPv6 only).
+family = "inet"
+
+# nftables table name. The daemon creates and manages this table exclusively.
+table = "auto_xdp"

@@ -10,9 +10,11 @@
 bogon_filter = true
 
 [under_attack]
-# When enabled, the daemon tightens rate limits and drops marginal traffic
-# automatically during detected flood conditions.
-enabled = true
+# Favors survivability under very high packet rates: packet-event telemetry is
+# switched off in the XDP data path to avoid per-packet ring-buffer writes.
+# Filtering and rate limits are unchanged; counters stay available. Leave it off
+# for normal operation so `axdp tui` can show packet decisions.
+enabled = false
 
 # Service-aware exposure policy. A listener is not an authorization grant.
 # Start with audit while introducing grants, then switch to enforce.
@@ -117,15 +119,15 @@ exclude_ports = []
 
 
 # TCP rate limits
-# New SYN packets allowed per second per source IP.
+# New SYN packets allowed per second per source (see source_cidr_v4/v6 below).
 # Lookup order: syn_by_proc (process name) → syn_by_service (IANA service name).
 # Ports absent from both tables use the default tier (see [xdp.runtime] below).
 
 [rate_limits]
-# Aggregation prefix used by syn_agg_rate and other per-prefix counters. Default
-# /24 for IPv4 so distributed floods from one /24
-# share a single counter; per-IP /32 counter still applies independently.
-# IPv6 default /64 covers a typical end-site.
+# Source grouping for the per-source and aggregate rate limits: every source in
+# one prefix shares one bucket. /24 (IPv4) and /64 (IPv6, a typical end-site)
+# make a distributed flood from one network count as one source.
+# Use 32 and 128 to limit each address on its own.
 source_cidr_v4 = 24
 source_cidr_v6 = 64
 
@@ -166,7 +168,7 @@ port_rate_default = 0
 # "25565" = 1000
 
 [rate_limits.syn_by_proc]
-# Key: process name as reported by /proc. Value: max new SYNs/s per source IP.
+# Key: process name as reported by /proc. Value: max new SYNs/s per source.
 sshd           = 2    # SSH brute-force protection
 vsftpd         = 10
 proftpd        = 10
@@ -203,9 +205,9 @@ vnc             = 2
 telnet          = 2
 
 [rate_limits.syn_agg_by_proc]
-# Aggregate SYN rate cap across all source IPs for a given process's ports.
-# Useful to bound total SYN flood volume even when per-IP rate is low.
-# Format: process_name = max_syns_per_second  (across all sources combined)
+# Second SYN rate cap for a given process's ports, counted per destination port
+# and source prefix (source_cidr_v4/v6), in addition to the per-source limit.
+# Format: process_name = max_syns_per_second
 # Example:
 # caddy = 5000      # each Caddy TCP port: max 5000 SYN/s per source prefix
 # sshd  = 50        # each SSH port: max 50 SYN/s per source prefix
@@ -222,7 +224,7 @@ telnet          = 2
 # UDP is connectionless, so rate limits are the primary abuse control.
 
 [rate_limits.udp_by_proc]
-# Max UDP packets per second per source IP for ports owned by this process.
+# Max UDP packets per second per source for ports owned by this process.
 named   = 5000   # DNS — high volume expected from resolvers
 unbound = 5000
 dnsmasq = 5000
@@ -236,7 +238,7 @@ isakmp  = 100    # IKE/VPN negotiation
 openvpn = 200
 
 [rate_limits.udp_agg_bytes_by_proc]
-# Aggregate UDP byte rate cap (bytes/s) across all sources for this process's ports.
+# UDP byte rate cap (bytes/s) per source prefix for this process's ports.
 # Blocks amplification floods where many sources each stay under the per-IP limit.
 # Format: process_name = max_bytes_per_second
 

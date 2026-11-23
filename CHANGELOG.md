@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file.
 - The dashboard no longer keeps a CPU core busy after an input prompt or the
   module settings page is closed.
 
+### Changed
+- The installer and `axdp config init` now create the same configuration.
+  `axdp config init` previously used a second template with different values
+  (bogon filtering off, per-address rate-limit buckets, no global UDP cap).
+- New configurations leave under-attack mode off, so packet decisions are
+  visible in `axdp tui` by default. Existing configuration files are unchanged.
+
 ### Documentation
 - Refreshed the README with a theme-aware logo, grouped icon badges, clearer
   navigation, and seven screenshots from real isolated Linux sessions.

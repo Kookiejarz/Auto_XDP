@@ -58,3 +58,13 @@ def test_shipped_templates_use_current_module_config(name):
     data = config_file.load_toml(Path(__file__).resolve().parents[2] / name)
     assert {"icmp", "syncookie"} <= config.module_configs(data).keys()
     config.parse_toml_config(data)
+
+
+def test_installer_and_packaged_templates_are_one_configuration():
+    # The installer seeds /etc from the repository copy; `axdp config init`
+    # uses the packaged one. A host must get the same firewall either way.
+    root = Path(__file__).resolve().parents[2]
+    assert (root / "config.toml").read_bytes() == (root / "auto_xdp/default_config.toml").read_bytes()
+    settings = config.parse_toml_config(config_file.load_toml(root / "config.toml"))
+    # Packet-event telemetry is on unless an operator opts into under-attack mode.
+    assert not settings.ISATTACK_MODE and settings.DROP_EVENTS_ENABLED
