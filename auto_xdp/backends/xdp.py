@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Mapping
+from typing import Collection, Mapping
 
 from auto_xdp import config as cfg
 from auto_xdp.admin import handlers as handler_admin
@@ -67,6 +67,9 @@ _PROFILE_IDS = {_MINECRAFT_PROFILE: 1}
 _PROFILE_STATE_DIR = "profile-handlers"
 _POLICY_GENERATION_STATE = "policy-generations.json"
 _TCP_ENDPOINT_VALUE_FORMAT = "=IIQQ"
+# struct endpoint_scope_key: ifindex, port, protocol, family, destination address.
+_SCOPE_KEY = struct.Struct("=IHBB16s")
+_SCOPE_PROTOCOLS = {"tcp": 6, "udp": 17, "sctp": 132}
 _TCP_ALLOW = 1
 
 
@@ -978,6 +981,120 @@ class XdpBackend(PortBackend):
         return ok
 
     @staticmethod
+    def _scope_group(raw: bytes) -> tuple[int, int] | None:
+        """The native (protocol, port) a scope key belongs to.
+
+        Scope keys of one port shadow each other (address, then interface
+        fallback), so a port is closed and reopened as one unit.
+        """
+        if len(raw) != _SCOPE_KEY.size:
+            return None
+        _, port, proto, _, _ = _SCOPE_KEY.unpack(raw)
+        return proto, port
+
+    def _syncookie_runtime_target(self, config: cfg.ConfigSnapshot) -> tuple[bool, int, int, int, int]:
+        """struct syncookie_runtime_cfg as this configuration wants it."""
+        active = config.SYNCOOKIE_ENABLED and self._syncookie_program_available(config)
+        return (bool(active), config.SYNCOOKIE_ACTIVATION_PERCENT, config.SYNCOOKIE_AUTO_MAX_PERCENT,
+                config.SYNCOOKIE_INVALID_ACK_RATE_PPS,
+                int(config.SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS * 1_000_000_000))
+
+    def _rate_outer_targets(self, desired: BackendProjection):
+        """(protocol, outer map, wanted capacities) for each per-source rate table."""
+        for proto, entries, v4, v6 in (
+            (6, desired.tcp_rate_map_entries, "syn4_outer", "syn6_outer"),
+            (17, desired.udp_rate_map_entries, "udprt4_outer", "udprt6_outer"),
+        ):
+            if getattr(self, v4, None) is not None:
+                yield proto, getattr(self, v4), entries
+            if getattr(self, v6, None) is not None:
+                yield proto, getattr(self, v6), {
+                    port: rate_map_entries_v6(capacity, config=desired.config)
+                    for port, capacity in entries.items()}
+
+    def _unsettled_groups(self, desired: BackendProjection) -> set[tuple[int, int]]:
+        """Native ports whose admission or protection maps still differ from the target."""
+        applied = self.get_applied_state()
+        groups = ({(6, port) for port in desired.tcp_ports ^ applied.tcp_ports}
+                  | {(17, port) for port in desired.udp_ports ^ applied.udp_ports})
+        if self.sctp_map is not None:
+            groups |= {(132, port) for port in desired.sctp_ports ^ applied.sctp_ports}
+        tables: list[tuple[int, Mapping[int, object], Mapping[int, object]]] = [
+            (proto, wanted, current) for proto, name, wanted, current in (
+                (6, "syn_rate_map", desired.tcp_syn_rate_limits, applied.tcp_syn_rate_limits),
+                (6, "syn_agg_rate_map", desired.tcp_syn_agg_rate_limits, applied.tcp_syn_agg_rate_limits),
+                (6, "tcp_syncookie_mode_map", desired.tcp_syncookie_modes, applied.tcp_syncookie_modes),
+                (6, "tcp_syncookie_rate_map", desired.tcp_syncookie_rate_limits, applied.tcp_syncookie_rate_limits),
+                (17, "udp_rate_map", desired.udp_rate_limits, applied.udp_rate_limits),
+                (17, "udp_agg_rate_map", desired.udp_agg_rate_limits, applied.udp_agg_rate_limits),
+            ) if getattr(self, name, None) is not None
+        ]
+        tables += [(proto, wanted, outer.active()) for proto, outer, wanted in self._rate_outer_targets(desired)]
+        for proto, wanted, current in tables:
+            # An absent entry and a zero/"off" one protect identically.
+            groups |= {(proto, port) for port in wanted.keys() | current.keys()
+                       if (wanted.get(port) or "off") != (current.get(port) or "off")}
+        # A port granted on named zone interfaces is admitted by its zone entries.
+        for proto, zone_ports, name in ((6, desired.zone_tcp_ports, "tcp_zone_map"),
+                                        (17, desired.zone_udp_ports, "udp_zone_map")):
+            zone_map = getattr(self, name, None)
+            if zone_map is None:
+                continue
+            for zone, ports in zone_ports.items():
+                for interface in desired.config.ZONES.get(zone, {}).get("interfaces", ()):
+                    if interface == "*":
+                        continue
+                    try:
+                        ifindex = socket.if_nametoindex(interface)
+                    except OSError:
+                        continue  # absent interface: the grant is deferred, not admitted
+                    for port in ports:
+                        value = zone_map.value(ifindex, port)
+                        if not (value and value[0]):
+                            groups.add((proto, port))
+        # Protection shared by every port of a protocol.
+        if self.global_rl_map is not None and self.global_rl_map.get() != desired.udp_global_byte_rate:
+            groups |= {(17, port) for port in desired.udp_ports | applied.udp_ports
+                       | {port for ports in desired.zone_udp_ports.values() for port in ports}}
+        cookie_runtime = getattr(self, "syncookie_runtime_map", None)
+        if cookie_runtime is not None and desired.tcp_syncookie_modes and \
+                cookie_runtime.get() != self._syncookie_runtime_target(desired.config):
+            groups |= {(6, port) for port in desired.tcp_syncookie_modes}
+        return groups
+
+    def _retained_groups(
+        self, desired: BackendProjection, scope_map: BpfEndpointScopeMap,
+        scope_values: Mapping[bytes, int], changed: set[tuple[int, int]],
+        blocked: Collection[EndpointKey],
+    ) -> set[tuple[int, int]]:
+        """Ports a failed round did not touch: their confirmed admission is kept.
+
+        A port qualifies only if no endpoint on it changed since the last fully
+        confirmed round or was blocked by this one (a protection profile that
+        failed to install, for example), its protection maps already equal the
+        target, and its scope keys (allows and deny shadows alike) are exactly
+        the wanted ones. Everything else stays closed until a round completes.
+        """
+        try:
+            # Runtime timing and gate flags (bogon filter, endpoint gate, ...)
+            # protect every port; a round that could not write them keeps none.
+            runtime = self.runtime_config_map
+            if runtime is None or runtime.get() != desired.xdp_runtime_config \
+                    or runtime.get_cfg_flags() != self._cfg_flags(desired):
+                return set()
+            unsettled = self._unsettled_groups(desired)
+        except (OSError, RuntimeError):
+            return set()
+        active = scope_map.active()
+        rejected: set[tuple[int, int] | None] = {
+            *changed, *unsettled, *((_SCOPE_PROTOCOLS[key[0]], key[2]) for key in blocked)}
+        for raw in active.keys() | scope_values.keys():
+            wanted, current = scope_values.get(raw), active.get(raw)
+            if (wanted is not None and current != wanted) or (wanted is None and current):
+                rejected.add(self._scope_group(raw))
+        return {group for group in map(self._scope_group, active) if group is not None} - rejected
+
+    @staticmethod
     def _scope_indexes(interfaces: tuple[str, ...]) -> list[int]:
         if not interfaces:
             return [0]
@@ -1014,8 +1131,8 @@ class XdpBackend(PortBackend):
             for family in families:
                 packed = ipaddress.ip_address(address).packed.ljust(16, b"\0") if address else bytes(16)
                 for index in indexes:
-                    raw = struct.pack("=IHBB16s", index, key[2], {"tcp": 6, "udp": 17, "sctp": 132}[key[0]],
-                                      2 if family == 4 else 10, packed)
+                    raw = _SCOPE_KEY.pack(index, key[2], _SCOPE_PROTOCOLS[key[0]],
+                                          2 if family == 4 else 10, packed)
                     # A deny on the same native key always wins.
                     values[raw] = min(values.get(raw, 1), int(policy.allow))
         # Public fallback must never grant admission on a named private NIC.
@@ -1276,9 +1393,8 @@ class XdpBackend(PortBackend):
 
         cookie_runtime_map = getattr(self, "syncookie_runtime_map", None)
         if cookie_runtime_map is not None:
-            active = desired_state.config.SYNCOOKIE_ENABLED and \
-                self._syncookie_program_available(desired_state.config)
-            self._map_operation(cookie_runtime_map, 'set', active, desired_state.config.SYNCOOKIE_ACTIVATION_PERCENT, desired_state.config.SYNCOOKIE_AUTO_MAX_PERCENT, desired_state.config.SYNCOOKIE_INVALID_ACK_RATE_PPS, int(desired_state.config.SYNCOOKIE_CHALLENGE_COOLDOWN_SECONDS * 1_000_000_000), dry_run)
+            self._map_operation(cookie_runtime_map, 'set',
+                                *self._syncookie_runtime_target(desired_state.config), dry_run)
 
         if self.udp_rate_map is not None:
             self._apply_rate_map_delta(
@@ -1299,24 +1415,8 @@ class XdpBackend(PortBackend):
                 "udp_agg",
             )
 
-        tcp_entries = desired_state.tcp_rate_map_entries
-        udp_entries = desired_state.udp_rate_map_entries
-        if self.syn4_outer is not None:
-            self._apply_rate_outer_delta(self.syn4_outer, tcp_entries, dry_run)
-        if self.syn6_outer is not None:
-            self._apply_rate_outer_delta(
-                self.syn6_outer,
-                {p: rate_map_entries_v6(c, config=desired_state.config) for p, c in tcp_entries.items()},
-                dry_run,
-            )
-        if self.udprt4_outer is not None:
-            self._apply_rate_outer_delta(self.udprt4_outer, udp_entries, dry_run)
-        if self.udprt6_outer is not None:
-            self._apply_rate_outer_delta(
-                self.udprt6_outer,
-                {p: rate_map_entries_v6(c, config=desired_state.config) for p, c in udp_entries.items()},
-                dry_run,
-            )
+        for _, outer, wanted in self._rate_outer_targets(desired_state):
+            self._apply_rate_outer_delta(outer, wanted, dry_run)
 
         if self._tcp_policy_map is not None:
             tcp_policy_ports = (
@@ -1453,6 +1553,10 @@ class XdpBackend(PortBackend):
             self._persisted_policy_generations = dict(self._policy_generations)
 
         scope_map = getattr(self, "endpoint_map", None)
+        # Native ports on which an endpoint was added, removed or modified
+        # since the last fully confirmed round. Only these are closed and
+        # reopened; every other port keeps serving through this round.
+        changed_groups: set[tuple[int, int]] = set()
         tentative_profile_generation = 0
         tcp_zone_values: dict[tuple[int, int], tuple[int, int, int, int]] = {}
         udp_zone_values: dict[tuple[int, int], int] = {}
@@ -1474,9 +1578,15 @@ class XdpBackend(PortBackend):
                         scope_map.verify()
                     except (OSError, RuntimeError) as exc:
                         result.failures.append(ApplyFailure(ApplyOperation("revoke", "endpoint_scopes", "read"), str(exc)))
-                    changed = getattr(self, "_endpoint_cache", {}) != projection.endpoint_policies
+                    confirmed = getattr(self, "_endpoint_cache", {})
+                    changed_groups.update(
+                        (_SCOPE_PROTOCOLS[key[0]], key[2])
+                        for key in confirmed.keys() | projection.endpoint_policies.keys()
+                        if confirmed.get(key) != projection.endpoint_policies.get(key))
                     for raw, value in scope_map.active().items():
-                        if value and (changed or scope_values.get(raw) != value):
+                        group = self._scope_group(raw)
+                        if value and (group is None or group in changed_groups
+                                      or scope_values.get(raw) != value):
                             self._map_operation(scope_map, "set", raw, 0, dry_run)
                     for raw, value in scope_values.items():
                         if not value and scope_map.active().get(raw) != 0:
@@ -1612,19 +1722,27 @@ class XdpBackend(PortBackend):
         if not dry_run:
             self._save_policy_generations()
 
-        return self._finish_apply(original, projection, result, dry_run, scope_map)
+        # A failed revocation leaves an admission that cannot be confirmed
+        # closed, so nothing is retained. Any later failure only concerns the
+        # ports this round touched.
+        retained: set[tuple[int, int]] = set()
+        if result.failures and "revoke" in completed and scope_map is not None:
+            retained = self._retained_groups(
+                projection, scope_map, scope_values, changed_groups, result.blocked_endpoints)
+        return self._finish_apply(original, projection, result, dry_run, scope_map, retained)
 
     def _finish_apply(
         self, original: DesiredState, desired_state: BackendProjection,
         result: ApplyResult, dry_run: bool, scope_map: BpfEndpointScopeMap | None,
+        retained: Collection[tuple[int, int]] = (),
     ) -> ApplyResult:
         if self.last_apply_failures:
             if scope_map is not None:
                 for raw, value in scope_map.active().items():
-                    if value:
+                    if value and self._scope_group(raw) not in retained:
                         self._map_operation(scope_map, "set", raw, 0, dry_run)
             for key, policy in original.endpoint_policies.items():
-                if policy.allow:
+                if policy.allow and (_SCOPE_PROTOCOLS[key[0]], key[2]) not in retained:
                     result.blocked_endpoints.setdefault(key, "target admission blocked after apply failure; existing state requires confirmation")
             result.unconfirmed["maps"] = "one or more backend operations failed; retained admissions require readback"
         if not dry_run and not self.last_apply_failures and not result.unconfirmed:
@@ -1675,12 +1793,19 @@ class XdpBackend(PortBackend):
                 result.unconfirmed["udp_global_rate"] = "global UDP rate could not be confirmed"
         if not dry_run and scope_map is not None and result.applied.evidence.get("endpoint_map") == "confirmed" and result.applied.evidence.get("runtime_config") == "confirmed":
             checked_policies = {**result.applied.endpoint_policies, **desired_state.endpoint_policies}
+            open_groups = {self._scope_group(raw) for raw, value in scope_map.active().items() if value}
             for key, policy in checked_policies.items():
-                if key in result.blocked_endpoints:
+                blocked = key in result.blocked_endpoints
+                if blocked:
                     policy = replace(policy, allow=False)
                 values, errors, _ = self._scope_values(replace(desired_state, endpoint_policies={key: policy}))
+                # A key that was never written is closed when nothing broader can
+                # admit it. For an endpoint this round blocked, that is any open
+                # key of its own port (the only keys the lookup falls back to);
+                # other ports may keep serving. Otherwise no key may be open.
                 known = bool(values) and key not in errors and all(scope_map.active().get(raw) == value or
-                    (not value and raw not in scope_map.active() and not any(scope_map.active().values()))
+                    (not value and raw not in scope_map.active()
+                     and (self._scope_group(raw) not in open_groups if blocked else not open_groups))
                     for raw, value in values.items())
                 if not values and not policy.allow and desired_state.endpoint_policy_enabled:
                     known = self._unresolved_scope_closed(key, desired_state.config, scope_map.active())

@@ -124,6 +124,7 @@ class ScopeMap:
 
     def __init__(self):
         self.cache = {}
+        self.writes = []
         self.fail_admit = False
         self.fail_revoke = False
         self.unreadable = False
@@ -132,6 +133,7 @@ class ScopeMap:
         return dict(self.cache)
 
     def set(self, key, value, dry_run=False):
+        self.writes.append((key, value))
         if self.fail_revoke and not value:
             self.last_error = "injected revoke failure"
             return False
@@ -303,6 +305,221 @@ def test_direct_plan_revokes_before_icmp_load_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="ICMP loader busy"):
         backend.apply_reconcile_plan(plan, False, desired)
     assert not backend.tcp_map.active_ports()
+
+
+SSH = ("tcp", "0.0.0.0", 22, "public")
+WEB = ("tcp", "0.0.0.0", 8443, "public")
+GRANT = EndpointPolicy(True, "grant")
+
+
+def scope_keys(backend, key):
+    values, _, _ = backend._scope_values(target({key: GRANT}))
+    return set(values)
+
+
+def confirmed_ssh_backend():
+    backend = xdp_backend()
+    result = backend.reconcile(target({SSH: GRANT}, ICMP_REPLY_ENABLED=False), False)
+    assert result.successful and result.applied.endpoint_admission[SSH] == "admitted"
+    backend.endpoint_map.writes.clear()
+    return backend
+
+
+def assert_ssh_served(backend, result):
+    ssh = scope_keys(backend, SSH)
+    assert all(backend.endpoint_map.cache[raw] == 1 for raw in ssh)
+    assert not [write for write in backend.endpoint_map.writes if write[0] in ssh]
+    assert 22 in backend.tcp_map.active_ports()
+    assert SSH not in result.blocked_endpoints
+    assert result.applied.endpoint_admission[SSH] == "admitted"
+
+
+def test_unrelated_endpoint_changes_do_not_close_a_confirmed_port():
+    backend = confirmed_ssh_backend()
+    for policies in ({SSH: GRANT, WEB: GRANT},                                    # added
+                     {SSH: GRANT, WEB: replace(GRANT, instance_id="restarted")},  # replaced
+                     {SSH: GRANT}):                                               # removed
+        result = backend.reconcile(target(policies, ICMP_REPLY_ENABLED=False), False)
+        assert result.successful
+        assert_ssh_served(backend, result)
+    # The changed port itself is still closed before it is prepared and reopened.
+    web = scope_keys(backend, WEB)
+    assert [value for raw, value in backend.endpoint_map.writes if raw in web][:3] == [1, 0, 1]
+
+
+@pytest.mark.parametrize("stage", ["prepare", "admit", "cleanup"])
+def test_apply_failure_closes_only_the_ports_it_touched(monkeypatch, stage):
+    backend = confirmed_ssh_backend()
+    desired = target({SSH: GRANT, WEB: GRANT}, ICMP_REPLY_ENABLED=False)
+    with monkeypatch.context() as patch:
+        if stage == "prepare":
+            patch.setattr(backend, "_ensure_profile_handlers", mock.Mock(side_effect=RuntimeError("busy")))
+        elif stage == "admit":
+            patch.setattr(backend.endpoint_map, "fail_admit", True)
+        else:
+            patch.setattr(backend, "_remove_stale_profile_handlers", mock.Mock(side_effect=RuntimeError("busy")))
+        for _ in range(2):  # a persistent cause never erodes the confirmed port
+            result = backend.reconcile(desired, False)
+            assert result.failures and not result.successful
+            assert_ssh_served(backend, result)
+            assert WEB in result.blocked_endpoints
+            assert result.applied.endpoint_admission[WEB] == "closed"
+            assert not any(backend.endpoint_map.cache.get(raw) for raw in scope_keys(backend, WEB))
+    result = backend.reconcile(desired, False)
+    assert result.successful and result.applied.endpoint_admission[WEB] == "admitted"
+    assert_ssh_served(backend, result)
+
+
+def test_apply_failure_does_not_retain_a_port_the_round_itself_blocked(monkeypatch):
+    game = ("tcp", "0.0.0.0", 25565, "public")
+    profiled = {SSH: GRANT, game: replace(GRANT, profile="minecraft")}
+    backend = xdp_backend()
+    # The handler object is unchanged throughout, so its generation is stable
+    # and the port-level entry keeps its value: only the block closes the port.
+    monkeypatch.setattr(backend, "_ensure_profile_handlers", lambda *args: (set(), 0))
+    assert backend.reconcile(target(profiled, ICMP_REPLY_ENABLED=False), False).successful
+    backend.endpoint_map.writes.clear()
+    # The unchanged port's profile handler can no longer be installed.
+    monkeypatch.setattr(backend, "_ensure_profile_handlers", lambda *args: ({("public", 25565)}, 0))
+    result = backend.reconcile(target(profiled, ICMP_REPLY_ENABLED=False), False)
+    assert backend.tcp_map.value(25565)[0] and (6, 25565) not in backend._unsettled_groups(
+        project_endpoint_policies(target(profiled, ICMP_REPLY_ENABLED=False))[0])
+    assert result.blocked_endpoints[game] == "protection profile installation failed"
+    assert not any(backend.endpoint_map.cache.get(raw) for raw in scope_keys(backend, game))
+    assert result.applied.endpoint_admission[game] == "closed"
+    assert_ssh_served(backend, result)
+
+
+def test_apply_failure_does_not_retain_a_port_whose_protection_is_unsettled(monkeypatch):
+    backend = confirmed_ssh_backend()
+    backend.tcp_map.set(22, (0, 0, 0, 0))  # drift: the port-level admission is gone
+    monkeypatch.setattr(backend, "_ensure_profile_handlers", mock.Mock(side_effect=RuntimeError("busy")))
+    result = backend.reconcile(target({SSH: GRANT, WEB: GRANT}, ICMP_REPLY_ENABLED=False), False)
+    assert SSH in result.blocked_endpoints
+    assert not any(backend.endpoint_map.cache.values())
+
+
+def protected_backend(**policy):
+    """A confirmed SSH port whose limits live in real-shaped rate tables."""
+    from test_xdp_port_sync import FakeGlobalRlMap, FakeRateOuterMap, FakeSynRateMap
+    backend = xdp_backend()
+    for name in ("syn_rate_map", "syn_agg_rate_map", "udp_rate_map", "udp_agg_rate_map"):
+        setattr(backend, name, FakeSynRateMap())
+    for name in ("syn4_outer", "syn6_outer", "udprt4_outer", "udprt6_outer"):
+        setattr(backend, name, FakeRateOuterMap())
+    backend.global_rl_map = FakeGlobalRlMap()
+    for resource in (backend.syn_rate_map, backend.syn_agg_rate_map, backend.udp_rate_map,
+                     backend.udp_agg_rate_map, backend.syn4_outer, backend.syn6_outer,
+                     backend.udprt4_outer, backend.udprt6_outer):
+        resource.verify = lambda: 0
+    limited = replace(GRANT, syn_rate=2, syn_aggregate_rate=50, rate_map_entries=4096, **policy)
+    desired = {SSH: limited}
+    result = backend.reconcile(target(desired, ICMP_REPLY_ENABLED=False), False)
+    assert result.successful, (result.failures, result.blocked_endpoints, result.unconfirmed)
+    backend.endpoint_map.writes.clear()
+    return backend, desired
+
+
+@pytest.mark.parametrize("drift", [None, "stray_allow", "syn_rate", "aggregate", "outer", "scope"])
+def test_apply_failure_retains_a_port_only_while_its_own_protection_matches(monkeypatch, drift):
+    backend, desired = protected_backend()
+    ssh = sorted(scope_keys(backend, SSH))
+    if drift == "syn_rate":
+        del backend.syn_rate_map._active[22]
+    elif drift == "aggregate":
+        backend.syn_agg_rate_map._active[22] = 9999
+    elif drift == "outer":
+        del backend.syn4_outer._active[22]
+    elif drift == "scope":
+        backend.endpoint_map.cache[ssh[0]] = 0
+    stray = struct.pack("=IHBB16s", 9, 22, 6, 2, bytes(16))
+    if drift == "stray_allow":  # an allow on the same port that the target does not contain
+        backend.endpoint_map.cache[stray] = 1
+    monkeypatch.setattr(backend, "_ensure_profile_handlers", mock.Mock(side_effect=RuntimeError("busy")))
+    result = backend.reconcile(target({**desired, WEB: GRANT}, ICMP_REPLY_ENABLED=False), False)
+    assert result.failures
+    if drift in (None, "stray_allow"):
+        # The port's own keys and limits are intact; a foreign allow is revoked, not kept.
+        assert_ssh_served(backend, result)
+        assert backend.syn_rate_map.active()[22] == 2 and backend.syn4_outer.active()[22] == 4096
+        assert not backend.endpoint_map.cache.get(stray)
+    else:
+        assert SSH in result.blocked_endpoints
+        assert not any(backend.endpoint_map.cache.values())
+
+
+@pytest.mark.parametrize("failing", ["udp_global_rate", "runtime_flags"])
+def test_apply_failure_retains_nothing_a_missing_global_protection_covers(monkeypatch, failing):
+    dns = ("udp", "0.0.0.0", 53, "public")
+    backend, desired = protected_backend()
+    desired = {**desired, dns: GRANT}
+    assert backend.reconcile(target(desired, ICMP_REPLY_ENABLED=False), False).successful
+    tightened = target(desired, ICMP_REPLY_ENABLED=False)
+    if failing == "udp_global_rate":
+        tightened = replace(tightened, udp_global_byte_rate=1_000_000)
+        monkeypatch.setattr(backend.global_rl_map, "set", lambda *args, **kwargs: False)
+    else:
+        tightened = replace(tightened, bogon_filter_enabled=not tightened.bogon_filter_enabled)
+        monkeypatch.setattr(backend.runtime_config_map, "set", lambda *args, **kwargs: False)
+    result = backend.reconcile(tightened, False)
+    assert result.failures and dns in result.blocked_endpoints
+    assert not any(backend.endpoint_map.cache.get(raw) for raw in scope_keys(backend, dns))
+    # TCP does not depend on the UDP cap; the runtime flags cover every port.
+    ssh_open = all(backend.endpoint_map.cache.get(raw) for raw in scope_keys(backend, SSH))
+    assert ssh_open is (failing == "udp_global_rate")
+    assert (SSH in result.blocked_endpoints) is (failing == "runtime_flags")
+
+
+def test_apply_failure_does_not_retain_a_zone_port_without_its_zone_entry(monkeypatch):
+    vpn = ("tcp", "0.0.0.0", 443, "trusted")
+    zones = {"public": {"interfaces": []}, "trusted": {"interfaces": ["wg0"]}}
+    monkeypatch.setattr(socket, "if_nametoindex", lambda name: 7)
+    monkeypatch.setattr(socket, "if_nameindex", lambda: [(1, "lo"), (7, "wg0")])
+    backend = xdp_backend()
+    backend.tcp_zone_map, backend.udp_zone_map = ZoneMap(), ZoneMap()
+    policies = {SSH: GRANT, vpn: GRANT}
+    result = backend.reconcile(target(policies, ICMP_REPLY_ENABLED=False, ZONES=zones), False)
+    assert result.successful and result.applied.endpoint_admission[vpn] == "admitted"
+    monkeypatch.setattr(backend, "_ensure_profile_handlers", mock.Mock(side_effect=RuntimeError("busy")))
+    desired = target({**policies, WEB: GRANT}, ICMP_REPLY_ENABLED=False, ZONES=zones)
+    result = backend.reconcile(desired, False)  # intact: the zone port is kept
+    assert vpn not in result.blocked_endpoints and result.applied.endpoint_admission[vpn] == "admitted"
+    del backend.tcp_zone_map.values[(7, 443)]   # drift: its zone admission is gone
+    result = backend.reconcile(desired, False)
+    assert vpn in result.blocked_endpoints and SSH not in result.blocked_endpoints
+    assert not any(backend.endpoint_map.cache.get(raw)
+                   for raw in backend._scope_values(target({vpn: GRANT}, ZONES=zones))[0])
+
+
+def test_port_removed_from_a_shared_port_group_closes_the_group_first():
+    other = ("tcp", "198.51.100.10", 22, "public")
+    backend = xdp_backend()
+    assert backend.reconcile(target({SSH: GRANT, other: GRANT}, ICMP_REPLY_ENABLED=False), False).successful
+    backend.endpoint_map.writes.clear()
+    assert backend.reconcile(target({SSH: GRANT}, ICMP_REPLY_ENABLED=False), False).successful
+    ssh = scope_keys(backend, SSH)
+    # The surviving endpoint shares the port's protection entries: close, then reopen.
+    assert [value for raw, value in backend.endpoint_map.writes if raw in ssh][:1] == [0]
+    assert all(backend.endpoint_map.cache[raw] == 1 for raw in ssh)
+
+
+def test_failed_revocation_still_closes_every_port():
+    backend = confirmed_ssh_backend()
+    backend.trusted_map.set("192.0.2.1/32", 1)
+    backend.trusted_map.delete = lambda *args, **kwargs: False
+    result = backend.reconcile(target({SSH: GRANT}, ICMP_REPLY_ENABLED=False), False)
+    assert any(failure.operation.stage == "revoke" for failure in result.failures)
+    assert SSH in result.blocked_endpoints
+    assert not any(backend.endpoint_map.cache.values())
+
+
+def test_a_backend_without_a_confirmed_round_retains_nothing(monkeypatch):
+    backend = xdp_backend()
+    backend.endpoint_map.cache = dict.fromkeys(scope_keys(backend, SSH), 1)
+    backend.tcp_map.set(22, (1, 0, 0, 0))
+    monkeypatch.setattr(backend, "_ensure_profile_handlers", mock.Mock(side_effect=RuntimeError("busy")))
+    result = backend.reconcile(target({SSH: GRANT}, ICMP_REPLY_ENABLED=False), False)
+    assert SSH in result.blocked_endpoints and not any(backend.endpoint_map.cache.values())
 
 
 @pytest.mark.parametrize("protocol", ["tcp", "udp"])

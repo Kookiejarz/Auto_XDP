@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 ## Unreleased
 
 ### Fixed
+- A failed policy update no longer closes every authorized service. Ports that
+  the update did not touch keep their confirmed admission; only the ports it
+  was changing stay closed until an update completes. Everything is still
+  closed when a revocation fails, when protection shared by all ports (runtime
+  flags such as the bogon filter) cannot be written, or when the failure
+  happens before the daemon has confirmed its first update after a start.
+- Adding, restarting, or removing one service no longer briefly closes the
+  other authorized ports while the change is applied.
 - The dashboard no longer keeps a CPU core busy after an input prompt or the
   module settings page is closed.
 
