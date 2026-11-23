@@ -22,7 +22,8 @@
   <a href="#installation"><strong>Install</strong></a> ·
   <a href="#first-run">First run</a> ·
   <a href="#more-screenshots">Screenshots</a> ·
-  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki">Wiki</a>
+  <a href="https://github.com/Kookiejarz/Auto_XDP/wiki">Wiki</a> ·
+  <a href="#support-auto-xdp">Support</a>
 </p>
 
 <p align="center">
@@ -210,6 +211,13 @@ They show functional behavior, not a throughput benchmark.
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution guidelines and local test commands.
+
+## Support Auto XDP
+
+Auto XDP receives donations through its fiscal host, [Open Source Europe (OSE)](https://www.opensourceeurope.org/).
+Donations help us run test servers, test Auto XDP on more Linux kernels and
+network cards, and maintain our release tools. You can donate or see the project's
+income and expenses on [Open Collective](https://opencollective.com/auto-xdp).
 
 ## License
 
